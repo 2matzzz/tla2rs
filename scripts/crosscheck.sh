@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Run the same spec with TLC and tla2rs and compare state counts, violated invariants, and
+# counterexample lengths.
+#   scripts/crosscheck.sh examples/DieHard.tla [examples/DieHard.cfg] [-deadlock]
+# Pass tla2tools.jar via TLA_TOOLS (default ~/.tla/tla2tools.jar).
+# State counts at a violation depend on search order, so TLC runs with one worker for a fixed order.
+set -euo pipefail
+tla="$1"; shift
+cfg="${tla%.tla}.cfg"
+if [[ $# -gt 0 && "$1" == *.cfg ]]; then cfg="$1"; shift; fi
+# Split arguments into those passed to both TLC and tla2rs and those for tla2rs only
+extra=(); rsonly=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -setcap|-memlimit|-tmpdir) rsonly+=("$1" "$2"); shift 2 ;;
+    -notrace|-fp128|-metal|-batched) rsonly+=("$1"); shift ;;
+    *) extra+=("$1"); shift ;;
+  esac
+done
+# A cfg line like `\* crosscheck: rsargs -memlimit 0` adds those arguments to tla2rs only
+if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*rsargs[[:space:]].*' "$cfg"); then
+  read -r -a more <<< "${a#*rsargs}"
+  rsonly+=("${more[@]}")
+fi
+jar="${TLA_TOOLS:-$HOME/.tla/tla2tools.jar}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+bin="$root/target/release/tla2rs"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cp "$tla" "$cfg" "$work/"
+cd "$work"
+t=$(basename "$tla"); c=$(basename "$cfg")
+
+summarize() {
+  # Line 1: verdict (ok / violated invariant / deadlock), line 2: state counts, line 3: trace length
+  local f="$1"
+  local res
+  res=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+ is false|No error has been found' "$f" | head -1 || true)
+  # If none of the above matched but there is an Error: line, treat it as an evaluation error.
+  # The message may differ from TLC's (TLC can also stop on an internal exception), so compare
+  # only the kind
+  if [[ -z "$res" ]] && grep -qE '^Error:' "$f"; then
+    res="Evaluation error"
+  fi
+  local temporal=0
+  if grep -qE 'Temporal propert(y .* is|ies were) violated' "$f"; then
+    res="Temporal property violated"; temporal=1
+  fi
+  local counts
+  counts=$(grep -oE '[0-9,]+ states generated, [0-9,]+ distinct states found' "$f" | tail -1 | tr -d ',' || true)
+  local trace
+  trace=$(grep -cE '^State [0-9]+:' "$f" || true)
+  # Don't compare lengths of liveness counterexamples (lassos); one property can have several
+  [[ $temporal == 1 ]] && trace=lasso
+  printf '%s\n%s\ntrace=%s\n' "$res" "$counts" "$trace"
+}
+
+s0=$(date +%s.%N)
+rc_tlc=0; rc_rs=0
+java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+s1=$(date +%s.%N)
+"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
+s2=$(date +%s.%N)
+
+# With both VIEW and SYMMETRY, TLC may keep states with equal views as distinct (its choice of
+# representative depends on the state itself). tla2rs collapses by orbit of the view, so its
+# distinct count can be lower than TLC's. In that case compare only the verdict.
+verdict_only=0
+if grep -qE '^[[:space:]]*VIEW[[:space:]]' "$c" && grep -qE '^[[:space:]]*SYMMETRY[[:space:]]' "$c"; then
+  verdict_only=1
+fi
+# If the cfg says `\* crosscheck: distinct-only`, don't compare generated-state counts.
+# TLC counts successors per \/ branch, so in specs where both branches can hold it counts the
+# same successor more than once (distinct counts and verdicts still match).
+distinct_only=0
+if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*distinct-only' "$c"; then
+  distinct_only=1
+fi
+
+a=$(summarize tlc.out); b=$(summarize rs.out)
+# If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
+if [[ -z "$(echo "$a" | head -1)" ]]; then
+  echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
+  exit 1
+fi
+# Compare exit codes too: identical verdict strings with different exit paths are not a match.
+# 0 / 10 (assumption) / 11 (deadlock) / 12 (safety) / 13 (liveness) are kept as is; anything else
+# is folded into "error" (TLC returns 255 for evaluation errors but 75 for internal exceptions)
+norm() { case "$1" in 0|10|11|12|13) echo "$1" ;; *) echo error ;; esac; }
+a="$a
+exit=$(norm $rc_tlc)"; b="$b
+exit=$(norm $rc_rs)"
+if [[ $verdict_only == 1 ]]; then
+  a=$(echo "$a" | head -1); b=$(echo "$b" | head -1)
+elif [[ $distinct_only == 1 ]]; then
+  a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
+fi
+printf '%-14s TLC %6.2fs | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$(echo "$s2 - $s1" | bc)"
+if [[ "$a" == "$b" ]]; then
+  if [[ $verdict_only == 1 ]]; then
+    echo "  MATCH(verdict only; VIEW+SYMMETRY): $(echo "$a" | tr '\n' ' ')"
+  elif [[ $distinct_only == 1 ]]; then
+    echo "  MATCH(distinct only; TLC counts \\/-duplicates): $(echo "$a" | tr '\n' ' ')"
+  else
+    echo "  MATCH: $(echo "$a" | tr '\n' ' ')"
+  fi
+else
+  echo "  MISMATCH"; echo "  TLC:    $(echo "$a" | tr '\n' ' ')"; echo "  tla2rs: $(echo "$b" | tr '\n' ' ')"
+  sed 's/^/    rs.err: /' rs.err | head -20
+  exit 1
+fi

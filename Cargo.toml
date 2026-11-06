@@ -1,0 +1,11 @@
+[package]
+name = "tla2rs"
+version = "0.1.0"
+edition = "2021"
+description = "Compile a TLA+ spec into a native Rust explicit-state model checker"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

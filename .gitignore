@@ -1,0 +1,5 @@
+target/
+/out/
+*.tlc-states/
+states/
+.tla2rs/
