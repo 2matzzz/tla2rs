@@ -1956,9 +1956,14 @@ impl<'a> Gen<'a> {
 
     /// Function that packs the deduplication key (the VIEW value if there is one, otherwise the
     /// state) into a bit string
-    pub fn gen_key(&mut self, view: Option<&Expr>) -> R<String> {
+    /// state) into a bit string. With `equiv` (see `view_is_equivariant`), also emits `view_perm`,
+    /// which permutes an already computed view value.
+    pub fn gen_key(&mut self, view: Option<&Expr>, equiv: bool) -> R<String> {
         let Some(view) = view else {
-            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Key { pack(s).unwrap() }\n".into());
+            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Key { pack(s).unwrap() }\n\
+                       const VIEW_EQUIV: bool = false;\ntype View = ();\nfn view_val(_: &State) -> View {}\n\
+                       fn view_perm(v: &View, _: &[u16]) -> View { *v }\nfn view_key(_: &View) -> Key { unreachable!() }\n"
+                .into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
         let mut body = String::new();
@@ -1966,10 +1971,17 @@ impl<'a> Gen<'a> {
         let bits = self.pack_value("__v", &vt, &mut body, &mut at)?;
         let vp = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let words = bits.div_ceil(64).max(1);
+        let vperm = if equiv { self.perm_code("(*v)", &vt)? } else { "*v".into() };
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
-             fn view_pack(s: &State) -> Option<Key> {{ let __v = {vc}; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn key_of(s: &State) -> Key {{ match view_pack(s) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n"
+             const VIEW_EQUIV: bool = {equiv};\ntype View = {};\n\
+             fn view_val(s: &State) -> View {{ {vc} }}\n\
+             fn view_pack_v(__v: &View) -> Option<Key> {{ let __v = *__v; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
+             fn view_perm(v: &View, pm: &[u16]) -> View {{ {vperm} }}\n\
+             fn view_pack(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n\
+             fn view_key(v: &View) -> Key {{ match view_pack_v(v) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n\
+             fn key_of(s: &State) -> Key {{ match view_pack(s) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n",
+            vt.repr()
         ))
     }
 

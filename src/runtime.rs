@@ -205,9 +205,15 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
     if PERMS.is_empty() {
         return fingerprint(&key_of(s));
     }
+    let v = if VIEW_EQUIV { Some(view_val(s)) } else { None };
     let mut best: Option<Key> = None;
-    for p in PERMS {
-        let k = key_of(&perm_state(s, p));
+    for (i, p) in PERMS.iter().enumerate() {
+        let k = match &v {
+            Some(v) if i == 0 && PERM0_IS_ID => view_key(v),
+            Some(v) => view_key(&view_perm(v, p)),
+            None if i == 0 && PERM0_IS_ID => key_of(s),
+            None => key_of(&perm_state(s, p)),
+        };
         if best.as_ref().is_none_or(|b| k < *b) {
             best = Some(k);
         }
