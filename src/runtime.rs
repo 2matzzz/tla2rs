@@ -1109,17 +1109,27 @@ fn run_safety(opt: &Opt) {
         let mut found: Option<SFound> = None;
         let mut done = 0usize;
         // Read the level one batch at a time and split each batch across threads for expansion.
-        // Only one batch is held in memory at a time.
-        let batch = (opt.mem_limit / PACK_BYTES).max(1024);
-        for part in frontier.batches(batch) {
-            if found.is_some() {
-                done += part.len();
+        // While the workers expand a batch, this thread merges the previous batch's results (which
+        // may spill them to disk) and reads the next batch, so up to two batches are in memory.
+        // Smaller batches leave less unoverlapped work at the start and end of a level.
+        let batch = (opt.mem_limit / PACK_BYTES).clamp(1024, 1 << 18);
+        let mut parts = frontier.batches(batch);
+        let mut cur = parts.next();
+        let mut pending: Vec<SChunk> = vec![];
+        while let Some(part) = cur {
+            let n = part.len();
+            done += n;
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // An earlier batch found an error: skip the rest of the level.
+                for c in pending.drain(..) {
+                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt);
+                }
+                cur = parts.next();
                 continue;
             }
-            let n = part.len();
             let k = if n < 1024 { 1 } else { opt.workers.min(n) };
             let per = n.div_ceil(k);
-            let chunks: Vec<SChunk> = std::thread::scope(|sc| {
+            let (chunks, next_part) = std::thread::scope(|sc| {
                 let hs: Vec<_> = (0..k)
                     .map(|i| {
                         let (x, y) = (i * per, ((i + 1) * per).min(n));
@@ -1127,25 +1137,30 @@ fn run_safety(opt: &Opt) {
                         sc.spawn(move || expand_safety(pt, x, y, seen, stop, opt))
                     })
                     .collect();
-                hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
-            });
-            done += n;
-            for c in chunks {
-                generated += c.generated;
-                distinct += c.distinct;
-                nxt.extend(c.next, opt);
-                if found.is_none() {
-                    found = c.found;
+                for c in pending.drain(..) {
+                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt);
                 }
-            }
+                let next_part = parts.next();
+                let chunks: Vec<SChunk> =
+                    hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect();
+                (chunks, next_part)
+            });
+            pending = chunks;
+            cur = next_part;
             if last.elapsed().as_secs() >= 10 {
                 last = std::time::Instant::now();
+                let (g, d, q) = pending.iter().fold((generated, distinct, nxt.len()), |(g, d, q), c| {
+                    (g + c.generated, d + c.distinct, q + c.next.len())
+                });
                 println!(
-                    "Progress({depth}): {generated} states generated, {distinct} distinct states found, {} states left on queue. ({:.0}s)",
-                    nxt.len() + (left_before - done),
+                    "Progress({depth}): {g} states generated, {d} distinct states found, {} states left on queue. ({:.0}s)",
+                    q + (left_before - done),
                     t0.elapsed().as_secs_f64()
                 );
             }
+        }
+        for c in pending {
+            merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt);
         }
         if let Some(f) = found {
             report_and_exit(&seen, f, generated, distinct, nxt.len() + (left_before - done));
@@ -1156,6 +1171,17 @@ fn run_safety(opt: &Opt) {
         }
     }
     finish(opt, t0, generated, distinct, depth);
+}
+
+/// Adds one worker's results to the totals and the next level. Chunks are merged in worker
+/// order, so the first error reported is the one from the earliest chunk.
+fn merge_chunk(c: SChunk, generated: &mut u64, distinct: &mut u64, nxt: &mut Level, found: &mut Option<SFound>, opt: &Opt) {
+    *generated += c.generated;
+    *distinct += c.distinct;
+    nxt.extend(c.next, opt);
+    if found.is_none() {
+        *found = c.found;
+    }
 }
 
 /// Reports a detected error and exits. Never returns.
