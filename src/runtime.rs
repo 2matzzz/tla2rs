@@ -220,7 +220,7 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
     for (i, p) in PERMS.iter().enumerate() {
         let k = match &v {
             Some(v) if i == 0 && PERM0_IS_ID => view_key(v),
-            Some(v) => view_key(&view_perm(v, p)),
+            Some(v) => view_perm_key(v, p, PERMS_INV[i]),
             None if i == 0 && PERM0_IS_ID => key_of(s),
             None => key_of(&perm_state(s, p)),
         };
