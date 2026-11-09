@@ -220,7 +220,11 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
     for (i, p) in PERMS.iter().enumerate() {
         let k = match &v {
             Some(v) if i == 0 && PERM0_IS_ID => view_key(v),
-            Some(v) => view_perm_key(v, p, PERMS_INV[i]),
+            Some(v) => match view_perm_pack(v, p, PERMS_INV[i], best.as_ref()) {
+                Some(Some(k)) => k,
+                Some(None) => continue,
+                None => type_error("VIEW value", ""),
+            },
             None if i == 0 && PERM0_IS_ID => key_of(s),
             None => key_of(&perm_state(s, p)),
         };
@@ -229,6 +233,26 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
         }
     }
     fingerprint(&best.unwrap())
+}
+
+/// Compares the fully written words `*cw..done` of a key being packed with `best`. Returns true
+/// once the key is known to be greater than `best`; once it is known to be smaller, moves `*cw`
+/// past the end so later calls return false at once.
+#[inline]
+fn prune(w: &[u64], best: Option<&Key>, done: usize, cw: &mut usize) -> bool {
+    let Some(b) = best else { return false };
+    while *cw < done {
+        let i = *cw;
+        if w[i] != b[i] {
+            if w[i] > b[i] {
+                return true;
+            }
+            *cw = usize::MAX;
+            return false;
+        }
+        *cw += 1;
+    }
+    false
 }
 
 #[inline]
