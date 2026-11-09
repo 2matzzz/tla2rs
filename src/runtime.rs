@@ -11,6 +11,16 @@ pub const RUNTIME: &str = r##"
 
 #[inline]
 fn put(w: &mut [u64], p: &mut u32, mut v: u128, mut n: u32) {
+    if n <= 64 {
+        let (i, o) = ((*p / 64) as usize, *p % 64);
+        let x = (v as u64) & if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+        w[i] |= x << o;
+        if o + n > 64 {
+            w[i + 1] |= x >> (64 - o);
+        }
+        *p += n;
+        return;
+    }
     while n > 0 {
         let i = (*p / 64) as usize;
         let o = *p % 64;
