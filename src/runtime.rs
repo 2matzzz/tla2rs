@@ -212,27 +212,32 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
     if !HAS_VIEW && PERMS.is_empty() {
         return fingerprint(w);
     }
+    canon_fp(s).unwrap_or_else(|| type_error("VIEW value", ""))
+}
+
+/// `state_fp` without the packed state, for when there is a VIEW or a SYMMETRY. None if the key
+/// (the VIEW value, or the state without a VIEW) is out of type.
+fn canon_fp(s: &State) -> Option<Fp> {
     if PERMS.is_empty() {
-        return fingerprint(&key_of(s));
+        return key_of(s).map(|k| fingerprint(&k));
     }
     let v = if VIEW_EQUIV { Some(view_val(s)) } else { None };
     let mut best: Option<Key> = None;
     for (i, p) in PERMS.iter().enumerate() {
         let k = match &v {
-            Some(v) if i == 0 && PERM0_IS_ID => view_key(v),
-            Some(v) => match view_perm_pack(v, p, PERMS_INV[i], best.as_ref()) {
-                Some(Some(k)) => k,
-                Some(None) => continue,
-                None => type_error("VIEW value", ""),
+            Some(v) if i == 0 && PERM0_IS_ID => view_pack_v(v)?,
+            Some(v) => match view_perm_pack(v, p, PERMS_INV[i], best.as_ref())? {
+                Some(k) => k,
+                None => continue,
             },
-            None if i == 0 && PERM0_IS_ID => key_of(s),
-            None => key_of(&perm_state(s, p)),
+            None if i == 0 && PERM0_IS_ID => key_of(s)?,
+            None => key_of(&perm_state(s, p))?,
         };
         if best.as_ref().is_none_or(|b| k < *b) {
             best = Some(k);
         }
     }
-    fingerprint(&best.unwrap())
+    Some(fingerprint(&best.unwrap()))
 }
 
 /// Compares the fully written words `*cw..done` of a key being packed with `best`. Returns true
@@ -933,6 +938,16 @@ struct SChunk {
 
 /// Expands a single state, pushing newly found states onto c.next.
 #[allow(clippy::too_many_arguments)]
+/// A successor that does not fit the packed layout: an invariant it violates, else an out-of-type
+/// error
+fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
+    let msg = match check_invariants(&t) {
+        Some(inv) => SMsg::Inv(inv),
+        None => SMsg::OutOfType,
+    };
+    SFound { fp: sfp, extra: Some((t, l)), msg }
+}
+
 fn expand_safety_one(
     w: &Packed,
     sfp: Fp,
@@ -958,19 +973,28 @@ fn expand_safety_one(
                 return Some(SFound { fp: sfp, extra: Some((t, l)), msg: SMsg::Action(name) });
             }
         }
-        let Some(tw) = pack(&t) else {
-            let msg = match check_invariants(&t) {
-                Some(inv) => SMsg::Inv(inv),
-                None => SMsg::OutOfType,
+        // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
+        // duplicate then goes unreported, as TLC checks invariants only on new states.
+        let (tfp, tw) = if HAS_VIEW {
+            match canon_fp(&t) {
+                Some(fp) => (fp, None),
+                None if pack(&t).is_none() => return Some(pack_failed(sfp, t, l)),
+                None => type_error("VIEW value", ""),
+            }
+        } else {
+            let Some(tw) = pack(&t) else {
+                return Some(pack_failed(sfp, t, l));
             };
-            return Some(SFound { fp: sfp, extra: Some((t, l)), msg });
+            (state_fp(&t, &tw), Some(tw))
         };
-        let tfp = state_fp(&t, &tw);
         if mine.has(tfp) {
             continue;
         }
         mine.put(tfp);
         if seen.insert_with(tfp, sfp) {
+            let Some(tw) = tw.or_else(|| pack(&t)) else {
+                return Some(pack_failed(sfp, t, l));
+            };
             c.distinct += 1;
             if let Some(inv) = check_invariants(&t) {
                 return Some(SFound { fp: tfp, extra: None, msg: SMsg::Inv(inv) });
