@@ -2042,9 +2042,9 @@ impl<'a> Gen<'a> {
     /// which permutes an already computed view value.
     pub fn gen_key(&mut self, view: Option<&Expr>, equiv: bool) -> R<String> {
         let Some(view) = view else {
-            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Key { pack(s).unwrap() }\n\
+            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\n\
                        const VIEW_EQUIV: bool = false;\ntype View = ();\nfn view_val(_: &State) -> View {}\n\
-                       fn view_perm_pack(_: &View, _: &[u16], _: &[u16], _: Option<&Key>) -> Option<Option<Key>> { unreachable!() }\nfn view_key(_: &View) -> Key { unreachable!() }\n"
+                       fn view_perm_pack(_: &View, _: &[u16], _: &[u16], _: Option<&Key>) -> Option<Option<Key>> { unreachable!() }\nfn view_pack_v(_: &View) -> Option<Key> { unreachable!() }\n"
                 .into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
@@ -2065,9 +2065,7 @@ impl<'a> Gen<'a> {
              fn view_val(s: &State) -> View {{ {vc} }}\n\
              fn view_pack_v(__v: &View) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
              fn view_perm_pack(__v: &View, pm: &[u16], pi: &[u16], __best: Option<&Key>) -> Option<Option<Key>> {{ let mut w: Key = [0; VWORDS]; let mut __cw = 0usize; {pvp}{pbody}Some(Some(w)) }}\n\
-             fn view_pack(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n\
-             fn view_key(v: &View) -> Key {{ match view_pack_v(v) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n\
-             fn key_of(s: &State) -> Key {{ match view_pack(s) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n",
+             fn key_of(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n",
             vt.repr()
         ))
     }
