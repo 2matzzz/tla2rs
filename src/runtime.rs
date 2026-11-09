@@ -9,7 +9,7 @@
 pub const RUNTIME: &str = r##"
 // ---------------------------------------------------------------- runtime (tla2rs)
 
-#[inline]
+#[inline(always)]
 fn put(w: &mut [u64], p: &mut u32, mut v: u128, mut n: u32) {
     if n <= 64 {
         let (i, o) = ((*p / 64) as usize, *p % 64);
