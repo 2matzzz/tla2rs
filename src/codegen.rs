@@ -1885,8 +1885,11 @@ impl<'a> Gen<'a> {
                 let (n, ord, a, b, k) = (self.fresh("n"), self.fresh("ord"), self.fresh("a"), self.fresh("b"), self.fresh("k"));
                 let lhs = self.perm_code(&format!("({c}).items[{ord}[{b} - 1] as usize]"), e)?;
                 let rhs = self.perm_code(&format!("({c}).items[{ord}[{b}] as usize]"), e)?;
-                if let Some(o) = at {
-                    write!(out, "let mut p = {o}u32; ").unwrap();
+                // Sorting is the costly part, so give up first if the words written so far
+                // already exceed the best key
+                match at {
+                    Some(o) => write!(out, "if prune(&w, __best, {}, &mut __cw) {{ return Some(None); }} let mut p = {o}u32; ", *o / 64).unwrap(),
+                    None => out.push_str("if prune(&w, __best, (p / 64) as usize, &mut __cw) { return Some(None); } "),
                 }
                 *at = None;
                 write!(
@@ -2041,7 +2044,7 @@ impl<'a> Gen<'a> {
         let Some(view) = view else {
             return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Key { pack(s).unwrap() }\n\
                        const VIEW_EQUIV: bool = false;\ntype View = ();\nfn view_val(_: &State) -> View {}\n\
-                       fn view_perm_key(_: &View, _: &[u16], _: &[u16]) -> Key { unreachable!() }\nfn view_key(_: &View) -> Key { unreachable!() }\n"
+                       fn view_perm_pack(_: &View, _: &[u16], _: &[u16], _: Option<&Key>) -> Option<Option<Key>> { unreachable!() }\nfn view_key(_: &View) -> Key { unreachable!() }\n"
                 .into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
@@ -2061,8 +2064,7 @@ impl<'a> Gen<'a> {
              const VIEW_EQUIV: bool = {equiv};\ntype View = {};\n\
              fn view_val(s: &State) -> View {{ {vc} }}\n\
              fn view_pack_v(__v: &View) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn view_perm_pack(__v: &View, pm: &[u16], pi: &[u16]) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {pvp}{pbody}Some(w) }}\n\
-             fn view_perm_key(v: &View, pm: &[u16], pi: &[u16]) -> Key {{ match view_perm_pack(v, pm, pi) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n\
+             fn view_perm_pack(__v: &View, pm: &[u16], pi: &[u16], __best: Option<&Key>) -> Option<Option<Key>> {{ let mut w: Key = [0; VWORDS]; let mut __cw = 0usize; {pvp}{pbody}Some(Some(w)) }}\n\
              fn view_pack(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n\
              fn view_key(v: &View) -> Key {{ match view_pack_v(v) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n\
              fn key_of(s: &State) -> Key {{ match view_pack(s) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n",
