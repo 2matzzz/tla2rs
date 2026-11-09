@@ -963,40 +963,40 @@ fn expand_safety_one(
     if buf.is_empty() && opt.check_deadlock {
         return Some(SFound { fp: sfp, extra: None, msg: SMsg::Deadlock });
     }
-    for &(t, l) in buf.iter() {
+    for &(ref t, l) in buf.iter() {
         c.generated += 1;
-        if !constraint(&t) {
+        if !constraint(t) {
             continue;
         }
         for (name, f) in ACTION_PROPS {
-            if !f(&s, &t) {
-                return Some(SFound { fp: sfp, extra: Some((t, l)), msg: SMsg::Action(name) });
+            if !f(&s, t) {
+                return Some(SFound { fp: sfp, extra: Some((*t, l)), msg: SMsg::Action(name) });
             }
         }
         // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
         // duplicate then goes unreported, as TLC checks invariants only on new states.
         let (tfp, tw) = if HAS_VIEW {
-            match canon_fp(&t) {
+            match canon_fp(t) {
                 Some(fp) => (fp, None),
-                None if pack(&t).is_none() => return Some(pack_failed(sfp, t, l)),
+                None if pack(t).is_none() => return Some(pack_failed(sfp, *t, l)),
                 None => type_error("VIEW value", ""),
             }
         } else {
-            let Some(tw) = pack(&t) else {
-                return Some(pack_failed(sfp, t, l));
+            let Some(tw) = pack(t) else {
+                return Some(pack_failed(sfp, *t, l));
             };
-            (state_fp(&t, &tw), Some(tw))
+            (state_fp(t, &tw), Some(tw))
         };
         if mine.has(tfp) {
             continue;
         }
         mine.put(tfp);
         if seen.insert_with(tfp, sfp) {
-            let Some(tw) = tw.or_else(|| pack(&t)) else {
-                return Some(pack_failed(sfp, t, l));
+            let Some(tw) = tw.or_else(|| pack(t)) else {
+                return Some(pack_failed(sfp, *t, l));
             };
             c.distinct += 1;
-            if let Some(inv) = check_invariants(&t) {
+            if let Some(inv) = check_invariants(t) {
                 return Some(SFound { fp: tfp, extra: None, msg: SMsg::Inv(inv) });
             }
             c.next.push((tw, tfp));
