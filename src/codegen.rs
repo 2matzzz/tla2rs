@@ -1849,6 +1849,85 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// Same layout as `pack_value`, but writes perm(c) (`pm`, inverse `pi`) without building the
+    /// permuted value. A function's entry j is read from the argument that `pm` maps to j, and a
+    /// sparse set's elements are written in the order of their permuted values.
+    fn pack_perm(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
+        let inv_key = |d: &Ty, k: &str| match d {
+            Ty::Enum(_) => Some(format!("pi[({k}) as usize]")),
+            Ty::Bool | Ty::Int(..) => Some(k.to_string()),
+            _ => None,
+        };
+        match t {
+            _ if t.size().is_some() => {
+                let pc = self.perm_code(c, t)?;
+                self.pack_value(&format!("({pc})"), t, out, at)
+            }
+            Ty::Rec(fs) => {
+                let mut total = 0;
+                for (i, (_, ft)) in fs.iter().enumerate() {
+                    total += self.pack_perm(&format!("{c}.{i}"), ft, out, at)?;
+                }
+                Ok(total)
+            }
+            Ty::Opt(inner) => {
+                match at {
+                    Some(o) => {
+                        out.push_str(&Self::put_at(&format!("({c}).0 as u128"), 1, *o));
+                        *o += 1;
+                    }
+                    None => write!(out, "put(&mut w, &mut p, ({c}).0 as u128, 1); ").unwrap(),
+                }
+                Ok(1 + self.pack_perm(&format!("({c}).1"), inner, out, at)?)
+            }
+            Ty::Set(e) if is_sparse(t) => {
+                let lb = Self::bits_for(self.scap as u64 + 1);
+                let (n, ord, a, b, k) = (self.fresh("n"), self.fresh("ord"), self.fresh("a"), self.fresh("b"), self.fresh("k"));
+                let lhs = self.perm_code(&format!("({c}).items[{ord}[{b} - 1] as usize]"), e)?;
+                let rhs = self.perm_code(&format!("({c}).items[{ord}[{b}] as usize]"), e)?;
+                if let Some(o) = at {
+                    write!(out, "let mut p = {o}u32; ").unwrap();
+                }
+                *at = None;
+                write!(
+                    out,
+                    "let {n} = ({c}).len as usize; let mut {ord} = [0u8; {}]; for {k} in 0..{n} {{ {ord}[{k}] = {k} as u8; }} \
+                     for {a} in 1..{n} {{ let mut {b} = {a}; while {b} > 0 && {lhs} > {rhs} {{ {ord}.swap({b} - 1, {b}); {b} -= 1; }} }} \
+                     put(&mut w, &mut p, {n} as u128, {lb}); for {k} in 0..{n} {{ ",
+                    self.scap
+                )
+                .unwrap();
+                let eb = self.pack_perm(&format!("({c}).items[{ord}[{k}] as usize]"), e, out, &mut None)?;
+                out.push_str("} ");
+                Ok(lb + eb * self.scap as u32)
+            }
+            Ty::Fun(d, cod) if inv_key(d, "").is_some() => {
+                let n = d.size().unwrap();
+                let did = self.ty_id(d)?;
+                if at.is_some() {
+                    let mut total = 0;
+                    for k in 0..n {
+                        let src = inv_key(d, &format!("dec_{did}({k}u64)")).unwrap();
+                        total += self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, at)?;
+                    }
+                    return Ok(total);
+                }
+                let k = self.fresh("k");
+                let src = inv_key(d, &format!("dec_{did}({k} as u64)")).unwrap();
+                write!(out, "for {k} in 0..{n} {{ ").unwrap();
+                let b = self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, &mut None)?;
+                out.push_str("} ");
+                Ok(b * n as u32)
+            }
+            _ => {
+                let pv = self.fresh("pv");
+                let pc = self.perm_code(c, t)?;
+                write!(out, "let {pv} = {pc}; ").unwrap();
+                self.pack_value(&pv, t, out, at)
+            }
+        }
+    }
+
     fn unpack_value(&mut self, t: &Ty, at: &mut Option<u32>) -> R<String> {
         if let Some(n) = t.size() {
             let id = self.ty_id(t)?;
@@ -1962,22 +2041,28 @@ impl<'a> Gen<'a> {
         let Some(view) = view else {
             return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Key { pack(s).unwrap() }\n\
                        const VIEW_EQUIV: bool = false;\ntype View = ();\nfn view_val(_: &State) -> View {}\n\
-                       fn view_perm(v: &View, _: &[u16]) -> View { *v }\nfn view_key(_: &View) -> Key { unreachable!() }\n"
+                       fn view_perm_key(_: &View, _: &[u16], _: &[u16]) -> Key { unreachable!() }\nfn view_key(_: &View) -> Key { unreachable!() }\n"
                 .into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
         let mut body = String::new();
         let mut at = Some(0u32);
-        let bits = self.pack_value("__v", &vt, &mut body, &mut at)?;
+        let bits = self.pack_value("(*__v)", &vt, &mut body, &mut at)?;
         let vp = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let words = bits.div_ceil(64).max(1);
-        let vperm = if equiv { self.perm_code("(*v)", &vt)? } else { "*v".into() };
+        let mut pbody = String::new();
+        let mut pat = Some(0u32);
+        if equiv {
+            self.pack_perm("(*__v)", &vt, &mut pbody, &mut pat)?;
+        }
+        let pvp = if pat.is_some() { "" } else { "let mut p = 0u32; " };
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
              const VIEW_EQUIV: bool = {equiv};\ntype View = {};\n\
              fn view_val(s: &State) -> View {{ {vc} }}\n\
-             fn view_pack_v(__v: &View) -> Option<Key> {{ let __v = *__v; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn view_perm(v: &View, pm: &[u16]) -> View {{ {vperm} }}\n\
+             fn view_pack_v(__v: &View) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
+             fn view_perm_pack(__v: &View, pm: &[u16], pi: &[u16]) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {pvp}{pbody}Some(w) }}\n\
+             fn view_perm_key(v: &View, pm: &[u16], pi: &[u16]) -> Key {{ match view_perm_pack(v, pm, pi) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n\
              fn view_pack(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n\
              fn view_key(v: &View) -> Key {{ match view_pack_v(v) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n\
              fn key_of(s: &State) -> Key {{ match view_pack(s) {{ Some(k) => k, None => type_error(\"VIEW value\", \"\") }} }}\n",
@@ -1992,7 +2077,7 @@ impl<'a> Gen<'a> {
             Ty::Enum(_) => format!("pm[({c}) as usize]"),
             Ty::Rec(fs) => {
                 let r = self.fresh("r");
-                let mut s = format!("{{ let {r} = {c}; (");
+                let mut s = format!("{{ let {r} = &({c}); (");
                 for (i, (_, ft)) in fs.iter().enumerate() {
                     s += &self.perm_code(&format!("{r}.{i}"), ft)?;
                     s += ",";
@@ -2001,14 +2086,24 @@ impl<'a> Gen<'a> {
             }
             Ty::Opt(inner) => {
                 let o = self.fresh("o");
-                format!("{{ let {o} = {c}; ({o}.0, {}) }}", self.perm_code(&format!("{o}.1"), inner)?)
+                format!("{{ let {o} = &({c}); ({o}.0, {}) }}", self.perm_code(&format!("{o}.1"), inner)?)
             }
             Ty::Fun(d, cod) => {
                 let did = self.ty_id(d)?;
                 let (f, o, i) = (self.fresh("f"), self.fresh("o"), self.fresh("i"));
                 let k = self.perm_code(&format!("dec_{did}({i} as u64)"), d)?;
                 let v = self.perm_code(&format!("{f}[{i}]"), cod)?;
-                format!("{{ let {f} = {c}; let mut {o} = {f}; for {i} in 0..{} {{ {o}[idx_{did}({k})] = {v}; }} {o} }}", d.size().unwrap())
+                format!("{{ let {f} = &({c}); let mut {o} = *{f}; for {i} in 0..{} {{ {o}[idx_{did}({k})] = {v}; }} {o} }}", d.size().unwrap())
+            }
+            // A permutation is a bijection, so permuting the elements of a sorted array in place
+            // leaves them distinct and one sort restores the order.
+            Ty::Set(e) if is_sparse(t) => {
+                let (acc, i, y) = (self.fresh("acc"), self.fresh("i"), self.fresh("y"));
+                let py = self.perm_code(&format!("{acc}.items[{i}]"), e)?;
+                format!(
+                    "{{ let mut {acc} = {c}; for {i} in 0..{acc}.len as usize {{ let {y} = {py}; {acc}.items[{i}] = {y}; }} \
+                     {acc}.items[..{acc}.len as usize].sort_unstable(); {acc} }}"
+                )
             }
             Ty::Set(e) => {
                 let x = self.fresh("x");
