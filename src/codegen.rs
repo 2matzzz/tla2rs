@@ -219,7 +219,7 @@ impl<'a> Gen<'a> {
     /// Statement adding element x (in the element type's representation) to acc
     fn s_add(&mut self, acc: &str, x: &str, st: &Ty) -> R<String> {
         let eid = self.ty_id(&Self::elem_of(st))?;
-        Ok(if is_sparse(st) { format!("{acc} = {acc}.with({x});") } else { format!("{acc} |= bit_{eid}({x});") })
+        Ok(if is_sparse(st) { format!("{acc}.insert({x});") } else { format!("{acc} |= bit_{eid}({x});") })
     }
 
     fn s_iter(&mut self, c: &str, st: &Ty) -> R<String> {

@@ -280,6 +280,12 @@ impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
     }
     #[inline]
     fn with(mut self, x: T) -> Self {
+        self.insert(x);
+        self
+    }
+    // Builders in generated code use this; `acc = acc.with(x)` in a loop moved the whole array per element.
+    #[inline]
+    fn insert(&mut self, x: T) {
         if let Err(i) = self.slice().binary_search(&x) {
             let n = self.len as usize;
             if n == N {
@@ -289,7 +295,6 @@ impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
             self.items[i] = x;
             self.len += 1;
         }
-        self
     }
     #[inline]
     fn without(mut self, x: T) -> Self {

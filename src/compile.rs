@@ -291,7 +291,10 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
                 };
                 t[*a as usize] = *b as u16;
             }
-            perms.push(t);
+            // Identities over different domains (e.g. Permutations(A) \cup Permutations(B)) become the same table.
+            if !perms.contains(&t) {
+                perms.push(t);
+            }
         }
     }
     let perm_code = if perms.is_empty() {
