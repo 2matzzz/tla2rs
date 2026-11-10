@@ -1970,7 +1970,15 @@ impl<'a> Gen<'a> {
                     let mut total = 0;
                     for k in 0..n {
                         let src = inv_key(d, &format!("dec_{did}({k}u64)")).unwrap();
+                        let words = at.map(|o| o / 64);
                         total += self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, at)?;
+                        // The permutation decides which entry lands here, so a key often loses
+                        // to the best one within the first entries
+                        if let (Some(before), Some(o)) = (words, *at) {
+                            if o / 64 > before {
+                                write!(out, "if prune(&w, __best, {}, &mut __cw) {{ return Some(None); }} ", o / 64).unwrap();
+                            }
+                        }
                     }
                     return Ok(total);
                 }
