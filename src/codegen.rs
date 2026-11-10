@@ -1249,10 +1249,13 @@ impl<'a> Gen<'a> {
                         Except(base, ups) if matches!(base.strip(), Ident(n) if *n == v) => {
                             self.gen_except_into(&place, ups, &t, &env2, out)?;
                         }
-                        _ => {
-                            let c = self.gen_as(rhs, env, &t)?;
-                            writeln!(out, "{place} = {c};").unwrap();
-                        }
+                        _ => match self.gen_set_update(&place, &v, rhs, &t, env) {
+                            Some(code) => out.push_str(&code),
+                            None => {
+                                let c = self.gen_as(rhs, env, &t)?;
+                                writeln!(out, "{place} = {c};").unwrap();
+                            }
+                        },
                     }
                     env2.primed.insert(v, (place, t));
                     return self.gen_action(rest, &env2, out);
@@ -1378,6 +1381,62 @@ impl<'a> Gen<'a> {
             e => return Err(format!("UNCHANGED of {}", short(e))),
         }
         Ok(())
+    }
+
+    /// Statements that turn `place`, which holds the value of the sparse set variable `v`, into
+    /// `e`, if `e` only adds elements to `v` and removes elements from it (`(v \ a) \cup b`).
+    /// Building the new set elsewhere would copy the whole array out and back in.
+    fn gen_set_update(&mut self, place: &str, v: &str, e: &Expr, st: &Ty, env: &Env) -> Option<String> {
+        use Expr::*;
+        if env.init || !is_sparse(st) {
+            return None;
+        }
+        match e.strip() {
+            Ident(n) if n == v => Some(String::new()),
+            Bin(op @ (BOp::Cup | BOp::SetMinus), a, b) => {
+                let base = self.gen_set_update(place, v, a, st, env)?;
+                let method = if *op == BOp::Cup { "insert" } else { "remove" };
+                Some(base + &self.gen_set_change(place, method, b, st, env)?)
+            }
+            _ => None,
+        }
+    }
+
+    /// Statements that call `method` (insert or remove) on `place` for each element of the set `e`.
+    /// None if an element may not fit the element type of `st`: coercing it would drop a field,
+    /// and it could then equal an element it differs from.
+    fn gen_set_change(&mut self, place: &str, method: &str, e: &Expr, st: &Ty, env: &Env) -> Option<String> {
+        use Expr::*;
+        let fits = |want: &Ty, got: &Ty| join(want, got).ok().as_ref() == Some(want);
+        match e.strip() {
+            SetLit(xs) => {
+                let el = Self::elem_of(st);
+                let mut code = String::new();
+                for x in xs {
+                    let (c, t) = self.gen(x, env, Some(&el)).ok()?;
+                    if !fits(&el, &t) {
+                        return None;
+                    }
+                    writeln!(code, "{place}.{method}({});", self.coerce(c, &t, &el).ok()?).unwrap();
+                }
+                Some(code)
+            }
+            If(c, x, y) => {
+                let c = self.gen_as(c, env, &Ty::Bool).ok()?;
+                let x = self.gen_set_change(place, method, x, st, env)?;
+                let y = self.gen_set_change(place, method, y, st, env)?;
+                Some(format!("if {c} {{\n{x}}} else {{\n{y}}}\n"))
+            }
+            _ => {
+                let (c, t) = self.gen(e, env, Some(st)).ok()?;
+                if !fits(st, &t) {
+                    return None;
+                }
+                let c = self.coerce(c, &t, st).ok()?;
+                let x = self.fresh("x");
+                Some(format!("for {x} in ({c}).iter() {{ {place}.{method}({x}); }}\n"))
+            }
+        }
     }
 
     /// Applies EXCEPT updates directly to `place`; `@` refers to the original value at `place`.

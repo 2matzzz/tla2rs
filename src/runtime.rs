@@ -368,19 +368,18 @@ impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
         }
     }
     #[inline]
-    fn without(mut self, x: T) -> Self {
+    fn remove(&mut self, x: T) {
         if let Ok(i) = self.slice().binary_search(&x) {
             let n = self.len as usize;
             self.items.copy_within(i + 1..n, i);
             self.items[n - 1] = T::default();
             self.len -= 1;
         }
-        self
     }
     fn union(self, o: Self) -> Self {
         let mut r = self;
         for x in o.iter() {
-            r = r.with(x);
+            r.insert(x);
         }
         r
     }
@@ -388,7 +387,7 @@ impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
         let mut r = Self::new();
         for x in self.iter() {
             if o.contains(&x) {
-                r = r.with(x);
+                r.insert(x);
             }
         }
         r
@@ -396,7 +395,7 @@ impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
     fn minus(self, o: Self) -> Self {
         let mut r = self;
         for x in o.iter() {
-            r = r.without(x);
+            r.remove(x);
         }
         r
     }
