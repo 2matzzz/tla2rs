@@ -219,8 +219,19 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
 /// `state_fp` without the packed state, for when there is a VIEW or a SYMMETRY. None if the key
 /// (the VIEW value, or the state without a VIEW) is out of type.
 fn canon_fp(s: &State) -> Option<Fp> {
+    fresh_fp(s, None).flatten()
+}
+
+/// `canon_fp`, or Some(None) if `mine` shows that this thread has fingerprinted the state before.
+fn fresh_fp(s: &State, mut mine: Option<&mut Seen>) -> Option<Option<Fp>> {
+    // The key under the first permutation decides the smallest one, so a repeat is caught before
+    // trying the others. A VIEW that does not commute with the permutations breaks this: states
+    // with equal VIEW values can then have different smallest keys.
+    let by_first = mine.is_some() && (!HAS_VIEW || VIEW_EQUIV);
+    let mut fresh = |fp| mine.as_mut().is_none_or(|m| m.fresh(fp));
     if PERMS.is_empty() {
-        return key_of(s).map(|k| fingerprint(&k));
+        let fp = fingerprint(&key_of(s)?);
+        return Some(fresh(fp).then_some(fp));
     }
     let v = if VIEW_EQUIV { Some(view_val(s)) } else { None };
     let mut best: Option<Key> = None;
@@ -234,11 +245,25 @@ fn canon_fp(s: &State) -> Option<Fp> {
             None if i == 0 && PERM0_IS_ID => key_of(s)?,
             None => key_of(&perm_state(s, p))?,
         };
+        if i == 0 && by_first && !fresh(fingerprint(&k)) {
+            return Some(None);
+        }
         if best.as_ref().is_none_or(|b| k < *b) {
             best = Some(k);
         }
     }
-    Some(fingerprint(&best.unwrap()))
+    let fp = fingerprint(&best.unwrap());
+    Some((by_first || fresh(fp)).then_some(fp))
+}
+
+/// `state_fp`, or None if `mine` shows that this thread has fingerprinted the state before.
+#[inline]
+fn fresh_state_fp(s: &State, w: &Packed, mine: &mut Seen) -> Option<Fp> {
+    if !HAS_VIEW && PERMS.is_empty() {
+        let fp = fingerprint(w);
+        return mine.fresh(fp).then_some(fp);
+    }
+    fresh_fp(s, Some(mine)).unwrap_or_else(|| type_error("VIEW value", ""))
 }
 
 /// Compares the fully written words `*cw..done` of a key being packed with `best`. Returns true
@@ -905,7 +930,8 @@ enum SMsg {
 /// A small per-thread table. The same fingerprints get looked up repeatedly, so it is checked
 /// before the shared table.
 /// It stores fingerprints verbatim, so it reports a hit only for fingerprints actually inserted
-/// (it can never cause a state to be missed).
+/// (it can never cause a state to be missed). With a SYMMETRY, they are the fingerprints of the key
+/// under the first permutation where that decides the smallest key (see `fresh_fp`).
 /// Sized to fit in L1/L2.
 const SEEN_BITS: usize = 16;
 
@@ -920,13 +946,13 @@ impl Seen {
         // The shared table picks slots by the low bits, so use different bits here.
         ((fp >> 17) as usize) & ((1 << SEEN_BITS) - 1)
     }
+    /// Records fp. False if it was already there.
     #[inline]
-    fn has(&self, fp: Fp) -> bool {
-        self.0[Self::slot(fp)] == fp
-    }
-    #[inline]
-    fn put(&mut self, fp: Fp) {
-        self.0[Self::slot(fp)] = fp;
+    fn fresh(&mut self, fp: Fp) -> bool {
+        let slot = &mut self.0[Self::slot(fp)];
+        let fresh = *slot != fp;
+        *slot = fp;
+        fresh
     }
 }
 
@@ -977,8 +1003,9 @@ fn expand_safety_one(
         // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
         // duplicate then goes unreported, as TLC checks invariants only on new states.
         let (tfp, tw) = if HAS_VIEW {
-            match canon_fp(t) {
-                Some(fp) => (fp, None),
+            match fresh_fp(t, Some(mine)) {
+                Some(Some(fp)) => (fp, None),
+                Some(None) => continue,
                 None if pack(t).is_none() => return Some(pack_failed(sfp, *t, l)),
                 None => type_error("VIEW value", ""),
             }
@@ -986,12 +1013,9 @@ fn expand_safety_one(
             let Some(tw) = pack(t) else {
                 return Some(pack_failed(sfp, *t, l));
             };
-            (state_fp(t, &tw), Some(tw))
+            let Some(fp) = fresh_state_fp(t, &tw, mine) else { continue };
+            (fp, Some(tw))
         };
-        if mine.has(tfp) {
-            continue;
-        }
-        mine.put(tfp);
         if seen.insert_with(tfp, sfp) {
             let Some(tw) = tw.or_else(|| pack(t)) else {
                 return Some(pack_failed(sfp, *t, l));
@@ -1613,11 +1637,7 @@ fn collect_phase(
                     };
                     return Some(SFound { fp: *sfp, extra: Some((t, l)), msg });
                 };
-                let tfp = state_fp(&t, &tw);
-                if mine.has(tfp) {
-                    continue;
-                }
-                mine.put(tfp);
+                let Some(tfp) = fresh_state_fp(&t, &tw, &mut mine) else { continue };
                 out.parts[part_of(tfp, parts)].push(Cand { w: tw, fp: tfp, pred: *sfp });
                 // Stop generating once a violating state is found (so we stop at the same count as
                 // the non-batched path). This candidate also goes into the table in phase 3, so the
