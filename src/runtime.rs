@@ -496,29 +496,53 @@ fn check_invariants(s: &State) -> Option<&'static str> {
     None
 }
 
-struct Shards(Vec<std::sync::Mutex<FpSet>>);
+/// The visited set, split into shards with a lock each. `at` follows each shard's table (address
+/// and mask) so that a slot can be prefetched without taking the lock.
+struct Shards {
+    sets: Vec<std::sync::Mutex<FpSet>>,
+    at: Vec<(std::sync::atomic::AtomicPtr<Fp>, std::sync::atomic::AtomicUsize)>,
+}
 
 impl Shards {
     fn new(keep_pred: bool) -> Self {
-        Shards((0..1024).map(|_| std::sync::Mutex::new(FpSet::new(keep_pred))).collect())
+        use std::sync::atomic::{AtomicPtr, AtomicUsize};
+        let sets: Vec<FpSet> = (0..1024).map(|_| FpSet::new(keep_pred)).collect();
+        let at = sets.iter().map(|f| (AtomicPtr::new(f.t.as_ptr().cast_mut()), AtomicUsize::new(f.mask))).collect();
+        Shards { sets: sets.into_iter().map(std::sync::Mutex::new).collect(), at }
     }
     #[inline]
     fn insert(&self, fp: Fp) -> bool {
-        self.0[shard(fp)].lock().unwrap().insert(fp)
+        self.sets[shard(fp)].lock().unwrap().insert(fp)
     }
     #[inline]
     fn insert_with(&self, fp: Fp, pred: Fp) -> bool {
-        self.0[shard(fp)].lock().unwrap().insert_with(fp, pred)
+        use std::sync::atomic::Ordering::Relaxed;
+        let sh = shard(fp);
+        let mut set = self.sets[sh].lock().unwrap();
+        let fresh = set.insert_with(fp, pred);
+        let (at, mask) = &self.at[sh];
+        if mask.load(Relaxed) != set.mask {
+            at.store(set.t.as_ptr().cast_mut(), Relaxed);
+            mask.store(set.mask, Relaxed);
+        }
+        fresh
+    }
+    /// Prefetches the line where `insert_with` starts looking for fp. The shard may replace its
+    /// table meanwhile; prefetching an address in the old one has no effect.
+    #[inline]
+    fn prefetch(&self, fp: Fp) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (at, mask) = &self.at[shard(fp)];
+        prefetch(at.load(Relaxed).wrapping_add((fp as usize) & mask.load(Relaxed)));
     }
     fn pred_of(&self, fp: Fp) -> Option<Fp> {
-        self.0[shard(fp)].lock().unwrap().pred_of(fp)
+        self.sets[shard(fp)].lock().unwrap().pred_of(fp)
     }
     /// Whether fp is already present. Does not modify the table.
     #[inline]
     fn contains(&self, fp: Fp) -> bool {
-        self.0[shard(fp)].lock().unwrap().contains(fp)
+        self.sets[shard(fp)].lock().unwrap().contains(fp)
     }
-
 }
 
 enum Found {
@@ -962,8 +986,6 @@ struct SChunk {
     found: Option<SFound>,
 }
 
-/// Expands a single state, pushing newly found states onto c.next.
-#[allow(clippy::too_many_arguments)]
 /// A successor that does not fit the packed layout: an invariant it violates, else an out-of-type
 /// error
 fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
@@ -974,35 +996,59 @@ fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
     SFound { fp: sfp, extra: Some((t, l)), msg }
 }
 
-fn expand_safety_one(
-    w: &Packed,
-    sfp: Fp,
-    seen: &Shards,
-    opt: &Opt,
-    c: &mut SChunk,
-    buf: &mut Vec<(State, u32)>,
-    mine: &mut Seen,
-) -> Option<SFound> {
+/// Per-thread working storage for `expand_safety_one`.
+struct SWork {
+    /// The successors of the state being expanded, each with the label of its action.
+    buf: Vec<(State, u32)>,
+    /// The successors that may be new: index in `buf`, fingerprint, and the packed state if the
+    /// fingerprint needed it.
+    cand: Vec<(usize, Fp, Option<Packed>)>,
+    mine: Seen,
+}
+
+/// Expands a single state, pushing newly found states onto c.next.
+fn expand_safety_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
     let s = unpack(w);
-    buf.clear();
-    next(&s, buf);
-    if buf.is_empty() && opt.check_deadlock {
+    ws.buf.clear();
+    ws.cand.clear();
+    next(&s, &mut ws.buf);
+    if ws.buf.is_empty() && opt.check_deadlock {
         return Some(SFound { fp: sfp, extra: None, msg: SMsg::Deadlock });
     }
-    for &(ref t, l) in buf.iter() {
+    // All successors are fingerprinted before any is looked up, so that their table lines arrive
+    // meanwhile. The successors are still reported on in order, as TLC does: an evaluation error in
+    // a later one waits until the ones before it are in the table and checked, and c.generated
+    // counts the successors up to the one that stops the search.
+    let base = c.generated;
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fingerprint_successors(&s, sfp, seen, c, ws)
+    }));
+    let examined = c.generated;
+    let found = insert_candidates(base, sfp, seen, c, ws);
+    if found.is_some() {
+        return found;
+    }
+    c.generated = examined;
+    stopped.unwrap_or_else(|p| std::panic::resume_unwind(p))
+}
+
+/// Fills ws.cand with the successors in ws.buf that may be new and prefetches the table line of
+/// each. Stops at a successor that is an error by itself and returns it.
+fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+    for (i, &(ref t, l)) in ws.buf.iter().enumerate() {
         c.generated += 1;
         if !constraint(t) {
             continue;
         }
         for (name, f) in ACTION_PROPS {
-            if !f(&s, t) {
+            if !f(s, t) {
                 return Some(SFound { fp: sfp, extra: Some((*t, l)), msg: SMsg::Action(name) });
             }
         }
         // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
         // duplicate then goes unreported, as TLC checks invariants only on new states.
         let (tfp, tw) = if HAS_VIEW {
-            match fresh_fp(t, Some(mine)) {
+            match fresh_fp(t, Some(&mut ws.mine)) {
                 Some(Some(fp)) => (fp, None),
                 Some(None) => continue,
                 None if pack(t).is_none() => return Some(pack_failed(sfp, *t, l)),
@@ -1012,19 +1058,32 @@ fn expand_safety_one(
             let Some(tw) = pack(t) else {
                 return Some(pack_failed(sfp, *t, l));
             };
-            let Some(fp) = fresh_state_fp(t, &tw, mine) else { continue };
+            let Some(fp) = fresh_state_fp(t, &tw, &mut ws.mine) else { continue };
             (fp, Some(tw))
         };
-        if seen.insert_with(tfp, sfp) {
-            let Some(tw) = tw.or_else(|| pack(t)) else {
-                return Some(pack_failed(sfp, *t, l));
-            };
-            c.distinct += 1;
-            if let Some(inv) = check_invariants(t) {
-                return Some(SFound { fp: tfp, extra: None, msg: SMsg::Inv(inv) });
-            }
-            c.next.push((tw, tfp));
+        seen.prefetch(tfp);
+        ws.cand.push((i, tfp, tw));
+    }
+    None
+}
+
+/// Adds the candidates to the visited set in order and queues the new ones. Stops at a new state
+/// that is an error and returns it. `base` is c.generated before the first successor.
+fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &SWork) -> Option<SFound> {
+    for &(i, tfp, tw) in ws.cand.iter() {
+        if !seen.insert_with(tfp, sfp) {
+            continue;
         }
+        c.generated = base + i as u64 + 1;
+        let (t, l) = &ws.buf[i];
+        let Some(tw) = tw.or_else(|| pack(t)) else {
+            return Some(pack_failed(sfp, *t, *l));
+        };
+        c.distinct += 1;
+        if let Some(inv) = check_invariants(t) {
+            return Some(SFound { fp: tfp, extra: None, msg: SMsg::Inv(inv) });
+        }
+        c.next.push((tw, tfp));
     }
     None
 }
@@ -1039,15 +1098,14 @@ fn expand_safety(
 ) -> SChunk {
     use std::sync::atomic::Ordering::Relaxed;
     let mut c = SChunk { next: vec![], generated: 0, distinct: 0, found: None };
-    let mut buf: Vec<(State, u32)> = Vec::with_capacity(64);
-    let mut mine = Seen::new();
+    let mut ws = SWork { buf: Vec::with_capacity(64), cand: Vec::with_capacity(64), mine: Seen::new() };
     for i in lo..hi {
         if stop.load(Relaxed) {
             break;
         }
         let (w, sfp) = &frontier[i];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            expand_safety_one(w, *sfp, seen, opt, &mut c, &mut buf, &mut mine)
+            expand_safety_one(w, *sfp, seen, opt, &mut c, &mut ws)
         }));
         let found = match r {
             Ok(f) => f,
