@@ -325,17 +325,60 @@ enum EvalErr {
     Other(String),
 }
 
+/// A type whose default value is a constant. An empty `SSet` is then copied from a constant as one
+/// block; filling its slots with `Default::default()` stored every field of every slot separately.
+trait ConstDefault: Copy {
+    const DEFAULT: Self;
+}
+
+impl ConstDefault for bool {
+    const DEFAULT: Self = false;
+}
+
+macro_rules! const_default_int {
+    ($($t:ty)*) => { $(impl ConstDefault for $t { const DEFAULT: Self = 0; })* };
+}
+const_default_int!(i64 u16 u128);
+
+macro_rules! const_default_tuple {
+    ($($t:ident)*) => {
+        impl<$($t: ConstDefault),*> ConstDefault for ($($t,)*) {
+            const DEFAULT: Self = ($($t::DEFAULT,)*);
+        }
+    };
+}
+const_default_tuple!(A);
+const_default_tuple!(A B);
+const_default_tuple!(A B C);
+const_default_tuple!(A B C D);
+const_default_tuple!(A B C D E);
+const_default_tuple!(A B C D E F);
+const_default_tuple!(A B C D E F G);
+const_default_tuple!(A B C D E F G H);
+const_default_tuple!(A B C D E F G H I);
+const_default_tuple!(A B C D E F G H I J);
+const_default_tuple!(A B C D E F G H I J K);
+const_default_tuple!(A B C D E F G H I J K L);
+
+impl<T: ConstDefault, const N: usize> ConstDefault for [T; N] {
+    const DEFAULT: Self = [T::DEFAULT; N];
+}
+
+impl<T: Copy + Ord + ConstDefault, const N: usize> ConstDefault for SSet<T, N> {
+    const DEFAULT: Self = SSet { len: 0, items: [T::DEFAULT; N] };
+}
+
 /// A set over a large element type, stored as a fixed-size sorted array so it can stay `Copy`.
 /// Unused slots hold the default value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct SSet<T: Copy + Ord + Default, const N: usize> {
+struct SSet<T: Copy + Ord + ConstDefault, const N: usize> {
     len: u8,
     items: [T; N],
 }
 
-impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
+impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
     fn new() -> Self {
-        SSet { len: 0, items: [T::default(); N] }
+        Self::DEFAULT
     }
     #[inline]
     fn slice(&self) -> &[T] {
@@ -372,7 +415,7 @@ impl<T: Copy + Ord + Default, const N: usize> SSet<T, N> {
         if let Ok(i) = self.slice().binary_search(&x) {
             let n = self.len as usize;
             self.items.copy_within(i + 1..n, i);
-            self.items[n - 1] = T::default();
+            self.items[n - 1] = T::DEFAULT;
             self.len -= 1;
         }
     }
