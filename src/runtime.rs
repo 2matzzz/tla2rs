@@ -63,14 +63,15 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Fingerprint of a packed state. The low 64 bits fold the state directly (with WORDS == 1, `mix`
-/// is a bijection, so there are no collisions). With `-fp128`, an independent 64-bit hash is
-/// placed above them to make 128 bits.
+/// Fingerprint of a packed state. The low 64 bits sum the words, each mixed with its position on
+/// its own: no word waits for the one before it, so the CPU mixes several at a time. (With
+/// WORDS == 1 this is a bijection, so there are no collisions.) With `-fp128`, an independent
+/// 64-bit hash is placed above them to make 128 bits.
 #[inline]
 fn fingerprint(w: &[u64]) -> Fp {
     let mut h = 0u64;
     for (i, &x) in w.iter().enumerate() {
-        h = if i == 0 { x } else { mix(h).wrapping_add(x) };
+        h = h.wrapping_add(mix(x.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))));
     }
     let lo = mix(h);
     if FP_BITS == 64 {
