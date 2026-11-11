@@ -94,7 +94,17 @@ fn main() {
         })
     };
     let t0 = Instant::now();
-    let output = match compile::compile(&read(&tla), &read(&cfg), tla.parent().unwrap_or(Path::new(".")), setcap, fp128, metal) {
+    // Compile on a thread with a large stack: evaluating a recursive operator at compile time nests
+    // deeply (up to value::REC_LIMIT calls)
+    let (src, cfg_src) = (read(&tla), read(&cfg));
+    let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let result = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, fp128, metal))
+        .expect("start the compiler thread")
+        .join()
+        .unwrap_or_else(|_| Err("internal error in the compiler".into()));
+    let output = match result {
         Ok(o) => o,
         Err(e) => {
             eprintln!("tla2rs: {e}");

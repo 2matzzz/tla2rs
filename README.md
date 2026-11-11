@@ -87,7 +87,7 @@ memory.
 
 | | |
 |---|---|
-| Expressions | logic, arithmetic (`+ - * \div %`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A`, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
+| Expressions | logic, arithmetic (`+ - * \div % ^`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A` (also `<<x, y>> \in S`), `CHOOSE` (also over sets in the state, picking what TLC picks), `RECURSIVE` operators and recursive function definitions, operator parameters and `LAMBDA`, infix operators defined by the spec (`a \oplus b == ...`), `Assert` / `Print` / `PrintT` / `:>` / `@@` from TLC, `UNION`, `SUBSET` and `\X` of sets in the state, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
 | Actions | `x' = e`, `x' \in S`, `UNCHANGED`, action-level `\/` `\E` `IF` `CASE`, guards that read an already assigned `x'` |
 | Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. A model value may share a type with integers (`1..4 \cup {None}`). `Name <- Def` substitutes a definition (also from a module that EXTENDS the spec, such as an MC.tla) for a constant, and `<-` / `=` on a defined name replace that definition. `ASSUME` is checked |
 | Properties | `INVARIANT`. `PROPERTY` supports `<>P`, `[]<>P`, `<>[]P`, `P ~> Q`, `[]P`, and `[][A]_v` (optionally quantified with `\A x \in S :`) |
@@ -104,8 +104,12 @@ memory.
 - Set elements may have at most 128 possible values. Sets of sets and sets of functions cannot be held as values
   (`SUBSET` and `[S -> T]` in `TypeOK` are fine)
 - Not supported: sequences (tuples whose length changes, and the operators of `Sequences`), a tuple index that is not
-  constant, strings mixed with integers in one value, arithmetic on a value that may be a model value, state-dependent `CHOOSE`, recursion, strong fairness (SF),
-  `ENABLED`, `<<A>>_v`, recursive function definitions, `Name <- [Module] Def` for a CONSTANT, and operator constants
+  constant, strings mixed with integers in one value, arithmetic on a value that may be a model value, functions over
+  part of a type (`[S -> T]` with S in the state, `:>` / `@@` other than `(d :> e) @@ f`), recursive operators with
+  operator parameters, strong fairness (SF), `ENABLED`, `<<A>>_v`, and `Name <- [Module] Def` for a CONSTANT (TLC
+  rejects it too)
+- Recursion deeper than 500 levels is an evaluation error. TLC overflows its stack somewhere between 500 and 900
+  levels depending on the operator, so a recursion between those depths can pass in TLC and fail here
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
   collision (an estimate is printed at the end)
 - Liveness: whether a fair action is enabled is decided by whether the `Next` branch that calls it produces a

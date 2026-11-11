@@ -47,6 +47,8 @@ pub struct Gen<'a> {
     tys: Vec<Ty>,
     ty_ids: HashMap<Ty, usize>,
     convs: BTreeSet<(usize, usize)>,
+    /// Whether `subsets_tlc` is used
+    need_subsets: bool,
     pub labels: Vec<String>,
     tmp: usize,
     /// Fairness instances
@@ -56,6 +58,14 @@ pub struct Gen<'a> {
     pub scap: usize,
     /// During type inference, collects the types of assigned values
     pub infer: Option<HashMap<String, Ty>>,
+    /// Rust functions for recursive operators, per (RecDef index, argument types): name and return
+    /// type once settled
+    rec_done: HashMap<(usize, Vec<Ty>), (String, Ty)>,
+    /// Those being generated, with their return type so far (innermost last)
+    rec_progress: Vec<((usize, Vec<Ty>), Ty)>,
+    rec_names: HashMap<(usize, Vec<Ty>), String>,
+    /// Function name -> its code (the latest version)
+    rec_code: std::collections::BTreeMap<String, String>,
 }
 
 fn rid(n: &str) -> String {
@@ -71,12 +81,17 @@ impl<'a> Gen<'a> {
             tys: vec![],
             ty_ids: HashMap::new(),
             convs: BTreeSet::new(),
+            need_subsets: false,
             labels: vec!["Init".into(), "Next".into()],
             tmp: 0,
             fair: vec![],
             fair_param_tys: vec![],
             scap: 8,
             infer: None,
+            rec_done: HashMap::new(),
+            rec_progress: vec![],
+            rec_names: HashMap::new(),
+            rec_code: std::collections::BTreeMap::new(),
         }
     }
 
@@ -189,6 +204,127 @@ impl<'a> Gen<'a> {
 
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
         self.ty_id(t)
+    }
+
+    /// Identifiers in the body of a recursive operator bound outside it (by the call site), sorted
+    fn rec_free(&self, rd: &crate::expand::RecDef) -> Vec<String> {
+        fn walk(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+            let binders: Vec<String> = match e {
+                Expr::Quant(_, bs, _) | Expr::SetMap(_, bs) => bs.iter().map(|(x, _)| x.clone()).collect(),
+                Expr::Choose(x, ..) | Expr::SetFilter(x, ..) | Expr::FunCons(x, ..) => vec![x.clone()],
+                Expr::Except(_, ups) => ups
+                    .iter()
+                    .flat_map(|(p, _)| p.iter().filter_map(|s| match s {
+                        Path::Field(k) if k.starts_with('@') => Some(k.clone()),
+                        _ => None,
+                    }))
+                    .collect(),
+                _ => vec![],
+            };
+            let n = bound.len();
+            bound.extend(binders);
+            if let Expr::Ident(x) = e {
+                if !bound.contains(x) && !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+            for c in e.children() {
+                walk(c, bound, out);
+            }
+            bound.truncate(n);
+        }
+        let mut bound = rd.params.clone();
+        let mut out = vec![];
+        walk(&rd.body, &mut bound, &mut out);
+        out.retain(|x| {
+            !self.is_var(x)
+                && !self.ce.constants.contains_key(x)
+                && !x.starts_with("@model:")
+                && !["BOOLEAN", "Nat", "Int"].contains(&x.as_str())
+        });
+        out.sort();
+        out
+    }
+
+    /// The Rust function for the recursive operator `rd` called with arguments of types `tys`
+    /// (its parameters, then the free variables of `rec_free`): its name and return type. The
+    /// return type is found by generating the body until the type settles, starting from a few
+    /// guesses; integer ranges that keep growing are widened to unbounded.
+    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, uses_state: bool) -> R<(String, Ty)> {
+        let key = (i, tys.clone());
+        if let Some(r) = self.rec_done.get(&key) {
+            return Ok(r.clone());
+        }
+        if !self.rec_names.contains_key(&key) && self.rec_names.keys().filter(|(j, _)| *j == i).count() >= 8 {
+            return Err(format!("recursive operator `{}`: the types of its arguments keep changing between calls", rd.name));
+        }
+        let n = self.rec_names.len();
+        let name = self.rec_names.entry(key.clone()).or_insert(format!("rec_{n}")).clone();
+        if let Some((_, t)) = self.rec_progress.iter().rev().find(|(k, _)| *k == key) {
+            return Ok((name, t.clone()));
+        }
+        let free = self.rec_free(rd);
+        let names: Vec<String> = rd.params.iter().chain(&free).cloned().collect();
+        let mut env = Env::default();
+        let mut sig = if uses_state { String::from("s: &State, ") } else { String::new() };
+        for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
+            env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
+            write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+        }
+        let mut last_err = String::new();
+        for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool] {
+            let mut ret = seed;
+            for round in 0..30 {
+                self.rec_progress.push((key.clone(), ret.clone()));
+                let r = self.gen(&rd.body, &env, None);
+                self.rec_progress.pop();
+                let (code, t) = match r {
+                    Ok(x) => x,
+                    Err(e) => {
+                        last_err = e;
+                        break;
+                    }
+                };
+                let Ok(j) = join(&ret, &t) else {
+                    last_err = format!("type mismatch: {ret:?} vs {t:?}");
+                    break;
+                };
+                let next = if round >= 3 { crate::compile::widen(&ret, &j) } else { j };
+                if next != ret {
+                    ret = next;
+                    continue;
+                }
+                let code = self.coerce(code, &t, &ret)?;
+                self.ty_id(&ret)?;
+                let f = format!(
+                    "fn {name}({sig}) -> {} {{ rec_enter({:?}); let __r: {} = {{ {code} }}; rec_leave(); __r }}\n",
+                    ret.repr(),
+                    rd.name,
+                    ret.repr()
+                );
+                self.rec_code.insert(name.clone(), f);
+                if self.rec_progress.is_empty() {
+                    self.rec_done.insert(key, (name.clone(), ret.clone()));
+                }
+                return Ok((name, ret));
+            }
+        }
+        Err(format!("recursive operator `{}`: {last_err}", rd.name))
+    }
+
+    /// The functions generated for recursive operators, with the depth guard they share
+    pub fn rec_functions(&self) -> String {
+        let mut s = format!(
+            "thread_local! {{ static REC_DEPTH: std::cell::Cell<u32> = const {{ std::cell::Cell::new(0) }}; }}\n\
+             fn rec_enter(name: &str) {{ REC_DEPTH.with(|d| {{ let n = d.get() + 1; if n > {} {{ d.set(0); eval_error(format!(\"`{{name}}` recursed more than {} levels deep (TLC overflows its stack)\")) }} d.set(n); }}) }}\n\
+             fn rec_leave() {{ REC_DEPTH.with(|d| d.set(d.get() - 1)) }}\n",
+            crate::value::REC_LIMIT,
+            crate::value::REC_LIMIT
+        );
+        for c in self.rec_code.values() {
+            s += c;
+        }
+        s
     }
 
     /// Rewrites (e)' as e with every variable in it primed
@@ -516,7 +652,9 @@ impl<'a> Gen<'a> {
             }
         }
         if matches!(from, Ty::Enum(v) if v.is_empty()) && !matches!(to, Ty::Enum(_)) {
-            return Ok(format!("{{ let __u: {} = unreachable!(); __u }}", to.repr()));
+            // No value has this type, so the code cannot produce one: it stops (e.g. CHOOSE from
+            // an empty set) and must still run to report that
+            return Ok(format!("{{ let __u: {} = {{ let _ = {code}; unreachable!() }}; __u }}", to.repr()));
         }
         match (from, to) {
             (Ty::Set(a), Ty::Set(b)) if !is_sparse(from) && !is_sparse(to) && a.kind_eq(b) && Self::trivial(a, b) => {
@@ -652,6 +790,74 @@ impl<'a> Gen<'a> {
                 }
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
+                ("IsFiniteSet", [s]) => {
+                    let (c, t) = self.gen(s, env, None)?;
+                    if !matches!(t, Ty::Set(_)) {
+                        return Err("IsFiniteSet of a non-set".into());
+                    }
+                    (format!("{{ let _ = {c}; true }}"), Ty::Bool)
+                }
+                ("Assert", [p, m]) => {
+                    let pc = self.gen_as(p, env, &Ty::Bool)?;
+                    let shown = match self.try_const(m, env) {
+                        Some(v) => crate::compile::show_value(self.atoms, &v),
+                        None => short(m),
+                    };
+                    let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
+                    (format!("(if {pc} {{ true }} else {{ eval_error({msg:?}.to_string()) }})"), Ty::Bool)
+                }
+                // Print and PrintT write to stderr (TLC prints to its output); the checker's verdict
+                // does not depend on them
+                // (d :> e) @@ f, with f over a whole type: f with the entry at d replaced. Any other
+                // use of :> and @@ builds a function over part of a type, which is not represented
+                ("@@", [l, f]) if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2) => {
+                    let Call(_, de) = l.strip() else { unreachable!() };
+                    let (fc, ft) = self.gen(f, env, want)?;
+                    let Ty::Fun(d, c) = &ft else { return Err("@@ of a value that is not a function".into()) };
+                    let did = self.ty_id(d)?;
+                    let kc = self.gen_as(&de[0], env, d)?;
+                    let vc = self.gen_as(&de[1], env, c)?;
+                    let (t, i) = (self.fresh("t"), self.fresh("i"));
+                    (
+                        format!("{{ let mut {t} = {fc}; let {i} = enc_{did}({kc}); if {i} == u64::MAX {{ eval_error(\"(d :> e) @@ f with d outside the domain of f is not supported\".into()) }} {t}[{i} as usize] = {vc}; {t} }}"),
+                        ft,
+                    )
+                }
+                (":>" | "@@", _) => {
+                    return Err(format!("`{f}` over values that depend on the state is only supported as `(d :> e) @@ f` with f a function over a whole type: {}", short(e)))
+                }
+                ("PrintT", [x]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    let id = self.ty_id(&t)?;
+                    (format!("{{ eprintln!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
+                }
+                ("Print", [x, v]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    let id = self.ty_id(&t)?;
+                    let (vc, vt) = self.gen(v, env, want)?;
+                    (format!("{{ eprintln!(\"{{}}\", fmt_{id}(&{c})); {vc} }}"), vt)
+                }
+                ("^", [a, b]) => {
+                    let (ac, (alo, ahi)) = self.gen_int(a, env)?;
+                    let (bc, (blo, bhi)) = self.gen_int(b, env)?;
+                    // Monotone in both arguments when both are natural numbers
+                    let t = match (alo >= 0, int_pow(alo, blo.max(0)), int_pow(ahi, bhi)) {
+                        (true, Some(lo), Some(hi)) if hi <= BIG => Ty::Int(if alo == 0 { 0 } else { lo }, hi.max(1)),
+                        _ => Ty::Int(-BIG, BIG),
+                    };
+                    (
+                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ eval_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => eval_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
+                        t,
+                    )
+                }
+                ("Cardinality", [s]) if matches!(s.strip(), Un(UOp::Subset, _)) && self.try_const(s, env).is_none() => {
+                    let Un(_, x) = s.strip() else { unreachable!() };
+                    let (c, t) = self.gen(x, env, None)?;
+                    let Ty::Set(el) = &t else { return Err("SUBSET of a non-set".into()) };
+                    let n = if is_sparse(&t) { self.scap as u32 } else { el.size().unwrap_or(0) as u32 };
+                    let hi = if n >= 62 { BIG } else { 1i64 << n };
+                    (format!("(1i64 << {})", self.s_card(&c, &t)), Ty::Int(1, hi))
+                }
                 ("Cardinality", [s]) => {
                     let (c, t) = self.gen(s, env, None)?;
                     let Ty::Set(el) = &t else { return Err("Cardinality of a non-set".into()) };
@@ -699,6 +905,54 @@ impl<'a> Gen<'a> {
                     parts.push(format!("{p} == s.v_{v}"));
                 }
                 (format!("({})", if parts.is_empty() { "true".into() } else { parts.join(" && ") }), Ty::Bool)
+            }
+            // UNION {e : x \in S} and UNION {A, B, ...}: the union of the sets as they are built
+            Un(UOp::Union, x) if matches!(x.strip(), SetMap(..) | SetLit(_)) => {
+                let we = want.cloned();
+                match x.strip() {
+                    SetMap(f, bs) => {
+                        let mut env2 = env.clone();
+                        let mut heads = vec![];
+                        for (x, s) in bs {
+                            let (it, et, ix) = self.iter_of_indexed(s, &env2)?;
+                            let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                            heads.push((it, lx));
+                        }
+                        let (fc, ft) = self.gen(f, &env2, we.as_ref())?;
+                        if !matches!(ft, Ty::Set(_)) {
+                            return Err("UNION of a set whose elements are not sets".into());
+                        }
+                        let st = Self::layout(we.as_ref(), ft.clone());
+                        let fc = self.coerce(fc, &ft, &st)?;
+                        let acc = self.fresh("acc");
+                        let mut body = format!("{acc} = {};", self.s_bin(BOp::Cup, &acc, &fc, &st));
+                        for (it, lx) in heads.into_iter().rev() {
+                            body = format!("for {lx} in {it} {{ {body} }}");
+                        }
+                        let empty = self.s_empty(&st)?;
+                        (format!("{{ let mut {acc} = {empty}; {body} {acc} }}"), st)
+                    }
+                    SetLit(xs) => {
+                        let mut parts = vec![];
+                        let mut t = Ty::Enum(vec![]);
+                        for x in xs {
+                            let (c, ct) = self.gen(x, env, we.as_ref())?;
+                            if !matches!(ct, Ty::Set(_)) {
+                                return Err("UNION of a set whose elements are not sets".into());
+                            }
+                            t = join(&t, &ct)?;
+                            parts.push((c, ct));
+                        }
+                        let st = Self::layout(we.as_ref(), t);
+                        let mut code = self.s_empty(&st)?;
+                        for (c, ct) in parts {
+                            let c = self.coerce(c, &ct, &st)?;
+                            code = self.s_bin(BOp::Cup, &code, &c, &st);
+                        }
+                        (code, st)
+                    }
+                    _ => unreachable!(),
+                }
             }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
@@ -1022,11 +1276,61 @@ impl<'a> Gen<'a> {
                 }
                 (code + ")", Ty::Rec(tys))
             }
-            Choose(..) => return Err("CHOOSE over state-dependent sets is not supported yet".into()),
+            Choose(x, s, p) => {
+                // The first element in iteration order that satisfies p. Sets iterate in TLC's
+                // order of values (ascending integers, strings and model values in order of first
+                // appearance, records and tuples element by element), so this is TLC's choice
+                let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                let mut env2 = env.clone();
+                let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                let pc = self.gen_as(p, &env2, &Ty::Bool)?;
+                let val = env2.locals[x].0.clone();
+                let r = self.fresh("r");
+                (
+                    format!(
+                        "{{ let mut {r}: Option<{}> = None; for {lx} in {it} {{ if {pc} {{ {r} = Some({val}); break; }} }} \
+                         match {r} {{ Some(v) => v, None => eval_error(\"Attempted to compute the value of an expression of form CHOOSE x \\\\in S: P, but no element of S satisfied P.\".into()) }} }}",
+                        et.repr()
+                    ),
+                    et,
+                )
+            }
             FunSet(..) | RecSet(..) => {
                 return Err("this set is only supported on the right of \\in (or must be constant)".into())
             }
             Let(..) | Label(..) => unreachable!(),
+            Lambda(..) => return Err("LAMBDA is only supported as the argument of an operator parameter".into()),
+            RecCall(i, args) => {
+                // Constant arguments were folded above when the whole call evaluates; otherwise
+                // call a Rust function generated for the operator
+                let rd = crate::expand::rec_def(*i);
+                if rd.body.is_action() {
+                    return Err(format!("recursive operator `{}` refers to primed variables, which is not supported", rd.name));
+                }
+                let uses_state = rd.body.any(&|e| matches!(e, Ident(n) if self.is_var(n)));
+                if uses_state && env.init {
+                    return Err(format!("recursive operator `{}` reads variables in Init, which is not supported", rd.name));
+                }
+                let mut codes = vec![];
+                let mut tys = vec![];
+                for a in args {
+                    // Integer arguments are passed unbounded: their ranges change from call to call
+                    // (n, n - 1, ...), and one function serves them all
+                    let (c, t) = self.gen(a, env, None)?;
+                    let w = unbounded_ints(&t);
+                    codes.push(self.coerce(c, &t, &w)?);
+                    tys.push(w);
+                }
+                // Bound variables of the call site that the body refers to are passed along
+                for f in self.rec_free(&rd) {
+                    let (c, t) = env.locals.get(&f).cloned().ok_or(format!("recursive operator `{}`: unknown identifier `{f}`", rd.name))?;
+                    codes.push(c);
+                    tys.push(t);
+                }
+                let (name, ret) = self.rec_fn(*i, &rd, tys, uses_state)?;
+                let s_arg = if uses_state { "s, " } else { "" };
+                (format!("{name}({s_arg}{})", codes.join(", ")), ret)
+            }
             BoxAction(..) | Fair(..) => return Err("temporal formula in a state expression".into()),
             Num(_) | Str(_) | Bool(_) => unreachable!("constants are folded"),
         })
@@ -1172,6 +1476,42 @@ impl<'a> Gen<'a> {
                 parts.push(self.lit(x, &et)?);
             }
             return Ok((format!("[{}].into_iter()", parts.join(", ")), *et, None));
+        }
+        // A product of sets that depend on the state, in TLC's order (the first element varies
+        // slowest)
+        if let Expr::Call(f, parts) = s {
+            if f == "\\X" {
+                let mut heads = vec![];
+                let mut tys = vec![];
+                let mut vals = vec![];
+                for part in parts {
+                    let (it, et, ix) = self.iter_of_indexed(part, env)?;
+                    let lx = self.fresh("x");
+                    let val = match ix {
+                        Some(_) => format!("dec_{}({lx})", self.ty_id(&et)?),
+                        None => lx.clone(),
+                    };
+                    heads.push((it, lx));
+                    vals.push(val);
+                    tys.push(et);
+                }
+                let tt = tuple_ty(tys)?;
+                let v = self.fresh("v");
+                let mut body = format!("{v}.push(({},));", vals.join(", "));
+                for (it, lx) in heads.into_iter().rev() {
+                    body = format!("for {lx} in {it} {{ {body} }}");
+                }
+                return Ok((format!("{{ let mut {v}: Vec<{}> = Vec::new(); {body} {v} }}.into_iter()", tt.repr()), tt, None));
+            }
+        }
+        // SUBSET of a set that depends on the state, in TLC's order (smaller subsets first)
+        if let Expr::Un(UOp::Subset, x) = s {
+            let (c, t) = self.gen(x, env, None)?;
+            if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
+                return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
+            }
+            self.need_subsets = true;
+            return Ok((format!("subsets_tlc({c}).into_iter()"), t, None));
         }
         if let Expr::Bin(BOp::Range, a, b) = s {
             let (ac, (alo, _)) = self.gen_int(a, env)?;
@@ -1905,6 +2245,13 @@ impl<'a> Gen<'a> {
 
     pub fn helpers(&mut self) -> R<String> {
         let mut s = String::new();
+        if self.need_subsets {
+            // The subsets of a bitmask set in TLC's order: by size, then by their elements in order
+            // (the lowest element where two subsets differ belongs to the earlier one)
+            s += "fn subsets_tlc(m: u128) -> Vec<u128> { if m.count_ones() > 20 { eval_error(format!(\"SUBSET of a set of {} elements is too large to enumerate\", m.count_ones())) } \
+                  let mut v = vec![]; let mut sub = m; loop { v.push(sub); if sub == 0 { break; } sub = (sub - 1) & m; } \
+                  v.sort_by(|a, b| a.count_ones().cmp(&b.count_ones()).then_with(|| { let d = a ^ b; if d == 0 { std::cmp::Ordering::Equal } else if a & d & d.wrapping_neg() != 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } })); v }\n";
+        }
         // fmt is needed for every type reachable from the variables' types, so register those first
         for (_, t) in self.vars.clone() {
             self.ty_id(&t)?;
@@ -2508,6 +2855,18 @@ fn eval_error_bool(msg: &str) -> String {
     format!("{{ let __b: bool = eval_error({msg:?}.to_string()); __b }}")
 }
 
+/// `t` with every integer range outside sets made unbounded
+fn unbounded_ints(t: &Ty) -> Ty {
+    match t {
+        Ty::Int(..) => Ty::Int(-BIG, BIG),
+        Ty::IntAtom(_, _, a) => Ty::IntAtom(-BIG, BIG, a.clone()),
+        Ty::Rec(fs) => Ty::Rec(fs.iter().map(|(n, t)| (n.clone(), unbounded_ints(t))).collect()),
+        Ty::Opt(x) => Ty::Opt(unbounded_ints(x).into()),
+        Ty::Fun(d, c) => Ty::Fun(d.clone(), unbounded_ints(c).into()),
+        t => t.clone(),
+    }
+}
+
 /// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
 /// the two is rejected rather than compared as unequal.
 fn seq_like_fun(t: &Ty) -> bool {
@@ -2582,6 +2941,8 @@ pub fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
         BoxAction(a, b) => BoxAction(mb(a), mb(b)),
         Fair(w, a, b) => Fair(*w, mb(a), mb(b)),
         Label(n, a, b) => Label(n.clone(), a.iter().map(m).collect(), mb(b)),
+        Lambda(ps, b) => Lambda(ps.clone(), mb(b)),
+        RecCall(i, a) => RecCall(*i, a.iter().map(m).collect()),
     }
 }
 

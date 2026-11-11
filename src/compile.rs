@@ -31,18 +31,52 @@ const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec<(String, String)>> {
     let def_params = |m: &Module, n: &str| m.defs.iter().rev().find(|d| d.name == n).map(|d| d.params.clone());
     let mut extra = vec![];
+    // A CONSTANT with parameters becomes a definition: `F <- Def` is F(p, ...) == Def(p, ...), and
+    // `F = v` (which TLC accepts) is F(p, ...) == v
+    let op_arity = |n: &str| m.op_constants.iter().find(|(c, _)| c == n).map(|(_, k)| *k);
+    let fresh = |k: usize| (1..=k).map(|i| format!("#p{i}")).collect::<Vec<_>>();
+    let mut op_done = vec![];
     for (n, e) in &cfg.constants {
-        if m.constants.contains(n) {
+        if let Some(k) = op_arity(n) {
+            extra.push(Def { name: n.clone(), params: fresh(k), arity: vec![0; k], body: e.clone() });
+            op_done.push(n.clone());
+        }
+    }
+    for (n, module, def) in &cfg.substs {
+        let Some(k) = op_arity(n) else { continue };
+        if let Some(md) = module {
+            return Err(format!("cfg: `{n} <- [{md}] {def}`: [Module] replaces a definition, but {n} is a CONSTANT (TLC leaves it without a value)"));
+        }
+        let Some(dp) = def_params(m, def) else {
+            return Err(format!("cfg: `{n} <- {def}`: {def} is not defined"));
+        };
+        if dp.len() != k {
+            return Err(format!("cfg: `{n} <- {def}`: {n} takes {k} arguments and {def} takes {}", dp.len()));
+        }
+        if op_done.contains(n) {
+            return Err(format!("cfg: `{n}` is given a value more than once"));
+        }
+        let ps = fresh(k);
+        let body = Expr::Call(def.clone(), ps.iter().map(|p| Expr::Ident(p.clone())).collect());
+        extra.push(Def { name: n.clone(), params: ps, arity: vec![0; k], body });
+        op_done.push(n.clone());
+    }
+    m.constants.retain(|c| !op_done.contains(c));
+    for (n, e) in &cfg.constants {
+        if m.constants.contains(n) || op_done.contains(n) {
             continue;
         }
         match def_params(m, n) {
-            Some(p) if p.is_empty() => extra.push(Def { name: n.clone(), params: vec![], body: e.clone() }),
+            Some(p) if p.is_empty() => extra.push(Def { name: n.clone(), params: vec![], arity: vec![], body: e.clone() }),
             Some(_) => return Err(format!("cfg: `{n} = ...` replaces an operator that takes arguments")),
             None => warnings.push(format!("cfg: `{n}` is neither a CONSTANT nor a definition of the spec; ignored")),
         }
     }
     let mut const_substs = vec![];
     for (n, module, def) in &cfg.substs {
+        if op_done.contains(n) {
+            continue;
+        }
         if const_substs.iter().any(|(c, _): &(String, String)| c == n) || cfg.constants.iter().any(|(c, _)| c == n) {
             return Err(format!("cfg: `{n}` is given a value more than once"));
         }
@@ -59,7 +93,7 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
                 return Err(format!("cfg: `{n} <- [{md}] {def}`: [Module] replaces a definition, but {n} is a CONSTANT (TLC leaves it without a value)"));
             }
             if !dp.is_empty() {
-                return Err(format!("cfg: `{n} <- {def}`: {def} takes arguments (operator constants are not supported)"));
+                return Err(format!("cfg: `{n} <- {def}`: {n} takes no arguments and {def} takes {}", dp.len()));
             }
             const_substs.push((n.clone(), def.clone()));
             continue;
@@ -73,7 +107,8 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
         // Name(p1, ...) == Def(p1, ...); defined last, so it takes precedence
         let args: Vec<Expr> = np.iter().map(|p| Expr::Ident(p.clone())).collect();
         let body = if args.is_empty() { Expr::Ident(def.clone()) } else { Expr::Call(def.clone(), args) };
-        extra.push(Def { name: n.clone(), params: np, body });
+        let arity = m.defs.iter().rev().find(|d| d.name == *n).map(|d| d.arity.clone()).unwrap_or_default();
+        extra.push(Def { name: n.clone(), params: np, arity, body });
     }
     m.defs.extend(extra);
     Ok(const_substs)
@@ -106,9 +141,13 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
                 out.defs.extend(sub.defs);
                 out.assumes.extend(sub.assumes);
                 out.modules.extend(sub.modules);
+                out.op_constants.extend(sub.op_constants);
+                out.recursive.extend(sub.recursive);
             }
         }
     }
+    out.op_constants.extend(m.op_constants);
+    out.recursive.extend(m.recursive);
     out.constants.extend(m.constants);
     out.variables.extend(m.variables);
     out.defs.extend(m.defs);
@@ -412,6 +451,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
         })
         .collect();
     writeln!(perm_code, "static PERMS_INV: &[&[u16]] = &[{}];", inv.join(", ")).unwrap();
+    let rec_fns = g.rec_functions();
     let helpers = g.helpers()?;
     let mut src = String::new();
     writeln!(src, "// Generated by tla2rs from module {}. Do not edit.", m.name).unwrap();
@@ -420,6 +460,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
     let fields: Vec<String> = g.vars.iter().map(|(v, t)| format!("v_{v}: {}", t.repr())).collect();
     writeln!(src, "#[derive(Clone, Copy, PartialEq, Eq, Hash)]\nstruct State {{ {} }}", fields.join(", ")).unwrap();
     src += &helpers;
+    src += &rec_fns;
     src += &pack;
     src += &key_code;
     src += &perm_code;
@@ -851,7 +892,7 @@ fn infer_types(
 const WIDEN_AFTER: u32 = 3;
 
 /// Widens integers whose range changed from the previous type to unbounded.
-fn widen(old: &Ty, new: &Ty) -> Ty {
+pub fn widen(old: &Ty, new: &Ty) -> Ty {
     match (old, new) {
         (Ty::Enum(o), _) if o.is_empty() => new.clone(),
         (Ty::Int(a, b), Ty::Int(c, d)) if (a, b) != (c, d) => Ty::Int(if c < a { -BIG } else { *a }, if d > b { BIG } else { *b }),

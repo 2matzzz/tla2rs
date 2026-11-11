@@ -38,6 +38,11 @@ pub enum Expr {
     Fair(bool, Box<Expr>, Box<Expr>),
     /// Marks where an operator was inlined: its name and (expanded) arguments.
     Label(String, Vec<Expr>, Box<Expr>),
+    /// LAMBDA x, y : e (only as the argument of an operator parameter)
+    Lambda(Vec<String>, Box<Expr>),
+    /// A call of a recursive operator that is not inlined: an index into `expand::rec_def` and the
+    /// (expanded) arguments
+    RecCall(usize, Vec<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +93,9 @@ pub enum BOp {
 pub struct Def {
     pub name: String,
     pub params: Vec<String>,
+    /// Per parameter, the number of arguments it takes: 0 for an ordinary parameter, n for an
+    /// operator parameter `F(_, ...)`
+    pub arity: Vec<usize>,
     pub body: Expr,
 }
 
@@ -102,6 +110,11 @@ pub struct Module {
     pub assumes: Vec<Assume>,
     /// Names of this module and of the modules it EXTENDS from files next to it
     pub modules: Vec<String>,
+    /// CONSTANTs declared with parameters (`CONSTANT F(_, _)`) and their number of parameters
+    pub op_constants: Vec<(String, usize)>,
+    /// Operators declared RECURSIVE (also in LET), and the operators that recursive function
+    /// definitions are turned into
+    pub recursive: Vec<String>,
 }
 
 /// An ASSUME expression and the position TLC reports on failure (1-based line and column; the end
@@ -163,6 +176,8 @@ impl Expr {
                 v.push(body);
                 v
             }
+            Lambda(_, body) => vec![body],
+            RecCall(_, a) => a.iter().collect(),
             Label(_, args, body) => {
                 let mut v: Vec<&Expr> = args.iter().collect();
                 v.push(body);

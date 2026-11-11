@@ -12,6 +12,10 @@ pub struct Parser {
     /// Bullet-list columns. An expression ends at a line-leading token at or left of this column;
     /// None means inside brackets.
     limits: Vec<Option<usize>>,
+    /// Names declared RECURSIVE, and the operators recursive function definitions become
+    recursive: Vec<String>,
+    /// Count of `<<x, y>> \in S` bound variables, for fresh names
+    tuple_binders: usize,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -30,11 +34,31 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![] };
+    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0 };
     p.module()
 }
 
+/// Infix operators without a built-in meaning, which a spec may define (`a ++ b == ...`), with
+/// their precedence (the lower end of the range in the TLA+ table). `:>` and `@@` are defined by
+/// the TLC module.
+const USER_INFIX: &[(&str, u8)] = &[
+    ("@@", 6), (":>", 7), ("<:", 7), ("\\prec", 5), ("\\succ", 5), ("\\preceq", 5), ("\\succeq", 5),
+    ("\\sim", 5), ("\\simeq", 5), ("\\approx", 5), ("\\cong", 5), ("\\asymp", 5), ("\\doteq", 5),
+    ("\\propto", 5), ("\\sqsubseteq", 5), ("\\sqsupseteq", 5), ("\\uplus", 9), ("\\sqcap", 9),
+    ("\\sqcup", 9), ("##", 9), ("$$", 9), ("\\wr", 9), ("\\oplus", 10), ("++", 10), ("%%", 10),
+    ("\\ominus", 11), ("\\otimes", 13), ("\\oslash", 13), ("\\odot", 13), ("**", 13), ("//", 13),
+    ("&&", 13), ("\\star", 13), ("\\bullet", 13), ("||", 13), ("^^", 14),
+];
+
+fn user_infix(t: &Tok) -> Option<(u8, &'static str)> {
+    let Tok::Sym(s) = t else { return None };
+    USER_INFIX.iter().find(|(n, _)| n == s).map(|(n, p)| (*p, *n))
+}
+
 fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
+    if let Some((p, n)) = user_infix(t) {
+        return Some((p, false, n));
+    }
     let Tok::Sym(s) = t else { return None };
     // (precedence, right-associative, normalized name)
     Some(match s.as_str() {
@@ -66,6 +90,7 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
         "\\div" => (13, false, "\\div"),
         // In TLA+, % is 10-11 (looser than * and \div, and looser than unary -)
         "%" => (11, false, "%"),
+        "^" => (14, true, "^"),
         _ => return None,
     })
 }
@@ -112,9 +137,21 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "\\div" => BOp::Div,
         "%" => BOp::Mod,
         "\\o" => return Expr::Call("\\o".into(), vec![a, b]),
+        "^" => return Expr::Call("^".into(), vec![a, b]),
+        o if USER_INFIX.iter().any(|(n, _)| *n == o) => return Expr::Call(o.into(), vec![a, b]),
         _ => unreachable!(),
     };
     Expr::Bin(o, a.b(), b.b())
+}
+
+/// e with every application `f[a]` replaced by the call `app(a)`
+fn calls_for_apps(e: &Expr, f: &str, app: &str) -> Expr {
+    match e {
+        Expr::App(g, a) if matches!(g.as_ref(), Expr::Ident(n) if n == f) => {
+            Expr::Call(app.to_string(), vec![calls_for_apps(a, f, app)])
+        }
+        _ => crate::codegen::map_children(e, &|c| calls_for_apps(c, f, app)),
+    }
 }
 
 /// `[x \in S |-> e]`, and for several bound variables `[x \in S, y \in T |-> e]`, a function on
@@ -132,6 +169,7 @@ fn fun_cons(bs: Vec<(String, Expr)>, body: Expr) -> Expr {
         .map(|(i, (x, _))| Def {
             name: x.clone(),
             params: vec![],
+            arity: vec![],
             body: Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b()),
         })
         .collect();
@@ -220,7 +258,12 @@ impl Parser {
                 }
                 Tok::Ident(k) if k == "CONSTANT" || k == "CONSTANTS" => {
                     self.pos += 1;
-                    m.constants.extend(self.ident_list()?);
+                    for (c, n) in self.ident_list_arity()? {
+                        if n > 0 {
+                            m.op_constants.push((c.clone(), n));
+                        }
+                        m.constants.push(c);
+                    }
                 }
                 Tok::Ident(k) if k == "VARIABLE" || k == "VARIABLES" => {
                     self.pos += 1;
@@ -240,14 +283,52 @@ impl Parser {
                     self.expr(0)?;
                 }
                 Tok::Ident(k) if k == "LOCAL" => self.pos += 1,
+                Tok::Ident(k) if k == "RECURSIVE" => {
+                    self.pos += 1;
+                    for (n, _) in self.ident_list_arity()? {
+                        self.recursive.push(n);
+                    }
+                }
                 Tok::Ident(_) => {
                     let d = self.def()?;
-                    m.defs.push(d);
+                    m.defs.extend(d);
                 }
                 _ => return self.err("unexpected token at module level"),
             }
         }
+        m.recursive = std::mem::take(&mut self.recursive);
         Ok(m)
+    }
+
+    /// Names with optional parameter lists `F(_, _)`, and the number of parameters of each
+    fn ident_list_arity(&mut self) -> R<Vec<(String, usize)>> {
+        let mut v = vec![];
+        loop {
+            let name = self.ident()?;
+            let mut n = 0;
+            if self.is("(") {
+                self.pos += 1;
+                loop {
+                    match self.peek() {
+                        Tok::Ident(u) if u == "_" => self.pos += 1,
+                        _ => return self.err("expected `_` in the parameters of a CONSTANT"),
+                    }
+                    n += 1;
+                    if self.is(",") {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(")")?;
+            }
+            v.push((name, n));
+            if self.is(",") {
+                self.pos += 1;
+            } else {
+                return Ok(v);
+            }
+        }
     }
 
     fn ident_list(&mut self) -> R<Vec<String>> {
@@ -272,13 +353,41 @@ impl Parser {
         Ok(v)
     }
 
-    fn def(&mut self) -> R<Def> {
+    fn def(&mut self) -> R<Vec<Def>> {
         let name = self.ident()?;
+        // An infix operator definition `a ++ b == e`
+        if let Some((_, op)) = user_infix(self.peek()) {
+            self.pos += 1;
+            let b = self.ident()?;
+            self.expect("==")?;
+            let body = self.expr(0)?;
+            return Ok(vec![Def { name: op.to_string(), params: vec![name, b], arity: vec![0, 0], body }]);
+        }
         let mut params = vec![];
+        let mut arity = vec![];
         if self.is("(") {
             self.pos += 1;
             loop {
                 params.push(self.ident()?);
+                // An operator parameter F(_, _)
+                let mut n = 0;
+                if self.is("(") {
+                    self.pos += 1;
+                    loop {
+                        match self.peek() {
+                            Tok::Ident(u) if u == "_" => self.pos += 1,
+                            _ => return self.err("expected `_` in an operator parameter"),
+                        }
+                        n += 1;
+                        if self.is(",") {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(")")?;
+                }
+                arity.push(n);
                 if self.is(",") {
                     self.pos += 1;
                 } else {
@@ -295,15 +404,41 @@ impl Parser {
             self.expect("]")?;
             self.expect("==")?;
             let body = self.expr(0)?;
+            let _ = at;
             if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
-                self.pos = at;
-                return self.err(&format!("recursive function definitions are not supported (`{name}` is used in its own definition)"));
+                return Ok(self.rec_fun(name, bs, body));
             }
-            return Ok(Def { name, params, body: fun_cons(bs, body) });
+            return Ok(vec![Def { name, params, arity, body: fun_cons(bs, body) }]);
         }
         self.expect("==")?;
         let body = self.expr(0)?;
-        Ok(Def { name, params, body })
+        Ok(vec![Def { name, params, arity, body }])
+    }
+
+    /// A recursive function definition `f[x \in S] == e` becomes the recursive operator
+    /// `f#app(x) == IF x \in S THEN e ELSE <error>`, with each `f[a]` in e a call `f#app(a)`, and
+    /// `f == [x \in S |-> f#app(x)]` for the function as a whole
+    fn rec_fun(&mut self, name: String, bs: Vec<(String, Expr)>, body: Expr) -> Vec<Def> {
+        let app = format!("{name}#app");
+        self.recursive.push(app.clone());
+        let body = calls_for_apps(&body, &name, &app);
+        let (x, dom, inner) = if bs.len() == 1 {
+            let (x, s) = bs.into_iter().next().unwrap();
+            (x, s, body)
+        } else {
+            match fun_cons(bs, body) {
+                Expr::FunCons(t, d, b) => (t, *d, *b),
+                _ => unreachable!(),
+            }
+        };
+        // Applying f outside its domain is an error, as in TLC (CHOOSE from the empty set fails)
+        let outside = Expr::Choose("#none".into(), Expr::SetLit(vec![]).b(), Expr::Bool(true).b());
+        let guarded = Expr::If(Expr::Bin(BOp::In, Expr::Ident(x.clone()).b(), dom.clone().b()).b(), inner.b(), outside.b());
+        let whole = Expr::FunCons(x.clone(), dom.b(), Expr::Call(app.clone(), vec![Expr::Ident(x.clone())]).b());
+        vec![
+            Def { name: app, params: vec![x], arity: vec![0], body: guarded },
+            Def { name, params: vec![], arity: vec![], body: whole },
+        ]
     }
 
     pub fn expr(&mut self, min: u8) -> R<Expr> {
@@ -355,8 +490,42 @@ impl Parser {
     }
 
     fn binders(&mut self) -> R<Vec<(String, Expr)>> {
+        let (bs, lets) = self.binders_pat()?;
+        if !lets.is_empty() {
+            return self.err("a tuple of bound variables `<<x, y>> \\in S` is only supported after \\E, \\A, and in {e : ...}");
+        }
+        Ok(bs)
+    }
+
+    /// Bound variables `x, y \in S, <<a, b>> \in T`. A tuple of variables binds a fresh variable t
+    /// and returns the definitions `a == t[1]`, `b == t[2]` to wrap the body in.
+    fn binders_pat(&mut self) -> R<(Vec<(String, Expr)>, Vec<Def>)> {
         let mut out = vec![];
+        let mut lets = vec![];
         loop {
+            if self.is("<<") {
+                self.pos += 1;
+                let mut names = vec![self.ident()?];
+                while self.is(",") {
+                    self.pos += 1;
+                    names.push(self.ident()?);
+                }
+                self.expect(">>")?;
+                self.expect("\\in")?;
+                let s = self.expr(4)?;
+                self.tuple_binders += 1;
+                let t = format!("#tup{}", self.tuple_binders);
+                for (i, n) in names.into_iter().enumerate() {
+                    let body = Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b());
+                    lets.push(Def { name: n, params: vec![], arity: vec![], body });
+                }
+                out.push((t, s));
+                if self.is(",") {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
             let mut names = vec![self.ident()?];
             while self.is(",") {
                 self.pos += 1;
@@ -373,7 +542,7 @@ impl Parser {
                 break;
             }
         }
-        Ok(out)
+        Ok((out, lets))
     }
 
     fn prefix(&mut self) -> R<Expr> {
@@ -399,9 +568,10 @@ impl Parser {
             Tok::Sym(s) if s == "\\E" || s == "\\A" => {
                 let ex = s == "\\E";
                 self.pos += 1;
-                let bs = self.binders()?;
+                let (bs, lets) = self.binders_pat()?;
                 self.expect(":")?;
                 let body = self.expr(0)?;
+                let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
                 Ok(Expr::Quant(ex, bs, body.b()))
             }
             Tok::Ident(k) => match k.as_str() {
@@ -455,11 +625,29 @@ impl Parser {
                     self.pos += 1;
                     let mut defs = vec![];
                     while !self.is_kw("IN") {
-                        defs.push(self.def()?);
+                        if self.is_kw("RECURSIVE") {
+                            self.pos += 1;
+                            for (n, _) in self.ident_list_arity()? {
+                                self.recursive.push(n);
+                            }
+                            continue;
+                        }
+                        defs.extend(self.def()?);
                     }
                     self.pos += 1;
                     let body = self.expr(0)?;
                     Ok(Expr::Let(defs, body.b()))
+                }
+                "LAMBDA" => {
+                    self.pos += 1;
+                    let mut ps = vec![self.ident()?];
+                    while self.is(",") {
+                        self.pos += 1;
+                        ps.push(self.ident()?);
+                    }
+                    self.expect(":")?;
+                    let body = self.expr(0)?;
+                    Ok(Expr::Lambda(ps, body.b()))
                 }
                 "CHOOSE" => {
                     self.pos += 1;
@@ -604,8 +792,9 @@ impl Parser {
                     return Ok(Expr::SetFilter(x.clone(), s.clone(), p.b()));
                 }
             }
-            let bs = self.binders()?;
+            let (bs, lets) = self.binders_pat()?;
             self.expect("}")?;
+            let first = if lets.is_empty() { first } else { Expr::Let(lets, first.b()) };
             return Ok(Expr::SetMap(first.b(), bs));
         }
         let mut v = vec![first];
