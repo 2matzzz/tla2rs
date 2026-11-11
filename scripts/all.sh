@@ -11,11 +11,20 @@ one() {
   local dir base tla
   dir=$(dirname "$cfg"); base=$(basename "$cfg" .cfg); tla="$dir/${base%%-*}.tla"
   [[ -f "$tla" ]] || tla="$dir/$base.tla"
-  scripts/crosscheck.sh "$tla" "$cfg" "$@" | tail -n +2 | grep -q '  MATCH' && echo "ok    $cfg" || echo "FAIL  $cfg"
+  local out
+  out=$(scripts/crosscheck.sh "$tla" "$cfg" "$@" 2>&1)
+  if tail -n +2 <<< "$out" | grep -q '  MATCH'; then
+    echo "ok    $cfg"
+  else
+    # Keep the details of a failure, since the summary line alone does not say what differed
+    mkdir -p target/crosscheck/fail && echo "$out" > "target/crosscheck/fail/$(basename "$cfg" .cfg).log"
+    echo "FAIL  $cfg"
+  fi
 }
 export -f one
 # Lines appear as configurations finish, so their order varies with JOBS
 log=$(mktemp); trap 'rm -f "$log"' EXIT
+rm -rf target/crosscheck/fail
 printf '%s\n' examples/*.cfg tests/tlc/*.cfg |
   xargs -P "${JOBS:-4}" -I{} bash -c 'one "$@"' _ {} "$@" | tee "$log"
 echo "total: $(grep -c '^ok' "$log") ok, $(grep -c '^FAIL' "$log") FAIL"

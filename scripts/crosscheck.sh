@@ -80,7 +80,9 @@ tlc_key() {
 }
 run_tlc() {
   rc_tlc=0
-  java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
+  mkdir -p "$work/jtmp"
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
   if [[ -n "$tlc_cache" ]]; then
     rm -rf "$tlc_cache"; mkdir -p "$tlc_cache.tmp$$" && cp tlc.out "$tlc_cache.tmp$$/" && echo "$rc_tlc" > "$tlc_cache.tmp$$/rc" &&
       mv "$tlc_cache.tmp$$" "$tlc_cache" 2>/dev/null || rm -rf "$tlc_cache.tmp$$"
