@@ -340,6 +340,150 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// SubSeq(q, m, n) on strings from the state: for each string q can be, a table of its
+    /// substrings by (m, n), interned now
+    fn substring_table(&mut self, qc: &str, d: &[u32], mc: &str, nc: &str) -> R<(String, Ty)> {
+        let empty = self.atoms.intern(false, "");
+        let mut res = vec![empty];
+        let mut arms = String::new();
+        let mut total = 0;
+        for &a in d {
+            if self.atoms.is_model(a) {
+                write!(arms, "{a} => eval_error(\"`SubSeq` of a value that is not a string\".to_string()), ").unwrap();
+                continue;
+            }
+            let chars: Vec<char> = self.atoms.name(a).chars().collect();
+            let l = chars.len();
+            total += l * l;
+            if total > 65536 {
+                return Err("`SubSeq` on strings from the state with more than 65536 substrings is not supported".into());
+            }
+            let mut table = vec![];
+            for i in 0..l {
+                for j in 0..l {
+                    let id = if i <= j { self.atoms.intern(false, &chars[i..=j].iter().collect::<String>()) } else { empty };
+                    res.push(id);
+                    table.push(id.to_string());
+                }
+            }
+            write!(
+                arms,
+                "{a} => {{ const T: [u16; {}] = [{}]; if __m > __n {{ {empty}u16 }} \
+                 else if __m < 1 || __m > {l} {{ arith_error(\"The second argument of SubSeq must be in the domain of its first argument.\".to_string()) }} \
+                 else if __n > {l} {{ arith_error(\"The third argument of SubSeq must be in the domain of its first argument.\".to_string()) }} \
+                 else {{ T[((__m - 1) * {l} + __n - 1) as usize] }} }}, ",
+                l * l,
+                table.join(", ")
+            )
+            .unwrap();
+        }
+        res.sort();
+        res.dedup();
+        Ok((format!("{{ let __m: i64 = {mc}; let __n: i64 = {nc}; match {qc} {{ {arms}_ => type_error(\"string\", \"\") }} }}"), Ty::Enum(res)))
+    }
+
+    /// Whether the value `x` of type `xt` is in [d -> r]: a function (sequences, bags, records
+    /// and partial functions included) whose domain is d and whose values are in r. TLC answers
+    /// FALSE for a model value and stops with an error for any other value that is not a function.
+    fn fun_set_member(&mut self, x: &str, xt: &Ty, d: &Expr, r: &Expr, s: &Expr, env: &Env) -> R<String> {
+        let not_fun = |g: &mut Self| -> R<String> {
+            let tid = g.ty_id(xt)?;
+            let msg = format!("Attempted to check if \n{{}}\nwhich is not a TLC function value, is in the set of functions:\n{}", short(s));
+            Ok(format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{x}))); __b }}"))
+        };
+        let in_r = |g: &mut Self, v: &str, t: &Ty| -> R<String> {
+            let e = g.fresh("e");
+            let inner = g.gen_member(&e, t, r, env)?;
+            Ok(format!("{{ let {e} = {v}; {inner} }}"))
+        };
+        match xt {
+            Ty::Enum(ids) => {
+                let strs: Vec<String> = ids.iter().filter(|&&a| !self.atoms.is_model(a)).map(|a| a.to_string()).collect();
+                if strs.is_empty() {
+                    return Ok("false".into());
+                }
+                let err = not_fun(self)?;
+                return Ok(format!("(if matches!({x}, {}) {{ {err} }} else {{ false }})", strs.join(" | ")));
+            }
+            Ty::Bool | Ty::Int(..) | Ty::IntAtom(..) | Ty::Set(_) => return not_fun(self),
+            // A sequence is a function over 1..Len
+            Ty::Seq(et) => {
+                let Some(dv) = self.try_const(d, env) else {
+                    let mut env2 = env.clone();
+                    env2.locals.insert("#seq".into(), (x.to_string(), xt.clone()));
+                    let (dc, dt) = self.gen(d, env, None)?;
+                    let range = Expr::Bin(BOp::Range, Expr::Num(1).b(), Expr::Call("Len".into(), vec![Expr::Ident("#seq".into())]).b());
+                    let (rc, rt) = self.gen(&range, &env2, Some(&dt))?;
+                    let t = join(&dt, &rt)?;
+                    let same = format!("({} == {})", self.coerce(dc, &dt, &t)?, self.coerce(rc, &rt, &t)?);
+                    let all = in_r(self, "__v", et)?;
+                    return Ok(format!("({same} && {x}.iter().all(|__v| {all}))"));
+                };
+                let dom = dv.as_set()?;
+                let n = dom.len();
+                if !(1..=n as i64).all(|i| dom.contains(&Value::Int(i))) {
+                    return Ok("false".into());
+                }
+                let all = in_r(self, "__v", et)?;
+                return Ok(format!("(({x}).len as usize == {n} && {x}.iter().all(|__v| {all}))"));
+            }
+            _ => {}
+        }
+        let Some(dv) = self.try_const(d, env) else {
+            return Err(format!("membership in [D -> R] with D from the state is not supported for {xt:?}: {}", short(s)));
+        };
+        let dom = dv.as_set()?.clone();
+        Ok(match xt {
+            Ty::Fun(dt, ct) => {
+                if dt.enumerate().into_iter().collect::<BTreeSet<_>>() != dom {
+                    return Ok("false".into());
+                }
+                let all = in_r(self, "__v", ct)?;
+                format!("{x}.iter().all(|&__v| {all})")
+            }
+            // Present keys must be exactly the domain
+            Ty::PFun(dt, _) | Ty::Bag(dt) => {
+                let keys = dt.enumerate();
+                if dom.iter().any(|k| !keys.contains(k)) {
+                    return Ok("false".into());
+                }
+                let mask: Vec<String> = keys.iter().map(|k| dom.contains(k).to_string()).collect();
+                let (present, val, vt) = match xt {
+                    Ty::PFun(_, ct) => ("__p.0", "__p.1", ct.as_ref().clone()),
+                    _ => ("(__p > 0)", "__p", Ty::Int(1, crate::types::BIG)),
+                };
+                let all = in_r(self, val, &vt)?;
+                format!(
+                    "{{ const D: [bool; {}] = [{}]; {x}.iter().enumerate().all(|(__i, &__p)| {present} == D[__i] && (!D[__i] || {all})) }}",
+                    keys.len(),
+                    mask.join(", ")
+                )
+            }
+            // A record is a function over its field names
+            Ty::Rec(fs) => {
+                let names: BTreeSet<Value> = fs.iter().map(|(k, _)| Value::Atom(self.atoms.intern(false, k))).collect();
+                if !dom.is_subset(&names) {
+                    return Ok("false".into());
+                }
+                let mut conj = vec!["true".to_string()];
+                for (i, (k, ft)) in fs.iter().enumerate() {
+                    let fp = format!("{x}{}", rec_field(fs.len(), i));
+                    let want = dom.contains(&Value::Atom(self.atoms.intern(false, k)));
+                    match ft {
+                        Ty::Opt(inner) => {
+                            let m = in_r(self, &format!("{fp}.1"), inner)?;
+                            conj.push(if want { format!("({fp}.0 && {m})") } else { format!("!{fp}.0") });
+                        }
+                        ft if want => conj.push(in_r(self, &fp, ft)?),
+                        _ => return Ok("false".into()),
+                    }
+                }
+                format!("({})", conj.join(" && "))
+            }
+            _ => return Err(format!("membership of {xt:?} in [D -> R] is not supported: {}", short(s))),
+        })
+    }
+
     /// Whether `b` is a bag held in the state (a constant bag is a plain function value)
     fn is_bag(&mut self, b: &Expr, env: &Env) -> bool {
         matches!(b.strip(), Expr::Ident(n) if n == "EmptyBag") || matches!(self.gen(b, env, None), Ok((_, Ty::Bag(_))))
@@ -462,7 +606,7 @@ impl<'a> Gen<'a> {
     /// (its parameters, then the free variables of `rec_free`): its name and return type. The
     /// return type is found by generating the body until the type settles, starting from a few
     /// guesses; integer ranges that keep growing are widened to unbounded.
-    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, uses_state: bool) -> R<(String, Ty)> {
+    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, reads: &[String], primes: &[String]) -> R<(String, Ty)> {
         let key = (i, tys.clone());
         if let Some(r) = self.rec_done.get(&key) {
             return Ok(r.clone());
@@ -476,12 +620,17 @@ impl<'a> Gen<'a> {
             return Ok((name, t.clone()));
         }
         let free = self.rec_free(rd);
-        let names: Vec<String> = rd.params.iter().chain(&free).cloned().collect();
+        let names: Vec<String> = rd.params.iter().chain(&free).chain(reads).cloned().collect();
         let mut env = Env::default();
-        let mut sig = if uses_state { String::from("s: &State, ") } else { String::new() };
+        let mut sig = String::new();
         for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
             env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
             write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+        }
+        for (k, (x, t)) in primes.iter().zip(&tys[names.len()..]).enumerate() {
+            let a = format!("a{}", names.len() + k);
+            env.primed.insert(x.clone(), (a.clone(), t.clone()));
+            write!(sig, "{a}: {}, ", t.repr()).unwrap();
         }
         let mut last_err = String::new();
         for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool] {
@@ -522,6 +671,53 @@ impl<'a> Gen<'a> {
             }
         }
         Err(format!("recursive operator `{}`: {last_err}", rd.name))
+    }
+
+    /// The variables that the recursive operator `i` reads, and those it reads primed, including
+    /// through the recursive operators it calls
+    fn rec_reads(&self, i: usize) -> R<(Vec<String>, Vec<String>)> {
+        let mut todo = vec![i];
+        let mut seen = BTreeSet::new();
+        let (mut reads, mut primes) = (BTreeSet::new(), BTreeSet::new());
+        while let Some(j) = todo.pop() {
+            if !seen.insert(j) {
+                continue;
+            }
+            let rd = crate::expand::rec_def(j);
+            if rd.body.any(&|e| matches!(e, Expr::Un(UOp::Enabled, _))) {
+                return Err(format!("recursive operator `{}`: ENABLED inside a recursive operator is not supported", rd.name));
+            }
+            self.collect_reads(&rd.body, false, &mut reads, &mut primes, &mut todo);
+        }
+        Ok((reads.into_iter().collect(), primes.into_iter().collect()))
+    }
+
+    fn collect_reads(&self, e: &Expr, primed: bool, reads: &mut BTreeSet<String>, primes: &mut BTreeSet<String>, todo: &mut Vec<usize>) {
+        match e {
+            Expr::Ident(n) if self.is_var(n) => {
+                if primed {
+                    primes.insert(n.clone());
+                } else {
+                    reads.insert(n.clone());
+                }
+            }
+            Expr::Prime(x) => self.collect_reads(x, true, reads, primes, todo),
+            Expr::Un(UOp::Unchanged, x) => {
+                self.collect_reads(x, false, reads, primes, todo);
+                self.collect_reads(x, true, reads, primes, todo);
+            }
+            Expr::RecCall(j, args) => {
+                todo.push(*j);
+                for a in args {
+                    self.collect_reads(a, primed, reads, primes, todo);
+                }
+            }
+            _ => {
+                for c in e.children() {
+                    self.collect_reads(c, primed, reads, primes, todo);
+                }
+            }
+        }
     }
 
     /// The functions generated for recursive operators, with the depth guard they share
@@ -707,6 +903,27 @@ impl<'a> Gen<'a> {
         Ok(if is_sparse(st) { format!("{acc}.insert({x});") } else { format!("{acc} |= bit_{eid}({x});") })
     }
 
+    /// The subsets of the set `c` of type `st`, in TLC's order: by size, then by their elements in
+    /// order. A set held as an array is mapped onto a bitmask over its elements (in TLC's order).
+    fn subsets_iter(&mut self, c: &str, st: &Ty) -> R<String> {
+        if !matches!(st, Ty::Set(_)) {
+            return Err(format!("SUBSET of {st:?}"));
+        }
+        self.need_subsets = true;
+        if !is_sparse(st) {
+            return Ok(format!("subsets_tlc({c}).into_iter()"));
+        }
+        let it = self.s_iter(c, st)?;
+        let et = Self::elem_of(st);
+        let empty = self.s_empty(st)?;
+        let add = self.s_add("__s", "__e[__i as usize]", st)?;
+        Ok(format!(
+            "{{ let __e: Vec<{}> = {it}.collect(); let __n = __e.len(); \
+             subsets_tlc(if __n >= 128 {{ u128::MAX }} else {{ (1u128 << __n) - 1 }}).into_iter().map(move |__m| {{ let mut __s = {empty}; for __i in bits(__m) {{ {add} }} __s }}) }}",
+            et.repr()
+        ))
+    }
+
     fn s_iter(&mut self, c: &str, st: &Ty) -> R<String> {
         let et = Self::elem_of(st);
         let eid = self.ty_id(&et)?;
@@ -747,7 +964,8 @@ impl<'a> Gen<'a> {
             Ty::Rec(fs) if needs_tlc_order(t) => {
                 let mut parts = vec![];
                 for (i, (_, ft)) in fs.iter().enumerate() {
-                    parts.push(self.tlc_cmp(ft, &format!("&{a}.{i}"), &format!("&{b}.{i}"))?);
+                    let fp = rec_field(fs.len(), i);
+                    parts.push(self.tlc_cmp(ft, &format!("&{a}{fp}"), &format!("&{b}{fp}"))?);
                 }
                 let mut code = parts.pop().unwrap();
                 while let Some(p) = parts.pop() {
@@ -860,7 +1078,7 @@ impl<'a> Gen<'a> {
             Ty::Bool => "false".into(),
             Ty::Int(..) | Ty::IntAtom(..) => "0i64".into(),
             Ty::Enum(_) => "0u16".into(),
-            Ty::Rec(fs) => format!("({})", fs.iter().map(|(_, t)| Self::default_code(t) + ",").collect::<String>()),
+            Ty::Rec(fs) => rec_build(&fs.iter().map(|(_, t)| Self::default_code(t)).collect::<Vec<_>>()),
             Ty::Opt(t) => format!("(false, {})", Self::default_code(t)),
             Ty::Fun(d, c) => format!("[{}; {}]", Self::default_code(c), d.size().unwrap_or(0)),
             Ty::Set(_) if is_sparse(t) => format!("{}::new()", t.repr().replace('<', "::<")),
@@ -911,25 +1129,20 @@ impl<'a> Gen<'a> {
                 format!("[{}]", parts.iter().map(|p| format!("{p},")).collect::<String>())
             }
             (Value::Tuple(xs), Ty::Rec(fs)) if is_tuple_fields(fs) && xs.len() == fs.len() => {
-                let mut s = String::from("(");
-                for (x, (_, ft)) in xs.iter().zip(fs) {
-                    s += &self.lit(x, ft)?;
-                    s += ",";
-                }
-                s + ")"
+                let parts: Vec<String> = xs.iter().zip(fs).map(|(x, (_, ft))| self.lit(x, ft)).collect::<R<_>>()?;
+                rec_build(&parts)
             }
             (Value::Rec(m), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
-                let mut s = String::from("(");
+                let mut parts = vec![];
                 for (k, ft) in fs {
-                    s += &match (ft, m.get(k)) {
+                    parts.push(match (ft, m.get(k)) {
                         (Ty::Opt(i), Some(v)) => format!("(true, {})", self.lit(v, i)?),
                         (Ty::Opt(_), None) => Self::default_code(ft),
                         (ft, Some(v)) => self.lit(v, ft)?,
                         (_, None) => return Err("record field mismatch".into()),
-                    };
-                    s += ",";
+                    });
                 }
-                s + ")"
+                rec_build(&parts)
             }
             (Value::Set(xs), Ty::Set(e)) if is_sparse(t) => {
                 let mut c = self.s_empty(t)?;
@@ -1029,24 +1242,25 @@ impl<'a> Gen<'a> {
             (Ty::Rec(a), Ty::Rec(b)) => {
                 // Per field of b: coerce from a if present, else leave it absent (if optional)
                 let r = self.fresh("r");
-                let mut s = format!("{{ let {r} = {code}; (");
+                let mut parts = vec![];
                 for (n, bt) in b {
                     let part = match a.iter().position(|(m, _)| m == n) {
                         Some(i) => {
                             let at = &a[i].1;
+                            let src = format!("{r}{}", rec_field(a.len(), i));
                             match (at, bt) {
                                 (Ty::Opt(x), Ty::Opt(y)) => {
                                     let o = self.fresh("o");
                                     let inner = self.coerce(format!("{o}.1"), x, y)?;
-                                    format!("{{ let {o} = {r}.{i}; if {o}.0 {{ (true, {inner}) }} else {{ {} }} }}", Self::default_code(bt))
+                                    format!("{{ let {o} = {src}; if {o}.0 {{ (true, {inner}) }} else {{ {} }} }}", Self::default_code(bt))
                                 }
-                                (x, Ty::Opt(y)) => format!("(true, {})", self.coerce(format!("{r}.{i}"), x, y)?),
+                                (x, Ty::Opt(y)) => format!("(true, {})", self.coerce(src.clone(), x, y)?),
                                 (Ty::Opt(x), y) => {
                                     let o = self.fresh("o");
                                     let inner = self.coerce(format!("{o}.1"), x, y)?;
-                                    format!("{{ let {o} = {r}.{i}; if !{o}.0 {{ type_error(\"record without field\", \"{n}\") }} {inner} }}")
+                                    format!("{{ let {o} = {src}; if !{o}.0 {{ type_error(\"record without field\", \"{n}\") }} {inner} }}")
                                 }
-                                (x, y) => self.coerce(format!("{r}.{i}"), x, y)?,
+                                (x, y) => self.coerce(src.clone(), x, y)?,
                             }
                         }
                         None => match bt {
@@ -1054,10 +1268,9 @@ impl<'a> Gen<'a> {
                             _ => return Err(format!("record has no field `{n}`")),
                         },
                     };
-                    s += &part;
-                    s += ",";
+                    parts.push(part);
                 }
-                Ok(s + ") }")
+                Ok(format!("{{ let {r} = {code}; {} }}", rec_build(&parts)))
             }
             (Ty::Set(_), Ty::Set(_)) => {
                 // Coerce element by element and rebuild the set
@@ -1097,7 +1310,7 @@ impl<'a> Gen<'a> {
                 let r = self.fresh("r");
                 let mut s = format!("{{ let {r} = {code}; let mut __o = {}; ", Self::default_code(to));
                 for k in 0..fs.len() {
-                    write!(s, "__o[idx_{eid}({}i64)] = {r}.{k}; ", k + 1).unwrap();
+                    write!(s, "__o[idx_{eid}({}i64)] = {r}{}; ", k + 1, rec_field(fs.len(), k)).unwrap();
                 }
                 Ok(s + "__o }")
             }
@@ -1126,8 +1339,9 @@ impl<'a> Gen<'a> {
                         write!(s, "for &{x} in {r}.iter() {{ {q}.push({xc}); }} ").unwrap();
                     }
                     _ => {
+                        let n = seq_elems(from).unwrap().len();
                         for (k, t) in seq_elems(from).unwrap().iter().enumerate() {
-                            let xc = self.coerce(format!("{r}.{k}"), t, e)?;
+                            let xc = self.coerce(format!("{r}{}", rec_field(n, k)), t, e)?;
                             write!(s, "{q}.push({xc}); ").unwrap();
                         }
                     }
@@ -1147,7 +1361,7 @@ impl<'a> Gen<'a> {
                         let ts: Vec<Ty> = tuple_elems(to).unwrap().into_iter().cloned().collect();
                         let parts: Vec<String> =
                             ts.iter().enumerate().map(|(k, t)| self.coerce(format!("{r}.items[{k}]"), fe, t)).collect::<R<_>>()?;
-                        (ts.len(), format!("({})", parts.iter().map(|p| format!("{p},")).collect::<String>()))
+                        (ts.len(), rec_build(&parts))
                     }
                 };
                 Ok(format!(
@@ -1156,13 +1370,13 @@ impl<'a> Gen<'a> {
             }
             (Ty::Rec(fs), Ty::Fun(d, c)) if is_tuple_fields(fs) && seq_domain(d) == Some(fs.len()) => {
                 let r = self.fresh("r");
-                let parts: Vec<String> = fs.iter().enumerate().map(|(k, (_, t))| self.coerce(format!("{r}.{k}"), t, c)).collect::<R<_>>()?;
+                let parts: Vec<String> = fs.iter().enumerate().map(|(k, (_, t))| self.coerce(format!("{r}{}", rec_field(fs.len(), k)), t, c)).collect::<R<_>>()?;
                 Ok(format!("{{ let {r} = {code}; [{}] }}", parts.iter().map(|p| format!("{p},")).collect::<String>()))
             }
             (Ty::Fun(d, c), Ty::Rec(fs)) if is_tuple_fields(fs) && seq_domain(d) == Some(fs.len()) => {
                 let r = self.fresh("r");
                 let parts: Vec<String> = fs.iter().enumerate().map(|(k, (_, t))| self.coerce(format!("{r}[{k}]"), c, t)).collect::<R<_>>()?;
-                Ok(format!("{{ let {r} = {code}; ({}) }}", parts.iter().map(|p| format!("{p},")).collect::<String>()))
+                Ok(format!("{{ let {r} = {code}; {} }}", rec_build(&parts)))
             }
             (Ty::Enum(_), Ty::IntAtom(..)) => Ok(format!("(i64::MIN + ({code}) as i64)")),
             (Ty::IntAtom(..), Ty::Enum(_)) => {
@@ -1242,7 +1456,30 @@ impl<'a> Gen<'a> {
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
-                ("ToString", _) => return Err("ToString of a value from the state is not supported: it builds a string the checker has no value for".into()),
+                // ToString of a value from the state: a table, indexed by the value's encoding, of
+                // the strings of every value of its type, interned now
+                ("ToString", [x]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    fn scalar_or_tuple(t: &Ty) -> bool {
+                        match t {
+                            Ty::Bool | Ty::Int(..) | Ty::Enum(_) | Ty::IntAtom(..) => true,
+                            Ty::Rec(fs) => is_tuple_fields(fs) && fs.iter().all(|(_, t)| scalar_or_tuple(t)),
+                            _ => false,
+                        }
+                    }
+                    // Records are left out: TLC prints their fields in an order of its own
+                    if !scalar_or_tuple(&t) {
+                        return Err(format!("ToString of a value from the state is only supported for Booleans, integers, strings, model values and tuples of them: {}", short(x)));
+                    }
+                    let n = t.size().filter(|&n| n <= 4096).ok_or(format!("ToString of a value from the state with more than 4096 possible values is not supported: {}", short(x)))?;
+                    let tid = self.ty_id(&t)?;
+                    let ids: Vec<u32> = t.enumerate().iter().map(|v| self.atoms.intern(false, &crate::compile::show_value(self.atoms, v))).collect();
+                    let table: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+                    let mut res = ids.clone();
+                    res.sort();
+                    res.dedup();
+                    (format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", ")), Ty::Enum(res))
+                }
                 ("RandomElement", [SetLit(xs)]) if xs.len() == 1 => self.gen(&xs[0], env, want)?,
                 ("RandomElement", _) => return Err("RandomElement over a set from the state is not supported: TLC picks an element at random".into()),
                 ("TLCGet" | "TLCSet", _) => return Err(format!("{f} is not supported: it reads or writes TLC's search state")),
@@ -1381,6 +1618,29 @@ impl<'a> Gen<'a> {
                         _ => (format!("{{ let (__a, __b) = ({ac}, {bc}); let __le = __a.iter().zip(__b.iter()).all(|(x, y)| x <= y); __le }}"), Ty::Bool),
                     }
                 }
+                // A function whose values are positive integers (an atom is held below every integer)
+                ("IsABag", [b]) => {
+                    let (c, t) = self.gen(b, env, None)?;
+                    let ints = |t: &Ty| matches!(t, Ty::Int(..) | Ty::IntAtom(..));
+                    let test = match &t {
+                        Ty::Bag(_) => "true".to_string(),
+                        Ty::Bool | Ty::Int(..) | Ty::IntAtom(..) | Ty::Enum(_) | Ty::Set(_) => "false".into(),
+                        Ty::Fun(_, r) if ints(r) => "__b.iter().all(|&x| x > 0)".into(),
+                        Ty::Seq(r) if ints(r) => "__b.iter().all(|x| x > 0)".into(),
+                        Ty::Fun(_, r) if !ints(r) => "__b.len() == 0".into(),
+                        Ty::Seq(r) if !ints(r) => "__b.len == 0".into(),
+                        Ty::Rec(fs) if !fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => {
+                            let parts: Vec<String> = fs
+                                .iter()
+                                .enumerate()
+                                .map(|(k, (_, ft))| if ints(ft) { format!("__b{} > 0", rec_field(fs.len(), k)) } else { "false".into() })
+                                .collect();
+                            if parts.is_empty() { "true".into() } else { parts.join(" && ") }
+                        }
+                        _ => return Err(format!("IsABag of {t:?} is not supported")),
+                    };
+                    (format!("{{ let __b = {c}; let _ = &__b; let __r: bool = {test}; __r }}"), Ty::Bool)
+                }
                 ("BagCardinality", [b]) => {
                     let (bc, _) = self.bag_of(b, env, None)?;
                     (format!("{{ let __b = {bc}; let __n: i64 = __b.iter().sum(); __n }}"), Ty::Int(0, BIG))
@@ -1402,6 +1662,9 @@ impl<'a> Gen<'a> {
                     let rt = Ty::Bag(yt.clone().into());
                     self.ty_id(&rt)?;
                     let yid = self.ty_id(&yt)?;
+                    if let Some(msg) = crate::value::bag_of_all_literal(self.atoms, body) {
+                        return Ok((format!("{{ let _ = {bc}; let __v: {} = eval_error({msg:?}.to_string()); __v }}", rt.repr()), rt));
+                    }
                     (
                         format!("{{ let __b = {bc}; let mut __r = {}; for __i in 0..__b.len() {{ if __b[__i] > 0 {{ let {x} = dec_{eid}(__i as u64); __r[idx_{yid}({yc})] += __b[__i]; }} }} __r }}", Self::default_code(&rt)),
                         rt,
@@ -1474,6 +1737,13 @@ impl<'a> Gen<'a> {
                     let (c, t) = self.gen(q, env, None)?;
                     let Ty::Enum(d) = &t else { unreachable!() };
                     self.string_table(f, &c, &[(d.clone(), None)])?
+                }
+                ("SubSeq", [q, m, n]) if matches!(self.gen(q, env, None), Ok((_, Ty::Enum(_)))) => {
+                    let (qc, qt) = self.gen(q, env, None)?;
+                    let Ty::Enum(d) = &qt else { unreachable!() };
+                    let (mc, _) = self.gen_int(m, env)?;
+                    let (nc, _) = self.gen_int(n, env)?;
+                    self.substring_table(&qc, d, &mc, &nc)?
                 }
                 ("Append" | "\\o", [a, b]) if matches!(self.gen(a, env, None), Ok((_, Ty::Enum(_)))) => {
                     let (ac, at) = self.gen(a, env, None)?;
@@ -1590,7 +1860,10 @@ impl<'a> Gen<'a> {
                     let (fc, _) = self.gen(f, env, None)?;
                     let st = Ty::Set(Ty::Int(1, self.qcap as i64).into());
                     if self.qcap > 128 {
-                        return Err("DOMAIN of a sequence longer than 128 is not supported".into());
+                        // More than 128 indices: a sorted array of 1..Len
+                        let empty = self.s_empty(&st)?;
+                        let add = self.s_add("__s", "__k", &st)?;
+                        return Ok((format!("{{ let __n = ({fc}).len as i64; let mut __s = {empty}; for __k in 1..=__n {{ {add} }} __s }}"), st));
                     }
                     self.ty_id(&st)?;
                     return Ok((format!("{{ let __n = ({fc}).len as u32; if __n >= 128 {{ u128::MAX }} else {{ (1u128 << __n) - 1 }} }}"), st));
@@ -1615,8 +1888,9 @@ impl<'a> Gen<'a> {
                 Self::unchanged_vars(x, &mut names)?;
                 let mut parts = vec![];
                 for v in names {
-                    let (p, _) = env.primed.get(&v).ok_or(format!("UNCHANGED {v} before {v}' is decided"))?;
-                    parts.push(format!("{p} == s.v_{v}"));
+                    let (p, _) = env.primed.get(&v).cloned().ok_or(format!("UNCHANGED {v} before {v}' is decided"))?;
+                    let (c, _) = self.gen(&Ident(v.clone()), env, None)?;
+                    parts.push(format!("{p} == {c}"));
                 }
                 (format!("({})", if parts.is_empty() { "true".into() } else { parts.join(" && ") }), Ty::Bool)
             }
@@ -1671,15 +1945,26 @@ impl<'a> Gen<'a> {
             // SUBSET S of a set in the state, as a value: a set of sets, in TLC's order
             Un(UOp::Subset, x) => {
                 let (c, t) = self.gen(x, env, None)?;
-                if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
-                    return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
-                }
-                self.need_subsets = true;
+                let it = self.subsets_iter(&c, &t)?;
                 let st = Ty::Set(t.clone().into());
                 let acc = self.fresh("acc");
                 let add = self.s_add(&acc, "__t", &st)?;
                 let empty = self.s_empty(&st)?;
-                (format!("{{ let mut {acc} = {empty}; for __t in subsets_tlc({c}) {{ {add} }} {acc} }}"), st)
+                (format!("{{ let mut {acc} = {empty}; for __t in {it} {{ {add} }} {acc} }}"), st)
+            }
+            // UNION S of a set of sets from the state
+            Un(UOp::Union, x) => {
+                let (c, t) = self.gen(x, env, None)?;
+                let Ty::Set(inner) = &t else { return Err("UNION of a non-set".into()) };
+                if !matches!(inner.as_ref(), Ty::Set(_)) {
+                    return Err("UNION of a set whose elements are not sets".into());
+                }
+                let rt = inner.as_ref().clone();
+                let it = self.s_iter(&c, &t)?;
+                let acc = self.fresh("acc");
+                let empty = self.s_empty(&rt)?;
+                let cup = self.s_bin(BOp::Cup, &acc, "__u", &rt);
+                (format!("{{ let mut {acc} = {empty}; for __u in {it} {{ {acc} = {cup}; }} {acc} }}"), rt)
             }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
@@ -1878,7 +2163,7 @@ impl<'a> Gen<'a> {
                     Some(Ty::Rec(w)) => Some(w.clone()),
                     _ => None,
                 };
-                let mut code = String::from("(");
+                let mut parts = vec![];
                 let mut tys = vec![];
                 for (k, v) in &fs {
                     let w = wf.as_ref().and_then(|w| w.iter().find(|(n, _)| n == k).map(|x| match &x.1 {
@@ -1894,11 +2179,10 @@ impl<'a> Gen<'a> {
                         (Some(Ty::Int(wl, wh)), Ty::Int(l, h)) if wl <= l && h <= wh => w.clone().unwrap(),
                         _ => t,
                     };
-                    code += &c;
-                    code += ",";
+                    parts.push(c);
                     tys.push((k.clone(), t));
                 }
-                (code + ")", Ty::Rec(tys))
+                (rec_build(&parts), Ty::Rec(tys))
             }
             App(f, x) => {
                 let (fc, ft) = self.gen(f, env, None)?;
@@ -1906,7 +2190,7 @@ impl<'a> Gen<'a> {
                     if is_tuple_fields(fs) {
                         if self.try_const(x, env).is_some() {
                             let k = self.tuple_index(x, env, fs.len())?;
-                            return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                            return Ok((format!("({fc}){}", rec_field(fs.len(), k)), fs[k].1.clone()));
                         }
                         // An index from the state: the elements as one type, chosen at run time
                         let mut t = Ty::Enum(vec![]);
@@ -1917,7 +2201,7 @@ impl<'a> Gen<'a> {
                         let (r, i) = (self.fresh("r"), self.fresh("i"));
                         let mut arms = String::new();
                         for (k, (_, ft)) in fs.iter().enumerate() {
-                            let c = self.coerce(format!("{r}.{k}"), ft, &t)?;
+                            let c = self.coerce(format!("{r}{}", rec_field(fs.len(), k)), ft, &t)?;
                             write!(arms, "{} => {c}, ", k + 1).unwrap();
                         }
                         return Ok((
@@ -1967,15 +2251,16 @@ impl<'a> Gen<'a> {
                 let (rc, rt) = self.gen(r, env, None)?;
                 let Ty::Rec(fs) = rt else { return Err(format!("field .{k} of a non-record")) };
                 let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
+                let fp = rec_field(fs.len(), i);
                 match &fs[i].1 {
                     Ty::Opt(t) => {
                         let o = self.fresh("o");
                         (
-                            format!("{{ let {o} = ({rc}).{i}; if !{o}.0 {{ eval_error(\"Attempted to access a nonexistent field `{k}` of a record\".into()) }} {o}.1 }}"),
+                            format!("{{ let {o} = ({rc}){fp}; if !{o}.0 {{ eval_error(\"Attempted to access a nonexistent field `{k}` of a record\".into()) }} {o}.1 }}"),
                             t.as_ref().clone(),
                         )
                     }
-                    t => (format!("({rc}).{i}"), t.clone()),
+                    t => (format!("({rc}){fp}"), t.clone()),
                 }
             }
             Except(f, ups) => {
@@ -2053,12 +2338,13 @@ impl<'a> Gen<'a> {
                                 match &fs[i].1 {
                                     // EXCEPT on an absent field is a no-op
                                     Ty::Opt(t) => {
-                                        conds.push(format!("{place}.{i}.0"));
-                                        place = format!("{place}.{i}.1");
+                                        let fp = rec_field(fs.len(), i);
+                                        conds.push(format!("{place}{fp}.0"));
+                                        place = format!("{place}{fp}.1");
                                         cur = t.as_ref().clone();
                                     }
                                     t => {
-                                        place = format!("{place}.{i}");
+                                        place = format!("{place}{}", rec_field(fs.len(), i));
                                         cur = t.clone();
                                     }
                                 }
@@ -2083,8 +2369,8 @@ impl<'a> Gen<'a> {
                 (s + &t + " }", ft)
             }
             Tuple(xs) => {
-                // Tuples are represented as records with fields #01, #02, ...
-                let mut code = String::from("(");
+                // Tuples are represented as records with fields #00001, #00002, ...
+                let mut parts = vec![];
                 let mut tys = vec![];
                 for (i, x) in xs.iter().enumerate() {
                     let w = match want {
@@ -2092,11 +2378,10 @@ impl<'a> Gen<'a> {
                         _ => None,
                     };
                     let (c, t) = self.gen(x, env, w.as_ref())?;
-                    code += &c;
-                    code += ",";
-                    tys.push((format!("#{:02}", i + 1), t));
+                    parts.push(c);
+                    tys.push((tuple_field(i), t));
                 }
-                (code + ")", Ty::Rec(tys))
+                (rec_build(&parts), Ty::Rec(tys))
             }
             Choose(x, s, p) => {
                 // The first element in iteration order that satisfies p. Sets iterate in TLC's
@@ -2125,8 +2410,26 @@ impl<'a> Gen<'a> {
                 let add = self.s_add("__s", "__f", &st)?;
                 (format!("{{ let mut __s = {empty}; for __f in {it} {{ {add} }} __s }}"), st)
             }
-            RecSet(..) => {
-                return Err("this set is only supported on the right of \\in (or must be constant)".into())
+            // [a : S, b : T] with sets from the state, as a value: every record, collected
+            RecSet(fs) => {
+                let mut fs = fs.clone();
+                fs.sort_by(|a, b| a.0.cmp(&b.0));
+                let (mut open, mut close, mut names, mut tys) = (String::new(), String::new(), vec![], vec![]);
+                for (k, se) in &fs {
+                    let (c, t) = self.gen(se, env, None)?;
+                    let Ty::Set(et) = &t else { return Err(format!("[{k} : S] with S not a set")) };
+                    let it = self.s_iter(&c, &t)?;
+                    let v = self.fresh("f");
+                    write!(open, "for {v} in {it} {{ ").unwrap();
+                    close.push('}');
+                    names.push(v);
+                    tys.push((k.clone(), et.as_ref().clone()));
+                }
+                let st = Ty::Set(Ty::Rec(tys).into());
+                let acc = self.fresh("acc");
+                let add = self.s_add(&acc, &rec_build(&names), &st)?;
+                let empty = self.s_empty(&st)?;
+                (format!("{{ let mut {acc} = {empty}; {open}{add} {close} {acc} }}"), st)
             }
             Let(..) | Label(..) => unreachable!(),
             Lambda(..) => return Err("LAMBDA is only supported as the argument of an operator parameter".into()),
@@ -2134,13 +2437,7 @@ impl<'a> Gen<'a> {
                 // Constant arguments were folded above when the whole call evaluates; otherwise
                 // call a Rust function generated for the operator
                 let rd = crate::expand::rec_def(*i);
-                if rd.body.is_action() {
-                    return Err(format!("recursive operator `{}` refers to primed variables, which is not supported", rd.name));
-                }
-                let uses_state = rd.body.any(&|e| matches!(e, Ident(n) if self.is_var(n)));
-                if uses_state && env.init {
-                    return Err(format!("recursive operator `{}` reads variables in Init, which is not supported", rd.name));
-                }
+                let (reads, primes) = self.rec_reads(*i)?;
                 let mut codes = vec![];
                 let mut tys = vec![];
                 for a in args {
@@ -2157,9 +2454,27 @@ impl<'a> Gen<'a> {
                     codes.push(c);
                     tys.push(t);
                 }
-                let (name, ret) = self.rec_fn(*i, &rd, tys, uses_state)?;
-                let s_arg = if uses_state { "s, " } else { "" };
-                (format!("{name}({s_arg}{})", codes.join(", ")), ret)
+                // So are the variables it reads (in Init, the values assigned so far) and the primed
+                // variables it reads, which must be determined before the call
+                for v in &reads {
+                    let (c, t) = self.gen(&Ident(v.clone()), env, None)?;
+                    let vt = self.var_ty(v);
+                    codes.push(self.coerce(c, &t, &vt)?);
+                    tys.push(vt);
+                }
+                for v in &primes {
+                    let Some((c, t)) = env.primed.get(v).cloned() else {
+                        return Err(format!(
+                            "recursive operator `{}` reads {v}' where the action has not determined it, which is not supported",
+                            rd.name
+                        ));
+                    };
+                    let vt = self.var_ty(v);
+                    codes.push(self.coerce(c, &t, &vt)?);
+                    tys.push(vt);
+                }
+                let (name, ret) = self.rec_fn(*i, &rd, tys, &reads, &primes)?;
+                (format!("{name}({})", codes.join(", ")), ret)
             }
             BoxAction(..) | Fair(..) => return Err("temporal formula in a state expression".into()),
             Num(_) | Str(_) | Bool(_) => unreachable!("constants are folded"),
@@ -2211,7 +2526,7 @@ impl<'a> Gen<'a> {
                 let (rc, rt) = self.gen(r, env, None)?;
                 let has = match &rt {
                     Ty::Rec(fs) => match fs.iter().position(|(n, _)| n == k) {
-                        Some(i) if matches!(fs[i].1, Ty::Opt(_)) => format!("({rc}).{i}.0"),
+                        Some(i) if matches!(fs[i].1, Ty::Opt(_)) => format!("({rc}){}.0", rec_field(fs.len(), i)),
                         Some(_) => "true".into(),
                         None => "false".into(),
                     },
@@ -2227,7 +2542,10 @@ impl<'a> Gen<'a> {
                 (format!("{neg}{{ let {x} = {xc}; {m} }}"), Ty::Bool)
             }
             // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
-            Subseteq if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int") => {
+            Subseteq
+                if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int" || n == "STRING")
+                    || matches!(b.strip(), Expr::Call(f, a) if f == "Seq" && a.len() == 1) =>
+            {
                 let (ac, at) = self.gen(a, env, None)?;
                 let x = self.fresh("x");
                 let m = self.gen_member(&x, &at, &Expr::Un(UOp::Subset, b.clone().into()), env)?;
@@ -2389,11 +2707,8 @@ impl<'a> Gen<'a> {
         }
         if let Expr::Un(UOp::Subset, x) = s {
             let (c, t) = self.gen(x, env, None)?;
-            if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
-                return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
-            }
-            self.need_subsets = true;
-            return Ok((format!("subsets_tlc({c}).into_iter()"), t, None));
+            let it = self.subsets_iter(&c, &t)?;
+            return Ok((it, t, None));
         }
         if let Expr::Bin(BOp::Range, a, b) = s {
             let (ac, (alo, _)) = self.gen_int(a, env)?;
@@ -2428,11 +2743,33 @@ impl<'a> Gen<'a> {
         // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
         // treats it as a function in [S -> T]; none of these is compiled
         if tuple_elems(xt).is_some() {
-            if matches!(s, FunSet(..)) {
-                return Err(format!("membership of a tuple in a set of functions is not supported: {}", short(s)));
+            // A tuple is the function over 1..n of its elements: in [D -> R] when D is 1..n and
+            // each element is in R
+            if let FunSet(d, r) = s {
+                let n = tuple_elems(xt).unwrap().len();
+                let one_to_n: BTreeSet<Value> = (1..=n as i64).map(Value::Int).collect();
+                let same_domain = match self.try_const(d, env) {
+                    Some(dv) if dv.as_set()? != &one_to_n => return Ok("false".into()),
+                    Some(_) => "true".to_string(),
+                    // D from the state: compare it with 1..n
+                    None => {
+                        let (dc, dt) = self.gen(d, env, None)?;
+                        let (rc, rt) = self.gen(&Bin(BOp::Range, Num(1).b(), Num(n as i64).b()), env, Some(&dt))?;
+                        let t = join(&dt, &rt)?;
+                        format!("({} == {})", self.coerce(dc, &dt, &t)?, self.coerce(rc, &rt, &t)?)
+                    }
+                };
+                let els: Vec<Ty> = tuple_elems(xt).unwrap().into_iter().cloned().collect();
+                let mut conj = vec![same_domain];
+                for (k, et) in els.iter().enumerate() {
+                    let e = self.fresh("e");
+                    let inner = self.gen_member(&e, et, r, env)?;
+                    conj.push(format!("{{ let {e} = {x}{}; {inner} }}", rec_field(n, k)));
+                }
+                return Ok(format!("({})", conj.join(" && ")));
             }
             if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
-                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int"].contains(&n.as_str()))
+                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int", "STRING"].contains(&n.as_str()))
             {
                 return Ok(eval_error_bool(&format!("Attempted to check if the tuple {x} is an element of {}", short(s))));
             }
@@ -2456,18 +2793,7 @@ impl<'a> Gen<'a> {
                     "{{ let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __p == {in_d} && (!__p || {in_r}) }}); __all }}"
                 ));
             }
-            FunSet(d, r) => {
-                let Ty::Fun(dt, ct) = xt else { return Ok("false".into()) };
-                let dv = self.ce.eval(d, &HashMap::new())?;
-                let mut dom = dt.enumerate();
-                dom.sort();
-                if dom.into_iter().collect::<BTreeSet<_>>() != *dv.as_set()? {
-                    return Ok("false".into());
-                }
-                let e = self.fresh("e");
-                let inner = self.gen_member(&e, ct, r, env)?;
-                return Ok(format!("{x}.iter().all(|&{e}| {inner})"));
-            }
+            FunSet(d, r) => return self.fun_set_member(x, xt, d, r, s, env),
             RecSet(fs) => {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
@@ -2479,7 +2805,7 @@ impl<'a> Gen<'a> {
                 for (i, ((_, se), (_, ft))) in fs.iter().zip(xf).enumerate() {
                     let e = self.fresh("e");
                     let inner = self.gen_member(&e, ft, se, env)?;
-                    parts.push(format!("{{ let {e} = {x}.{i}; {inner} }}"));
+                    parts.push(format!("{{ let {e} = {x}{}; {inner} }}", rec_field(xf.len(), i)));
                 }
                 return Ok(format!("({})", parts.join(" && ")));
             }
@@ -2492,8 +2818,18 @@ impl<'a> Gen<'a> {
                     if matches!(xt, Ty::Enum(_)) {
                         return Ok("false".into());
                     }
-                    if seq_like_fun(xt) {
-                        return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+                    // A function over 1..n is the tuple of its values
+                    if let Ty::Fun(d, c) = xt {
+                        if seq_domain(d) != Some(parts.len()) {
+                            return Ok("false".into());
+                        }
+                        let mut conj = vec![];
+                        for (i, part) in parts.iter().enumerate() {
+                            let e = self.fresh("e");
+                            let inner = self.gen_member(&e, c, part, env)?;
+                            conj.push(format!("{{ let {e} = {x}[{i}]; {inner} }}"));
+                        }
+                        return Ok(format!("({})", conj.join(" && ")));
                     }
                     return Ok(eval_error_bool(&format!("Attempted to check if a non-tuple value of type {xt:?} is an element of a cartesian product")));
                 };
@@ -2505,7 +2841,7 @@ impl<'a> Gen<'a> {
                 for (i, (part, et)) in parts.iter().zip(&el).enumerate() {
                     let e = self.fresh("e");
                     let inner = self.gen_member(&e, et, part, env)?;
-                    conj.push(format!("{{ let {e} = {x}.{i}; {inner} }}"));
+                    conj.push(format!("{{ let {e} = {x}{}; {inner} }}", rec_field(el.len(), i)));
                 }
                 return Ok(format!("({})", conj.join(" && ")));
             }
@@ -2525,7 +2861,7 @@ impl<'a> Gen<'a> {
                         let mut conj = vec!["true".to_string()];
                         for (k, (_, t)) in fs.iter().enumerate() {
                             let inner = self.gen_member(&e, t, &a[0], env)?;
-                            conj.push(format!("{{ let {e} = {x}.{k}; {inner} }}"));
+                            conj.push(format!("{{ let {e} = {x}{}; {inner} }}", rec_field(fs.len(), k)));
                         }
                         format!("({})", conj.join(" && "))
                     }
@@ -2545,6 +2881,31 @@ impl<'a> Gen<'a> {
             }
             Ident(n) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
+            }
+            // TRUE for a string, FALSE for a model value, and an error for anything else, as in TLC
+            Ident(n) if n == "STRING" && !env.locals.contains_key(n) => {
+                let err = |what: &str| format!("Attempted to check if the value:\n{what}\nis an element of STRING.");
+                return Ok(match xt {
+                    Ty::Enum(d) => {
+                        let strs: Vec<String> = d.iter().filter(|&&a| !self.atoms.is_model(a)).map(|a| a.to_string()).collect();
+                        match strs.len() {
+                            0 => "false".into(),
+                            n if n == d.len() => "true".into(),
+                            _ => format!("matches!({x}, {})", strs.join(" | ")),
+                        }
+                    }
+                    Ty::IntAtom(..) => {
+                        let tid = self.ty_id(xt)?;
+                        format!(
+                            "(if {x} < i64::MIN + 65536 {{ IS_STR[({x} - i64::MIN) as usize] }} else {{ let __b: bool = eval_error(format!({:?}, fmt_{tid}(&{x}))); __b }})",
+                            err("{}")
+                        )
+                    }
+                    _ => {
+                        let tid = self.ty_id(xt)?;
+                        format!("{{ let __b: bool = eval_error(format!({:?}, fmt_{tid}(&{x}))); __b }}", err("{}"))
+                    }
+                });
             }
             Ident(n) if n == "Int" => {
                 return Ok(match xt {
@@ -3035,12 +3396,13 @@ impl<'a> Gen<'a> {
                         match &fs[i].1 {
                             // EXCEPT on an absent field is a no-op
                             Ty::Opt(t) => {
-                                conds.push(format!("{p}.{i}.0"));
-                                p = format!("{p}.{i}.1");
+                                let fp = rec_field(fs.len(), i);
+                                conds.push(format!("{p}{fp}.0"));
+                                p = format!("{p}{fp}.1");
                                 cur = t.as_ref().clone();
                             }
                             t => {
-                                p = format!("{p}.{i}");
+                                p = format!("{p}{}", rec_field(fs.len(), i));
                                 cur = t.clone();
                             }
                         }
@@ -3191,7 +3553,8 @@ impl<'a> Gen<'a> {
                             let fid = self.ty_id(ft)?;
                             write!(
                                 b,
-                                "let e = enc_{fid}(v.{k}); if e == u64::MAX {{ return u64::MAX; }} acc = acc * {} + e; ",
+                                "let e = enc_{fid}(v{}); if e == u64::MAX {{ return u64::MAX; }} acc = acc * {} + e; ",
+                                rec_field(fs.len(), k),
                                 ft.size().unwrap()
                             )
                             .unwrap();
@@ -3229,7 +3592,7 @@ impl<'a> Gen<'a> {
                             parts.push(k);
                         }
                         parts.reverse();
-                        b + &format!("({})", parts.iter().map(|k| format!("f{k},")).collect::<String>())
+                        b + &rec_build(&parts.iter().map(|k| format!("f{k}")).collect::<Vec<_>>())
                     }
                     Ty::Opt(inner) => {
                         let iid = self.ty_id(inner)?;
@@ -3286,21 +3649,22 @@ impl<'a> Gen<'a> {
                     let mut parts = vec![];
                     for (k, (_, ft)) in fs.iter().enumerate() {
                         let fid = self.ty_id(ft)?;
-                        parts.push(format!("fmt_{fid}(&v.{k})"));
+                        parts.push(format!("fmt_{fid}(&v{})", rec_field(fs.len(), k)));
                     }
                     format!("format!(\"<<{{}}>>\", [{}].join(\", \"))", parts.join(", "))
                 }
                 Ty::Rec(fs) => {
                     let mut b = String::from("let mut ps: Vec<String> = vec![]; ");
                     for (k, (name, ft)) in fs.iter().enumerate() {
+                        let fp = rec_field(fs.len(), k);
                         match ft {
                             Ty::Opt(inner) => {
                                 let fid = self.ty_id(inner)?;
-                                write!(b, "if v.{k}.0 {{ ps.push(format!(\"{name} |-> {{}}\", fmt_{fid}(&v.{k}.1))); }} ").unwrap();
+                                write!(b, "if v{fp}.0 {{ ps.push(format!(\"{name} |-> {{}}\", fmt_{fid}(&v{fp}.1))); }} ").unwrap();
                             }
                             ft => {
                                 let fid = self.ty_id(ft)?;
-                                write!(b, "ps.push(format!(\"{name} |-> {{}}\", fmt_{fid}(&v.{k}))); ").unwrap();
+                                write!(b, "ps.push(format!(\"{name} |-> {{}}\", fmt_{fid}(&v{fp}))); ").unwrap();
                             }
                         }
                     }
@@ -3484,7 +3848,7 @@ impl<'a> Gen<'a> {
             Ty::Rec(fs) => {
                 let mut total = 0;
                 for (i, (_, ft)) in fs.iter().enumerate() {
-                    total += self.pack_value(&format!("{c}.{i}"), ft, out, at)?;
+                    total += self.pack_value(&format!("{c}{}", rec_field(fs.len(), i)), ft, out, at)?;
                 }
                 total
             }
@@ -3515,7 +3879,7 @@ impl<'a> Gen<'a> {
             Ty::Rec(fs) => {
                 let mut total = 0;
                 for (i, (_, ft)) in fs.iter().enumerate() {
-                    total += self.pack_perm(&format!("{c}.{i}"), ft, out, at)?;
+                    total += self.pack_perm(&format!("{c}{}", rec_field(fs.len(), i)), ft, out, at)?;
                 }
                 Ok(total)
             }
@@ -3620,7 +3984,7 @@ impl<'a> Gen<'a> {
                 *at = None;
                 let inner = self.unpack_value(e, &mut None)?;
                 format!(
-                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u8; ss }}",
+                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u16; ss }}",
                     Self::default_code(t)
                 )
             }
@@ -3674,12 +4038,11 @@ impl<'a> Gen<'a> {
                 format!("std::array::from_fn(|_| {})", self.unpack_value(cod, &mut None)?)
             }
             Ty::Rec(fs) => {
-                let mut s = String::from("(");
+                let mut parts = vec![];
                 for (_, ft) in fs {
-                    s += &self.unpack_value(ft, at)?;
-                    s += ",";
+                    parts.push(self.unpack_value(ft, at)?);
                 }
-                s + ")"
+                rec_build(&parts)
             }
             _ => unreachable!(),
         })
@@ -3764,12 +4127,11 @@ impl<'a> Gen<'a> {
             }
             Ty::Rec(fs) => {
                 let r = self.fresh("r");
-                let mut s = format!("{{ let {r} = &({c}); (");
+                let mut parts = vec![];
                 for (i, (_, ft)) in fs.iter().enumerate() {
-                    s += &self.perm_code(&format!("{r}.{i}"), ft)?;
-                    s += ",";
+                    parts.push(self.perm_code(&format!("{r}{}", rec_field(fs.len(), i)), ft)?);
                 }
-                s + ") }"
+                format!("{{ let {r} = &({c}); {} }}", rec_build(&parts))
             }
             Ty::Opt(inner) => {
                 let o = self.fresh("o");
@@ -3860,7 +4222,7 @@ enum Cmp {
 pub const SQ_RUNTIME: &str = r#"
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Sq<T: Copy + Ord + ConstDefault, const N: usize> {
-    len: u8,
+    len: u16,
     items: [T; N],
 }
 impl<T: Copy + Ord + ConstDefault, const N: usize> ConstDefault for Sq<T, N> {
@@ -3991,12 +4353,6 @@ fn unbounded_ints(t: &Ty) -> Ty {
         Ty::Fun(d, c) => Ty::Fun(d.clone(), unbounded_ints(c).into()),
         t => t.clone(),
     }
-}
-
-/// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
-/// the two is rejected rather than compared as unequal.
-fn seq_like_fun(t: &Ty) -> bool {
-    matches!(t, Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(1, _)))
 }
 
 impl Env {

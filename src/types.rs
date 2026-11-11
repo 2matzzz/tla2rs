@@ -70,16 +70,37 @@ pub fn narrows(from: &Ty, to: &Ty) -> bool {
     }
 }
 
-/// A tuple `<<e1, ..., en>>` has the type of a record whose fields are named #01, #02, ... (no TLA+
+/// A tuple `<<e1, ..., en>>` has the type of a record whose fields are named #00001, #00002, ... (no TLA+
 /// field name starts with `#`, and the names sort in element order). Tuples of different lengths
 /// are different types, so sequences (tuples whose length changes) are not expressible.
 pub fn tuple_field(i: usize) -> String {
-    format!("#{:02}", i + 1)
+    format!("#{:05}", i + 1)
+}
+
+/// Rust implements Eq, Hash, and Ord for tuples of at most 12 elements, so a record or tuple with
+/// more fields is stored as nested tuples: groups of 12, grouped again while there are more than
+/// 12 groups. `rec_build` builds a value (or type) from its fields in order, and `rec_field` is
+/// the path to field i of n.
+pub const REC_GROUP: usize = 12;
+
+pub fn rec_build(parts: &[String]) -> String {
+    if parts.len() <= REC_GROUP {
+        return format!("({})", parts.iter().map(|p| format!("{p},")).collect::<String>());
+    }
+    let groups: Vec<String> = parts.chunks(REC_GROUP).map(rec_build).collect();
+    rec_build(&groups)
+}
+
+pub fn rec_field(n: usize, i: usize) -> String {
+    if n <= REC_GROUP {
+        return format!(".{i}");
+    }
+    format!("{}.{}", rec_field(n.div_ceil(REC_GROUP), i / REC_GROUP), i % REC_GROUP)
 }
 
 pub fn tuple_ty(elems: Vec<Ty>) -> R<Ty> {
-    if elems.len() > 99 {
-        return Err("tuples of more than 99 elements are not supported".into());
+    if elems.len() > 99_999 {
+        return Err("tuples of more than 99,999 elements are not supported".into());
     }
     Ok(Ty::Rec(elems.into_iter().enumerate().map(|(i, t)| (tuple_field(i), t)).collect()))
 }
@@ -116,7 +137,7 @@ impl Ty {
             Ty::Bool => "bool".into(),
             Ty::Int(..) | Ty::IntAtom(..) => "i64".into(),
             Ty::Enum(_) => "u16".into(),
-            Ty::Rec(fs) => format!("({})", fs.iter().map(|(_, t)| t.repr() + ",").collect::<String>()),
+            Ty::Rec(fs) => rec_build(&fs.iter().map(|(_, t)| t.repr()).collect::<Vec<_>>()),
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
             Ty::Set(e) if is_sparse(self) => format!("SSet<{}, SCAP>", e.repr()),
             Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),

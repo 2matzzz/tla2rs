@@ -34,9 +34,10 @@ cargo build --release
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` sets the capacity of sets whose size is only known at run time
-- `-seqcap N` sets the maximum length of sequences, when the spec does not bound them with `Len(x) <= N` in `TypeOK`,
-  `UNION {[1..n -> S] : n \in 0..N}`, or a length test such as `Len(q) < N`
-  or a `CONSTRAINT`
+- `-seqcap N` sets the maximum length of sequences (at most 1024), when the spec does not bound them with
+  `Len(x) <= N` in `TypeOK` or a `CONSTRAINT`, or `UNION {[1..n -> S] : n \in 0..N}`. Otherwise the lengths are
+  computed from Init and Next until they stop growing (a length test such as `Len(q) < N` in an action bounds `q`
+  there); if they keep growing, the length tests in the spec suggest the bound
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
   the CPU
@@ -113,13 +114,14 @@ memory.
   of up to `-setcap` elements. A sequence holds up to `-seqcap` elements (see above); growing past it is an
   evaluation error
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
-  characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`), `Bags`, and from `TLC` `Print`, `PrintT`,
-  `Assert`, `ToString` (in constant expressions), `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+  characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`), `Bags`, `STRING`, and from `TLC` `Print`, `PrintT`,
+  `Assert`, `ToString` (of a value from the state when it is a Boolean, integer, string, model value or tuple of
+  them, with at most 4096 possible values), `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
 - Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--` and `|-` are accepted; `Print` and `PrintT` write to stdout as TLC does
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
-  reason), sets that may hold both strings and integers, recursive operators with operator parameters, and
+  reason), sets that may hold both strings and integers, ENABLED inside a recursive operator, and
   `Name <- [Module] Def` for a CONSTANT (TLC rejects it too)
 - Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
   body; 50,000 levels at compile time). TLC overflows its JVM stack much earlier (500 to 900 levels for small
