@@ -122,10 +122,11 @@ fn main() {
     for w in &output.warnings {
         eprintln!("warning: {w}");
     }
-    // A false ASSUME. As in TLC, stop before exploring, with the same message and exit code (10)
-    if let Some(msg) = &output.assume_failed {
+    // A false ASSUME, or a temporal formula TLC cannot check: as in TLC, stop before exploring, with
+    // the same message and exit code
+    if let Some((msg, code)) = &output.rejected {
         println!("{msg}");
-        exit(10);
+        exit(*code);
     }
     let stem = cfg.file_stem().unwrap().to_string_lossy().to_string();
     let dir = out.unwrap_or_else(|| tla.parent().unwrap_or(Path::new(".")).join(".tla2rs").join(&stem));
