@@ -1045,6 +1045,7 @@ impl<'a> Gen<'a> {
                 return Err("this set is only supported on the right of \\in (or must be constant)".into())
             }
             Let(..) | Label(..) => unreachable!(),
+            Lambda(..) => return Err("LAMBDA is only supported as the argument of an operator parameter".into()),
             BoxAction(..) | Fair(..) => return Err("temporal formula in a state expression".into()),
             Num(_) | Str(_) | Bool(_) => unreachable!("constants are folded"),
         })
@@ -2600,6 +2601,7 @@ pub fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
         BoxAction(a, b) => BoxAction(mb(a), mb(b)),
         Fair(w, a, b) => Fair(*w, mb(a), mb(b)),
         Label(n, a, b) => Label(n.clone(), a.iter().map(m).collect(), mb(b)),
+        Lambda(ps, b) => Lambda(ps.clone(), mb(b)),
     }
 }
 

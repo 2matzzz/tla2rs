@@ -38,6 +38,8 @@ pub enum Expr {
     Fair(bool, Box<Expr>, Box<Expr>),
     /// Marks where an operator was inlined: its name and (expanded) arguments.
     Label(String, Vec<Expr>, Box<Expr>),
+    /// LAMBDA x, y : e (only as the argument of an operator parameter)
+    Lambda(Vec<String>, Box<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +90,9 @@ pub enum BOp {
 pub struct Def {
     pub name: String,
     pub params: Vec<String>,
+    /// Per parameter, the number of arguments it takes: 0 for an ordinary parameter, n for an
+    /// operator parameter `F(_, ...)`
+    pub arity: Vec<usize>,
     pub body: Expr,
 }
 
@@ -163,6 +168,7 @@ impl Expr {
                 v.push(body);
                 v
             }
+            Lambda(_, body) => vec![body],
             Label(_, args, body) => {
                 let mut v: Vec<&Expr> = args.iter().collect();
                 v.push(body);

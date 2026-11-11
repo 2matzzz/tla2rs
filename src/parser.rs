@@ -132,6 +132,7 @@ fn fun_cons(bs: Vec<(String, Expr)>, body: Expr) -> Expr {
         .map(|(i, (x, _))| Def {
             name: x.clone(),
             params: vec![],
+            arity: vec![],
             body: Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b()),
         })
         .collect();
@@ -275,10 +276,30 @@ impl Parser {
     fn def(&mut self) -> R<Def> {
         let name = self.ident()?;
         let mut params = vec![];
+        let mut arity = vec![];
         if self.is("(") {
             self.pos += 1;
             loop {
                 params.push(self.ident()?);
+                // An operator parameter F(_, _)
+                let mut n = 0;
+                if self.is("(") {
+                    self.pos += 1;
+                    loop {
+                        match self.peek() {
+                            Tok::Ident(u) if u == "_" => self.pos += 1,
+                            _ => return self.err("expected `_` in an operator parameter"),
+                        }
+                        n += 1;
+                        if self.is(",") {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(")")?;
+                }
+                arity.push(n);
                 if self.is(",") {
                     self.pos += 1;
                 } else {
@@ -299,11 +320,11 @@ impl Parser {
                 self.pos = at;
                 return self.err(&format!("recursive function definitions are not supported (`{name}` is used in its own definition)"));
             }
-            return Ok(Def { name, params, body: fun_cons(bs, body) });
+            return Ok(Def { name, params, arity, body: fun_cons(bs, body) });
         }
         self.expect("==")?;
         let body = self.expr(0)?;
-        Ok(Def { name, params, body })
+        Ok(Def { name, params, arity, body })
     }
 
     pub fn expr(&mut self, min: u8) -> R<Expr> {
@@ -460,6 +481,17 @@ impl Parser {
                     self.pos += 1;
                     let body = self.expr(0)?;
                     Ok(Expr::Let(defs, body.b()))
+                }
+                "LAMBDA" => {
+                    self.pos += 1;
+                    let mut ps = vec![self.ident()?];
+                    while self.is(",") {
+                        self.pos += 1;
+                        ps.push(self.ident()?);
+                    }
+                    self.expect(":")?;
+                    let body = self.expr(0)?;
+                    Ok(Expr::Lambda(ps, body.b()))
                 }
                 "CHOOSE" => {
                     self.pos += 1;

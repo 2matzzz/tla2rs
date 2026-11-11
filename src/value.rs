@@ -392,7 +392,7 @@ impl ConstEval<'_> {
                 }
                 v
             }
-            At | Let(..) | Prime(_) | BoxAction(..) | Fair(..) => {
+            At | Let(..) | Prime(_) | BoxAction(..) | Fair(..) | Lambda(..) => {
                 return Err("not a constant expression".into())
             }
         })

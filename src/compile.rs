@@ -36,7 +36,7 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
             continue;
         }
         match def_params(m, n) {
-            Some(p) if p.is_empty() => extra.push(Def { name: n.clone(), params: vec![], body: e.clone() }),
+            Some(p) if p.is_empty() => extra.push(Def { name: n.clone(), params: vec![], arity: vec![], body: e.clone() }),
             Some(_) => return Err(format!("cfg: `{n} = ...` replaces an operator that takes arguments")),
             None => warnings.push(format!("cfg: `{n}` is neither a CONSTANT nor a definition of the spec; ignored")),
         }
@@ -73,7 +73,8 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
         // Name(p1, ...) == Def(p1, ...); defined last, so it takes precedence
         let args: Vec<Expr> = np.iter().map(|p| Expr::Ident(p.clone())).collect();
         let body = if args.is_empty() { Expr::Ident(def.clone()) } else { Expr::Call(def.clone(), args) };
-        extra.push(Def { name: n.clone(), params: np, body });
+        let arity = m.defs.iter().rev().find(|d| d.name == *n).map(|d| d.arity.clone()).unwrap_or_default();
+        extra.push(Def { name: n.clone(), params: np, arity, body });
     }
     m.defs.extend(extra);
     Ok(const_substs)
