@@ -108,6 +108,16 @@ impl Value {
 
 pub const ENUM_LIMIT: usize = 1 << 20;
 
+/// How deep a recursive operator may call itself, both when evaluated at compile time and in the
+/// generated checker. TLC stops with a stack overflow at a depth that depends on its JVM stack and
+/// on the operator's body: measured between 800 and 900 levels for `1 + Sum(k - 1)`, and between
+/// 500 and 700 for a body with two LETs. Erring on the side of an error, deeper is an error here.
+pub const REC_LIMIT: u32 = 500;
+
+thread_local! {
+    static REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone)]
 pub struct ConstEval<'a> {
     pub atoms: &'a Atoms,
@@ -391,6 +401,24 @@ impl ConstEval<'_> {
                     v = self.except_at(v, &steps, val, at.as_deref(), env)?;
                 }
                 v
+            }
+            RecCall(i, args) => {
+                let rd = crate::expand::rec_def(*i);
+                let mut env2 = env.clone();
+                for (p, a) in rd.params.iter().zip(args) {
+                    env2.insert(p.clone(), self.eval(a, env)?);
+                }
+                let depth = REC_DEPTH.with(|d| {
+                    d.set(d.get() + 1);
+                    d.get()
+                });
+                let r = if depth > REC_LIMIT {
+                    Err(format!("`{}` recursed more than {REC_LIMIT} levels deep (TLC overflows its stack)", rd.name))
+                } else {
+                    self.eval(&rd.body, &env2)
+                };
+                REC_DEPTH.with(|d| d.set(d.get() - 1));
+                r?
             }
             At | Let(..) | Prime(_) | BoxAction(..) | Fair(..) | Lambda(..) => {
                 return Err("not a constant expression".into())

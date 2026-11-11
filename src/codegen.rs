@@ -56,6 +56,14 @@ pub struct Gen<'a> {
     pub scap: usize,
     /// During type inference, collects the types of assigned values
     pub infer: Option<HashMap<String, Ty>>,
+    /// Rust functions for recursive operators, per (RecDef index, argument types): name and return
+    /// type once settled
+    rec_done: HashMap<(usize, Vec<Ty>), (String, Ty)>,
+    /// Those being generated, with their return type so far (innermost last)
+    rec_progress: Vec<((usize, Vec<Ty>), Ty)>,
+    rec_names: HashMap<(usize, Vec<Ty>), String>,
+    /// Function name -> its code (the latest version)
+    rec_code: std::collections::BTreeMap<String, String>,
 }
 
 fn rid(n: &str) -> String {
@@ -77,6 +85,10 @@ impl<'a> Gen<'a> {
             fair_param_tys: vec![],
             scap: 8,
             infer: None,
+            rec_done: HashMap::new(),
+            rec_progress: vec![],
+            rec_names: HashMap::new(),
+            rec_code: std::collections::BTreeMap::new(),
         }
     }
 
@@ -189,6 +201,127 @@ impl<'a> Gen<'a> {
 
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
         self.ty_id(t)
+    }
+
+    /// Identifiers in the body of a recursive operator bound outside it (by the call site), sorted
+    fn rec_free(&self, rd: &crate::expand::RecDef) -> Vec<String> {
+        fn walk(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+            let binders: Vec<String> = match e {
+                Expr::Quant(_, bs, _) | Expr::SetMap(_, bs) => bs.iter().map(|(x, _)| x.clone()).collect(),
+                Expr::Choose(x, ..) | Expr::SetFilter(x, ..) | Expr::FunCons(x, ..) => vec![x.clone()],
+                Expr::Except(_, ups) => ups
+                    .iter()
+                    .flat_map(|(p, _)| p.iter().filter_map(|s| match s {
+                        Path::Field(k) if k.starts_with('@') => Some(k.clone()),
+                        _ => None,
+                    }))
+                    .collect(),
+                _ => vec![],
+            };
+            let n = bound.len();
+            bound.extend(binders);
+            if let Expr::Ident(x) = e {
+                if !bound.contains(x) && !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+            for c in e.children() {
+                walk(c, bound, out);
+            }
+            bound.truncate(n);
+        }
+        let mut bound = rd.params.clone();
+        let mut out = vec![];
+        walk(&rd.body, &mut bound, &mut out);
+        out.retain(|x| {
+            !self.is_var(x)
+                && !self.ce.constants.contains_key(x)
+                && !x.starts_with("@model:")
+                && !["BOOLEAN", "Nat", "Int"].contains(&x.as_str())
+        });
+        out.sort();
+        out
+    }
+
+    /// The Rust function for the recursive operator `rd` called with arguments of types `tys`
+    /// (its parameters, then the free variables of `rec_free`): its name and return type. The
+    /// return type is found by generating the body until the type settles, starting from a few
+    /// guesses; integer ranges that keep growing are widened to unbounded.
+    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, uses_state: bool) -> R<(String, Ty)> {
+        let key = (i, tys.clone());
+        if let Some(r) = self.rec_done.get(&key) {
+            return Ok(r.clone());
+        }
+        if !self.rec_names.contains_key(&key) && self.rec_names.keys().filter(|(j, _)| *j == i).count() >= 8 {
+            return Err(format!("recursive operator `{}`: the types of its arguments keep changing between calls", rd.name));
+        }
+        let n = self.rec_names.len();
+        let name = self.rec_names.entry(key.clone()).or_insert(format!("rec_{n}")).clone();
+        if let Some((_, t)) = self.rec_progress.iter().rev().find(|(k, _)| *k == key) {
+            return Ok((name, t.clone()));
+        }
+        let free = self.rec_free(rd);
+        let names: Vec<String> = rd.params.iter().chain(&free).cloned().collect();
+        let mut env = Env::default();
+        let mut sig = if uses_state { String::from("s: &State, ") } else { String::new() };
+        for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
+            env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
+            write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+        }
+        let mut last_err = String::new();
+        for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool] {
+            let mut ret = seed;
+            for round in 0..30 {
+                self.rec_progress.push((key.clone(), ret.clone()));
+                let r = self.gen(&rd.body, &env, None);
+                self.rec_progress.pop();
+                let (code, t) = match r {
+                    Ok(x) => x,
+                    Err(e) => {
+                        last_err = e;
+                        break;
+                    }
+                };
+                let Ok(j) = join(&ret, &t) else {
+                    last_err = format!("type mismatch: {ret:?} vs {t:?}");
+                    break;
+                };
+                let next = if round >= 3 { crate::compile::widen(&ret, &j) } else { j };
+                if next != ret {
+                    ret = next;
+                    continue;
+                }
+                let code = self.coerce(code, &t, &ret)?;
+                self.ty_id(&ret)?;
+                let f = format!(
+                    "fn {name}({sig}) -> {} {{ rec_enter({:?}); let __r: {} = {{ {code} }}; rec_leave(); __r }}\n",
+                    ret.repr(),
+                    rd.name,
+                    ret.repr()
+                );
+                self.rec_code.insert(name.clone(), f);
+                if self.rec_progress.is_empty() {
+                    self.rec_done.insert(key, (name.clone(), ret.clone()));
+                }
+                return Ok((name, ret));
+            }
+        }
+        Err(format!("recursive operator `{}`: {last_err}", rd.name))
+    }
+
+    /// The functions generated for recursive operators, with the depth guard they share
+    pub fn rec_functions(&self) -> String {
+        let mut s = format!(
+            "thread_local! {{ static REC_DEPTH: std::cell::Cell<u32> = const {{ std::cell::Cell::new(0) }}; }}\n\
+             fn rec_enter(name: &str) {{ REC_DEPTH.with(|d| {{ let n = d.get() + 1; if n > {} {{ d.set(0); eval_error(format!(\"`{{name}}` recursed more than {} levels deep (TLC overflows its stack)\")) }} d.set(n); }}) }}\n\
+             fn rec_leave() {{ REC_DEPTH.with(|d| d.set(d.get() - 1)) }}\n",
+            crate::value::REC_LIMIT,
+            crate::value::REC_LIMIT
+        );
+        for c in self.rec_code.values() {
+            s += c;
+        }
+        s
     }
 
     /// Rewrites (e)' as e with every variable in it primed
@@ -516,7 +649,9 @@ impl<'a> Gen<'a> {
             }
         }
         if matches!(from, Ty::Enum(v) if v.is_empty()) && !matches!(to, Ty::Enum(_)) {
-            return Ok(format!("{{ let __u: {} = unreachable!(); __u }}", to.repr()));
+            // No value has this type, so the code cannot produce one: it stops (e.g. CHOOSE from
+            // an empty set) and must still run to report that
+            return Ok(format!("{{ let __u: {} = {{ let _ = {code}; unreachable!() }}; __u }}", to.repr()));
         }
         match (from, to) {
             (Ty::Set(a), Ty::Set(b)) if !is_sparse(from) && !is_sparse(to) && a.kind_eq(b) && Self::trivial(a, b) => {
@@ -1046,6 +1181,37 @@ impl<'a> Gen<'a> {
             }
             Let(..) | Label(..) => unreachable!(),
             Lambda(..) => return Err("LAMBDA is only supported as the argument of an operator parameter".into()),
+            RecCall(i, args) => {
+                // Constant arguments were folded above when the whole call evaluates; otherwise
+                // call a Rust function generated for the operator
+                let rd = crate::expand::rec_def(*i);
+                if rd.body.is_action() {
+                    return Err(format!("recursive operator `{}` refers to primed variables, which is not supported", rd.name));
+                }
+                let uses_state = rd.body.any(&|e| matches!(e, Ident(n) if self.is_var(n)));
+                if uses_state && env.init {
+                    return Err(format!("recursive operator `{}` reads variables in Init, which is not supported", rd.name));
+                }
+                let mut codes = vec![];
+                let mut tys = vec![];
+                for a in args {
+                    // Integer arguments are passed unbounded: their ranges change from call to call
+                    // (n, n - 1, ...), and one function serves them all
+                    let (c, t) = self.gen(a, env, None)?;
+                    let w = unbounded_ints(&t);
+                    codes.push(self.coerce(c, &t, &w)?);
+                    tys.push(w);
+                }
+                // Bound variables of the call site that the body refers to are passed along
+                for f in self.rec_free(&rd) {
+                    let (c, t) = env.locals.get(&f).cloned().ok_or(format!("recursive operator `{}`: unknown identifier `{f}`", rd.name))?;
+                    codes.push(c);
+                    tys.push(t);
+                }
+                let (name, ret) = self.rec_fn(*i, &rd, tys, uses_state)?;
+                let s_arg = if uses_state { "s, " } else { "" };
+                (format!("{name}({s_arg}{})", codes.join(", ")), ret)
+            }
             BoxAction(..) | Fair(..) => return Err("temporal formula in a state expression".into()),
             Num(_) | Str(_) | Bool(_) => unreachable!("constants are folded"),
         })
@@ -2527,6 +2693,18 @@ fn eval_error_bool(msg: &str) -> String {
     format!("{{ let __b: bool = eval_error({msg:?}.to_string()); __b }}")
 }
 
+/// `t` with every integer range outside sets made unbounded
+fn unbounded_ints(t: &Ty) -> Ty {
+    match t {
+        Ty::Int(..) => Ty::Int(-BIG, BIG),
+        Ty::IntAtom(_, _, a) => Ty::IntAtom(-BIG, BIG, a.clone()),
+        Ty::Rec(fs) => Ty::Rec(fs.iter().map(|(n, t)| (n.clone(), unbounded_ints(t))).collect()),
+        Ty::Opt(x) => Ty::Opt(unbounded_ints(x).into()),
+        Ty::Fun(d, c) => Ty::Fun(d.clone(), unbounded_ints(c).into()),
+        t => t.clone(),
+    }
+}
+
 /// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
 /// the two is rejected rather than compared as unequal.
 fn seq_like_fun(t: &Ty) -> bool {
@@ -2602,6 +2780,7 @@ pub fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
         Fair(w, a, b) => Fair(*w, mb(a), mb(b)),
         Label(n, a, b) => Label(n.clone(), a.iter().map(m).collect(), mb(b)),
         Lambda(ps, b) => Lambda(ps.clone(), mb(b)),
+        RecCall(i, a) => RecCall(*i, a.iter().map(m).collect()),
     }
 }
 

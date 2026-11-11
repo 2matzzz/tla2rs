@@ -40,6 +40,9 @@ pub enum Expr {
     Label(String, Vec<Expr>, Box<Expr>),
     /// LAMBDA x, y : e (only as the argument of an operator parameter)
     Lambda(Vec<String>, Box<Expr>),
+    /// A call of a recursive operator that is not inlined: an index into `expand::rec_def` and the
+    /// (expanded) arguments
+    RecCall(usize, Vec<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +112,9 @@ pub struct Module {
     pub modules: Vec<String>,
     /// CONSTANTs declared with parameters (`CONSTANT F(_, _)`) and their number of parameters
     pub op_constants: Vec<(String, usize)>,
+    /// Operators declared RECURSIVE (also in LET), and the operators that recursive function
+    /// definitions are turned into
+    pub recursive: Vec<String>,
 }
 
 /// An ASSUME expression and the position TLC reports on failure (1-based line and column; the end
@@ -171,6 +177,7 @@ impl Expr {
                 v
             }
             Lambda(_, body) => vec![body],
+            RecCall(_, a) => a.iter().collect(),
             Label(_, args, body) => {
                 let mut v: Vec<&Expr> = args.iter().collect();
                 v.push(body);

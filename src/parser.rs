@@ -12,6 +12,8 @@ pub struct Parser {
     /// Bullet-list columns. An expression ends at a line-leading token at or left of this column;
     /// None means inside brackets.
     limits: Vec<Option<usize>>,
+    /// Names declared RECURSIVE, and the operators recursive function definitions become
+    recursive: Vec<String>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -30,7 +32,7 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![] };
+    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![], recursive: vec![] };
     p.module()
 }
 
@@ -115,6 +117,16 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         _ => unreachable!(),
     };
     Expr::Bin(o, a.b(), b.b())
+}
+
+/// e with every application `f[a]` replaced by the call `app(a)`
+fn calls_for_apps(e: &Expr, f: &str, app: &str) -> Expr {
+    match e {
+        Expr::App(g, a) if matches!(g.as_ref(), Expr::Ident(n) if n == f) => {
+            Expr::Call(app.to_string(), vec![calls_for_apps(a, f, app)])
+        }
+        _ => crate::codegen::map_children(e, &|c| calls_for_apps(c, f, app)),
+    }
 }
 
 /// `[x \in S |-> e]`, and for several bound variables `[x \in S, y \in T |-> e]`, a function on
@@ -246,13 +258,20 @@ impl Parser {
                     self.expr(0)?;
                 }
                 Tok::Ident(k) if k == "LOCAL" => self.pos += 1,
+                Tok::Ident(k) if k == "RECURSIVE" => {
+                    self.pos += 1;
+                    for (n, _) in self.ident_list_arity()? {
+                        self.recursive.push(n);
+                    }
+                }
                 Tok::Ident(_) => {
                     let d = self.def()?;
-                    m.defs.push(d);
+                    m.defs.extend(d);
                 }
                 _ => return self.err("unexpected token at module level"),
             }
         }
+        m.recursive = std::mem::take(&mut self.recursive);
         Ok(m)
     }
 
@@ -309,7 +328,7 @@ impl Parser {
         Ok(v)
     }
 
-    fn def(&mut self) -> R<Def> {
+    fn def(&mut self) -> R<Vec<Def>> {
         let name = self.ident()?;
         let mut params = vec![];
         let mut arity = vec![];
@@ -352,15 +371,41 @@ impl Parser {
             self.expect("]")?;
             self.expect("==")?;
             let body = self.expr(0)?;
+            let _ = at;
             if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
-                self.pos = at;
-                return self.err(&format!("recursive function definitions are not supported (`{name}` is used in its own definition)"));
+                return Ok(self.rec_fun(name, bs, body));
             }
-            return Ok(Def { name, params, arity, body: fun_cons(bs, body) });
+            return Ok(vec![Def { name, params, arity, body: fun_cons(bs, body) }]);
         }
         self.expect("==")?;
         let body = self.expr(0)?;
-        Ok(Def { name, params, arity, body })
+        Ok(vec![Def { name, params, arity, body }])
+    }
+
+    /// A recursive function definition `f[x \in S] == e` becomes the recursive operator
+    /// `f#app(x) == IF x \in S THEN e ELSE <error>`, with each `f[a]` in e a call `f#app(a)`, and
+    /// `f == [x \in S |-> f#app(x)]` for the function as a whole
+    fn rec_fun(&mut self, name: String, bs: Vec<(String, Expr)>, body: Expr) -> Vec<Def> {
+        let app = format!("{name}#app");
+        self.recursive.push(app.clone());
+        let body = calls_for_apps(&body, &name, &app);
+        let (x, dom, inner) = if bs.len() == 1 {
+            let (x, s) = bs.into_iter().next().unwrap();
+            (x, s, body)
+        } else {
+            match fun_cons(bs, body) {
+                Expr::FunCons(t, d, b) => (t, *d, *b),
+                _ => unreachable!(),
+            }
+        };
+        // Applying f outside its domain is an error, as in TLC (CHOOSE from the empty set fails)
+        let outside = Expr::Choose("#none".into(), Expr::SetLit(vec![]).b(), Expr::Bool(true).b());
+        let guarded = Expr::If(Expr::Bin(BOp::In, Expr::Ident(x.clone()).b(), dom.clone().b()).b(), inner.b(), outside.b());
+        let whole = Expr::FunCons(x.clone(), dom.b(), Expr::Call(app.clone(), vec![Expr::Ident(x.clone())]).b());
+        vec![
+            Def { name: app, params: vec![x], arity: vec![0], body: guarded },
+            Def { name, params: vec![], arity: vec![], body: whole },
+        ]
     }
 
     pub fn expr(&mut self, min: u8) -> R<Expr> {
@@ -512,7 +557,14 @@ impl Parser {
                     self.pos += 1;
                     let mut defs = vec![];
                     while !self.is_kw("IN") {
-                        defs.push(self.def()?);
+                        if self.is_kw("RECURSIVE") {
+                            self.pos += 1;
+                            for (n, _) in self.ident_list_arity()? {
+                                self.recursive.push(n);
+                            }
+                            continue;
+                        }
+                        defs.extend(self.def()?);
                     }
                     self.pos += 1;
                     let body = self.expr(0)?;
