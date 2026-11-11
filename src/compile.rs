@@ -253,6 +253,14 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     });
     let mut out = Module { name: m.name.clone(), modules: vec![m.name.clone()], ..Default::default() };
     for e in &m.extends {
+        if e == "RealTime" {
+            real_time(&mut out);
+            continue;
+        }
+        if e == "Reals" {
+            reals(&mut out);
+            continue;
+        }
         if standard_module(e, "EXTENDS")? {
             out.extends.push(e.clone());
             continue;
@@ -293,10 +301,74 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
         // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
         // for the Toolbox's trace explorer.
         "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" | "Bags" => Ok(true),
-        "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
+        // Handled by `real_time` (EXTENDS only)
+        "RealTime" => Err(format!("{how} {name}: only EXTENDS RealTime is supported")),
         // TLC picks the subsets at random, so its results cannot be reproduced
         "Randomization" => Err(format!("{how} {name}: TLC chooses its values at random; not supported")),
         _ => Ok(false),
+    }
+}
+
+/// RealTime: Reals (for TLC, Integers) and the variable `now`. TLC cannot check RTBound and RTnow
+/// (they quantify over Real, and RTBound uses \EE), so their bodies are left undefined: using them
+/// is refused (see `uses_real_time`)
+fn real_time(out: &mut Module) {
+    reals(out);
+    out.modules.push("RealTime".into());
+    if !out.variables.iter().any(|v| v == "now") {
+        out.variables.push("now".into());
+    }
+    for (name, params) in [("RTBound", vec!["A", "v", "D", "E"]), ("RTnow", vec!["v"])] {
+        out.defs.push(Def {
+            name: name.into(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+            arity: vec![0; params.len()],
+            body: Expr::Call(format!("#{name}"), vec![]),
+        });
+    }
+}
+
+/// Reals: for TLC, Integers, with the dummy Real == "Reals" of its Reals module (so using Real as
+/// a set is an error, as in TLC)
+fn reals(out: &mut Module) {
+    out.extends.push("Reals".into());
+    if !out.defs.iter().any(|d| d.name == "Real") {
+        out.defs.push(Def { name: "Real".into(), params: vec![], arity: vec![], body: Expr::Str("Reals".into()) });
+    }
+}
+
+/// Whether e uses RealTime's RTBound or RTnow
+fn uses_real_time(e: &Expr) -> bool {
+    e.any(&|x| matches!(x, Expr::Label(n, ..) if n == "RTBound" || n == "RTnow"))
+}
+
+/// The operators of the standard modules and their numbers of arguments, for a named instance
+/// (`S == INSTANCE Sequences` used as `S!Len(s)`)
+fn std_ops(m: &str) -> &'static [(&'static str, usize)] {
+    const NAT: &[(&str, usize)] = &[
+        ("Nat", 0), ("+", 2), ("-", 2), ("*", 2), ("^", 2), ("<", 2), (">", 2), ("<=", 2), (">=", 2), ("%", 2),
+        ("\\div", 2), ("..", 2),
+    ];
+    const INT: &[(&str, usize)] = &[
+        ("Nat", 0), ("Int", 0), ("+", 2), ("-", 2), ("*", 2), ("^", 2), ("<", 2), (">", 2), ("<=", 2), (">=", 2),
+        ("%", 2), ("\\div", 2), ("..", 2),
+    ];
+    match m {
+        "Naturals" => NAT,
+        "Integers" | "Reals" => INT,
+        "Sequences" => &[
+            ("Seq", 1), ("Len", 1), ("\\o", 2), ("Append", 2), ("Head", 1), ("Tail", 1), ("SubSeq", 3), ("SelectSeq", 2),
+        ],
+        "FiniteSets" => &[("IsFiniteSet", 1), ("Cardinality", 1)],
+        "TLC" => &[
+            ("Print", 2), ("PrintT", 1), ("Assert", 2), ("JavaTime", 0), ("TLCGet", 1), ("TLCSet", 2), (":>", 2), ("@@", 2),
+            ("Permutations", 1), ("SortSeq", 2), ("RandomElement", 1), ("Any", 0), ("ToString", 1), ("TLCEval", 1),
+        ],
+        "Bags" => &[
+            ("IsABag", 1), ("BagToSet", 1), ("SetToBag", 1), ("BagIn", 2), ("EmptyBag", 0), ("\\oplus", 2), ("\\ominus", 2),
+            ("BagUnion", 1), ("\\sqsubseteq", 2), ("SubBag", 1), ("BagCardinality", 1), ("CopiesIn", 2),
+        ],
+        _ => &[],
     }
 }
 
@@ -312,10 +384,25 @@ static INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<()> {
     let mname = &inst.module;
     if standard_module(mname, "INSTANCE")? {
-        if let Some(n) = &inst.name {
-            return Err(format!("`{n} == INSTANCE {mname}`: a named instance of a standard module is not supported"));
-        }
         out.extends.push(mname.clone());
+        // A named instance: N!Op stands for the module's Op
+        if let Some(n) = &inst.name {
+            for &(op, k) in std_ops(mname) {
+                let ps: Vec<String> = (1..=k).map(|i| format!("#a{i}")).collect();
+                let args: Vec<Expr> = ps.iter().map(|p| Expr::Ident(p.clone())).collect();
+                let body = if op.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    if k == 0 { Expr::Ident(op.into()) } else { Expr::Call(op.into(), args) }
+                } else {
+                    let mut it = args.into_iter();
+                    crate::parser::bin(op, it.next().unwrap(), it.next().unwrap())
+                };
+                let mut params = inst.params.clone();
+                params.extend(ps);
+                let mut arity = inst.arity.clone();
+                arity.extend(vec![0; k]);
+                out.defs.push(Def { name: format!("{n}!{op}"), params, arity, body });
+            }
+        }
         return Ok(());
     }
     let mm = find_module(mname, "INSTANCE", dir, warnings, depth + 1)?;
@@ -383,7 +470,16 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
             Some(n) => {
                 let mut ps = inst.params.clone();
                 ps.extend(d.params.iter().cloned());
-                let mut ar = vec![0; inst.params.len()];
+                let mut ar = inst.arity.clone();
+                // An instance hoisted out of a LET takes the names its substitutions mention; one
+                // that names an operator with arguments is passed as that operator
+                if n.contains("#let") {
+                    for (i, p) in inst.params.iter().enumerate() {
+                        if let Some(def) = out.defs.iter().rev().find(|x| x.name == *p) {
+                            ar[i] = def.params.len();
+                        }
+                    }
+                }
                 ar.extend(d.arity.iter().copied());
                 (format!("{n}!{}", d.name), ps, ar)
             }
@@ -488,6 +584,9 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     }
 
     let (init, next, fairness) = resolve_spec(&m, &cfg, &mut ex)?;
+    if uses_real_time(&init) || uses_real_time(&next) || fairness.iter().any(uses_real_time) {
+        return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
+    }
 
     let mut g = Gen::new(&atoms, &constants);
     if setcap > 0 {
@@ -594,6 +693,10 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
+        if uses_real_time(&e) {
+            let msg = format!("Error: TLC cannot handle the temporal formula {name} (RTBound / RTnow of RealTime)");
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
+        }
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
         let whole = parts.len() == 1;

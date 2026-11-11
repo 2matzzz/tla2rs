@@ -129,6 +129,8 @@ pub struct Module {
 pub struct Instance {
     pub name: Option<String>,
     pub params: Vec<String>,
+    /// Per parameter, the number of arguments it takes (0 for an ordinary parameter)
+    pub arity: Vec<usize>,
     pub module: String,
     pub subs: Vec<(String, Expr)>,
 }

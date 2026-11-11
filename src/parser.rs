@@ -16,6 +16,8 @@ pub struct Parser {
     recursive: Vec<String>,
     /// Count of `<<x, y>> \in S` bound variables, for fresh names
     tuple_binders: usize,
+    /// Instances defined inside LET, made module-level (see `let_instance`)
+    let_instances: Vec<Instance>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -41,7 +43,7 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex_module(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0 };
+    let mut p = Parser { toks: lex_module(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![] };
     p.module()
 }
 
@@ -112,7 +114,7 @@ pub fn bin_expr(op: &str, a: Expr, b: Expr) -> Expr {
     bin(op, a, b)
 }
 
-fn bin(op: &str, a: Expr, b: Expr) -> Expr {
+pub(crate) fn bin(op: &str, a: Expr, b: Expr) -> Expr {
     let o = match op {
         "=>" => BOp::Implies,
         "<=>" => BOp::Equiv,
@@ -173,6 +175,66 @@ fn tuple_lets(t: &str, names: Vec<String>) -> Vec<Def> {
             body: Expr::App(Expr::Ident(t.to_string()).b(), Expr::Num(i as i64 + 1).b()),
         })
         .collect()
+}
+
+/// The identifiers e mentions and does not bind itself, in order, without repeats
+fn free_names(e: &Expr, out: &mut Vec<String>) {
+    let mut bound = vec![];
+    binder_names(e, &mut bound);
+    let mut all = vec![];
+    all_names(e, &mut all);
+    for n in all {
+        if !bound.contains(&n) && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+}
+
+fn all_names(e: &Expr, out: &mut Vec<String>) {
+    if let Expr::Ident(n) = e {
+        if !n.starts_with('@') {
+            out.push(n.clone());
+        }
+    }
+    for c in e.children() {
+        all_names(c, out);
+    }
+}
+
+fn binder_names(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Lambda(ps, _) => out.extend(ps.iter().cloned()),
+        Expr::Quant(_, bs, _) | Expr::SetMap(_, bs) => out.extend(bs.iter().map(|(x, _)| x.clone())),
+        Expr::Choose(x, ..) | Expr::SetFilter(x, ..) | Expr::FunCons(x, ..) => out.push(x.clone()),
+        Expr::Let(defs, _) => out.extend(defs.iter().map(|d| d.name.clone())),
+        _ => {}
+    }
+    for c in e.children() {
+        binder_names(c, out);
+    }
+}
+
+/// e with the references `N!Op` to a LET instance N renamed to the module-level instance, passing
+/// the names it takes as its first arguments
+fn rename_instance(e: &Expr, r: &(String, String, Vec<String>)) -> Expr {
+    let (local, unique, names) = r;
+    let prefix = format!("{local}!");
+    let target = |n: &str| n.strip_prefix(&prefix).map(|op| format!("{unique}!{op}"));
+    match e {
+        Expr::Ident(n) | Expr::Call(n, _) if target(n).is_some() => {
+            let mut args: Vec<Expr> = names.iter().map(|n| Expr::Ident(n.clone())).collect();
+            if let Expr::Call(_, a) = e {
+                args.extend(a.iter().map(|x| rename_instance(x, r)));
+            }
+            let name = target(match e {
+                Expr::Ident(n) | Expr::Call(n, _) => n,
+                _ => unreachable!(),
+            })
+            .unwrap();
+            if args.is_empty() { Expr::Ident(name) } else { Expr::Call(name, args) }
+        }
+        _ => crate::codegen::map_children(e, &|c| rename_instance(c, r)),
+    }
 }
 
 /// e with every application `f[a]` replaced by the call `app(a)`
@@ -320,7 +382,7 @@ impl Parser {
                 Tok::Ident(k) if PROOF_UNITS.contains(&k.as_str()) => self.skip_proof_unit(),
                 Tok::Ident(k) if k == "INSTANCE" => {
                     self.pos += 1;
-                    let inst = self.instance(None, vec![])?;
+                    let inst = self.instance(None, vec![], vec![])?;
                     m.instances.push(inst);
                 }
                 Tok::Ident(k) if k == "LOCAL" => {
@@ -345,6 +407,7 @@ impl Parser {
             }
         }
         m.recursive = std::mem::take(&mut self.recursive);
+        m.instances.append(&mut self.let_instances);
         Ok(m)
     }
 
@@ -352,6 +415,20 @@ impl Parser {
     fn ident_list_arity(&mut self) -> R<Vec<(String, usize)>> {
         let mut v = vec![];
         loop {
+            // An infix operator constant `_ ** _`
+            if matches!(self.peek(), Tok::Ident(u) if u == "_") {
+                if let Some((_, _, op)) = infix(self.peek2()) {
+                    if matches!(&self.toks[self.pos + 2].tok, Tok::Ident(u) if u == "_") {
+                        self.pos += 3;
+                        v.push((op.to_string(), 2));
+                        if self.is(",") {
+                            self.pos += 1;
+                            continue;
+                        }
+                        return Ok(v);
+                    }
+                }
+            }
             let name = self.ident()?;
             let mut n = 0;
             if self.is("(") {
@@ -428,19 +505,31 @@ impl Parser {
     }
 
     /// The rest of an INSTANCE statement after the keyword: `M [WITH x <- e, ...]`
-    fn instance(&mut self, name: Option<String>, params: Vec<String>) -> R<Instance> {
+    fn instance(&mut self, name: Option<String>, params: Vec<String>, arity: Vec<usize>) -> R<Instance> {
         let module = self.ident()?;
         let mut subs = vec![];
         if self.is_kw("WITH") {
             self.pos += 1;
             loop {
+                // A name, or an operator symbol (`** <- Mul`)
                 let x = match self.peek().clone() {
                     Tok::Ident(x) => x,
-                    _ => return self.err("expected a name in a WITH substitution (operator symbols are not supported)"),
+                    t => match infix(&t) {
+                        Some((_, _, op)) => op.to_string(),
+                        None => return self.err("expected a name or an operator in a WITH substitution"),
+                    },
                 };
                 self.pos += 1;
                 self.expect("<-")?;
-                let e = self.expr(0)?;
+                // An operator symbol on the right (`** <- +`) stands for LAMBDA a, b : a + b
+                let e = match infix(self.peek()) {
+                    Some((_, _, op)) if matches!(self.peek2(), Tok::Sym(c) if c == ",") || matches!(self.peek2(), Tok::Eof) || self.toks[self.pos + 1].first => {
+                        self.pos += 1;
+                        let (a, b) = (Expr::Ident("#l".into()), Expr::Ident("#r".into()));
+                        Expr::Lambda(vec!["#l".into(), "#r".into()], bin(op, a, b).b())
+                    }
+                    _ => self.expr(0)?,
+                };
                 subs.push((x, e));
                 if self.is(",") {
                     self.pos += 1;
@@ -449,7 +538,26 @@ impl Parser {
                 }
             }
         }
-        Ok(Instance { name, params, module, subs })
+        Ok(Instance { name, params, arity, module, subs })
+    }
+
+    /// An instance defined inside LET becomes a module-level instance with a unique name that
+    /// takes as parameters the names its substitutions mention (they may be bound around the
+    /// LET); references `N!Op(args)` in the LET are rewritten to pass them
+    fn let_instance(&mut self, inst: Instance) -> (String, String, Vec<String>) {
+        let local = inst.name.clone().unwrap_or_default();
+        let unique = format!("{local}#let{}", self.let_instances.len());
+        let mut names: Vec<String> = vec![];
+        for (_, e) in &inst.subs {
+            free_names(e, &mut names);
+        }
+        names.retain(|n| !inst.params.contains(n));
+        let mut params = names.clone();
+        params.extend(inst.params.iter().cloned());
+        let mut arity = vec![0; names.len()];
+        arity.extend(inst.arity.iter().copied());
+        self.let_instances.push(Instance { name: Some(unique.clone()), params, arity, module: inst.module, subs: inst.subs });
+        (local, unique, names)
     }
 
     /// A definition, or (as Err) a definition of an instance `N(p) == INSTANCE M ...`
@@ -520,10 +628,7 @@ impl Parser {
         self.expect("==")?;
         if self.is_kw("INSTANCE") {
             self.pos += 1;
-            if arity.iter().any(|&a| a > 0) {
-                return self.err("an instance with operator parameters is not supported");
-            }
-            return Ok(Err(self.instance(Some(name), params)?));
+            return Ok(Err(self.instance(Some(name), params, arity)?));
         }
         let body = self.expr(0)?;
         Ok(Ok(vec![Def { name, params, arity, body }]))
@@ -768,6 +873,7 @@ impl Parser {
                 "LET" => {
                     self.pos += 1;
                     let mut defs = vec![];
+                    let mut renames = vec![];
                     while !self.is_kw("IN") {
                         if self.is_kw("RECURSIVE") {
                             self.pos += 1;
@@ -778,11 +884,20 @@ impl Parser {
                         }
                         match self.def()? {
                             Ok(d) => defs.extend(d),
-                            Err(_) => return self.err("INSTANCE inside LET is not supported"),
+                            Err(inst) => renames.push(self.let_instance(inst)),
                         }
                     }
                     self.pos += 1;
-                    let body = self.expr(0)?;
+                    let mut body = self.expr(0)?;
+                    for r in &renames {
+                        body = rename_instance(&body, r);
+                        for d in defs.iter_mut() {
+                            d.body = rename_instance(&d.body, r);
+                        }
+                    }
+                    if defs.is_empty() {
+                        return Ok(body);
+                    }
                     Ok(Expr::Let(defs, body.b()))
                 }
                 "LAMBDA" => {
@@ -927,6 +1042,12 @@ impl Parser {
                     // An operator of an instance: `N!Op`, `N(a)!Op(b)` (the arguments are joined)
                     match (self.peek(), self.peek2()) {
                         (Tok::Sym(b), Tok::Ident(op)) if b == "!" => {
+                            name = format!("{name}!{op}");
+                            self.pos += 2;
+                        }
+                        // An operator symbol of an instance: `N!+(a, b)`
+                        (Tok::Sym(b), t) if b == "!" && infix(t).is_some() => {
+                            let op = infix(t).unwrap().2;
                             name = format!("{name}!{op}");
                             self.pos += 2;
                         }
