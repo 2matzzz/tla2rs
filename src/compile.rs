@@ -758,6 +758,9 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     let mut leftover = 0;
     for c in conj {
         match c.strip() {
+            // STRING is not a set of values here: the variable's type is inferred, and the conjunct
+            // is checked as an invariant
+            Expr::Bin(BOp::In | BOp::Subseteq, _, s) if matches!(s.strip(), Expr::Ident(n) if n == "STRING") => leftover += 1,
             Expr::Bin(BOp::In, v, s) => {
                 let mut taken = false;
                 if let Expr::Ident(v) = v.strip() {

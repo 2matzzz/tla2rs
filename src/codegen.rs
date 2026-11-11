@@ -340,6 +340,48 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// SubSeq(q, m, n) on strings from the state: for each string q can be, a table of its
+    /// substrings by (m, n), interned now
+    fn substring_table(&mut self, qc: &str, d: &[u32], mc: &str, nc: &str) -> R<(String, Ty)> {
+        let empty = self.atoms.intern(false, "");
+        let mut res = vec![empty];
+        let mut arms = String::new();
+        let mut total = 0;
+        for &a in d {
+            if self.atoms.is_model(a) {
+                write!(arms, "{a} => eval_error(\"`SubSeq` of a value that is not a string\".to_string()), ").unwrap();
+                continue;
+            }
+            let chars: Vec<char> = self.atoms.name(a).chars().collect();
+            let l = chars.len();
+            total += l * l;
+            if total > 65536 {
+                return Err("`SubSeq` on strings from the state with more than 65536 substrings is not supported".into());
+            }
+            let mut table = vec![];
+            for i in 0..l {
+                for j in 0..l {
+                    let id = if i <= j { self.atoms.intern(false, &chars[i..=j].iter().collect::<String>()) } else { empty };
+                    res.push(id);
+                    table.push(id.to_string());
+                }
+            }
+            write!(
+                arms,
+                "{a} => {{ const T: [u16; {}] = [{}]; if __m > __n {{ {empty}u16 }} \
+                 else if __m < 1 || __m > {l} {{ arith_error(\"The second argument of SubSeq must be in the domain of its first argument.\".to_string()) }} \
+                 else if __n > {l} {{ arith_error(\"The third argument of SubSeq must be in the domain of its first argument.\".to_string()) }} \
+                 else {{ T[((__m - 1) * {l} + __n - 1) as usize] }} }}, ",
+                l * l,
+                table.join(", ")
+            )
+            .unwrap();
+        }
+        res.sort();
+        res.dedup();
+        Ok((format!("{{ let __m: i64 = {mc}; let __n: i64 = {nc}; match {qc} {{ {arms}_ => type_error(\"string\", \"\") }} }}"), Ty::Enum(res)))
+    }
+
     /// Whether `b` is a bag held in the state (a constant bag is a plain function value)
     fn is_bag(&mut self, b: &Expr, env: &Env) -> bool {
         matches!(b.strip(), Expr::Ident(n) if n == "EmptyBag") || matches!(self.gen(b, env, None), Ok((_, Ty::Bag(_))))
@@ -1291,7 +1333,30 @@ impl<'a> Gen<'a> {
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
-                ("ToString", _) => return Err("ToString of a value from the state is not supported: it builds a string the checker has no value for".into()),
+                // ToString of a value from the state: a table, indexed by the value's encoding, of
+                // the strings of every value of its type, interned now
+                ("ToString", [x]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    fn scalar_or_tuple(t: &Ty) -> bool {
+                        match t {
+                            Ty::Bool | Ty::Int(..) | Ty::Enum(_) | Ty::IntAtom(..) => true,
+                            Ty::Rec(fs) => is_tuple_fields(fs) && fs.iter().all(|(_, t)| scalar_or_tuple(t)),
+                            _ => false,
+                        }
+                    }
+                    // Records are left out: TLC prints their fields in an order of its own
+                    if !scalar_or_tuple(&t) {
+                        return Err(format!("ToString of a value from the state is only supported for Booleans, integers, strings, model values and tuples of them: {}", short(x)));
+                    }
+                    let n = t.size().filter(|&n| n <= 4096).ok_or(format!("ToString of a value from the state with more than 4096 possible values is not supported: {}", short(x)))?;
+                    let tid = self.ty_id(&t)?;
+                    let ids: Vec<u32> = t.enumerate().iter().map(|v| self.atoms.intern(false, &crate::compile::show_value(self.atoms, v))).collect();
+                    let table: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+                    let mut res = ids.clone();
+                    res.sort();
+                    res.dedup();
+                    (format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", ")), Ty::Enum(res))
+                }
                 ("RandomElement", [SetLit(xs)]) if xs.len() == 1 => self.gen(&xs[0], env, want)?,
                 ("RandomElement", _) => return Err("RandomElement over a set from the state is not supported: TLC picks an element at random".into()),
                 ("TLCGet" | "TLCSet", _) => return Err(format!("{f} is not supported: it reads or writes TLC's search state")),
@@ -1523,6 +1588,13 @@ impl<'a> Gen<'a> {
                     let (c, t) = self.gen(q, env, None)?;
                     let Ty::Enum(d) = &t else { unreachable!() };
                     self.string_table(f, &c, &[(d.clone(), None)])?
+                }
+                ("SubSeq", [q, m, n]) if matches!(self.gen(q, env, None), Ok((_, Ty::Enum(_)))) => {
+                    let (qc, qt) = self.gen(q, env, None)?;
+                    let Ty::Enum(d) = &qt else { unreachable!() };
+                    let (mc, _) = self.gen_int(m, env)?;
+                    let (nc, _) = self.gen_int(n, env)?;
+                    self.substring_table(&qc, d, &mc, &nc)?
                 }
                 ("Append" | "\\o", [a, b]) if matches!(self.gen(a, env, None), Ok((_, Ty::Enum(_)))) => {
                     let (ac, at) = self.gen(a, env, None)?;
@@ -2292,7 +2364,7 @@ impl<'a> Gen<'a> {
                 (format!("{neg}{{ let {x} = {xc}; {m} }}"), Ty::Bool)
             }
             // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
-            Subseteq if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int") => {
+            Subseteq if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int" || n == "STRING") => {
                 let (ac, at) = self.gen(a, env, None)?;
                 let x = self.fresh("x");
                 let m = self.gen_member(&x, &at, &Expr::Un(UOp::Subset, b.clone().into()), env)?;
@@ -2514,7 +2586,7 @@ impl<'a> Gen<'a> {
                 return Ok(format!("({})", conj.join(" && ")));
             }
             if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
-                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int"].contains(&n.as_str()))
+                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int", "STRING"].contains(&n.as_str()))
             {
                 return Ok(eval_error_bool(&format!("Attempted to check if the tuple {x} is an element of {}", short(s))));
             }
@@ -2637,6 +2709,31 @@ impl<'a> Gen<'a> {
             }
             Ident(n) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
+            }
+            // TRUE for a string, FALSE for a model value, and an error for anything else, as in TLC
+            Ident(n) if n == "STRING" && !env.locals.contains_key(n) => {
+                let err = |what: &str| format!("Attempted to check if the value:\n{what}\nis an element of STRING.");
+                return Ok(match xt {
+                    Ty::Enum(d) => {
+                        let strs: Vec<String> = d.iter().filter(|&&a| !self.atoms.is_model(a)).map(|a| a.to_string()).collect();
+                        match strs.len() {
+                            0 => "false".into(),
+                            n if n == d.len() => "true".into(),
+                            _ => format!("matches!({x}, {})", strs.join(" | ")),
+                        }
+                    }
+                    Ty::IntAtom(..) => {
+                        let tid = self.ty_id(xt)?;
+                        format!(
+                            "(if {x} < i64::MIN + 65536 {{ IS_STR[({x} - i64::MIN) as usize] }} else {{ let __b: bool = eval_error(format!({:?}, fmt_{tid}(&{x}))); __b }})",
+                            err("{}")
+                        )
+                    }
+                    _ => {
+                        let tid = self.ty_id(xt)?;
+                        format!("{{ let __b: bool = eval_error(format!({:?}, fmt_{tid}(&{x}))); __b }}", err("{}"))
+                    }
+                });
             }
             Ident(n) if n == "Int" => {
                 return Ok(match xt {

@@ -492,13 +492,18 @@ impl ConstEval<'_> {
             // `x \in Nat` / `x \in Int` (common in assumptions). The set itself can't be built, so
             // only test membership
             Bin(op @ (BOp::In | BOp::NotIn), x, set)
-                if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int" || n == "Any")
+                if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int" || n == "Any" || n == "STRING")
                     && !env.contains_key(n) && !self.constants.contains_key(n)) =>
             {
                 let Ident(n) = set.strip() else { unreachable!() };
                 let inside = match self.eval(x, env)? {
                     // TLC's Any contains every value
                     _ if n == "Any" => true,
+                    // TRUE for a string, FALSE for a model value, and an error for anything else
+                    Value::Atom(a) if n == "STRING" => !self.atoms.is_model(a),
+                    v if n == "STRING" => {
+                        return Err(format!("Attempted to check if the value:\n{}\nis an element of STRING.", crate::compile::show_value(self.atoms, &v)))
+                    }
                     Value::Int(v) => n == "Int" || v >= 0,
                     _ => false,
                 };
