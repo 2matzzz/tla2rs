@@ -799,6 +799,10 @@ fn infer_types(
 ) -> R<HashMap<String, Ty>> {
     let bottom = Ty::Enum(vec![]);
     let mut cur: HashMap<String, Ty> = undeclared.iter().map(|v| (v.clone(), bottom.clone())).collect();
+    // How many times each type grew after its first value. A range that settles within a few rounds
+    // (e.g. `Cardinality(S)` or `x % 3` written into a variable) stays finite; one that keeps
+    // growing (`x + 1`) is widened to unbounded
+    let mut grew: HashMap<String, u32> = HashMap::new();
     for _ in 0..40 {
         let mut g = Gen::new(atoms, constants);
         g.scap = scap;
@@ -815,7 +819,17 @@ fn infer_types(
             let old = cur[v].clone();
             let Some(t) = got.get(v) else { continue };
             let j = join(&old, t).unwrap_or_else(|_| t.clone());
-            let w = widen(&old, &j);
+            let w = if old == bottom || j == old {
+                j
+            } else {
+                let n = grew.entry(v.clone()).or_insert(0);
+                *n += 1;
+                if *n < WIDEN_AFTER {
+                    j
+                } else {
+                    widen(&old, &j)
+                }
+            };
             if w != old {
                 cur.insert(v.clone(), w);
                 changed = true;
@@ -832,6 +846,9 @@ fn infer_types(
     }
     Err(format!("type inference did not settle for {}; add them to TypeOK (or TypeDecl)", undeclared.join(", ")))
 }
+
+/// Rounds of growth after which an inferred integer range is widened to unbounded
+const WIDEN_AFTER: u32 = 3;
 
 /// Widens integers whose range changed from the previous type to unbounded.
 fn widen(old: &Ty, new: &Ty) -> Ty {
