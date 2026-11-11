@@ -117,6 +117,28 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
     Expr::Bin(o, a.b(), b.b())
 }
 
+/// `[x \in S |-> e]`, and for several bound variables `[x \in S, y \in T |-> e]`, a function on
+/// tuples: `[t \in S \X T |-> LET x == t[1] y == t[2] IN e]`
+fn fun_cons(bs: Vec<(String, Expr)>, body: Expr) -> Expr {
+    if bs.len() == 1 {
+        let (x, s) = bs.into_iter().next().unwrap();
+        return Expr::FunCons(x, s.b(), body.b());
+    }
+    // `#` cannot start a TLA+ identifier, so this name cannot capture one of the spec's
+    let t = "#args".to_string();
+    let defs = bs
+        .iter()
+        .enumerate()
+        .map(|(i, (x, _))| Def {
+            name: x.clone(),
+            params: vec![],
+            body: Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b()),
+        })
+        .collect();
+    let dom = Expr::Call("\\X".into(), bs.into_iter().map(|(_, s)| s).collect());
+    Expr::FunCons(t, dom.b(), Expr::Let(defs, body.b()).b())
+}
+
 impl Parser {
     fn raw(&self) -> &Token {
         &self.toks[self.pos]
@@ -265,8 +287,19 @@ impl Parser {
             }
             self.expect(")")?;
         }
-        if self.is("[") {
-            return self.err("function definitions `f[x \\in S] == ...` are not supported yet");
+        if self.is("[") && params.is_empty() {
+            // f[x \in S] == e is f == [x \in S |-> e]
+            let at = self.pos;
+            self.pos += 1;
+            let bs = self.nested(|p| p.binders())?;
+            self.expect("]")?;
+            self.expect("==")?;
+            let body = self.expr(0)?;
+            if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
+                self.pos = at;
+                return self.err(&format!("recursive function definitions are not supported (`{name}` is used in its own definition)"));
+            }
+            return Ok(Def { name, params, body: fun_cons(bs, body) });
         }
         self.expect("==")?;
         let body = self.expr(0)?;
@@ -608,7 +641,17 @@ impl Parser {
                 return Ok(if lit { Expr::RecLit(fs) } else { Expr::RecSet(fs) });
             }
         }
+        let start = self.pos;
         let e = self.expr(0)?;
+        if self.is(",") && matches!(&e, Expr::Ident(_) | Expr::Bin(BOp::In, ..)) {
+            // [x \in S, y \in T |-> e] or [x, y \in S |-> e]
+            self.pos = start;
+            let bs = self.binders()?;
+            self.expect("|->")?;
+            let body = self.expr(0)?;
+            self.expect("]")?;
+            return Ok(fun_cons(bs, body));
+        }
         if self.is_kw("EXCEPT") {
             self.pos += 1;
             let mut ups = vec![];
@@ -618,8 +661,9 @@ impl Parser {
                 loop {
                     if self.is("[") {
                         self.pos += 1;
-                        let i = self.expr(0)?;
-                        self.expect("]")?;
+                        // ![a, b] is ![<<a, b>>]
+                        let mut ix = self.comma_list("]")?;
+                        let i = if ix.len() == 1 { ix.pop().unwrap() } else { Expr::Tuple(ix) };
                         path.push(Path::Idx(i));
                     } else if self.is(".") {
                         self.pos += 1;
@@ -654,7 +698,7 @@ impl Parser {
                     return Ok(Expr::FunCons(x.clone(), s.clone(), body.b()));
                 }
             }
-            return self.err("unsupported function constructor (only [x \\in S |-> e])");
+            return self.err("unsupported function constructor");
         }
         self.expect("]")?;
         // [A]_v
