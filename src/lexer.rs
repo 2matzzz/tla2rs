@@ -208,6 +208,16 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
             }
         } else {
             let rest: String = cs[i..(i + 3).min(cs.len())].iter().collect();
+            // (+) and (-) spell \oplus and \ominus (the bag union and difference of Bags)
+            if rest == "(+)" || rest == "(-)" {
+                for _ in 0..3 {
+                    adv!();
+                }
+                let name = if rest == "(+)" { "\\oplus" } else { "\\ominus" };
+                out.push(Token { tok: Tok::Sym(name.into()), line: tl, col: tc, first });
+                line_has_tok = true;
+                continue;
+            }
             let Some(sym) = SYMS.iter().find(|s| rest.starts_with(**s)) else {
                 return Err(format!("line {line}:{col}: unexpected character {c:?}"));
             };

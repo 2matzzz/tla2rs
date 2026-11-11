@@ -26,6 +26,9 @@ pub enum Ty {
     Set(Box<Ty>),
     /// A sequence (a tuple whose length varies) of elements of this type, up to QCAP long
     Seq(Box<Ty>),
+    /// A bag (Bags module) of elements of this (enumerable) type: a count per element, 0 for an
+    /// element not in it. As a TLA+ value it is the function from its elements to their counts
+    Bag(Box<Ty>),
     /// An optional record field (arises when records whose fields differ by variant are merged into
     /// one type). Represented as (present, value); an absent field holds the default value
     Opt(Box<Ty>),
@@ -101,7 +104,7 @@ impl Ty {
             Ty::IntAtom(lo, hi, v) => int_count(*lo, *hi)?.checked_add(v.len() as u64),
             Ty::Rec(fs) => fs.iter().try_fold(1u64, |acc, (_, t)| acc.checked_mul(t.size()?)),
             Ty::Opt(t) => t.size()?.checked_add(1),
-            Ty::Fun(..) | Ty::Set(..) | Ty::Seq(_) => None,
+            Ty::Fun(..) | Ty::Set(..) | Ty::Seq(_) | Ty::Bag(_) => None,
         }
     }
 
@@ -114,6 +117,7 @@ impl Ty {
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
             Ty::Set(e) if is_sparse(self) => format!("SSet<{}, SCAP>", e.repr()),
             Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),
+            Ty::Bag(e) => format!("[i64; {}]", e.size().unwrap_or(0)),
             Ty::Set(_) => "u128".into(),
             Ty::Opt(t) => format!("(bool, {})", t.repr()),
         }
@@ -140,6 +144,7 @@ impl Ty {
             (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) => d1 == d2 && c1.kind_eq(c2),
             (Ty::Set(_), Ty::Set(_)) => is_sparse(self) == is_sparse(o),
             (Ty::Seq(a), Ty::Seq(b)) => a.kind_eq(b),
+            (Ty::Bag(a), Ty::Bag(b)) => a == b,
             (Ty::Opt(a), Ty::Opt(b)) => a.kind_eq(b),
             _ => false,
         }
@@ -239,6 +244,8 @@ impl Ty {
             }
             (Ty::Fun(d, c), Value::Tuple(xs)) if seq_domain(d) == Some(xs.len()) => xs.iter().all(|x| c.conforms(x)),
             (Ty::Seq(e), Value::Tuple(xs)) => xs.iter().all(|x| e.conforms(x)),
+            (Ty::Bag(e), v) => crate::value::as_fun(v)
+                .is_some_and(|m| m.iter().all(|(k, c)| e.enc(k).is_some() && matches!(c, Value::Int(n) if *n > 0))),
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
@@ -321,6 +328,9 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::Fun(d1, _), Ty::Fun(d2, _)) if seq_domain(d1).is_some() && seq_domain(d2).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         (Ty::Seq(_), t) | (t, Ty::Seq(_)) if seq_elems(t).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(join(x, y)?.into()),
+        (Ty::Bag(x), Ty::Bag(y)) => Ty::Bag(join(x, y)?.into()),
+        // <<>> is the empty function, so also the empty bag
+        (Ty::Bag(x), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Bag(x)) if fs.is_empty() => Ty::Bag(x.clone()),
         _ => return Err(format!("type mismatch: {a:?} vs {b:?}")),
     })
 }

@@ -169,6 +169,8 @@ impl ConstEval<'_> {
                     Value::Atom(self.atoms.get(true, m).ok_or("unknown model value")?)
                 } else if n == "BOOLEAN" {
                     Value::Set([Value::Bool(false), Value::Bool(true)].into())
+                } else if n == "EmptyBag" {
+                    Value::Tuple(vec![])
                 } else {
                     return Err(format!("`{n}` is not a constant"));
                 }
@@ -265,6 +267,84 @@ impl ConstEval<'_> {
                     Value::Atom(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v)))
                 }
                 ("TLCEval", [x]) => self.eval(x, env)?,
+                // Bags: functions from elements to their (positive) counts
+                ("SetToBag", [s]) => fun_value(self.eval(s, env)?.as_set()?.iter().map(|x| (x.clone(), Value::Int(1))).collect()),
+                ("BagToSet", [b]) => Value::Set(self.bag(b, env)?.into_keys().collect()),
+                ("BagIn", [x, b]) => Value::Bool(self.bag(b, env)?.contains_key(&self.eval(x, env)?)),
+                ("CopiesIn", [x, b]) => self.bag(b, env)?.get(&self.eval(x, env)?).cloned().unwrap_or(Value::Int(0)),
+                ("\\oplus", [a, b]) => {
+                    let mut m = self.bag(a, env)?;
+                    for (k, c) in self.bag(b, env)? {
+                        let n = m.get(&k).map_or(Ok(0), |v| v.as_int())? + c.as_int()?;
+                        m.insert(k, Value::Int(n));
+                    }
+                    fun_value(m)
+                }
+                ("\\ominus", [a, b]) => {
+                    let mut m = self.bag(a, env)?;
+                    for (k, c) in self.bag(b, env)? {
+                        if let Some(v) = m.get(&k).cloned() {
+                            let n = v.as_int()? - c.as_int()?;
+                            if n > 0 {
+                                m.insert(k, Value::Int(n));
+                            } else {
+                                m.remove(&k);
+                            }
+                        }
+                    }
+                    fun_value(m)
+                }
+                ("BagUnion", [s]) => {
+                    let mut m: BTreeMap<Value, Value> = BTreeMap::new();
+                    for b in self.eval(s, env)?.as_set()? {
+                        for (k, c) in as_fun(b).ok_or("BagUnion of a set holding a value that is not a bag")? {
+                            let n = m.get(&k).map_or(Ok(0), |v| v.as_int())? + c.as_int()?;
+                            m.insert(k, Value::Int(n));
+                        }
+                    }
+                    fun_value(m)
+                }
+                ("\\sqsubseteq", [a, b]) => {
+                    let (a, b) = (self.bag(a, env)?, self.bag(b, env)?);
+                    let mut ok = true;
+                    for (k, c) in &a {
+                        ok &= c.as_int()? <= b.get(k).map_or(Ok(0), |v| v.as_int())?;
+                    }
+                    Value::Bool(ok)
+                }
+                ("SubBag", [b]) => {
+                    let b: Vec<(Value, i64)> = self.bag(b, env)?.into_iter().map(|(k, c)| Ok((k, c.as_int()?))).collect::<R<_>>()?;
+                    let mut out = vec![BTreeMap::new()];
+                    for (k, c) in b {
+                        let mut next = vec![];
+                        for m in &out {
+                            for n in 0..=c {
+                                let mut m2: BTreeMap<Value, Value> = m.clone();
+                                if n > 0 {
+                                    m2.insert(k.clone(), Value::Int(n));
+                                }
+                                next.push(m2);
+                            }
+                        }
+                        out = next;
+                        if out.len() > ENUM_LIMIT {
+                            return Err("SubBag too large to enumerate".into());
+                        }
+                    }
+                    Value::Set(out.into_iter().map(fun_value).collect())
+                }
+                ("BagOfAll", [Lambda(ps, body), b]) if ps.len() == 1 => {
+                    let mut m: BTreeMap<Value, Value> = BTreeMap::new();
+                    for (k, c) in self.bag(b, env)? {
+                        let mut env2 = env.clone();
+                        env2.insert(ps[0].clone(), k);
+                        let y = self.eval(body, &env2)?;
+                        let n = m.get(&y).map_or(Ok(0), |v| v.as_int())? + c.as_int()?;
+                        m.insert(y, Value::Int(n));
+                    }
+                    fun_value(m)
+                }
+                ("BagCardinality", [b]) => Value::Int(self.bag(b, env)?.values().map(|c| c.as_int()).sum::<R<i64>>()?),
                 // A stable insertion sort with Op as "comes before"
                 ("SortSeq", [q, Lambda(ps, body)]) if ps.len() == 2 => {
                     let mut t = self.seq(q, env, "SortSeq")?;
@@ -696,6 +776,12 @@ impl ConstEval<'_> {
             return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and an integer)"));
         }
         Ok(a == b)
+    }
+
+    /// The entries of a bag
+    fn bag(&self, e: &Expr, env: &HashMap<String, Value>) -> R<BTreeMap<Value, Value>> {
+        let v = self.eval(e, env)?;
+        as_fun(&v).ok_or(format!("{v:?} is not a bag"))
     }
 
     /// Whether `e` evaluates to a string

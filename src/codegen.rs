@@ -124,6 +124,11 @@ impl<'a> Gen<'a> {
                 }
                 self.ty_id(e)?;
             }
+            Ty::Bag(e) => {
+                e.size().ok_or("a bag of elements of a type that is not enumerable is not supported")?;
+                self.ty_id(e)?;
+                self.ty_id(&bag_fun(e))?;
+            }
             Ty::Seq(e) => {
                 if self.qcap == 0 {
                     return Err("sequences whose length changes need a maximum length: add `Len(x) <= N` to TypeOK or a CONSTRAINT, or pass -seqcap N".into());
@@ -333,6 +338,51 @@ impl<'a> Gen<'a> {
             res_ids.dedup();
             (code, Ty::Enum(res_ids))
         })
+    }
+
+    /// Whether `b` is a bag held in the state (a constant bag is a plain function value)
+    fn is_bag(&mut self, b: &Expr, env: &Env) -> bool {
+        matches!(b.strip(), Expr::Ident(n) if n == "EmptyBag") || matches!(self.gen(b, env, None), Ok((_, Ty::Bag(_))))
+            || matches!(b.strip(), Expr::Call(f, _) if f == "SetToBag")
+    }
+
+    /// The code of the bag `b` and its element type; with `elem`, converted to bags of that type
+    fn bag_of(&mut self, b: &Expr, env: &Env, elem: Option<&Ty>) -> R<(String, Ty)> {
+        if let Some(v) = self.try_const(b, env) {
+            let m = crate::value::as_fun(&v).ok_or(format!("{v:?} is not a bag"))?;
+            let e = match elem {
+                Some(e) => e.clone(),
+                None => match ty_of_value(&Value::Set(m.keys().cloned().collect()))? {
+                    Ty::Set(e) => *e,
+                    _ => unreachable!(),
+                },
+            };
+            let bt = Ty::Bag(e.clone().into());
+            return Ok((self.lit(&v, &bt)?, e));
+        }
+        let want = elem.map(|e| Ty::Bag(e.clone().into()));
+        let (c, t) = self.gen(b, env, want.as_ref())?;
+        // <<>> (the type of a variable that has only been EmptyBag so far) is the empty bag
+        if matches!(&t, Ty::Rec(fs) if fs.is_empty()) {
+            let e = elem.cloned().unwrap_or(Ty::Enum(vec![]));
+            let bt = Ty::Bag(e.clone().into());
+            return Ok((format!("{{ let _ = {c}; {} }}", Self::default_code(&bt)), e));
+        }
+        let Ty::Bag(e) = &t else { return Err(format!("a bag operator applied to {t:?}, which is not a bag")) };
+        match elem {
+            Some(w) if w != e.as_ref() => Ok((self.coerce(c, &t, &Ty::Bag(w.clone().into()))?, w.clone())),
+            _ => Ok((c, e.as_ref().clone())),
+        }
+    }
+
+    /// The set of elements of a bag (BagToSet, and DOMAIN of a bag)
+    fn bag_domain(&mut self, b: &Expr, env: &Env) -> R<(String, Ty)> {
+        let (bc, e) = self.bag_of(b, env, None)?;
+        let st = Ty::Set(e.clone().into());
+        let eid = self.ty_id(&e)?;
+        let empty = self.s_empty(&st)?;
+        let add = self.s_add("__s", &format!("dec_{eid}(__i as u64)"), &st)?;
+        Ok((format!("{{ let __b = {bc}; let mut __s = {empty}; for __i in 0..__b.len() {{ if __b[__i] > 0 {{ {add} }} }} __s }}"), st))
     }
 
     /// The value of `q` as a sequence (converting a tuple or a function over 1..n), and its type
@@ -777,6 +827,7 @@ impl<'a> Gen<'a> {
     /// Default value of a type (used for omitted fields and unused SSet slots)
     fn default_code(t: &Ty) -> String {
         match t {
+            Ty::Bag(e) => format!("[0i64; {}]", e.size().unwrap_or(0)),
             Ty::Bool => "false".into(),
             Ty::Int(..) | Ty::IntAtom(..) => "0i64".into(),
             Ty::Enum(_) => "0u16".into(),
@@ -797,6 +848,15 @@ impl<'a> Gen<'a> {
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
             (Value::Atom(a), _) => format!("{a}u16"),
+            (v, Ty::Bag(e)) if crate::value::as_fun(v).is_some() => {
+                self.ty_id(t)?;
+                let m = crate::value::as_fun(v).unwrap();
+                let parts: Vec<String> = e.enumerate().iter().map(|k| match m.get(k) {
+                    Some(Value::Int(c)) => format!("{c}i64"),
+                    _ => "0i64".into(),
+                }).collect();
+                format!("[{}]", parts.iter().map(|p| format!("{p},")).collect::<String>())
+            }
             (Value::Tuple(xs), Ty::Seq(e)) => {
                 if xs.len() > self.qcap {
                     return Err(format!("a sequence of length {} is longer than the maximum length {}", xs.len(), self.qcap));
@@ -971,6 +1031,16 @@ impl<'a> Gen<'a> {
                 Ok(format!("{{ let mut {acc} = {empty}; for {x} in {it} {{ {add} }} {acc} }}"))
             }
             (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..) | Ty::Seq(_)) if x.is_empty() => Err("empty enum".into()),
+            (Ty::Rec(fs), Ty::Bag(_)) if fs.is_empty() => Ok(Self::default_code(to)),
+            // Bags over different element types: move each count to its element's place
+            (Ty::Bag(a), Ty::Bag(b)) => {
+                let (aid, bid) = (self.ty_id(a)?, self.ty_id(b)?);
+                let r = self.fresh("r");
+                Ok(format!(
+                    "{{ let {r} = {code}; let mut __o = {}; for (__i, &__c) in {r}.iter().enumerate() {{ if __c > 0 {{ __o[idx_{bid}(dec_{aid}(__i as u64))] = __c; }} }} __o }}",
+                    Self::default_code(to)
+                ))
+            }
             // Between tuples, functions over 1..n, and sequences
             (_, Ty::Seq(e)) if seq_elems(from).is_some() => {
                 let (r, q) = (self.fresh("r"), self.fresh("q"));
@@ -1074,6 +1144,14 @@ impl<'a> Gen<'a> {
                     } else {
                         (format!("s.v_{n}"), self.var_ty(n))
                     }
+                } else if n == "EmptyBag" {
+                    let t = match want {
+                        Some(Ty::Bag(e)) => Ty::Bag(e.clone()),
+                        _ => Ty::Bag(Ty::Enum(vec![]).into()),
+                    };
+                    (Self::default_code(&t), t)
+                } else if n == "JavaTime" {
+                    return Err("JavaTime is not supported: it reads the clock, so no two runs agree".into());
                 } else {
                     return Err(format!("unknown identifier `{n}` (missing CONSTANT in cfg?)"));
                 }
@@ -1159,6 +1237,68 @@ impl<'a> Gen<'a> {
                         t,
                     )
                 }
+                ("SetToBag", [x]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    let Ty::Set(e) = &t else { return Err("SetToBag of a non-set".into()) };
+                    let bt = Ty::Bag(e.clone());
+                    self.ty_id(&bt)?;
+                    let eid = self.ty_id(e)?;
+                    let it = self.s_iter(&c, &t)?;
+                    (format!("{{ let mut __b = {}; for __x in {it} {{ __b[idx_{eid}(__x)] = 1; }} __b }}", Self::default_code(&bt)), bt)
+                }
+                ("BagToSet", [b]) => self.bag_domain(b, env)?,
+                ("BagIn" | "CopiesIn", [x, b]) => {
+                    let (bc, e) = self.bag_of(b, env, None)?;
+                    let eid = self.ty_id(&e)?;
+                    let xc = self.gen_as(x, env, &e)?;
+                    let get = format!("{{ let __b = {bc}; let __i = enc_{eid}({xc}); if __i == u64::MAX {{ 0 }} else {{ __b[__i as usize] }} }}");
+                    if f == "BagIn" {
+                        (format!("({get} > 0)"), Ty::Bool)
+                    } else {
+                        (get, Ty::Int(0, BIG))
+                    }
+                }
+                ("\\oplus" | "\\ominus" | "\\sqsubseteq", [a, b]) if self.is_bag(a, env) || self.is_bag(b, env) => {
+                    let (_, ea) = self.bag_of(a, env, None)?;
+                    let (_, eb) = self.bag_of(b, env, None)?;
+                    let e = join(&ea, &eb)?;
+                    let (ac, _) = self.bag_of(a, env, Some(&e))?;
+                    let (bc, _) = self.bag_of(b, env, Some(&e))?;
+                    let bt = Ty::Bag(e.into());
+                    self.ty_id(&bt)?;
+                    match f.as_str() {
+                        "\\oplus" => (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for __i in 0..__a.len() {{ __a[__i] += __b[__i]; }} __a }}"), bt),
+                        "\\ominus" => (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for __i in 0..__a.len() {{ __a[__i] = (__a[__i] - __b[__i]).max(0); }} __a }}"), bt),
+                        _ => (format!("{{ let (__a, __b) = ({ac}, {bc}); let __le = __a.iter().zip(__b.iter()).all(|(x, y)| x <= y); __le }}"), Ty::Bool),
+                    }
+                }
+                ("BagCardinality", [b]) => {
+                    let (bc, _) = self.bag_of(b, env, None)?;
+                    (format!("{{ let __b = {bc}; let __n: i64 = __b.iter().sum(); __n }}"), Ty::Int(0, BIG))
+                }
+                ("BagUnion", [s]) => {
+                    let (c, t) = self.gen(s, env, None)?;
+                    let Ty::Set(bt) = &t else { return Err("BagUnion of a non-set".into()) };
+                    let Ty::Bag(_) = bt.as_ref() else { return Err("BagUnion of a set of values that are not bags".into()) };
+                    let it = self.s_iter(&c, &t)?;
+                    (format!("{{ let mut __a = {}; for __b in {it} {{ for __i in 0..__a.len() {{ __a[__i] += __b[__i]; }} }} __a }}", Self::default_code(bt)), bt.as_ref().clone())
+                }
+                ("BagOfAll", [Lambda(ps, body), b]) if ps.len() == 1 => {
+                    let (bc, e) = self.bag_of(b, env, None)?;
+                    let eid = self.ty_id(&e)?;
+                    let mut env2 = env.clone();
+                    let x = rid(&ps[0]);
+                    env2.locals.insert(ps[0].clone(), (x.clone(), e.clone()));
+                    let (yc, yt) = self.gen(body, &env2, None)?;
+                    let rt = Ty::Bag(yt.clone().into());
+                    self.ty_id(&rt)?;
+                    let yid = self.ty_id(&yt)?;
+                    (
+                        format!("{{ let __b = {bc}; let mut __r = {}; for __i in 0..__b.len() {{ if __b[__i] > 0 {{ let {x} = dec_{eid}(__i as u64); __r[idx_{yid}({yc})] += __b[__i]; }} }} __r }}", Self::default_code(&rt)),
+                        rt,
+                    )
+                }
+                ("SubBag", _) => return Err("SubBag of a bag from the state is not supported".into()),
                 // Counted without building the set (which could outgrow a sparse set's capacity)
                 ("Cardinality", [s]) if matches!(s.strip(), Call(f, _) if f == "\\X") && self.try_const(s, env).is_none() => {
                     let Call(_, parts) = s.strip() else { unreachable!() };
@@ -1299,6 +1439,9 @@ impl<'a> Gen<'a> {
             }
             Un(UOp::Domain, f) => {
                 let (_, ft) = self.gen(f, env, None)?;
+                if let Ty::Bag(_) = &ft {
+                    return self.bag_domain(f, env);
+                }
                 if let Ty::Seq(_) = &ft {
                     let (fc, _) = self.gen(f, env, None)?;
                     let st = Ty::Set(Ty::Int(1, self.qcap as i64).into());
@@ -1633,6 +1776,15 @@ impl<'a> Gen<'a> {
                 if let Ty::Seq(e) = &ft {
                     let (ic, _) = self.gen_int(x, env)?;
                     return Ok((format!("({fc}).at({ic})"), e.as_ref().clone()));
+                }
+                // A bag applied to an element: its count, an error for an element not in it
+                if let Ty::Bag(e) = &ft {
+                    let eid = self.ty_id(e)?;
+                    let xc = self.gen_as(x, env, e)?;
+                    return Ok((
+                        format!("{{ let __b = {fc}; let __i = enc_{eid}({xc}); if __i == u64::MAX || __b[__i as usize] == 0 {{ eval_error(\"Attempted to apply a bag to an element not in it\".into()) }} __b[__i as usize] }}"),
+                        Ty::Int(1, BIG),
+                    ));
                 }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
                 // If the argument is a bound variable with a known index, use it without conversion
@@ -2938,6 +3090,19 @@ impl<'a> Gen<'a> {
             }
             // fmt
             let fmt_body = match &t {
+                // A bag prints as the function it is: << >> when empty (TLC's spelling for an empty
+                // function), a tuple over 1..n
+                Ty::Bag(e) => {
+                    let eid = self.ty_id(e)?;
+                    let ints = matches!(e.as_ref(), Ty::Int(..));
+                    format!(
+                        "let ks: Vec<(u64, i64)> = v.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, &c)| (i as u64, c)).collect(); \
+                         if ks.is_empty() {{ return \"<< >>\".into(); }} \
+                         if {ints} && ks.iter().enumerate().all(|(j, &(i, _))| fmt_{eid}(&dec_{eid}(i)) == (j + 1).to_string()) {{ \
+                         return format!(\"<<{{}}>>\", ks.iter().map(|&(_, c)| c.to_string()).collect::<Vec<_>>().join(\", \")); }} \
+                         format!(\"({{}})\", ks.iter().map(|&(i, c)| format!(\"{{}} :> {{}}\", fmt_{eid}(&dec_{eid}(i)), c)).collect::<Vec<_>>().join(\" @@ \"))"
+                    )
+                }
                 Ty::Bool => "if *v { \"TRUE\".into() } else { \"FALSE\".into() }".to_string(),
                 Ty::Int(..) => "v.to_string()".into(),
                 Ty::Enum(_) => "ATOMS[*v as usize].to_string()".into(),
@@ -3054,6 +3219,9 @@ impl<'a> Gen<'a> {
     /// so shift amounts are baked in. After the first value whose size is only known at runtime
     /// (a sparse set), `at` becomes None and the code falls back to threading the offset.
     fn pack_value(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
+        if let Ty::Bag(e) = t {
+            return self.pack_value(c, &bag_fun(e), out, at);
+        }
         if let Some(n) = t.size() {
             let id = self.ty_id(t)?;
             let b = Self::bits_for(n);
@@ -3151,6 +3319,9 @@ impl<'a> Gen<'a> {
     /// permuted value. A function's entry j is read from the argument that `pm` maps to j, and a
     /// sparse set's elements are written in the order of their permuted values.
     fn pack_perm(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
+        if let Ty::Bag(e) = t {
+            return self.pack_perm(c, &bag_fun(e), out, at);
+        }
         let inv_key = |d: &Ty, k: &str| match d {
             Ty::Enum(_) => Some(format!("pi[({k}) as usize]")),
             Ty::Bool | Ty::Int(..) => Some(k.to_string()),
@@ -3238,6 +3409,9 @@ impl<'a> Gen<'a> {
     }
 
     fn unpack_value(&mut self, t: &Ty, at: &mut Option<u32>) -> R<String> {
+        if let Ty::Bag(e) = t {
+            return self.unpack_value(&bag_fun(e), at);
+        }
         if let Some(n) = t.size() {
             let id = self.ty_id(t)?;
             let b = Self::bits_for(n);
@@ -3391,7 +3565,11 @@ impl<'a> Gen<'a> {
 
     /// Expression applying the model-value permutation pm to value c of type t
     fn perm_code(&mut self, c: &str, t: &Ty) -> R<String> {
+        if let Ty::Bag(e) = t {
+            return self.perm_code(c, &bag_fun(e));
+        }
         Ok(match t {
+            Ty::Bag(_) => unreachable!(),
             Ty::Bool | Ty::Int(..) => c.to_string(),
             Ty::Enum(_) => format!("pm[({c}) as usize]"),
             Ty::IntAtom(..) => {
@@ -3579,6 +3757,11 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     }
 }
 "#;
+
+/// The function type a bag is stored as: element -> count (0 when absent)
+fn bag_fun(e: &Ty) -> Ty {
+    Ty::Fun(e.clone().into(), Ty::Int(0, BIG).into())
+}
 
 /// Whether the Rust order of values of type `t` differs from TLC's: a set held as a bitmask compares
 /// as a number in Rust, but by size and then elements in TLC
