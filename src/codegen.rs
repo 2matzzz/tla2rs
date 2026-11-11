@@ -1057,8 +1057,7 @@ impl<'a> Gen<'a> {
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),
             Un(UOp::Neg, x) => {
-                let (c, t) = self.gen(x, env, None)?;
-                let Ty::Int(lo, hi) = t else { return Err("negation of a non-integer".into()) };
+                let (c, (lo, hi)) = self.gen_int(x, env).map_err(|_| "negation of a non-integer".to_string())?;
                 (format!("(-{c})"), Ty::Int(-hi, -lo))
             }
             Un(UOp::Domain, f) => {
@@ -1682,6 +1681,12 @@ impl<'a> Gen<'a> {
         let (c, t) = self.gen(e, env, None)?;
         match t {
             Ty::Int(lo, hi) => Ok((c, (lo, hi))),
+            // An integer or a model value (`x # None => x + 1 > 0`): a model value reaching
+            // arithmetic or a comparison is an evaluation error, as in TLC
+            Ty::IntAtom(lo, hi, _) => Ok((
+                format!("{{ let __n: i64 = {c}; if __n < i64::MIN + 65536 {{ eval_error(format!(\"Attempted to use the model value {{}} as an integer\", ATOMS[(__n - i64::MIN) as usize])) }} __n }}"),
+                (lo, hi),
+            )),
             t => Err(format!("expected an integer, got {t:?} in {e:?}")),
         }
     }
