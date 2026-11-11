@@ -12,6 +12,11 @@ pub enum Ty {
     Int(i64, i64),
     /// Strings and model values, as ascending ids
     Enum(Vec<u32>),
+    /// Integers lo..hi together with model values (ascending ids), as in `1..4 \cup {None}`. Stored
+    /// as i64; model value a is i64::MIN + a, below every integer the checker stores, so it never
+    /// equals an integer and every integer type's `enc` rejects it. The model values come first in
+    /// the enumeration order, as TLC orders them before integers
+    IntAtom(i64, i64, Vec<u32>),
     /// Sorted by field name
     Rec(Vec<(String, Ty)>),
     /// Domain (an enumerable type) and range
@@ -34,13 +39,69 @@ pub fn is_sparse(t: &Ty) -> bool {
 
 pub const SET_BITS: u64 = 128;
 
+/// Number of integers in lo..hi
+fn int_count(lo: i64, hi: i64) -> Option<u64> {
+    u64::try_from((hi as i128 - lo as i128 + 1).max(0)).ok()
+}
+
+/// Whether coercing `from` to `to` turns an integer-or-model-value into a model value somewhere.
+/// That conversion fails at run time on an integer, so a comparison has to be made in the joined
+/// type instead.
+pub fn narrows(from: &Ty, to: &Ty) -> bool {
+    match (from, to) {
+        (Ty::IntAtom(..), Ty::Enum(_)) => true,
+        (Ty::Rec(a), Ty::Rec(b)) => a.iter().any(|(n, t)| b.iter().find(|(m, _)| m == n).is_some_and(|(_, u)| narrows(t, u))),
+        (Ty::Opt(a), Ty::Opt(b)) => narrows(a, b),
+        (Ty::Opt(a), b) => narrows(a, b),
+        (a, Ty::Opt(b)) => narrows(a, b),
+        (Ty::Fun(_, a), Ty::Fun(_, b)) | (Ty::Set(a), Ty::Set(b)) => narrows(a, b),
+        _ => false,
+    }
+}
+
+/// A tuple `<<e1, ..., en>>` has the type of a record whose fields are named #01, #02, ... (no TLA+
+/// field name starts with `#`, and the names sort in element order). Tuples of different lengths
+/// are different types, so sequences (tuples whose length changes) are not expressible.
+pub fn tuple_field(i: usize) -> String {
+    format!("#{:02}", i + 1)
+}
+
+/// Operators of the Sequences module. Sequences (tuples whose length changes) are not supported, so
+/// these are rejected by name.
+pub const SEQ_OPS: &[&str] = &["Seq", "Len", "Append", "Head", "Tail", "SubSeq", "SelectSeq", "\\o"];
+
+pub fn seq_op_error(f: &str) -> String {
+    format!("sequences are not supported yet (`{f}`); fixed-length tuples are")
+}
+
+pub fn tuple_ty(elems: Vec<Ty>) -> R<Ty> {
+    if elems.len() > 99 {
+        return Err("tuples of more than 99 elements are not supported".into());
+    }
+    Ok(Ty::Rec(elems.into_iter().enumerate().map(|(i, t)| (tuple_field(i), t)).collect()))
+}
+
+/// Whether record fields are those of a tuple
+pub fn is_tuple_fields(fs: &[(String, Ty)]) -> bool {
+    fs.iter().all(|(n, _)| n.starts_with('#'))
+}
+
+/// The element types of a tuple type
+pub fn tuple_elems(t: &Ty) -> Option<Vec<&Ty>> {
+    match t {
+        Ty::Rec(fs) if is_tuple_fields(fs) => Some(fs.iter().map(|(_, t)| t).collect()),
+        _ => None,
+    }
+}
+
 impl Ty {
     /// Number of values of an enumerable type
     pub fn size(&self) -> Option<u64> {
         match self {
             Ty::Bool => Some(2),
-            Ty::Int(lo, hi) => u64::try_from((*hi as i128 - *lo as i128 + 1).max(0)).ok(),
+            Ty::Int(lo, hi) => int_count(*lo, *hi),
             Ty::Enum(v) => Some(v.len() as u64),
+            Ty::IntAtom(lo, hi, v) => int_count(*lo, *hi)?.checked_add(v.len() as u64),
             Ty::Rec(fs) => fs.iter().try_fold(1u64, |acc, (_, t)| acc.checked_mul(t.size()?)),
             Ty::Opt(t) => t.size()?.checked_add(1),
             Ty::Fun(..) | Ty::Set(..) => None,
@@ -50,7 +111,7 @@ impl Ty {
     pub fn repr(&self) -> String {
         match self {
             Ty::Bool => "bool".into(),
-            Ty::Int(..) => "i64".into(),
+            Ty::Int(..) | Ty::IntAtom(..) => "i64".into(),
             Ty::Enum(_) => "u16".into(),
             Ty::Rec(fs) => format!("({})", fs.iter().map(|(_, t)| t.repr() + ",").collect::<String>()),
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
@@ -63,7 +124,7 @@ impl Ty {
     /// Whether the representation is layout-independent (i.e. retyping needs no conversion code)
     pub fn is_scalar(&self) -> bool {
         match self {
-            Ty::Bool | Ty::Int(..) | Ty::Enum(_) => true,
+            Ty::Bool | Ty::Int(..) | Ty::Enum(_) | Ty::IntAtom(..) => true,
             Ty::Rec(fs) => fs.iter().all(|(_, t)| t.is_scalar()),
             Ty::Opt(t) => t.is_scalar(),
             _ => false,
@@ -72,7 +133,9 @@ impl Ty {
 
     pub fn kind_eq(&self, o: &Ty) -> bool {
         match (self, o) {
-            (Ty::Bool, Ty::Bool) | (Ty::Int(..), Ty::Int(..)) | (Ty::Enum(_), Ty::Enum(_)) => true,
+            (Ty::Bool, Ty::Bool) | (Ty::Enum(_), Ty::Enum(_)) => true,
+            // The same i64 representation
+            (Ty::Int(..) | Ty::IntAtom(..), Ty::Int(..) | Ty::IntAtom(..)) => true,
             (Ty::Rec(a), Ty::Rec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|((x, s), (y, t))| x == y && s.kind_eq(t))
             }
@@ -89,6 +152,16 @@ impl Ty {
             Ty::Bool => vec![Value::Bool(false), Value::Bool(true)],
             Ty::Int(lo, hi) => (*lo..=*hi).map(Value::Int).collect(),
             Ty::Enum(v) => v.iter().map(|&a| Value::Atom(a)).collect(),
+            Ty::IntAtom(lo, hi, v) => v.iter().map(|&a| Value::Atom(a)).chain((*lo..=*hi).map(Value::Int)).collect(),
+            Ty::Rec(fs) if is_tuple_fields(fs) => {
+                // The first element varies slowest, as in enc
+                let mut out: Vec<Vec<Value>> = vec![vec![]];
+                for (_, t) in fs {
+                    let vals = t.enumerate();
+                    out = out.iter().flat_map(|r| vals.iter().map(move |v| [r.as_slice(), &[v.clone()]].concat())).collect();
+                }
+                out.into_iter().map(Value::Tuple).collect()
+            }
             Ty::Rec(fs) => {
                 let mut out = vec![std::collections::BTreeMap::new()];
                 for (k, t) in fs {
@@ -120,7 +193,19 @@ impl Ty {
             (Ty::Bool, Value::Bool(b)) => Some(*b as u64),
             (Ty::Int(lo, hi), Value::Int(i)) if lo <= i && i <= hi => Some((i - lo) as u64),
             (Ty::Enum(d), Value::Atom(a)) => d.iter().position(|x| x == a).map(|p| p as u64),
-            (Ty::Rec(fs), Value::Rec(m)) => {
+            (Ty::IntAtom(lo, hi, d), Value::Int(i)) if lo <= i && i <= hi => Some(d.len() as u64 + (i - lo) as u64),
+            (Ty::IntAtom(_, _, d), Value::Atom(a)) => d.iter().position(|x| x == a).map(|p| p as u64),
+            (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) => {
+                if xs.len() != fs.len() {
+                    return None;
+                }
+                let mut acc = 0u64;
+                for ((_, t), x) in fs.iter().zip(xs) {
+                    acc = acc * t.size()? + t.enc(x)?;
+                }
+                Some(acc)
+            }
+            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 if m.keys().any(|k| !fs.iter().any(|(n, _)| n == k)) {
                     return None;
                 }
@@ -150,7 +235,10 @@ impl Ty {
                 dom.sort();
                 keys == dom && m.values().all(|x| c.conforms(x))
             }
-            (Ty::Rec(fs), Value::Rec(m)) => {
+            (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) => {
+                xs.len() == fs.len() && fs.iter().zip(xs).all(|((_, t), x)| t.conforms(x))
+            }
+            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
                         (Ty::Opt(i), Some(x)) => i.conforms(x),
@@ -174,8 +262,29 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
             let s: BTreeSet<u32> = x.iter().chain(y).copied().collect();
             Ty::Enum(s.into_iter().collect())
         }
+        (Ty::Int(a, b), Ty::Enum(x)) | (Ty::Enum(x), Ty::Int(a, b)) => Ty::IntAtom(*a, *b, x.clone()),
+        (Ty::IntAtom(a, b, x), Ty::Int(c, d)) | (Ty::Int(c, d), Ty::IntAtom(a, b, x)) => Ty::IntAtom(*a.min(c), *b.max(d), x.clone()),
+        (Ty::IntAtom(a, b, x), Ty::Enum(y)) | (Ty::Enum(y), Ty::IntAtom(a, b, x)) => {
+            Ty::IntAtom(*a, *b, x.iter().chain(y).copied().collect::<BTreeSet<u32>>().into_iter().collect())
+        }
+        (Ty::IntAtom(a, b, x), Ty::IntAtom(c, d, y)) => {
+            Ty::IntAtom(*a.min(c), *b.max(d), x.iter().chain(y).copied().collect::<BTreeSet<u32>>().into_iter().collect())
+        }
         (Ty::Opt(a), Ty::Opt(b)) => Ty::Opt(join(a, b)?.into()),
         (Ty::Opt(a), b) | (b, Ty::Opt(a)) => Ty::Opt(join(a, b)?.into()),
+        (Ty::Rec(x), Ty::Rec(y)) if is_tuple_fields(x) || is_tuple_fields(y) => {
+            if !is_tuple_fields(x) || !is_tuple_fields(y) {
+                return Err(format!("type mismatch: a tuple and a record: {a:?} vs {b:?}"));
+            }
+            if x.len() != y.len() {
+                return Err(format!(
+                    "tuples of different lengths ({} and {}); sequences are not supported yet",
+                    x.len(),
+                    y.len()
+                ));
+            }
+            Ty::Rec(x.iter().zip(y).map(|((n, s), (_, t))| Ok((n.clone(), join(s, t)?))).collect::<R<_>>()?)
+        }
         (Ty::Rec(x), Ty::Rec(y)) => {
             // Union of the fields; a field present on only one side becomes optional
             let mut names: Vec<String> = x.iter().chain(y).map(|f| f.0.clone()).collect();
@@ -198,6 +307,9 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
             Ty::Rec(fs)
         }
         (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) if d1 == d2 => Ty::Fun(d1.clone(), join(c1, c2)?.into()),
+        (Ty::Fun(d, _), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, _)) if is_tuple_fields(fs) && matches!(**d, Ty::Int(1, _)) => {
+            return Err(format!("comparing a function over 1..n with a tuple is not supported: {a:?} vs {b:?}"))
+        }
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(join(x, y)?.into()),
         _ => return Err(format!("type mismatch: {a:?} vs {b:?}")),
     })
@@ -224,7 +336,7 @@ pub fn ty_of_value(v: &Value) -> R<Ty> {
             }
             Ty::Fun(dom.into(), c.into())
         }
-        Value::Tuple(_) => return Err("tuples / sequences are not supported yet".into()),
+        Value::Tuple(xs) => tuple_ty(xs.iter().map(ty_of_value).collect::<R<_>>()?)?,
     })
 }
 

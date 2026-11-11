@@ -55,7 +55,8 @@ not finish.
 2. **Expansion** (`expand.rs`): every operator definition is inlined. Bound variables are renamed to avoid capture,
    and each call site keeps a trace (name and arguments)
 3. **Types** (`types.rs`): a finite type per variable, taken from `x \in S` / `x \subseteq S` in `TypeOK`.
-   Strings and model values become `u16`, integers `i64`, records tuples, functions arrays, and sets `u128` bitmasks
+   Strings and model values become `u16`, integers `i64`, records and tuples Rust tuples, functions arrays, and sets
+   `u128` bitmasks
 4. **Code generation** (`codegen.rs`): constant subexpressions are evaluated at compile time and become literals.
    Actions are generated in continuation-passing style, threading "the remaining conjuncts" through; every `\/`,
    `\E`, and `IF` becomes a branch, and `x' = e` becomes a `let`
@@ -86,9 +87,9 @@ memory.
 
 | | |
 |---|---|
-| Expressions | logic, arithmetic (`+ - * \div %`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A`, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`) |
+| Expressions | logic, arithmetic (`+ - * \div %`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A`, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
 | Actions | `x' = e`, `x' \in S`, `UNCHANGED`, action-level `\/` `\E` `IF` `CASE`, guards that read an already assigned `x'` |
-| Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. `ASSUME` is checked |
+| Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. A model value may share a type with integers (`1..4 \cup {None}`). `ASSUME` is checked |
 | Properties | `INVARIANT`. `PROPERTY` supports `<>P`, `[]<>P`, `<>[]P`, `P ~> Q`, `[]P`, and `[][A]_v` (optionally quantified with `\A x \in S :`) |
 | Fairness | `WF_v(A)` (optionally quantified with `\A`). `A` must be a named definition called from `Next` |
 | State space | `CONSTRAINT`, `VIEW`, `SYMMETRY` |
@@ -100,7 +101,8 @@ memory.
   stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant)
 - Set elements may have at most 128 possible values. Sets of sets and sets of functions cannot be held as values
   (`SUBSET` and `[S -> T]` in `TypeOK` are fine)
-- Not supported: sequence and tuple values (`Sequences`), state-dependent `CHOOSE`, recursion, strong fairness (SF),
+- Not supported: sequences (tuples whose length changes, and the operators of `Sequences`), a tuple index that is not
+  constant, strings mixed with integers in one value, arithmetic on a value that may be a model value, state-dependent `CHOOSE`, recursion, strong fairness (SF),
   `ENABLED`, `<<A>>_v`, function definitions (`f[x \in S] == ...`), and `<-` in the cfg
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
   collision (an estimate is printed at the end)

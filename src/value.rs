@@ -49,9 +49,11 @@ pub enum Value {
 impl Value {
     fn rank(&self) -> u8 {
         match self {
-            Value::Bool(_) => 0,
-            Value::Int(_) => 1,
-            Value::Atom(_) => 2,
+            // TLC orders a model value before any other value. Atoms mix only with integers in one
+            // type (strings never do), so this matters for `1..3 \cup {None}`
+            Value::Atom(_) => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) => 2,
             Value::Set(_) => 3,
             Value::Fun(_) => 4,
             Value::Rec(_) => 5,
@@ -136,6 +138,18 @@ impl ConstEval<'_> {
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("Cardinality", [s]) => Value::Int(self.eval(s, env)?.as_set()?.len() as i64),
                 ("IsFiniteSet", [_]) => Value::Bool(true),
+                ("\\X", parts) => {
+                    let mut out: Vec<Vec<Value>> = vec![vec![]];
+                    for s in parts {
+                        let s = self.eval(s, env)?;
+                        let s = s.as_set()?;
+                        if out.len().saturating_mul(s.len()) > ENUM_LIMIT {
+                            return Err("cartesian product too large to enumerate".into());
+                        }
+                        out = out.iter().flat_map(|t| s.iter().map(move |x| [t.as_slice(), &[x.clone()]].concat())).collect();
+                    }
+                    Value::Set(out.into_iter().map(Value::Tuple).collect())
+                }
                 ("Permutations", [x]) => {
                     let elems: Vec<Value> = self.eval(x, env)?.as_set()?.iter().cloned().collect();
                     if elems.len() > 8 {
@@ -153,6 +167,7 @@ impl ConstEval<'_> {
                     }
                     Value::Set(out)
                 }
+                (f, _) if crate::types::SEQ_OPS.contains(&f) => return Err(crate::types::seq_op_error(f)),
                 _ => return Err(format!("operator `{f}` is not supported in constant expressions")),
             },
             Un(op, x) => {
@@ -182,6 +197,7 @@ impl ConstEval<'_> {
                     }
                     UOp::Domain => match v {
                         Value::Fun(m) => Value::Set(m.keys().cloned().collect()),
+                        Value::Tuple(t) => Value::Set((1..=t.len() as i64).map(Value::Int).collect()),
                         _ => return Err("DOMAIN of a non-function".into()),
                     },
                     _ => return Err(format!("{op:?} is not a constant operator")),

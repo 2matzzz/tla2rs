@@ -116,12 +116,75 @@ impl<'a> Gen<'a> {
                     self.ty_id(f)?;
                 }
             }
+            Ty::IntAtom(_, _, d) => self.check_model_values(d)?,
             _ => {}
         }
         let i = self.tys.len();
         self.tys.push(t.clone());
         self.ty_ids.insert(t.clone(), i);
         Ok(i)
+    }
+
+    /// Only model values can share a type with integers: TLC compares a model value with anything,
+    /// but stops with an error when comparing a string with an integer
+    fn check_model_values(&self, atoms: &[u32]) -> R<()> {
+        match atoms.iter().find(|&&a| !self.atoms.list[a as usize].0) {
+            Some(&a) => Err(format!(
+                "the string {} is mixed with integers in one value; only model values can be (TLC reports comparing a string with an integer as an error)",
+                self.atoms.show(a)
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// How TLC compares values of types `a` and `b` when a tuple meets something else. A tuple of
+    /// another length or a model value is unequal to it; an integer, boolean, string, record, set,
+    /// or function makes TLC stop with an error. A function over 1..n is not compiled (Err).
+    fn tuple_cmp(&self, a: &Ty, b: &Ty) -> R<Cmp> {
+        // Several parts: an error anywhere wins, then a part that is never equal
+        let all = |parts: Vec<Cmp>| {
+            parts.iter().find(|c| matches!(c, Cmp::Fails(_))).cloned().unwrap_or(if parts.contains(&Cmp::Unequal) {
+                Cmp::Unequal
+            } else {
+                Cmp::Normal
+            })
+        };
+        Ok(match (tuple_elems(a), tuple_elems(b)) {
+            (Some(x), Some(y)) if x.len() != y.len() => Cmp::Unequal,
+            (Some(x), Some(y)) => all(x.iter().zip(&y).map(|(s, t)| self.tuple_cmp(s, t)).collect::<R<_>>()?),
+            (Some(_), None) => self.tuple_vs(b)?,
+            (None, Some(_)) => self.tuple_vs(a)?,
+            (None, None) => match (a, b) {
+                (Ty::Rec(x), Ty::Rec(y)) => all(
+                    x.iter()
+                        .filter_map(|(n, s)| y.iter().find(|(m, _)| m == n).map(|(_, t)| self.tuple_cmp(s, t)))
+                        .collect::<R<_>>()?,
+                ),
+                // Only an error carries over: empty sets or absent fields can still be equal
+                (Ty::Opt(_), _) | (_, Ty::Opt(_)) | (Ty::Set(_), Ty::Set(_)) | (Ty::Fun(..), Ty::Fun(..)) => {
+                    let (x, y): (&Ty, &Ty) = match (a, b) {
+                        (Ty::Opt(x), y) | (y, Ty::Opt(x)) => (x, y),
+                        (Ty::Set(x), Ty::Set(y)) | (Ty::Fun(_, x), Ty::Fun(_, y)) => (x, y),
+                        _ => unreachable!(),
+                    };
+                    match self.tuple_cmp(x, y)? {
+                        Cmp::Fails(m) => Cmp::Fails(m),
+                        _ => Cmp::Normal,
+                    }
+                }
+                _ => Cmp::Normal,
+            },
+        })
+    }
+
+    /// `tuple_cmp` of a tuple against a value of the non-tuple type `t`
+    fn tuple_vs(&self, t: &Ty) -> R<Cmp> {
+        Ok(match t {
+            Ty::Enum(v) if v.is_empty() => Cmp::Normal,
+            Ty::Enum(v) if v.iter().all(|&a| self.atoms.list[a as usize].0) => Cmp::Unequal,
+            _ if seq_like_fun(t) => return Err("comparing a function over 1..n with a tuple is not supported".into()),
+            _ => Cmp::Fails(format!("Attempted to compare a tuple with a value of type {t:?}")),
+        })
     }
 
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
@@ -162,6 +225,34 @@ impl<'a> Gen<'a> {
     }
 
     // ---------------------------------------------------------------- Sets (bitmasks and SSet)
+
+    /// 0-based position of the constant index `i` into a tuple of `n` elements
+    fn tuple_index(&self, i: &Expr, env: &Env, n: usize) -> R<usize> {
+        match self.try_const(i, env) {
+            Some(Value::Int(k)) if k >= 1 && k as u64 <= n as u64 => Ok(k as usize - 1),
+            Some(Value::Int(k)) => Err(format!("tuple index {k} is outside 1..{n}")),
+            _ => Err(format!("a tuple can only be indexed by a constant integer (got {})", short(i))),
+        }
+    }
+
+    /// Rewrites the steps of an EXCEPT path that index into a tuple (`![k][1]`) as steps into the
+    /// field the element is stored in
+    fn resolve_path(&self, t: &Ty, path: &[Path], env: &Env) -> R<Vec<Path>> {
+        let mut cur = Some(t.clone());
+        let mut out = vec![];
+        for p in path {
+            let step = match (p, &cur) {
+                (Path::Idx(i), Some(Ty::Rec(fs))) if is_tuple_fields(fs) => Path::Field(tuple_field(self.tuple_index(i, env, fs.len())?)),
+                _ => p.clone(),
+            };
+            cur = match &cur {
+                Some(c) => Self::path_type(c, std::slice::from_ref(&step)),
+                None => None,
+            };
+            out.push(step);
+        }
+        Ok(out)
+    }
 
     /// Type at the end of an EXCEPT path
     fn path_type(t: &Ty, path: &[Path]) -> Option<Ty> {
@@ -239,14 +330,33 @@ impl<'a> Gen<'a> {
     /// Whether x (of type xt) is a member of set c (of type st)
     fn s_has(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<String> {
         let et = Self::elem_of(st);
+        match self.tuple_cmp(xt, &et)? {
+            Cmp::Normal => {}
+            Cmp::Unequal => return Ok("false".into()),
+            // TLC compares only against the elements present, so an empty set is no error
+            Cmp::Fails(m) => {
+                let empty = if is_sparse(st) { format!("(({c}).len == 0)") } else { format!("({c} == 0)") };
+                return Ok(format!("(if {empty} {{ false }} else {{ {} }})", eval_error_bool(&m)));
+            }
+        }
         if matches!(&et, Ty::Enum(v) if v.is_empty()) {
             return Ok("false".into());
+        }
+        if narrows(xt, &et) {
+            // x may hold a model value stored as an integer-or-model-value: compare in the joined
+            // type rather than convert x (which fails at run time on an integer)
+            let jst = Ty::Set(join(xt, &et)?.into());
+            let cc = self.coerce(c.to_string(), st, &jst)?;
+            let v = self.fresh("s");
+            let inner = self.s_has(&v, &jst, x, xt)?;
+            return Ok(format!("{{ let {v} = {cc}; {inner} }}"));
         }
         if is_sparse(st) {
             let Ok(xc) = self.coerce_soft(x.to_string(), xt, &et) else { return Ok("false".into()) };
             return Ok(format!("({c}).contains(&{xc})"));
         }
-        if !xt.is_scalar() || !(xt.kind_eq(&et) || matches!((xt, &et), (Ty::Rec(_), Ty::Rec(_)))) {
+        let widens = join(xt, &et).ok().as_ref() == Some(&et);
+        if !xt.is_scalar() || !(xt.kind_eq(&et) || widens || matches!((xt, &et), (Ty::Rec(_), Ty::Rec(_)))) {
             return Ok("false".into());
         }
         let eid = self.ty_id(&et)?;
@@ -262,6 +372,9 @@ impl<'a> Gen<'a> {
             if a.iter().any(|(n, _)| !b.iter().any(|(m, _)| m == n)) {
                 return Err("record fields do not fit".into());
             }
+        }
+        if narrows(from, to) {
+            return Err("an integer does not fit a model value".into());
         }
         self.coerce(code, from, to)
     }
@@ -286,7 +399,7 @@ impl<'a> Gen<'a> {
     fn default_code(t: &Ty) -> String {
         match t {
             Ty::Bool => "false".into(),
-            Ty::Int(..) => "0i64".into(),
+            Ty::Int(..) | Ty::IntAtom(..) => "0i64".into(),
             Ty::Enum(_) => "0u16".into(),
             Ty::Rec(fs) => format!("({})", fs.iter().map(|(_, t)| Self::default_code(t) + ",").collect::<String>()),
             Ty::Opt(t) => format!("(false, {})", Self::default_code(t)),
@@ -302,8 +415,20 @@ impl<'a> Gen<'a> {
         Ok(match (v, t) {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
+            (Value::Atom(a), Ty::IntAtom(..)) => {
+                self.check_model_values(&[*a])?;
+                format!("(i64::MIN + {a}i64)")
+            }
             (Value::Atom(a), _) => format!("{a}u16"),
-            (Value::Rec(m), Ty::Rec(fs)) => {
+            (Value::Tuple(xs), Ty::Rec(fs)) if is_tuple_fields(fs) && xs.len() == fs.len() => {
+                let mut s = String::from("(");
+                for (x, (_, ft)) in xs.iter().zip(fs) {
+                    s += &self.lit(x, ft)?;
+                    s += ",";
+                }
+                s + ")"
+            }
+            (Value::Rec(m), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
                 let mut s = String::from("(");
                 for (k, ft) in fs {
                     s += &match (ft, m.get(k)) {
@@ -372,6 +497,15 @@ impl<'a> Gen<'a> {
     }
 
     fn coerce(&mut self, code: String, from: &Ty, to: &Ty) -> R<String> {
+        if let (Some(a), Some(b)) = (tuple_elems(from), tuple_elems(to)) {
+            if a.len() != b.len() {
+                return Err(format!(
+                    "tuples of different lengths ({} and {}); sequences are not supported yet",
+                    a.len(),
+                    b.len()
+                ));
+            }
+        }
         if from == to || (from.kind_eq(to) && Self::trivial(from, to)) {
             return Ok(code);
         }
@@ -385,7 +519,7 @@ impl<'a> Gen<'a> {
             return Ok(format!("{{ let __u: {} = unreachable!(); __u }}", to.repr()));
         }
         match (from, to) {
-            (Ty::Set(_), Ty::Set(_)) if !is_sparse(from) && !is_sparse(to) => {
+            (Ty::Set(a), Ty::Set(b)) if !is_sparse(from) && !is_sparse(to) && a.kind_eq(b) && Self::trivial(a, b) => {
                 let (a, b) = (self.ty_id(from)?, self.ty_id(to)?);
                 self.convs.insert((a, b));
                 Ok(format!("conv_{a}_{b}({code})"))
@@ -433,7 +567,7 @@ impl<'a> Gen<'a> {
                 }
                 Ok(s + ") }")
             }
-            (Ty::Set(_), Ty::Set(_)) if is_sparse(from) || is_sparse(to) => {
+            (Ty::Set(_), Ty::Set(_)) => {
                 // Coerce element by element and rebuild the set
                 let et = Self::elem_of(from);
                 let tt = Self::elem_of(to);
@@ -446,6 +580,16 @@ impl<'a> Gen<'a> {
                 Ok(format!("{{ let mut {acc} = {empty}; for {x} in {it} {{ {add} }} {acc} }}"))
             }
             (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..)) if x.is_empty() => Err("empty enum".into()),
+            (Ty::Enum(x), Ty::IntAtom(..)) => {
+                self.check_model_values(x)?;
+                Ok(format!("(i64::MIN + ({code}) as i64)"))
+            }
+            (Ty::IntAtom(..), Ty::Enum(_)) => {
+                let a = self.fresh("a");
+                Ok(format!(
+                    "{{ let {a} = {code}; if {a} >= i64::MIN + 65536 {{ eval_error(format!(\"the integer {{}} is used where a model value is expected\", {a})) }} ({a} - i64::MIN) as u16 }}"
+                ))
+            }
             _ if from.kind_eq(to) => Ok(code),
             _ => Err(format!("type mismatch: cannot use {from:?} as {to:?}")),
         }
@@ -514,6 +658,13 @@ impl<'a> Gen<'a> {
                     let hi = if is_sparse(&t) { BIG } else { el.size().unwrap_or(0) as i64 };
                     (self.s_card(&c, &t), Ty::Int(0, hi))
                 }
+                ("\\X", _) => {
+                    return Err(format!(
+                        "the cartesian product \\X over state-dependent sets is only supported on the right of \\in: {}",
+                        short(e)
+                    ))
+                }
+                (f, _) if SEQ_OPS.contains(&f) => return Err(seq_op_error(f)),
                 _ => return Err(format!("unknown operator `{f}`")),
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),
@@ -524,6 +675,14 @@ impl<'a> Gen<'a> {
             }
             Un(UOp::Domain, f) => {
                 let (_, ft) = self.gen(f, env, None)?;
+                if let Some(el) = tuple_elems(&ft) {
+                    // A tuple of n elements is a function over 1..n
+                    let n = el.len();
+                    let st = Ty::Set(Ty::Int(1, n as i64).into());
+                    self.ty_id(&st)?;
+                    let mask: u128 = if n >= 128 { u128::MAX } else { (1u128 << n) - 1 };
+                    return Ok((format!("{mask}u128"), st));
+                }
                 let Ty::Fun(d, _) = ft else { return Err("DOMAIN of a non-function".into()) };
                 let st = Ty::Set(d.clone());
                 self.ty_id(&st)?;
@@ -723,6 +882,12 @@ impl<'a> Gen<'a> {
             }
             App(f, x) => {
                 let (fc, ft) = self.gen(f, env, None)?;
+                if let Ty::Rec(fs) = &ft {
+                    if is_tuple_fields(fs) {
+                        let k = self.tuple_index(x, env, fs.len())?;
+                        return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                    }
+                }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
                 // If the argument is a bound variable with a known index, use it without conversion
                 if let Ident(n) = x.strip() {
@@ -753,6 +918,9 @@ impl<'a> Gen<'a> {
             }
             Except(f, ups) => {
                 let (fc, ft0) = self.gen(f, env, want)?;
+                let ups: Vec<(Vec<Path>, Expr)> =
+                    ups.iter().map(|(p, v)| Ok((self.resolve_path(&ft0, p, env)?, v.clone()))).collect::<R<_>>()?;
+                let ups = &ups;
                 // Widen to include the types of the written values (when writing a wider value into
                 // a narrower function; type inference relies on this too)
                 let mut ft = ft0.clone();
@@ -876,6 +1044,12 @@ impl<'a> Gen<'a> {
             Eq | Neq => {
                 let (ac, at) = self.gen(a, env, None)?;
                 let (bc, bt) = self.gen(b, env, Some(&at))?;
+                // Still evaluate both sides, which may stop with an error as in TLC
+                match self.tuple_cmp(&at, &bt)? {
+                    Cmp::Normal => {}
+                    Cmp::Unequal => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", op == Neq), Ty::Bool)),
+                    Cmp::Fails(m) => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", eval_error_bool(&m)), Ty::Bool)),
+                }
                 let t = join(&at, &bt)?;
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
@@ -1029,6 +1203,18 @@ impl<'a> Gen<'a> {
     fn gen_member(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
         let s = s.strip();
+        // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
+        // treats it as a function in [S -> T]; none of these is compiled
+        if tuple_elems(xt).is_some() {
+            if matches!(s, FunSet(..)) {
+                return Err(format!("membership of a tuple in a set of functions is not supported: {}", short(s)));
+            }
+            if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
+                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int"].contains(&n.as_str()))
+            {
+                return Ok(eval_error_bool(&format!("Attempted to check if the tuple {x} is an element of {}", short(s))));
+            }
+        }
         match s {
             Un(UOp::Subset, t) => {
                 let Ty::Set(et) = xt else { return Ok("false".into()) };
@@ -1064,11 +1250,43 @@ impl<'a> Gen<'a> {
                 }
                 return Ok(format!("({})", parts.join(" && ")));
             }
+            // Membership in A \X B is decided element by element, also for constant sets (that
+            // avoids enumerating a large product)
+            Call(f, parts) if f == "\\X" => {
+                let Some(el) = tuple_elems(xt) else {
+                    // TLC answers FALSE for a string or model value and stops with an error for
+                    // anything else that is not a tuple
+                    if matches!(xt, Ty::Enum(_)) {
+                        return Ok("false".into());
+                    }
+                    if seq_like_fun(xt) {
+                        return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+                    }
+                    return Ok(eval_error_bool(&format!("Attempted to check if a non-tuple value of type {xt:?} is an element of a cartesian product")));
+                };
+                if el.len() != parts.len() {
+                    return Ok("false".into());
+                }
+                let el: Vec<Ty> = el.into_iter().cloned().collect();
+                let mut conj = vec![];
+                for (i, (part, et)) in parts.iter().zip(&el).enumerate() {
+                    let e = self.fresh("e");
+                    let inner = self.gen_member(&e, et, part, env)?;
+                    conj.push(format!("{{ let {e} = {x}.{i}; {inner} }}"));
+                }
+                return Ok(format!("({})", conj.join(" && ")));
+            }
             Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
             Ident(n) if n == "Nat" => {
-                return Ok(if matches!(xt, Ty::Int(..)) { format!("({x} >= 0)") } else { "false".into() })
+                return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
             }
-            Ident(n) if n == "Int" => return Ok(matches!(xt, Ty::Int(..)).to_string()),
+            Ident(n) if n == "Int" => {
+                return Ok(match xt {
+                    Ty::Int(..) => "true".into(),
+                    Ty::IntAtom(..) => format!("({x} >= i64::MIN + 65536)"),
+                    _ => "false".into(),
+                })
+            }
             Bin(BOp::Range, a, b) => {
                 let (ac, _) = self.gen_int(a, env)?;
                 let (bc, _) = self.gen_int(b, env)?;
@@ -1094,7 +1312,23 @@ impl<'a> Gen<'a> {
         }
         if let Some(v) = self.try_const(s, env) {
             let set = v.as_set()?;
-            let fits: Vec<&Value> = set.iter().filter(|e| xt.conforms(e)).collect();
+            let mut fits: Vec<&Value> = vec![];
+            let mut clash = None;
+            for e in set {
+                match self.tuple_cmp(xt, &ty_of_value(e)?).map_err(|m| format!("{m}: {}", short(s)))? {
+                    Cmp::Normal if xt.conforms(e) => fits.push(e),
+                    Cmp::Normal | Cmp::Unequal => {}
+                    Cmp::Fails(m) => clash = Some(m),
+                }
+            }
+            if let Some(m) = clash {
+                // TLC stops comparing x with an element it cannot compare it with. If other
+                // elements might match first, whether it stops depends on its order: reject
+                if !fits.is_empty() {
+                    return Err(format!("{m}: {}", short(s)));
+                }
+                return Ok(eval_error_bool(&m));
+            }
             if fits.is_empty() {
                 return Ok("false".into());
             }
@@ -1103,7 +1337,10 @@ impl<'a> Gen<'a> {
                     fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
                 return Ok(format!("({})", parts.join(" || ")));
             }
-            let Ty::Set(et) = ty_of_value(&v)? else { unreachable!() };
+            let Ty::Set(mut et) = ty_of_value(&v)? else { unreachable!() };
+            if narrows(xt, &et) {
+                et = join(xt, &et)?.into();
+            }
             let st = Ty::Set(et.clone());
             let mask = self.lit(&v, &st)?;
             let eid = self.ty_id(&et)?;
@@ -1112,11 +1349,37 @@ impl<'a> Gen<'a> {
         }
         if let SetLit(xs) = s {
             let mut parts = vec![];
+            let mut clash = None;
+            let mut comparable = false;
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
-                if let Ok(c) = self.coerce_soft(c, &t, xt) {
+                match self.tuple_cmp(xt, &t)? {
+                    Cmp::Normal => comparable = true,
+                    Cmp::Unequal => {
+                        parts.push(format!("{{ let _ = {c}; false }}"));
+                        continue;
+                    }
+                    Cmp::Fails(m) => {
+                        clash = Some(m);
+                        parts.push(format!("{{ let _ = {c}; false }}"));
+                        continue;
+                    }
+                }
+                if narrows(&t, xt) {
+                    // Compare in the joined type (converting the element could fail at run time)
+                    let j = join(xt, &t)?;
+                    let xc = self.coerce(x.to_string(), xt, &j)?;
+                    let c = self.coerce(c, &t, &j)?;
+                    parts.push(format!("{xc} == {c}"));
+                } else if let Ok(c) = self.coerce_soft(c, &t, xt) {
                     parts.push(format!("{x} == {c}"));
                 }
+            }
+            if let Some(m) = clash {
+                if comparable {
+                    return Err(format!("{m}: {}", short(s)));
+                }
+                return Ok(format!("({} || {})", parts.join(" || "), eval_error_bool(&m)));
             }
             return Ok(if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) });
         }
@@ -1449,6 +1712,7 @@ impl<'a> Gen<'a> {
         out: &mut String,
     ) -> R<()> {
         for (path, val) in ups {
+            let path = &self.resolve_path(ft, path, env)?;
             let mut p = place.to_string();
             let mut cur = ft.clone();
             let mut conds = vec![];
@@ -1658,6 +1922,14 @@ impl<'a> Gen<'a> {
                         let arms: String = d.iter().enumerate().map(|(p, a)| format!("{a} => {p}, ")).collect();
                         format!("match v {{ {arms}_ => u64::MAX }}")
                     }
+                    Ty::IntAtom(lo, hi, d) => {
+                        // Model values first, then the integers
+                        let k = d.len();
+                        let arms: String = d.iter().enumerate().map(|(p, a)| format!("{a} => {p}, ")).collect();
+                        format!(
+                            "if v >= {lo} && v <= {hi} {{ (v as i128 - {lo} as i128) as u64 + {k} }} else {{ match (v as i128 - i64::MIN as i128) as u64 {{ {arms}_ => u64::MAX }} }}"
+                        )
+                    }
                     Ty::Rec(fs) => {
                         let mut b = String::from("let mut acc: u64 = 0; ");
                         for (k, (_, ft)) in fs.iter().enumerate() {
@@ -1683,6 +1955,14 @@ impl<'a> Gen<'a> {
                     Ty::Enum(d) => {
                         let list: Vec<String> = d.iter().map(|a| format!("{a}u16")).collect();
                         format!("const T: [u16; {}] = [{}]; T[i as usize]", d.len(), list.join(", "))
+                    }
+                    Ty::IntAtom(lo, _, d) => {
+                        let k = d.len();
+                        let list: Vec<String> = d.iter().map(|a| format!("{a}u16")).collect();
+                        format!(
+                            "if i >= {k} {{ ({lo} as i128 + (i - {k}) as i128) as i64 }} else {{ const T: [u16; {k}] = [{}]; i64::MIN + T[i as usize] as i64 }}",
+                            list.join(", ")
+                        )
                     }
                     Ty::Rec(fs) => {
                         let mut b = String::from("let mut i = i; ");
@@ -1721,6 +2001,7 @@ impl<'a> Gen<'a> {
                 Ty::Bool => "if *v { \"TRUE\".into() } else { \"FALSE\".into() }".to_string(),
                 Ty::Int(..) => "v.to_string()".into(),
                 Ty::Enum(_) => "ATOMS[*v as usize].to_string()".into(),
+                Ty::IntAtom(..) => "if *v < i64::MIN + 65536 { ATOMS[(*v - i64::MIN) as usize].to_string() } else { v.to_string() }".into(),
                 Ty::Rec(fs) if fs.iter().all(|(n, _)| n.starts_with('#')) => {
                     // Tuple
                     let mut parts = vec![];
@@ -2142,6 +2423,10 @@ impl<'a> Gen<'a> {
         Ok(match t {
             Ty::Bool | Ty::Int(..) => c.to_string(),
             Ty::Enum(_) => format!("pm[({c}) as usize]"),
+            Ty::IntAtom(..) => {
+                let x = self.fresh("x");
+                format!("{{ let {x} = {c}; if {x} < i64::MIN + 65536 {{ i64::MIN + pm[({x} - i64::MIN) as usize] as i64 }} else {{ {x} }} }}")
+            }
             Ty::Rec(fs) => {
                 let r = self.fresh("r");
                 let mut s = format!("{{ let {r} = &({c}); (");
@@ -2204,6 +2489,29 @@ impl<'a> Gen<'a> {
         let names: Vec<String> = self.atoms.list.iter().enumerate().map(|(i, _)| format!("{:?}", self.atoms.show(i as u32))).collect();
         format!("static ATOMS: [&str; {}] = [{}];\n", names.len(), names.join(", "))
     }
+}
+
+/// How a comparison involving tuples turns out in TLC (see `Gen::tuple_cmp`)
+#[derive(Clone, PartialEq)]
+enum Cmp {
+    /// Compare the values
+    Normal,
+    /// Never equal
+    Unequal,
+    /// TLC stops with this error when it evaluates the comparison
+    Fails(String),
+}
+
+/// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
+/// when it evaluates the comparison, so a branch never taken must not be an error)
+fn eval_error_bool(msg: &str) -> String {
+    format!("{{ let __b: bool = eval_error({msg:?}.to_string()); __b }}")
+}
+
+/// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
+/// the two is rejected rather than compared as unequal.
+fn seq_like_fun(t: &Ty) -> bool {
+    matches!(t, Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(1, _)))
 }
 
 /// Turns a constant value into a literal (for \\A bindings in properties)

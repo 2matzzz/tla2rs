@@ -33,7 +33,8 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     let mut out = Module { name: m.name.clone(), ..Default::default() };
     for e in &m.extends {
         match e.as_str() {
-            "Naturals" | "Integers" | "FiniteSets" | "TLC" => out.extends.push(e.clone()),
+            // Sequences only for its tuples; its operators are rejected by name (SEQ_OPS)
+            "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" => out.extends.push(e.clone()),
             // Apalache type annotations and Gen are not used
             "Apalache" => {}
             _ => {
@@ -477,6 +478,7 @@ fn ty_of_set(g: &Gen, s: &Expr) -> R<Ty> {
             fs.sort_by(|a, b| a.0.cmp(&b.0));
             Ty::Rec(fs)
         }
+        Expr::Call(f, parts) if f == "\\X" => tuple_ty(parts.iter().map(|x| ty_of_set(g, x)).collect::<R<_>>()?)?,
         Expr::Ident(n) if n == "BOOLEAN" => Ty::Bool,
         // Unbounded integers are stored as 64-bit
         Expr::Ident(n) if n == "Nat" => Ty::Int(0, BIG),
@@ -750,6 +752,9 @@ fn widen(old: &Ty, new: &Ty) -> Ty {
     match (old, new) {
         (Ty::Enum(o), _) if o.is_empty() => new.clone(),
         (Ty::Int(a, b), Ty::Int(c, d)) if (a, b) != (c, d) => Ty::Int(if c < a { -BIG } else { *a }, if d > b { BIG } else { *b }),
+        (Ty::Int(a, b) | Ty::IntAtom(a, b, _), Ty::IntAtom(c, d, x)) if (a, b) != (c, d) => {
+            Ty::IntAtom(if c < a { -BIG } else { *a }, if d > b { BIG } else { *b }, x.clone())
+        }
         (Ty::Rec(a), Ty::Rec(b)) => Ty::Rec(
             b.iter()
                 .map(|(n, t)| match a.iter().find(|(m, _)| m == n) {
