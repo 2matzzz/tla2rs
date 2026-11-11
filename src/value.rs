@@ -83,8 +83,21 @@ impl Ord for Value {
             (Int(a), Int(b)) => a.cmp(b),
             (Atom(a), Atom(b)) => a.cmp(b),
             (Set(a), Set(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
-            (Fun(a), Fun(b)) => a.iter().cmp(b.iter()),
-            (Rec(a), Rec(b)) => a.iter().cmp(b.iter()),
+            // As TLC: by the size of the domain, then key and value pair by pair
+            (Fun(a), Fun(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
+            // As TLC: by the number of fields, then name and value pair by pair, in TLC's order of
+            // field names
+            (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| {
+                let fa = crate::types::sorted_fields(a.iter().map(|(k, v)| (k.clone(), v)).collect());
+                let fb = crate::types::sorted_fields(b.iter().map(|(k, v)| (k.clone(), v)).collect());
+                for ((ka, va), (kb, vb)) in fa.iter().zip(&fb) {
+                    let c = crate::types::field_cmp(ka, kb).then_with(|| va.cmp(vb));
+                    if c.is_ne() {
+                        return c;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            }),
             (Tuple(a), Tuple(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
             _ => self.rank().cmp(&o.rank()),
         }
@@ -296,6 +309,9 @@ impl ConstEval<'_> {
                 }
                 ("ToString", [x]) => {
                     let v = self.eval(x, env)?;
+                    if let Some((a, b)) = disordered_in(&v) {
+                        return Err(crate::types::disordered_error(&a, &b));
+                    }
                     Value::Atom(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v)))
                 }
                 ("TLCEval", [x]) => self.eval(x, env)?,
@@ -992,6 +1008,20 @@ pub fn fun_value(m: BTreeMap<Value, Value>) -> Value {
         return Value::Tuple(m.into_values().collect());
     }
     Value::Fun(m)
+}
+
+/// A pair of fields of a record inside v that the spec writes in the order opposite to TLC's
+pub fn disordered_in(v: &Value) -> Option<(String, String)> {
+    match v {
+        Value::Rec(m) => {
+            let names: Vec<&str> = m.keys().map(|k| k.as_str()).collect();
+            crate::types::disordered_fields(&names).or_else(|| m.values().find_map(disordered_in))
+        }
+        Value::Set(s) => s.iter().find_map(disordered_in),
+        Value::Fun(m) => m.iter().find_map(|(k, x)| disordered_in(k).or_else(|| disordered_in(x))),
+        Value::Tuple(t) => t.iter().find_map(disordered_in),
+        _ => None,
+    }
 }
 
 /// The entries of a function value, also of a tuple

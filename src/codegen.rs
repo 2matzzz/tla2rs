@@ -944,22 +944,21 @@ impl<'a> Gen<'a> {
     fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
         Ok(match t {
             Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
-            // A function over part of a type: by the size of its domain, then the domain, then the
-            // values
+            // A function over part of a type, as TLC compares functions: by the size of the
+            // domain, then key and value pair by pair
             Ty::PFun(_, c) => {
                 let vc = self.tlc_cmp(c, "(&__x[__i].1)", "(&__y[__j].1)")?;
                 format!(
                     "{{ let (__x, __y) = ({a}, {b}); let __dx: Vec<usize> = (0..__x.len()).filter(|&i| __x[i].0).collect(); \
                      let __dy: Vec<usize> = (0..__y.len()).filter(|&i| __y[i].0).collect(); \
-                     __dx.len().cmp(&__dy.len()).then_with(|| __dx.cmp(&__dy)).then_with(|| __dx.iter().zip(__dy.iter()).map(|(&__i, &__j)| {vc}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
+                     __dx.len().cmp(&__dy.len()).then_with(|| __dx.iter().zip(__dy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| {vc})).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
                 )
             }
-            // A bag compares as the function it is: by the size of its domain, then the domain,
-            // then the counts
+            // A bag compares as the function it is
             Ty::Bag(_) => format!(
                 "{{ let (__x, __y) = ({a}, {b}); let __dx: Vec<usize> = (0..__x.len()).filter(|&i| __x[i] > 0).collect(); \
                  let __dy: Vec<usize> = (0..__y.len()).filter(|&i| __y[i] > 0).collect(); \
-                 __dx.len().cmp(&__dy.len()).then_with(|| __dx.cmp(&__dy)).then_with(|| __dx.iter().map(|&i| __x[i]).cmp(__dy.iter().map(|&i| __y[i]))) }}"
+                 __dx.len().cmp(&__dy.len()).then_with(|| __dx.iter().zip(__dy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| __x[__i].cmp(&__y[__j]))).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
             ),
             Ty::Rec(fs) if needs_tlc_order(t) => {
                 let mut parts = vec![];
@@ -1458,6 +1457,9 @@ impl<'a> Gen<'a> {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
                 // ToString of a value from the state: a table, indexed by the value's encoding, of
                 // the strings of every value of its type, interned now
+                // ToString of a value from the state: the string of every value of its type is
+                // interned now. A Boolean, integer, string, model value or tuple of them indexes a
+                // table by its encoding; other values print at run time and look their string up.
                 ("ToString", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     fn scalar_or_tuple(t: &Ty) -> bool {
@@ -1467,18 +1469,50 @@ impl<'a> Gen<'a> {
                             _ => false,
                         }
                     }
-                    // Records are left out: TLC prints their fields in an order of its own
-                    if !scalar_or_tuple(&t) {
-                        return Err(format!("ToString of a value from the state is only supported for Booleans, integers, strings, model values and tuples of them: {}", short(x)));
+                    if let Some((a, b)) = disordered_ty(&t) {
+                        return Err(crate::types::disordered_error(&a, &b));
                     }
-                    let n = t.size().filter(|&n| n <= 4096).ok_or(format!("ToString of a value from the state with more than 4096 possible values is not supported: {}", short(x)))?;
+                    let room = (1usize << 16).saturating_sub(self.atoms.len());
                     let tid = self.ty_id(&t)?;
-                    let ids: Vec<u32> = t.enumerate().iter().map(|v| self.atoms.intern(false, &crate::compile::show_value(self.atoms, v))).collect();
-                    let table: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
-                    let mut res = ids.clone();
+                    let too_many = || {
+                        format!(
+                            "ToString of {}: its type {t:?} has more values than the {room} strings that can still be added (strings are 16-bit ids; -setcap and -seqcap bound sets and sequences)",
+                            short(x)
+                        )
+                    };
+                    if scalar_or_tuple(&t) {
+                        let n = t.size().filter(|&n| n <= room as u64).ok_or_else(too_many)?;
+                        let ids: Vec<u32> = t.enumerate().iter().map(|v| self.atoms.intern(false, &crate::compile::show_value(self.atoms, v))).collect();
+                        let table: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+                        let mut res = ids.clone();
+                        res.sort();
+                        res.dedup();
+                        return Ok((format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", ")), Ty::Enum(res)));
+                    }
+                    let vals = crate::types::all_values(&t, self.qcap, self.scap, room).ok_or_else(too_many)?;
+                    let mut table: Vec<(String, u32)> = vals
+                        .iter()
+                        .map(|v| {
+                            let s = crate::compile::show_value(self.atoms, v);
+                            let id = self.atoms.intern(false, &s);
+                            (s, id)
+                        })
+                        .collect();
+                    table.sort();
+                    table.dedup();
+                    let mut res: Vec<u32> = table.iter().map(|(_, i)| *i).collect();
                     res.sort();
                     res.dedup();
-                    (format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", ")), Ty::Enum(res))
+                    let rows: Vec<String> = table.iter().map(|(s, i)| format!("({s:?}, {i})")).collect();
+                    (
+                        format!(
+                            "{{ static T: [(&str, u16); {}] = [{}]; let __k = fmt_{tid}(&{c}); match T.binary_search_by(|(s, _)| (*s).cmp(__k.as_str())) {{ \
+                             Ok(__i) => T[__i].1, Err(_) => eval_error(format!(\"ToString of {{__k}}: TLC prints this value in a way that depends on how it was built (an empty function prints as << >> or <<>>)\")) }} }}",
+                            rows.len(),
+                            rows.join(", ")
+                        ),
+                        Ty::Enum(res),
+                    )
                 }
                 ("RandomElement", [SetLit(xs)]) if xs.len() == 1 => self.gen(&xs[0], env, want)?,
                 ("RandomElement", _) => return Err("RandomElement over a set from the state is not supported: TLC picks an element at random".into()),
@@ -1500,10 +1534,14 @@ impl<'a> Gen<'a> {
                     (format!("(if {pc} {{ true }} else {{ assert_error({msg:?}.to_string()) }})"), Ty::Bool)
                 }
                 // Print and PrintT write to stdout as TLC does, when the checker evaluates them
-                // (d :> e) @@ f, with f over a whole type: f with the entry at d replaced. Any other
-                // use of :> and @@ builds a function over part of a type, which is not represented
+                // (d :> e) @@ f, with f over a whole type that d's type lies in: f with the entry at
+                // d replaced. Otherwise :> and @@ build a function over part of a type (below).
                 ("@@", [l, f])
-                    if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2) && matches!(self.gen(f, env, want), Ok((_, Ty::Fun(..)))) =>
+                    if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2)
+                        && matches!(self.gen(f, env, want), Ok((_, Ty::Fun(fd, _))) if {
+                            let Call(_, de) = l.strip() else { unreachable!() };
+                            matches!(self.gen(&de[0], env, None), Ok((_, kt)) if join(&kt, &fd).is_ok_and(|j| j == *fd))
+                        }) =>
                 {
                     let Call(_, de) = l.strip() else { unreachable!() };
                     let (fc, ft) = self.gen(f, env, want)?;
@@ -1513,7 +1551,7 @@ impl<'a> Gen<'a> {
                     let vc = self.gen_as(&de[1], env, c)?;
                     let (t, i) = (self.fresh("t"), self.fresh("i"));
                     (
-                        format!("{{ let mut {t} = {fc}; let {i} = enc_{did}({kc}); if {i} == u64::MAX {{ eval_error(\"(d :> e) @@ f with d outside the domain of f is not supported\".into()) }} {t}[{i} as usize] = {vc}; {t} }}"),
+                        format!("{{ let mut {t} = {fc}; let {i} = enc_{did}({kc}); if {i} == u64::MAX {{ type_error(\"function argument\", \"\") }} {t}[{i} as usize] = {vc}; {t} }}"),
                         ft,
                     )
                 }
@@ -2158,7 +2196,7 @@ impl<'a> Gen<'a> {
             }
             RecLit(fs) => {
                 let mut fs: Vec<(String, Expr)> = fs.clone();
-                fs.sort_by(|a, b| a.0.cmp(&b.0));
+                fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
                 let wf: Option<Vec<(String, Ty)>> = match want {
                     Some(Ty::Rec(w)) => Some(w.clone()),
                     _ => None,
@@ -2413,7 +2451,7 @@ impl<'a> Gen<'a> {
             // [a : S, b : T] with sets from the state, as a value: every record, collected
             RecSet(fs) => {
                 let mut fs = fs.clone();
-                fs.sort_by(|a, b| a.0.cmp(&b.0));
+                fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
                 let (mut open, mut close, mut names, mut tys) = (String::new(), String::new(), vec![], vec![]);
                 for (k, se) in &fs {
                     let (c, t) = self.gen(se, env, None)?;
@@ -2797,7 +2835,7 @@ impl<'a> Gen<'a> {
             RecSet(fs) => {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
-                fs.sort_by(|a, b| a.0.cmp(&b.0));
+                fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
                 if fs.len() != xf.len() || fs.iter().zip(xf).any(|(a, b)| a.0 != b.0) {
                     return Ok("false".into());
                 }
@@ -3615,7 +3653,29 @@ impl<'a> Gen<'a> {
                 let _ = n;
             }
             // fmt
+            let string_keys = |d: &Ty| -> Option<Vec<String>> {
+                match d {
+                    Ty::Enum(ids) if !ids.is_empty() && ids.iter().all(|&a| !self.atoms.is_model(a)) => Some(ids.iter().map(|&a| self.atoms.name(a)).collect()),
+                    _ => None,
+                }
+            };
             let fmt_body = match &t {
+                // A function over strings prints as a record (<< >> when empty, as TLC spells an
+                // empty function)
+                Ty::Fun(d, _) | Ty::PFun(d, _) | Ty::Bag(d) if string_keys(d).is_some() => {
+                    let names: Vec<String> = string_keys(d).unwrap().iter().map(|n| format!("{n:?}")).collect();
+                    let entry = match &t {
+                        Ty::Fun(_, c) => format!("Some(fmt_{}(x))", self.ty_id(c)?),
+                        Ty::PFun(_, c) => format!("if x.0 {{ Some(fmt_{}(&x.1)) }} else {{ None }}", self.ty_id(c)?),
+                        _ => "if *x > 0 { Some(x.to_string()) } else { None }".into(),
+                    };
+                    format!(
+                        "const K: [&str; {}] = [{}]; let ps: Vec<String> = v.iter().enumerate().filter_map(|(i, x)| {{ let e: Option<String> = {entry}; e.map(|e| format!(\"{{}} |-> {{}}\", K[i], e)) }}).collect(); \
+                         if ps.is_empty() {{ return \"<< >>\".into(); }} format!(\"[{{}}]\", ps.join(\", \"))",
+                        names.len(),
+                        names.join(", ")
+                    )
+                }
                 // A bag prints as the function it is: << >> when empty (TLC's spelling for an empty
                 // function), a tuple over 1..n
                 Ty::PFun(d, c) => {
@@ -4334,6 +4394,19 @@ fn needs_tlc_order(t: &Ty) -> bool {
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
         Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),
         _ => false,
+    }
+}
+
+/// A pair of fields of a record type inside t that the spec writes in the order opposite to TLC's
+fn disordered_ty(t: &Ty) -> Option<(String, String)> {
+    match t {
+        Ty::Rec(fs) => {
+            let names: Vec<&str> = fs.iter().map(|(k, _)| k.as_str()).collect();
+            crate::types::disordered_fields(&names).or_else(|| fs.iter().find_map(|(_, t)| disordered_ty(t)))
+        }
+        Ty::Set(e) | Ty::Seq(e) | Ty::Opt(e) | Ty::Bag(e) => disordered_ty(e),
+        Ty::Fun(d, c) | Ty::PFun(d, c) => disordered_ty(d).or_else(|| disordered_ty(c)),
+        _ => None,
     }
 }
 
