@@ -34,6 +34,41 @@ pub fn is_sparse(t: &Ty) -> bool {
 
 pub const SET_BITS: u64 = 128;
 
+/// A tuple `<<e1, ..., en>>` has the type of a record whose fields are named #01, #02, ... (no TLA+
+/// field name starts with `#`, and the names sort in element order). Tuples of different lengths
+/// are different types, so sequences (tuples whose length changes) are not expressible.
+pub fn tuple_field(i: usize) -> String {
+    format!("#{:02}", i + 1)
+}
+
+/// Operators of the Sequences module. Sequences (tuples whose length changes) are not supported, so
+/// these are rejected by name.
+pub const SEQ_OPS: &[&str] = &["Seq", "Len", "Append", "Head", "Tail", "SubSeq", "SelectSeq", "\\o"];
+
+pub fn seq_op_error(f: &str) -> String {
+    format!("sequences are not supported yet (`{f}`); fixed-length tuples are")
+}
+
+pub fn tuple_ty(elems: Vec<Ty>) -> R<Ty> {
+    if elems.len() > 99 {
+        return Err("tuples of more than 99 elements are not supported".into());
+    }
+    Ok(Ty::Rec(elems.into_iter().enumerate().map(|(i, t)| (tuple_field(i), t)).collect()))
+}
+
+/// Whether record fields are those of a tuple
+pub fn is_tuple_fields(fs: &[(String, Ty)]) -> bool {
+    fs.iter().all(|(n, _)| n.starts_with('#'))
+}
+
+/// The element types of a tuple type
+pub fn tuple_elems(t: &Ty) -> Option<Vec<&Ty>> {
+    match t {
+        Ty::Rec(fs) if is_tuple_fields(fs) => Some(fs.iter().map(|(_, t)| t).collect()),
+        _ => None,
+    }
+}
+
 impl Ty {
     /// Number of values of an enumerable type
     pub fn size(&self) -> Option<u64> {
@@ -89,6 +124,15 @@ impl Ty {
             Ty::Bool => vec![Value::Bool(false), Value::Bool(true)],
             Ty::Int(lo, hi) => (*lo..=*hi).map(Value::Int).collect(),
             Ty::Enum(v) => v.iter().map(|&a| Value::Atom(a)).collect(),
+            Ty::Rec(fs) if is_tuple_fields(fs) => {
+                // The first element varies slowest, as in enc
+                let mut out: Vec<Vec<Value>> = vec![vec![]];
+                for (_, t) in fs {
+                    let vals = t.enumerate();
+                    out = out.iter().flat_map(|r| vals.iter().map(move |v| [r.as_slice(), &[v.clone()]].concat())).collect();
+                }
+                out.into_iter().map(Value::Tuple).collect()
+            }
             Ty::Rec(fs) => {
                 let mut out = vec![std::collections::BTreeMap::new()];
                 for (k, t) in fs {
@@ -120,7 +164,17 @@ impl Ty {
             (Ty::Bool, Value::Bool(b)) => Some(*b as u64),
             (Ty::Int(lo, hi), Value::Int(i)) if lo <= i && i <= hi => Some((i - lo) as u64),
             (Ty::Enum(d), Value::Atom(a)) => d.iter().position(|x| x == a).map(|p| p as u64),
-            (Ty::Rec(fs), Value::Rec(m)) => {
+            (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) => {
+                if xs.len() != fs.len() {
+                    return None;
+                }
+                let mut acc = 0u64;
+                for ((_, t), x) in fs.iter().zip(xs) {
+                    acc = acc * t.size()? + t.enc(x)?;
+                }
+                Some(acc)
+            }
+            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 if m.keys().any(|k| !fs.iter().any(|(n, _)| n == k)) {
                     return None;
                 }
@@ -150,7 +204,10 @@ impl Ty {
                 dom.sort();
                 keys == dom && m.values().all(|x| c.conforms(x))
             }
-            (Ty::Rec(fs), Value::Rec(m)) => {
+            (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) => {
+                xs.len() == fs.len() && fs.iter().zip(xs).all(|((_, t), x)| t.conforms(x))
+            }
+            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
                         (Ty::Opt(i), Some(x)) => i.conforms(x),
@@ -176,6 +233,19 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         }
         (Ty::Opt(a), Ty::Opt(b)) => Ty::Opt(join(a, b)?.into()),
         (Ty::Opt(a), b) | (b, Ty::Opt(a)) => Ty::Opt(join(a, b)?.into()),
+        (Ty::Rec(x), Ty::Rec(y)) if is_tuple_fields(x) || is_tuple_fields(y) => {
+            if !is_tuple_fields(x) || !is_tuple_fields(y) {
+                return Err(format!("type mismatch: a tuple and a record: {a:?} vs {b:?}"));
+            }
+            if x.len() != y.len() {
+                return Err(format!(
+                    "tuples of different lengths ({} and {}); sequences are not supported yet",
+                    x.len(),
+                    y.len()
+                ));
+            }
+            Ty::Rec(x.iter().zip(y).map(|((n, s), (_, t))| Ok((n.clone(), join(s, t)?))).collect::<R<_>>()?)
+        }
         (Ty::Rec(x), Ty::Rec(y)) => {
             // Union of the fields; a field present on only one side becomes optional
             let mut names: Vec<String> = x.iter().chain(y).map(|f| f.0.clone()).collect();
@@ -198,6 +268,9 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
             Ty::Rec(fs)
         }
         (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) if d1 == d2 => Ty::Fun(d1.clone(), join(c1, c2)?.into()),
+        (Ty::Fun(d, _), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, _)) if is_tuple_fields(fs) && matches!(**d, Ty::Int(1, _)) => {
+            return Err(format!("comparing a function over 1..n with a tuple is not supported: {a:?} vs {b:?}"))
+        }
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(join(x, y)?.into()),
         _ => return Err(format!("type mismatch: {a:?} vs {b:?}")),
     })
@@ -224,7 +297,7 @@ pub fn ty_of_value(v: &Value) -> R<Ty> {
             }
             Ty::Fun(dom.into(), c.into())
         }
-        Value::Tuple(_) => return Err("tuples / sequences are not supported yet".into()),
+        Value::Tuple(xs) => tuple_ty(xs.iter().map(ty_of_value).collect::<R<_>>()?)?,
     })
 }
 

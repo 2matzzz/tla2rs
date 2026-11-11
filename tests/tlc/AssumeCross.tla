@@ -16,5 +16,5 @@ ASSUME (0..1) \X {"a"} = {0, 1} \X {"a"} \cup {}
 Pairs == {p \in Nodes \X Nodes : p \notin Edges}
 VARIABLE n
 Init == n = 0
-Next == n' = (n + Cardinality(Pairs)) % 4
+Next == \E p \in Pairs : n' = (n + Cardinality({q \in Edges : q[2] = p[1]})) % 4
 ====

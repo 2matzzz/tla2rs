@@ -61,6 +61,8 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
         "+" => (10, false, "+"),
         "-" => (10, false, "-"),
         "*" => (13, false, "*"),
+        // Sequence concatenation, parsed only to reject it with a clear message
+        "\\o" | "\\circ" => (13, false, "\\o"),
         "\\div" => (13, false, "\\div"),
         // In TLA+, % is 10-11 (looser than * and \div, and looser than unary -)
         "%" => (11, false, "%"),
@@ -109,6 +111,7 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "*" => BOp::Mul,
         "\\div" => BOp::Div,
         "%" => BOp::Mod,
+        "\\o" => return Expr::Call("\\o".into(), vec![a, b]),
         _ => unreachable!(),
     };
     Expr::Bin(o, a.b(), b.b())

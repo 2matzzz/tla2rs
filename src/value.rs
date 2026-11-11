@@ -165,6 +165,7 @@ impl ConstEval<'_> {
                     }
                     Value::Set(out)
                 }
+                (f, _) if crate::types::SEQ_OPS.contains(&f) => return Err(crate::types::seq_op_error(f)),
                 _ => return Err(format!("operator `{f}` is not supported in constant expressions")),
             },
             Un(op, x) => {
@@ -194,6 +195,7 @@ impl ConstEval<'_> {
                     }
                     UOp::Domain => match v {
                         Value::Fun(m) => Value::Set(m.keys().cloned().collect()),
+                        Value::Tuple(t) => Value::Set((1..=t.len() as i64).map(Value::Int).collect()),
                         _ => return Err("DOMAIN of a non-function".into()),
                     },
                     _ => return Err(format!("{op:?} is not a constant operator")),

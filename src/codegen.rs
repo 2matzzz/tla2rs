@@ -163,6 +163,34 @@ impl<'a> Gen<'a> {
 
     // ---------------------------------------------------------------- Sets (bitmasks and SSet)
 
+    /// 0-based position of the constant index `i` into a tuple of `n` elements
+    fn tuple_index(&self, i: &Expr, env: &Env, n: usize) -> R<usize> {
+        match self.try_const(i, env) {
+            Some(Value::Int(k)) if k >= 1 && k as u64 <= n as u64 => Ok(k as usize - 1),
+            Some(Value::Int(k)) => Err(format!("tuple index {k} is outside 1..{n}")),
+            _ => Err(format!("a tuple can only be indexed by a constant integer (got {})", short(i))),
+        }
+    }
+
+    /// Rewrites the steps of an EXCEPT path that index into a tuple (`![k][1]`) as steps into the
+    /// field the element is stored in
+    fn resolve_path(&self, t: &Ty, path: &[Path], env: &Env) -> R<Vec<Path>> {
+        let mut cur = Some(t.clone());
+        let mut out = vec![];
+        for p in path {
+            let step = match (p, &cur) {
+                (Path::Idx(i), Some(Ty::Rec(fs))) if is_tuple_fields(fs) => Path::Field(tuple_field(self.tuple_index(i, env, fs.len())?)),
+                _ => p.clone(),
+            };
+            cur = match &cur {
+                Some(c) => Self::path_type(c, std::slice::from_ref(&step)),
+                None => None,
+            };
+            out.push(step);
+        }
+        Ok(out)
+    }
+
     /// Type at the end of an EXCEPT path
     fn path_type(t: &Ty, path: &[Path]) -> Option<Ty> {
         let mut cur = t.clone();
@@ -239,6 +267,9 @@ impl<'a> Gen<'a> {
     /// Whether x (of type xt) is a member of set c (of type st)
     fn s_has(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<String> {
         let et = Self::elem_of(st);
+        if (seq_like_fun(xt) && tuple_elems(&et).is_some()) || (tuple_elems(xt).is_some() && seq_like_fun(&et)) {
+            return Err("comparing a function over 1..n with a tuple is not supported".into());
+        }
         if matches!(&et, Ty::Enum(v) if v.is_empty()) {
             return Ok("false".into());
         }
@@ -303,7 +334,15 @@ impl<'a> Gen<'a> {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), _) => format!("{a}u16"),
-            (Value::Rec(m), Ty::Rec(fs)) => {
+            (Value::Tuple(xs), Ty::Rec(fs)) if is_tuple_fields(fs) && xs.len() == fs.len() => {
+                let mut s = String::from("(");
+                for (x, (_, ft)) in xs.iter().zip(fs) {
+                    s += &self.lit(x, ft)?;
+                    s += ",";
+                }
+                s + ")"
+            }
+            (Value::Rec(m), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
                 let mut s = String::from("(");
                 for (k, ft) in fs {
                     s += &match (ft, m.get(k)) {
@@ -372,6 +411,15 @@ impl<'a> Gen<'a> {
     }
 
     fn coerce(&mut self, code: String, from: &Ty, to: &Ty) -> R<String> {
+        if let (Some(a), Some(b)) = (tuple_elems(from), tuple_elems(to)) {
+            if a.len() != b.len() {
+                return Err(format!(
+                    "tuples of different lengths ({} and {}); sequences are not supported yet",
+                    a.len(),
+                    b.len()
+                ));
+            }
+        }
         if from == to || (from.kind_eq(to) && Self::trivial(from, to)) {
             return Ok(code);
         }
@@ -520,6 +568,7 @@ impl<'a> Gen<'a> {
                         short(e)
                     ))
                 }
+                (f, _) if SEQ_OPS.contains(&f) => return Err(seq_op_error(f)),
                 _ => return Err(format!("unknown operator `{f}`")),
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),
@@ -530,6 +579,14 @@ impl<'a> Gen<'a> {
             }
             Un(UOp::Domain, f) => {
                 let (_, ft) = self.gen(f, env, None)?;
+                if let Some(el) = tuple_elems(&ft) {
+                    // A tuple of n elements is a function over 1..n
+                    let n = el.len();
+                    let st = Ty::Set(Ty::Int(1, n as i64).into());
+                    self.ty_id(&st)?;
+                    let mask: u128 = if n >= 128 { u128::MAX } else { (1u128 << n) - 1 };
+                    return Ok((format!("{mask}u128"), st));
+                }
                 let Ty::Fun(d, _) = ft else { return Err("DOMAIN of a non-function".into()) };
                 let st = Ty::Set(d.clone());
                 self.ty_id(&st)?;
@@ -729,6 +786,12 @@ impl<'a> Gen<'a> {
             }
             App(f, x) => {
                 let (fc, ft) = self.gen(f, env, None)?;
+                if let Ty::Rec(fs) = &ft {
+                    if is_tuple_fields(fs) {
+                        let k = self.tuple_index(x, env, fs.len())?;
+                        return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                    }
+                }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
                 // If the argument is a bound variable with a known index, use it without conversion
                 if let Ident(n) = x.strip() {
@@ -759,6 +822,9 @@ impl<'a> Gen<'a> {
             }
             Except(f, ups) => {
                 let (fc, ft0) = self.gen(f, env, want)?;
+                let ups: Vec<(Vec<Path>, Expr)> =
+                    ups.iter().map(|(p, v)| Ok((self.resolve_path(&ft0, p, env)?, v.clone()))).collect::<R<_>>()?;
+                let ups = &ups;
                 // Widen to include the types of the written values (when writing a wider value into
                 // a narrower function; type inference relies on this too)
                 let mut ft = ft0.clone();
@@ -1070,6 +1136,25 @@ impl<'a> Gen<'a> {
                 }
                 return Ok(format!("({})", parts.join(" && ")));
             }
+            // Membership in A \X B is decided element by element, also for constant sets (that
+            // avoids enumerating a large product)
+            Call(f, parts) if f == "\\X" => {
+                if seq_like_fun(xt) {
+                    return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+                }
+                let Some(el) = tuple_elems(xt) else { return Ok("false".into()) };
+                if el.len() != parts.len() {
+                    return Ok("false".into());
+                }
+                let el: Vec<Ty> = el.into_iter().cloned().collect();
+                let mut conj = vec![];
+                for (i, (part, et)) in parts.iter().zip(&el).enumerate() {
+                    let e = self.fresh("e");
+                    let inner = self.gen_member(&e, et, part, env)?;
+                    conj.push(format!("{{ let {e} = {x}.{i}; {inner} }}"));
+                }
+                return Ok(format!("({})", conj.join(" && ")));
+            }
             Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
             Ident(n) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..)) { format!("({x} >= 0)") } else { "false".into() })
@@ -1100,6 +1185,11 @@ impl<'a> Gen<'a> {
         }
         if let Some(v) = self.try_const(s, env) {
             let set = v.as_set()?;
+            if (seq_like_fun(xt) && set.iter().any(|e| matches!(e, Value::Tuple(_))))
+                || (tuple_elems(xt).is_some() && set.iter().any(|e| matches!(e, Value::Fun(_))))
+            {
+                return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+            }
             let fits: Vec<&Value> = set.iter().filter(|e| xt.conforms(e)).collect();
             if fits.is_empty() {
                 return Ok("false".into());
@@ -1455,6 +1545,7 @@ impl<'a> Gen<'a> {
         out: &mut String,
     ) -> R<()> {
         for (path, val) in ups {
+            let path = &self.resolve_path(ft, path, env)?;
             let mut p = place.to_string();
             let mut cur = ft.clone();
             let mut conds = vec![];
@@ -2210,6 +2301,12 @@ impl<'a> Gen<'a> {
         let names: Vec<String> = self.atoms.list.iter().enumerate().map(|(i, _)| format!("{:?}", self.atoms.show(i as u32))).collect();
         format!("static ATOMS: [&str; {}] = [{}];\n", names.len(), names.join(", "))
     }
+}
+
+/// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
+/// the two is rejected rather than compared as unequal.
+fn seq_like_fun(t: &Ty) -> bool {
+    matches!(t, Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(1, _)))
 }
 
 /// Turns a constant value into a literal (for \\A bindings in properties)
