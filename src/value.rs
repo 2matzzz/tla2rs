@@ -416,7 +416,14 @@ impl ConstEval<'_> {
                 }
                 return Err(EVAL_FAILURES[3].into());
             }
-            SetLit(xs) => Value::Set(xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?),
+            SetLit(xs) => {
+                let vs: Vec<Value> = xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?;
+                // TLC sorts a set's elements, and stops when that compares a string with an integer
+                if vs.iter().any(|a| vs.iter().any(|b| self.str_int(a, b))) {
+                    return Err("Attempted to compare a string with an integer in a set".into());
+                }
+                Value::Set(vs.into_iter().collect())
+            }
             SetFilter(x, s, p) => {
                 let s = self.eval(s, env)?;
                 let mut out = BTreeSet::new();
@@ -586,6 +593,21 @@ impl ConstEval<'_> {
         })
     }
 
+    /// Whether a and b are a string and an integer, which TLC does not compare
+    fn str_int(&self, a: &Value, b: &Value) -> bool {
+        let s = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.list[*x as usize].0);
+        let i = |v: &Value| matches!(v, Value::Int(_));
+        (s(a) && i(b)) || (i(a) && s(b))
+    }
+
+    /// Equality as TLC evaluates it: comparing a string with an integer is an error
+    fn tlc_eq(&self, a: &Value, b: &Value) -> R<bool> {
+        if self.str_int(a, b) {
+            return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and an integer)"));
+        }
+        Ok(a == b)
+    }
+
     /// The elements of a sequence value (a tuple)
     fn seq(&self, q: &Expr, env: &HashMap<String, Value>, op: &str) -> R<Vec<Value>> {
         match self.eval(q, env)? {
@@ -625,14 +647,19 @@ impl ConstEval<'_> {
             Implies => Value::Bool(!a.as_bool()? || b.as_bool()?),
             Equiv => Value::Bool(a.as_bool()? == b.as_bool()?),
             LeadsTo => return Err("~> is temporal".into()),
-            Eq => Value::Bool(a == b),
-            Neq => Value::Bool(a != b),
+            Eq => Value::Bool(self.tlc_eq(&a, &b)?),
+            Neq => Value::Bool(!self.tlc_eq(&a, &b)?),
             Lt => Value::Bool(a.as_int()? < b.as_int()?),
             Le => Value::Bool(a.as_int()? <= b.as_int()?),
             Gt => Value::Bool(a.as_int()? > b.as_int()?),
             Ge => Value::Bool(a.as_int()? >= b.as_int()?),
-            In => Value::Bool(b.as_set()?.contains(&a)),
-            NotIn => Value::Bool(!b.as_set()?.contains(&a)),
+            In | NotIn => {
+                let set = b.as_set()?;
+                if let Some(e) = set.iter().find(|e| self.str_int(&a, e)) {
+                    return Err(format!("Attempted to check equality of {a:?} with {e:?} (a string and an integer)"));
+                }
+                Value::Bool(set.contains(&a) == (op == In))
+            }
             Subseteq => Value::Bool(a.as_set()?.is_subset(b.as_set()?)),
             Cup => Value::Set(a.as_set()?.union(b.as_set()?).cloned().collect()),
             Cap => Value::Set(a.as_set()?.intersection(b.as_set()?).cloned().collect()),

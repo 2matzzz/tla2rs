@@ -119,6 +119,9 @@ impl<'a> Gen<'a> {
         }
         match t {
             Ty::Set(e) => {
+                if matches!(e.as_ref(), Ty::IntAtom(..)) && self.has_str(e) {
+                    return Err("a set that may hold both strings and integers is not supported (TLC stops with an error when it builds one with both)".into());
+                }
                 self.ty_id(e)?;
             }
             Ty::Seq(e) => {
@@ -140,7 +143,7 @@ impl<'a> Gen<'a> {
                     self.ty_id(f)?;
                 }
             }
-            Ty::IntAtom(_, _, d) => self.check_model_values(d)?,
+            Ty::IntAtom(..) => {}
             _ => {}
         }
         let i = self.tys.len();
@@ -149,16 +152,41 @@ impl<'a> Gen<'a> {
         Ok(i)
     }
 
-    /// Only model values can share a type with integers: TLC compares a model value with anything,
-    /// but stops with an error when comparing a string with an integer
-    fn check_model_values(&self, atoms: &[u32]) -> R<()> {
-        match atoms.iter().find(|&&a| !self.atoms.list[a as usize].0) {
-            Some(&a) => Err(format!(
-                "the string {} is mixed with integers in one value; only model values can be (TLC reports comparing a string with an integer as an error)",
-                self.atoms.show(a)
-            )),
-            None => Ok(()),
+    /// `x \in set` (a constant set) when x may be a string and the set holds integers or the other
+    /// way around: compared element by element as TLC does, which stops on a string against an
+    /// integer. None when no such comparison can happen.
+    fn member_mixed(&mut self, x: &str, xt: &Ty, set: &BTreeSet<Value>) -> R<Option<String>> {
+        let mut j = xt.clone();
+        let mut mixed = false;
+        for e in set {
+            let Ok(et) = ty_of_value(e) else { return Ok(None) };
+            if !matches!(et, Ty::Int(..) | Ty::Enum(_) | Ty::IntAtom(..)) {
+                return Ok(None);
+            }
+            mixed |= self.str_meets_int(xt, &et);
+            j = join(&j, &et)?;
         }
+        if !mixed {
+            return Ok(None);
+        }
+        let xc = self.coerce(x.to_string(), xt, &j)?;
+        let parts: Vec<String> = set.iter().map(|e| Ok(format!("mixed_eq(__x, {})", self.lit(e, &j)?))).collect::<R<_>>()?;
+        Ok(Some(format!("{{ let __x = {xc}; {} }}", if parts.is_empty() { "false".into() } else { parts.join(" || ") })))
+    }
+
+    /// Whether a value of type `t` may be a string
+    fn has_str(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.iter().any(|&a| !self.atoms.list[a as usize].0),
+            _ => false,
+        }
+    }
+
+    /// Whether comparing values of types `a` and `b` may compare a string with an integer, which TLC
+    /// stops on (a model value compares unequal with anything)
+    fn str_meets_int(&self, a: &Ty, b: &Ty) -> bool {
+        let int = |t: &Ty| matches!(t, Ty::Int(..) | Ty::IntAtom(..));
+        (self.has_str(a) && int(b)) || (int(a) && self.has_str(b))
     }
 
     /// How TLC compares values of types `a` and `b` when a tuple meets something else. A tuple of
@@ -577,6 +605,14 @@ impl<'a> Gen<'a> {
         if matches!(&et, Ty::Enum(v) if v.is_empty()) {
             return Ok("false".into());
         }
+        if self.str_meets_int(xt, &et) {
+            // Compare with each element as TLC does, which stops on a string against an integer
+            let j = join(xt, &et)?;
+            let xc = self.coerce(x.to_string(), xt, &j)?;
+            let ec = self.coerce("__e".into(), &et, &j)?;
+            let it = self.s_iter(c, st)?;
+            return Ok(format!("{{ let __x = {xc}; let __any = {it}.any(|__e| mixed_eq(__x, {ec})); __any }}"));
+        }
         if narrows(xt, &et) {
             // x may hold a model value stored as an integer-or-model-value: compare in the joined
             // type rather than convert x (which fails at run time on an integer)
@@ -651,10 +687,7 @@ impl<'a> Gen<'a> {
         Ok(match (v, t) {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
-            (Value::Atom(a), Ty::IntAtom(..)) => {
-                self.check_model_values(&[*a])?;
-                format!("(i64::MIN + {a}i64)")
-            }
+            (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
             (Value::Atom(a), _) => format!("{a}u16"),
             (Value::Tuple(xs), Ty::Seq(e)) => {
                 if xs.len() > self.qcap {
@@ -884,10 +917,7 @@ impl<'a> Gen<'a> {
                 let parts: Vec<String> = fs.iter().enumerate().map(|(k, (_, t))| self.coerce(format!("{r}[{k}]"), c, t)).collect::<R<_>>()?;
                 Ok(format!("{{ let {r} = {code}; ({}) }}", parts.iter().map(|p| format!("{p},")).collect::<String>()))
             }
-            (Ty::Enum(x), Ty::IntAtom(..)) => {
-                self.check_model_values(x)?;
-                Ok(format!("(i64::MIN + ({code}) as i64)"))
-            }
+            (Ty::Enum(_), Ty::IntAtom(..)) => Ok(format!("(i64::MIN + ({code}) as i64)")),
             (Ty::IntAtom(..), Ty::Enum(_)) => {
                 let a = self.fresh("a");
                 Ok(format!(
@@ -1646,6 +1676,11 @@ impl<'a> Gen<'a> {
                 let t = join(&at, &bt)?;
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
+                if matches!(t, Ty::IntAtom(..)) && self.has_str(&t) && self.str_meets_int(&at, &bt) {
+                    // A string and an integer: TLC stops with an error when it compares them
+                    let neg = if op == Eq { "" } else { "!" };
+                    return Ok((format!("{neg}mixed_eq({ac}, {bc})"), Ty::Bool));
+                }
                 (format!("({ac} {} {bc})", if op == Eq { "==" } else { "!=" }), Ty::Bool)
             }
             Lt | Le | Gt | Ge => {
@@ -1970,6 +2005,9 @@ impl<'a> Gen<'a> {
         }
         if let Some(v) = self.try_const(s, env) {
             let set = v.as_set()?;
+            if let Some(code) = self.member_mixed(x, xt, set)? {
+                return Ok(code);
+            }
             let mut fits: Vec<&Value> = vec![];
             let mut clash = None;
             for e in set {
@@ -2011,6 +2049,14 @@ impl<'a> Gen<'a> {
             let mut comparable = false;
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
+                if self.str_meets_int(xt, &t) {
+                    let j = join(xt, &t)?;
+                    let xc = self.coerce(x.to_string(), xt, &j)?;
+                    let c = self.coerce(c, &t, &j)?;
+                    parts.push(format!("mixed_eq({xc}, {c})"));
+                    comparable = true;
+                    continue;
+                }
                 match self.tuple_cmp(xt, &t)? {
                     Cmp::Normal => comparable = true,
                     Cmp::Unequal => {
@@ -3201,7 +3247,18 @@ impl<'a> Gen<'a> {
 
     pub fn atoms_table(&self) -> String {
         let names: Vec<String> = self.atoms.list.iter().enumerate().map(|(i, _)| format!("{:?}", self.atoms.show(i as u32))).collect();
-        format!("static ATOMS: [&str; {}] = [{}];\n", names.len(), names.join(", "))
+        let strs: Vec<String> = self.atoms.list.iter().map(|(model, _)| (!model).to_string()).collect();
+        format!(
+            "static ATOMS: [&str; {}] = [{}];\nstatic IS_STR: [bool; {}] = [{}];\n\
+             // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\
+             fn mixed_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
+             if ai != bi {{ let at = if ai {{ b }} else {{ a }}; let n = if ai {{ a }} else {{ b }}; if IS_STR[(at - i64::MIN) as usize] {{ \
+             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer {{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
+            names.len(),
+            names.join(", "),
+            strs.len(),
+            strs.join(", ")
+        )
     }
 }
 
