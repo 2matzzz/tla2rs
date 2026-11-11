@@ -527,6 +527,45 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// An EXCEPT step `[i]` into a tuple with i not constant: `!p[i] ... = v` becomes
+    /// `!p = CASE i = 1 -> [@ EXCEPT ![1] ... = v] [] ... [] OTHER -> @`, since each element of a
+    /// tuple may have its own type (an index outside the tuple leaves it unchanged, as in TLC)
+    fn split_dynamic_index(&mut self, t: &Ty, path: &[Path], val: &Expr, env: &Env) -> (Vec<Path>, Expr) {
+        let mut cur = Some(t.clone());
+        for (j, p) in path.iter().enumerate() {
+            if let (Path::Idx(i), Some(Ty::Rec(fs))) = (p, &cur) {
+                if is_tuple_fields(fs) && self.try_const(i, env).is_none() {
+                    self.tmp += 1;
+                    let at = format!("@dyn{}", self.tmp);
+                    let base = Expr::Ident(at.clone());
+                    let arms = (1..=fs.len())
+                        .map(|k| {
+                            let mut inner: Vec<Path> = vec![Path::Idx(Expr::Num(k as i64))];
+                            inner.extend(path[j + 1..].iter().cloned());
+                            // Within the arm the index is k, which lets constant tests on it pick
+                            // the branch meant for this element's type
+                            let v = replace_expr(val, i, &Expr::Num(k as i64));
+                            let arm = Expr::Except(base.clone().b(), vec![(inner, v)]);
+                            (Expr::Bin(BOp::Eq, i.clone().b(), Expr::Num(k as i64).b()), Expr::Label("#per-element".into(), vec![], arm.b()))
+                        })
+                        .collect();
+                    let mut outer: Vec<Path> = path[..j].to_vec();
+                    outer.push(Path::Field(at));
+                    return (outer, Expr::Case(arms, Some(base.b())));
+                }
+            }
+            cur = match (&cur, p) {
+                (Some(c), Path::Field(k)) if k.starts_with('@') => Some(c.clone()),
+                (Some(Ty::Rec(fs)), Path::Idx(i)) if is_tuple_fields(fs) => {
+                    self.tuple_index(i, env, fs.len()).ok().map(|k| fs[k].1.clone())
+                }
+                (Some(c), p) => Self::path_type(c, std::slice::from_ref(p)),
+                (None, _) => None,
+            };
+        }
+        (path.to_vec(), val.clone())
+    }
+
     /// Rewrites the steps of an EXCEPT path that index into a tuple (`![k][1]`) as steps into the
     /// field the element is stored in
     fn resolve_path(&self, t: &Ty, path: &[Path], env: &Env) -> R<Vec<Path>> {
@@ -1338,6 +1377,12 @@ impl<'a> Gen<'a> {
                 let parts: Vec<String> = xs.iter().map(|x| self.gen_as(x, env, &Ty::Bool)).collect::<R<_>>()?;
                 (format!("({})", parts.join(sep)), Ty::Bool)
             }
+            // A constant condition picks its branch here, so the other need not type-check (TLC
+            // never evaluates it either)
+            If(c, a, b) if matches!(self.try_const(c, env), Some(Value::Bool(_))) => {
+                let Some(Value::Bool(t)) = self.try_const(c, env) else { unreachable!() };
+                return self.gen(if t { a } else { b }, env, want);
+            }
             If(c, a, b) => {
                 let c = self.gen_as(c, env, &Ty::Bool)?;
                 let (ac, at) = self.gen(a, env, want)?;
@@ -1352,7 +1397,14 @@ impl<'a> Gen<'a> {
                 let mut t = Ty::Enum(vec![]);
                 for (p, v) in arms {
                     let pc = self.gen_as(p, env, &Ty::Bool)?;
-                    let (vc, vt) = self.gen(v, env, want)?;
+                    let (vc, vt) = match (v, self.gen(v, env, want)) {
+                        // An arm made for one element of a tuple (see split_dynamic_index) that
+                        // does not fit its type fails only if it is taken
+                        (Label(n, _, _), Err(m)) if n == "#per-element" => {
+                            (format!("eval_error({:?}.to_string())", format!("EXCEPT at an index from the state: {m}")), Ty::Enum(vec![]))
+                        }
+                        (_, r) => r?,
+                    };
                     t = join(&t, &vt)?;
                     parts.push((pc, vc, vt));
                 }
@@ -1588,8 +1640,13 @@ impl<'a> Gen<'a> {
             }
             Except(f, ups) => {
                 let (fc, ft0) = self.gen(f, env, want)?;
-                let ups: Vec<(Vec<Path>, Expr)> =
-                    ups.iter().map(|(p, v)| Ok((self.resolve_path(&ft0, p, env)?, v.clone()))).collect::<R<_>>()?;
+                let ups: Vec<(Vec<Path>, Expr)> = ups
+                    .iter()
+                    .map(|(p, v)| {
+                        let (p, v) = self.split_dynamic_index(&ft0, p, v, env);
+                        Ok((self.resolve_path(&ft0, &p, env)?, v))
+                    })
+                    .collect::<R<_>>()?;
                 let ups = &ups;
                 // Widen to include the types of the written values (when writing a wider value into
                 // a narrower function; type inference relies on this too)
@@ -2077,6 +2134,15 @@ impl<'a> Gen<'a> {
             }
             Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
             Ident(n) if n == "Any" => return Ok("true".into()),
+            // x \in UNION {[1..n -> S] : n \in R}: the length in R and each element in S
+            _ if crate::compile::bounded_seq(s).is_some() && matches!(xt, Ty::Seq(_)) => {
+                let (r, el) = crate::compile::bounded_seq(s).unwrap();
+                let Ty::Seq(et) = xt else { unreachable!() };
+                let (l, e) = (self.fresh("l"), self.fresh("e"));
+                let in_r = self.gen_member(&l, &Ty::Int(0, self.qcap as i64), r, env)?;
+                let in_s = self.gen_member(&e, et, el, env)?;
+                return Ok(format!("{{ let {l} = ({x}).len as i64; let __all = {in_r} && ({x}).iter().all(|{e}| {in_s}); __all }}"));
+            }
             Ident(n) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
             }
@@ -2526,7 +2592,9 @@ impl<'a> Gen<'a> {
         out: &mut String,
     ) -> R<()> {
         for (path, val) in ups {
-            let path = &self.resolve_path(ft, path, env)?;
+            let (path, val) = self.split_dynamic_index(ft, path, val, env);
+            let val = &val;
+            let path = &self.resolve_path(ft, &path, env)?;
             let mut p = place.to_string();
             let mut cur = ft.clone();
             let mut conds = vec![];
@@ -3526,6 +3594,14 @@ impl Env {
     pub fn bind(&mut self, name: &str, code: String, t: Ty) {
         self.locals.insert(name.to_string(), (code, t));
     }
+}
+
+/// e with every occurrence of the expression `from` replaced by `to`
+fn replace_expr(e: &Expr, from: &Expr, to: &Expr) -> Expr {
+    if e.strip() == from.strip() {
+        return to.clone();
+    }
+    map_children(e, &|c| replace_expr(c, from, to))
 }
 
 /// Rebuilds e with each child replaced by f(child), preserving its structure
