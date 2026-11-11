@@ -282,8 +282,10 @@ impl<'a> Gen<'a> {
             [(da, _), (db, _)] => da.iter().flat_map(|&x| db.iter().map(move |&y| vec![x, y])).collect(),
             _ => unreachable!(),
         };
-        if cases.len() > 4096 {
-            return Err(format!("`{op}` over {} combinations of strings is not supported", cases.len()));
+        // Every result is a string interned now (16-bit ids)
+        let room = (1usize << 16).saturating_sub(self.atoms.len());
+        if cases.len() > room {
+            return Err(format!("`{op}` over {} combinations of strings from the state: more than the {room} strings that can still be added (strings are 16-bit ids)", cases.len()));
         }
         let b = operands.get(1).and_then(|(_, c)| c.clone());
         let mut arms = String::new();
@@ -355,8 +357,8 @@ impl<'a> Gen<'a> {
             let chars: Vec<char> = self.atoms.name(a).chars().collect();
             let l = chars.len();
             total += l * l;
-            if total > 65536 {
-                return Err("`SubSeq` on strings from the state with more than 65536 substrings is not supported".into());
+            if total > 1 << 22 {
+                return Err(format!("`SubSeq` on strings from the state: a table of {total} substrings is too large (at most {})", 1 << 22));
             }
             let mut table = vec![];
             for i in 0..l {

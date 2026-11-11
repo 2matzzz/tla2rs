@@ -134,8 +134,9 @@ fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize, ini
             },
         }
     };
-    if cap > 1024 {
-        return Err(format!("sequences of up to {cap} elements are not supported (at most 1024)"));
+    // A sequence's length is 16 bits
+    if cap > 65535 {
+        return Err(format!("sequences of up to {cap} elements are not supported (at most 65535: a length is 16 bits)"));
     }
     Ok(cap)
 }
