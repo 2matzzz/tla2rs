@@ -1148,6 +1148,11 @@ impl Seen {
     /// Records fp. False if it was already there.
     #[inline]
     fn fresh(&mut self, fp: Fp) -> bool {
+        // Slots start at 0, so 0 cannot be recorded here (the fingerprint of an all-zero packed
+        // state is 0): leave it to the shared table, which keeps 0 apart
+        if fp == 0 {
+            return true;
+        }
         let slot = &mut self.0[Self::slot(fp)];
         let fresh = *slot != fp;
         *slot = fp;
