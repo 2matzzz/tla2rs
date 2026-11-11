@@ -324,6 +324,8 @@ enum EvalErr {
     /// A failed arithmetic operation (`\div` by zero, `%` by a non-positive number). TLC exits
     /// with a different code for these than for the other errors (see `eval_code`).
     Arith(String),
+    /// Assert(P, msg) with P false. TLC exits with its own code for this (see `eval_code`).
+    Assert(String),
     /// Anything else (no matching CASE arm, a missing record field, etc.).
     Other(String),
 }
@@ -465,6 +467,11 @@ fn arith_error(msg: String) -> ! {
     std::panic::panic_any(EvalErr::Arith(msg))
 }
 
+#[cold]
+fn assert_error(msg: String) -> ! {
+    std::panic::panic_any(EvalErr::Assert(msg))
+}
+
 fn describe_panic(p: Box<dyn std::any::Any + Send>) -> EvalErr {
     match p.downcast::<EvalErr>() {
         Ok(e) => *e,
@@ -482,6 +489,7 @@ fn eval_code(e: &EvalErr) -> i32 {
     match e {
         EvalErr::Type(_) if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) => 12,
         EvalErr::Type(_) | EvalErr::Arith(_) => 255,
+        EvalErr::Assert(_) => 14,
         EvalErr::Other(_) => 75,
     }
 }
@@ -498,7 +506,7 @@ fn init_eval_code(e: &EvalErr) -> i32 {
 impl EvalErr {
     fn msg(&self) -> &str {
         match self {
-            EvalErr::Type(m) | EvalErr::Arith(m) | EvalErr::Other(m) => m,
+            EvalErr::Type(m) | EvalErr::Arith(m) | EvalErr::Assert(m) | EvalErr::Other(m) => m,
         }
     }
 }
@@ -517,7 +525,7 @@ fn report_eval(e: &EvalErr) {
             }
             println!("  ({m}; tla2rs cannot represent that state)");
         }
-        EvalErr::Arith(m) | EvalErr::Other(m) => println!("Error: {m}"),
+        EvalErr::Arith(m) | EvalErr::Assert(m) | EvalErr::Other(m) => println!("Error: {m}"),
     }
 }
 

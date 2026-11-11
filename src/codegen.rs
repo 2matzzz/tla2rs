@@ -1000,7 +1000,7 @@ impl<'a> Gen<'a> {
                         None => short(m),
                     };
                     let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
-                    (format!("(if {pc} {{ true }} else {{ eval_error({msg:?}.to_string()) }})"), Ty::Bool)
+                    (format!("(if {pc} {{ true }} else {{ assert_error({msg:?}.to_string()) }})"), Ty::Bool)
                 }
                 // Print and PrintT write to stderr (TLC prints to its output); the checker's verdict
                 // does not depend on them
@@ -1042,7 +1042,7 @@ impl<'a> Gen<'a> {
                         _ => Ty::Int(-BIG, BIG),
                     };
                     (
-                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ eval_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => eval_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
+                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ arith_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => arith_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
                         t,
                     )
                 }
@@ -3273,7 +3273,8 @@ enum Cmp {
     Fails(String),
 }
 
-/// The sequence type of the generated checker, pasted in with the runtime. Unused slots hold the
+/// The sequence type of the generated checker, pasted in with the runtime. Errors of the operators
+/// TLC implements as built-ins (Head, Tail, SubSeq) use `arith_error`, for TLC's exit code. Unused slots hold the
 /// default value, so derived equality and hashing see only the elements; it orders as TLC orders
 /// tuples, by length and then element by element.
 pub const SQ_RUNTIME: &str = r#"
@@ -3331,13 +3332,13 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     }
     fn head(&self) -> T {
         if self.len == 0 {
-            eval_error("Attempted to apply Head to the empty sequence.".into())
+            arith_error("Attempted to apply Head to the empty sequence.".into())
         }
         self.items[0]
     }
     fn tail(&self) -> Self {
         if self.len == 0 {
-            eval_error("Attempted to apply Tail to the empty sequence.".into())
+            arith_error("Attempted to apply Tail to the empty sequence.".into())
         }
         Self::from_slice(&self.slice()[1..])
     }
@@ -3353,10 +3354,10 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
             return Self::new();
         }
         if m < 1 || m > self.len as i64 {
-            eval_error("The second argument of SubSeq must be in the domain of its first argument.".into())
+            arith_error("The second argument of SubSeq must be in the domain of its first argument.".into())
         }
         if n > self.len as i64 {
-            eval_error("The third argument of SubSeq must be in the domain of its first argument.".into())
+            arith_error("The third argument of SubSeq must be in the domain of its first argument.".into())
         }
         Self::from_slice(&self.slice()[(m - 1) as usize..n as usize])
     }
