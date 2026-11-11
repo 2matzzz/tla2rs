@@ -541,6 +541,32 @@ impl<'a> Gen<'a> {
         if let Ty::Seq(_) = t {
             return Ok((c, t));
         }
+        // A string from the state is the sequence of its one-character strings, as TLC treats it
+        // here (the result is a tuple, not a string)
+        if let Ty::Enum(d) = &t {
+            let mut arms = String::new();
+            let mut chars: Vec<u32> = vec![];
+            let mut longest = 0;
+            for &a in d {
+                if self.atoms.is_model(a) {
+                    write!(arms, "{a} => eval_error(\"`{op}` of a model value, which is not a sequence\".to_string()), ").unwrap();
+                    continue;
+                }
+                let cs: Vec<u32> = self.atoms.name(a).chars().map(|ch| self.atoms.intern(false, &ch.to_string())).collect();
+                longest = longest.max(cs.len());
+                chars.extend(&cs);
+                let items: Vec<String> = cs.iter().map(|x| format!("{x}u16")).collect();
+                write!(arms, "{a} => Sq::from_slice(&[{}]), ", items.join(", ")).unwrap();
+            }
+            if longest > self.qcap {
+                return Err(format!("`{op}` of a string of {longest} characters, longer than the {} elements a sequence holds here; raise it with -seqcap", self.qcap));
+            }
+            chars.sort();
+            chars.dedup();
+            let st = Ty::Seq(Ty::Enum(chars).into());
+            self.ty_id(&st)?;
+            return Ok((format!("{{ let __q: Sq<u16, QCAP> = match {c} {{ {arms}_ => type_error(\"string\", \"\") }}; __q }}"), st));
+        }
         let el = seq_elem_join(&[&t]).map_err(|_| self.seq_op_err(op, &t))?;
         let st = Ty::Seq(el.into());
         Ok((self.coerce(c, &t, &st)?, st))
@@ -1416,6 +1442,14 @@ impl<'a> Gen<'a> {
         if let Some(v) = self.try_const(e, env) {
             return self.lit_auto(&v, want);
         }
+        // A constant comparison that TLC fails to evaluate fails when the checker evaluates it
+        if matches!(e, Bin(BOp::Eq | BOp::Neq | BOp::In | BOp::NotIn, ..)) && self.is_const(e, env) {
+            if let Err(m) = self.ce.eval(e, &HashMap::new()) {
+                if crate::value::is_eval_failure(&m) {
+                    return Ok((eval_error_bool(&m), Ty::Bool));
+                }
+            }
+        }
         Ok(match e {
             Ident(n) => {
                 if let Some((c, t)) = env.locals.get(n) {
@@ -1828,7 +1862,8 @@ impl<'a> Gen<'a> {
                 }
                 ("\\o", [a, b]) => {
                     let (ac, at) = self.gen(a, env, None)?;
-                    let (bc, bt) = self.gen(b, env, None)?;
+                    // A tuple followed by a string: the string as its characters (TLC)
+                    let (bc, bt) = if matches!(self.gen(b, env, None), Ok((_, Ty::Enum(_)))) { self.as_seq(b, env, "\\o")? } else { self.gen(b, env, None)? };
                     let el = seq_elem_join(&[&at, &bt]).map_err(|_| self.seq_op_err("\\o", &at))?;
                     let st = Ty::Seq(el.into());
                     let ac = self.coerce(ac, &at, &st)?;
