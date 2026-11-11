@@ -186,6 +186,12 @@ impl<'a> Expander<'a> {
                 Some((d, e)) => (d.clone(), e.clone()),
                 None => match self.defs.get(g.as_str()) {
                     Some(d) => ((*d).clone(), Env::default()),
+                    // A built-in infix operator, as in SortSeq(s, <)
+                    None if crate::parser::is_infix_name(g) => {
+                        let ps = vec!["#lhs".to_string(), "#rhs".to_string()];
+                        let body = crate::parser::bin_expr(g, Expr::Ident(ps[0].clone()), Expr::Ident(ps[1].clone()));
+                        (Def { name: format!("{g}#op"), params: ps, arity: vec![0, 0], body }, Env::default())
+                    }
                     None => return Err(format!("`{name}`: `{g}` passed for the operator parameter `{p}` is not an operator")),
                 },
             },
@@ -231,16 +237,24 @@ impl<'a> Expander<'a> {
                     self.call(n, &d, denv, args, env)?
                 } else if let Some(d) = self.defs.get(n.as_str()).copied() {
                     self.call(n, d, Env::default(), args, env)?
-                } else if n == "SelectSeq" && args.len() == 2 {
-                    // The built-in SelectSeq(s, Test(_)): Test becomes a LAMBDA over a fresh name
-                    let q = ex(self, &args[0])?;
-                    let (d, denv) = self.op_arg(n, "Test", 1, &args[1], env)?;
-                    let mut denv = with_self(&d.name, &d, denv);
-                    let x = self.bind(&d.params[0], &mut denv);
-                    self.stack.push(d.name.clone());
-                    let body = self.expand(&d.body, &denv);
-                    self.stack.pop();
-                    Call(n.clone(), vec![q, Lambda(vec![x], body?.b())])
+                } else if let Some((k, arity)) = builtin_op_param(n, args.len()) {
+                    // A built-in with an operator parameter (SelectSeq(s, Test(_)), SortSeq(s,
+                    // Op(_, _)), BagOfAll(F(_), B)): the operator becomes a LAMBDA over fresh names
+                    let mut out = vec![];
+                    for (i, a) in args.iter().enumerate() {
+                        if i != k {
+                            out.push(ex(self, a)?);
+                            continue;
+                        }
+                        let (d, denv) = self.op_arg(n, "the operator argument", arity, a, env)?;
+                        let mut denv = with_self(&d.name, &d, denv);
+                        let xs: Vec<String> = d.params.iter().map(|p| self.bind(p, &mut denv)).collect();
+                        self.stack.push(d.name.clone());
+                        let body = self.expand(&d.body, &denv);
+                        self.stack.pop();
+                        out.push(Lambda(xs, body?.b()));
+                    }
+                    Call(n.clone(), out)
                 } else {
                     Call(n.clone(), args.iter().map(|a| ex(self, a)).collect::<R<_>>()?)
                 }
@@ -330,6 +344,16 @@ impl<'a> Expander<'a> {
             Fair(w, v, a) => Fair(*w, ex(self, v)?.b(), ex(self, a)?.b()),
             Label(n, args, b) => Label(n.clone(), args.clone(), ex(self, b)?.b()),
         })
+    }
+}
+
+/// For a built-in operator taking an operator argument: its position and number of arguments
+fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)> {
+    match (name, args) {
+        ("SelectSeq", 2) => Some((1, 1)),
+        ("SortSeq", 2) => Some((1, 2)),
+        ("BagOfAll", 2) => Some((0, 1)),
+        _ => None,
     }
 }
 

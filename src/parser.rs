@@ -102,6 +102,16 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
     })
 }
 
+/// Whether `name` is an infix operator the parser knows (by its normalized name)
+pub fn is_infix_name(name: &str) -> bool {
+    infix(&Tok::Sym(name.to_string())).is_some_and(|(_, _, n)| n == name)
+}
+
+/// `a op b` for an infix operator by its normalized name, as the parser builds it
+pub fn bin_expr(op: &str, a: Expr, b: Expr) -> Expr {
+    bin(op, a, b)
+}
+
 fn bin(op: &str, a: Expr, b: Expr) -> Expr {
     let o = match op {
         "=>" => BOp::Implies,
@@ -149,6 +159,20 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         _ => unreachable!(),
     };
     Expr::Bin(o, a.b(), b.b())
+}
+
+/// The definitions `x1 == t[1]`, `x2 == t[2]`, ... binding the names of a tuple pattern
+fn tuple_lets(t: &str, names: Vec<String>) -> Vec<Def> {
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| Def {
+            name: n,
+            params: vec![],
+            arity: vec![],
+            body: Expr::App(Expr::Ident(t.to_string()).b(), Expr::Num(i as i64 + 1).b()),
+        })
+        .collect()
 }
 
 /// e with every application `f[a]` replaced by the call `app(a)`
@@ -572,6 +596,36 @@ impl Parser {
         Ok(bs)
     }
 
+    /// At `<<x, y>> \in`, the names (consuming the pattern up to `\in` inclusive); otherwise None
+    /// and nothing is consumed
+    fn tuple_pattern(&mut self) -> Option<Vec<String>> {
+        if !self.is("<<") {
+            return None;
+        }
+        let mut i = self.pos + 1;
+        let mut names = vec![];
+        loop {
+            let Tok::Ident(n) = &self.toks[i].tok else { return None };
+            names.push(n.clone());
+            i += 1;
+            match &self.toks[i].tok {
+                Tok::Sym(s) if s == "," => i += 1,
+                Tok::Sym(s) if s == ">>" => break,
+                _ => return None,
+            }
+        }
+        if !matches!(&self.toks[i + 1].tok, Tok::Sym(s) if s == "\\in") {
+            return None;
+        }
+        self.pos = i + 2;
+        Some(names)
+    }
+
+    fn fresh_tuple_name(&mut self) -> String {
+        self.tuple_binders += 1;
+        format!("#tup{}", self.tuple_binders)
+    }
+
     /// Bound variables `x, y \in S, <<a, b>> \in T`. A tuple of variables binds a fresh variable t
     /// and returns the definitions `a == t[1]`, `b == t[2]` to wrap the body in.
     fn binders_pat(&mut self) -> R<(Vec<(String, Expr)>, Vec<Def>)> {
@@ -729,11 +783,23 @@ impl Parser {
                 }
                 "CHOOSE" => {
                     self.pos += 1;
-                    let x = self.ident()?;
-                    self.expect("\\in")?;
+                    // CHOOSE <<x, y>> \in S : P binds a fresh name to the tuple
+                    let pat = self.tuple_pattern();
+                    let x = match &pat {
+                        Some(_) => self.fresh_tuple_name(),
+                        None => {
+                            let x = self.ident()?;
+                            self.expect("\\in")?;
+                            x
+                        }
+                    };
                     let s = self.expr(4)?;
                     self.expect(":")?;
                     let p = self.expr(0)?;
+                    let p = match pat {
+                        Some(names) => Expr::Let(tuple_lets(&x, names), p.b()),
+                        None => p,
+                    };
                     Ok(Expr::Choose(x, s.b(), p.b()))
                 }
                 _ => self.postfix(),
@@ -772,6 +838,19 @@ impl Parser {
             return Ok(v);
         }
         loop {
+            // An infix operator passed as an operator argument, as in SortSeq(s, <)
+            if let Some((_, _, name)) = infix(self.peek()) {
+                if matches!(self.peek2(), Tok::Sym(s) if s == "," || s == close) {
+                    self.pos += 1;
+                    v.push(Expr::Ident(name.to_string()));
+                    if self.is(",") {
+                        self.pos += 1;
+                        continue;
+                    }
+                    self.expect(close)?;
+                    return Ok(v);
+                }
+            }
             v.push(self.expr(0)?);
             if self.is(",") {
                 self.pos += 1;
@@ -876,6 +955,19 @@ impl Parser {
         // {x \in S : P} only when it starts with `identifier \in`; a parenthesized (y \in T) is a
         // map expression
         let filter_shape = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::Sym(s) if s == "\\in");
+        // {<<x, y>> \in S : P}
+        let at = self.pos;
+        if let Some(names) = self.tuple_pattern() {
+            let s = self.expr(4)?;
+            if self.is(":") {
+                self.pos += 1;
+                let t = self.fresh_tuple_name();
+                let p = self.expr(0)?;
+                self.expect("}")?;
+                return Ok(Expr::SetFilter(t.clone(), s.b(), Expr::Let(tuple_lets(&t, names), p.b()).b()));
+            }
+            self.pos = at;
+        }
         let first = self.expr(0)?;
         if self.is(":") {
             self.pos += 1;
@@ -979,6 +1071,16 @@ impl Parser {
                     let body = self.expr(0)?;
                     self.expect("]")?;
                     return Ok(Expr::FunCons(x.clone(), s.clone(), body.b()));
+                }
+                // [<<x, y>> \in S |-> e]
+                if let Expr::Tuple(xs) = x.as_ref() {
+                    if let Some(names) = xs.iter().map(|x| if let Expr::Ident(n) = x { Some(n.clone()) } else { None }).collect::<Option<Vec<_>>>() {
+                        self.pos += 1;
+                        let body = self.expr(0)?;
+                        self.expect("]")?;
+                        let t = self.fresh_tuple_name();
+                        return Ok(Expr::FunCons(t.clone(), s.clone(), Expr::Let(tuple_lets(&t, names), body.b()).b()));
+                    }
                 }
             }
             return self.err("unsupported function constructor");

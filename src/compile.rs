@@ -23,6 +23,18 @@ const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv",
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 
+/// The bounded sequences `UNION {[1..n -> S] : n \in R}`: (R, S)
+pub fn bounded_seq(e: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Un(UOp::Union, x) = e.strip() else { return None };
+    let Expr::SetMap(f, bs) = x.strip() else { return None };
+    let [(n, r)] = bs.as_slice() else { return None };
+    let Expr::FunSet(d, s) = f.strip() else { return None };
+    match d.strip() {
+        Expr::Bin(BOp::Range, lo, hi) if matches!(lo.strip(), Expr::Num(1)) && matches!(hi.strip(), Expr::Ident(m) if m == n) => Some((r, s)),
+        _ => None,
+    }
+}
+
 /// The maximum length of a sequence value. `-seqcap N` sets it. Otherwise it comes from bounds
 /// `Len(e) <= N` (or `< N`) among the conjuncts of TypeOK and of the CONSTRAINTs: one more than
 /// the largest, so that a state one element too long can still be built, counted, and reported
@@ -63,6 +75,16 @@ fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize) -> 
             let mut conj = vec![];
             conjuncts(src, &mut conj);
             for c in conj {
+                // x \in UNION {[1..n -> S] : n \in R}
+                if let Expr::Bin(BOp::In, _, set) = c.strip() {
+                    if let Some((r, _)) = bounded_seq(set) {
+                        if let Ok(Value::Set(r)) = g.ce.eval(r, &HashMap::new()) {
+                            if let Some(Value::Int(k)) = r.iter().max() {
+                                bound = Some(bound.unwrap_or(0).max(*k.max(&0) as usize + 1));
+                            }
+                        }
+                    }
+                }
                 let (k, strict) = match c.strip() {
                     Expr::Bin(BOp::Le, l, k) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => (k, false),
                     Expr::Bin(BOp::Lt, l, k) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => (k, true),
@@ -74,9 +96,29 @@ fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize) -> 
                 }
             }
         }
+        // Otherwise a test of a length anywhere in the spec (a guard such as `Len(q) < 3` before
+        // an Append) suggests the bound. It need not be proven: a sequence growing past the bound
+        // is an evaluation error, never cut short
+        let guard = || -> Option<usize> {
+            let best = std::cell::Cell::new(None::<usize>);
+            for d in &m.defs {
+                d.body.any(&|e| {
+                    let k = match e {
+                        Expr::Bin(BOp::Le | BOp::Lt, l, k) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => k,
+                        Expr::Bin(BOp::Ge | BOp::Gt, k, l) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => k,
+                        _ => return false,
+                    };
+                    if let Ok(Value::Int(k)) = g.ce.eval(k, &HashMap::new()) {
+                        best.set(Some(best.get().unwrap_or(0).max(k.max(0) as usize + 2)));
+                    }
+                    false
+                });
+            }
+            best.get()
+        };
         match bound {
             Some(b) => b.max(lit),
-            None if m.defs.iter().any(|d| grows(&d.body)) => 0,
+            None if m.defs.iter().any(|d| grows(&d.body)) => guard().map_or(0, |b| b.max(lit)),
             None => lit,
         }
     };
@@ -228,8 +270,8 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
     match name {
         // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
         // for the Toolbox's trace explorer.
-        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" => Ok(true),
-        "Bags" | "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
+        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" | "Bags" => Ok(true),
+        "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
         // TLC picks the subsets at random, so its results cannot be reproduced
         "Randomization" => Err(format!("{how} {name}: TLC chooses its values at random; not supported")),
         _ => Ok(false),
@@ -463,7 +505,8 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
                 if let Expr::Ident(v) = v.strip() {
                     if m.variables.contains(v) {
                         decl.insert(v.clone(), ty_of_set(&g, s).map_err(|e| format!("{tname}: type of `{v}`: {e}"))?);
-                        taken = true;
+                        // Packing checks the element type of a bounded sequence, not its length
+                        taken = bounded_seq(s).is_none();
                     }
                 }
                 if !taken {
@@ -628,8 +671,14 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         let e = ex.expand_def(sym)?;
         let v = g.ce.eval(&e, &HashMap::new()).map_err(|m| format!("SYMMETRY {sym}: {m}"))?;
         for f in v.as_set()? {
-            let Value::Fun(m) = f else { return Err(format!("SYMMETRY {sym} must be a set of permutations")) };
-            let mut t: Vec<u16> = (0..atoms.list.len() as u16).collect();
+            let m = match f {
+                Value::Fun(m) => m.clone(),
+                // The permutation of the empty set is the empty function, <<>>
+                Value::Tuple(t) if t.is_empty() => Default::default(),
+                _ => return Err(format!("SYMMETRY {sym} must be a set of permutations of model values or strings")),
+            };
+            let m = &m;
+            let mut t: Vec<u16> = (0..atoms.len() as u16).collect();
             for (a, b) in m {
                 let (Value::Atom(a), Value::Atom(b)) = (a, b) else {
                     return Err(format!("SYMMETRY {sym}: only permutations of model values / strings are supported"));
@@ -830,6 +879,7 @@ fn ty_of_set(g: &Gen, s: &Expr) -> R<Ty> {
         }
         Expr::Call(f, parts) if f == "\\X" => tuple_ty(parts.iter().map(|x| ty_of_set(g, x)).collect::<R<_>>()?)?,
         Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Ty::Seq(ty_of_set(g, &a[0])?.into()),
+        e if bounded_seq(e).is_some() => Ty::Seq(ty_of_set(g, bounded_seq(e).unwrap().1)?.into()),
         Expr::Ident(n) if n == "BOOLEAN" => Ty::Bool,
         // Unbounded integers are stored as 64-bit
         Expr::Ident(n) if n == "Nat" => Ty::Int(0, BIG),

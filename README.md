@@ -34,7 +34,8 @@ cargo build --release
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` sets the capacity of sets whose size is only known at run time
-- `-seqcap N` sets the maximum length of sequences, when the spec does not bound them with `Len(x) <= N` in `TypeOK`
+- `-seqcap N` sets the maximum length of sequences, when the spec does not bound them with `Len(x) <= N` in `TypeOK`,
+  `UNION {[1..n -> S] : n \in 0..N}`, or a length test such as `Len(q) < N`
   or a `CONSTRAINT`
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
@@ -108,10 +109,14 @@ memory.
 - A set whose element type has at most 128 values is a bitmask; a larger one (including sets of sets) is a sorted array
   of up to `-setcap` elements. A sequence holds up to `-seqcap` elements (see above); growing past it is an
   evaluation error
-- Not supported: operators other than `Len` on strings, sets that may hold both strings and integers, functions over
-  part of a type (`[S -> T]` with S in the state, `:>` / `@@` other than `(d :> e) @@ f`), recursive operators with
-  operator parameters, strong fairness (SF), `ENABLED`, `<<A>>_v`, and `Name <- [Module] Def` for a CONSTANT (TLC
-  rejects it too)
+- Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
+  characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`), `Bags`, and from `TLC` `Print`, `PrintT`,
+  `Assert`, `ToString` (in constant expressions), `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+- Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
+  reason), sets that may hold both strings and integers, functions over part of a type (`[S -> T]` with S in the
+  state, `:>` / `@@` other than `(d :> e) @@ f`, `Permutations` of a set in the state, `SubBag` of a bag in the
+  state), user-defined prefix and postfix operators, recursive operators with operator parameters, strong fairness
+  (SF), `ENABLED`, `<<A>>_v`, and `Name <- [Module] Def` for a CONSTANT (TLC rejects it too)
 - Recursion deeper than 500 levels is an evaluation error. TLC overflows its stack somewhere between 500 and 900
   levels depending on the operator, so a recursion between those depths can pass in TLC and fail here
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
