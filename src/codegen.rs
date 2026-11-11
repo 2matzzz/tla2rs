@@ -137,6 +137,56 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// How TLC compares values of types `a` and `b` when a tuple meets something else. A tuple of
+    /// another length or a model value is unequal to it; an integer, boolean, string, record, set,
+    /// or function makes TLC stop with an error. A function over 1..n is not compiled (Err).
+    fn tuple_cmp(&self, a: &Ty, b: &Ty) -> R<Cmp> {
+        // Several parts: an error anywhere wins, then a part that is never equal
+        let all = |parts: Vec<Cmp>| {
+            parts.iter().find(|c| matches!(c, Cmp::Fails(_))).cloned().unwrap_or(if parts.contains(&Cmp::Unequal) {
+                Cmp::Unequal
+            } else {
+                Cmp::Normal
+            })
+        };
+        Ok(match (tuple_elems(a), tuple_elems(b)) {
+            (Some(x), Some(y)) if x.len() != y.len() => Cmp::Unequal,
+            (Some(x), Some(y)) => all(x.iter().zip(&y).map(|(s, t)| self.tuple_cmp(s, t)).collect::<R<_>>()?),
+            (Some(_), None) => self.tuple_vs(b)?,
+            (None, Some(_)) => self.tuple_vs(a)?,
+            (None, None) => match (a, b) {
+                (Ty::Rec(x), Ty::Rec(y)) => all(
+                    x.iter()
+                        .filter_map(|(n, s)| y.iter().find(|(m, _)| m == n).map(|(_, t)| self.tuple_cmp(s, t)))
+                        .collect::<R<_>>()?,
+                ),
+                // Only an error carries over: empty sets or absent fields can still be equal
+                (Ty::Opt(_), _) | (_, Ty::Opt(_)) | (Ty::Set(_), Ty::Set(_)) | (Ty::Fun(..), Ty::Fun(..)) => {
+                    let (x, y): (&Ty, &Ty) = match (a, b) {
+                        (Ty::Opt(x), y) | (y, Ty::Opt(x)) => (x, y),
+                        (Ty::Set(x), Ty::Set(y)) | (Ty::Fun(_, x), Ty::Fun(_, y)) => (x, y),
+                        _ => unreachable!(),
+                    };
+                    match self.tuple_cmp(x, y)? {
+                        Cmp::Fails(m) => Cmp::Fails(m),
+                        _ => Cmp::Normal,
+                    }
+                }
+                _ => Cmp::Normal,
+            },
+        })
+    }
+
+    /// `tuple_cmp` of a tuple against a value of the non-tuple type `t`
+    fn tuple_vs(&self, t: &Ty) -> R<Cmp> {
+        Ok(match t {
+            Ty::Enum(v) if v.is_empty() => Cmp::Normal,
+            Ty::Enum(v) if v.iter().all(|&a| self.atoms.list[a as usize].0) => Cmp::Unequal,
+            _ if seq_like_fun(t) => return Err("comparing a function over 1..n with a tuple is not supported".into()),
+            _ => Cmp::Fails(format!("Attempted to compare a tuple with a value of type {t:?}")),
+        })
+    }
+
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
         self.ty_id(t)
     }
@@ -280,8 +330,14 @@ impl<'a> Gen<'a> {
     /// Whether x (of type xt) is a member of set c (of type st)
     fn s_has(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<String> {
         let et = Self::elem_of(st);
-        if (seq_like_fun(xt) && tuple_elems(&et).is_some()) || (tuple_elems(xt).is_some() && seq_like_fun(&et)) {
-            return Err("comparing a function over 1..n with a tuple is not supported".into());
+        match self.tuple_cmp(xt, &et)? {
+            Cmp::Normal => {}
+            Cmp::Unequal => return Ok("false".into()),
+            // TLC compares only against the elements present, so an empty set is no error
+            Cmp::Fails(m) => {
+                let empty = if is_sparse(st) { format!("(({c}).len == 0)") } else { format!("({c} == 0)") };
+                return Ok(format!("(if {empty} {{ false }} else {{ {} }})", eval_error_bool(&m)));
+            }
         }
         if matches!(&et, Ty::Enum(v) if v.is_empty()) {
             return Ok("false".into());
@@ -988,6 +1044,12 @@ impl<'a> Gen<'a> {
             Eq | Neq => {
                 let (ac, at) = self.gen(a, env, None)?;
                 let (bc, bt) = self.gen(b, env, Some(&at))?;
+                // Still evaluate both sides, which may stop with an error as in TLC
+                match self.tuple_cmp(&at, &bt)? {
+                    Cmp::Normal => {}
+                    Cmp::Unequal => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", op == Neq), Ty::Bool)),
+                    Cmp::Fails(m) => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", eval_error_bool(&m)), Ty::Bool)),
+                }
                 let t = join(&at, &bt)?;
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
@@ -1141,6 +1203,18 @@ impl<'a> Gen<'a> {
     fn gen_member(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
         let s = s.strip();
+        // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
+        // treats it as a function in [S -> T]; none of these is compiled
+        if tuple_elems(xt).is_some() {
+            if matches!(s, FunSet(..)) {
+                return Err(format!("membership of a tuple in a set of functions is not supported: {}", short(s)));
+            }
+            if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
+                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int"].contains(&n.as_str()))
+            {
+                return Ok(eval_error_bool(&format!("Attempted to check if the tuple {x} is an element of {}", short(s))));
+            }
+        }
         match s {
             Un(UOp::Subset, t) => {
                 let Ty::Set(et) = xt else { return Ok("false".into()) };
@@ -1179,10 +1253,17 @@ impl<'a> Gen<'a> {
             // Membership in A \X B is decided element by element, also for constant sets (that
             // avoids enumerating a large product)
             Call(f, parts) if f == "\\X" => {
-                if seq_like_fun(xt) {
-                    return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
-                }
-                let Some(el) = tuple_elems(xt) else { return Ok("false".into()) };
+                let Some(el) = tuple_elems(xt) else {
+                    // TLC answers FALSE for a string or model value and stops with an error for
+                    // anything else that is not a tuple
+                    if matches!(xt, Ty::Enum(_)) {
+                        return Ok("false".into());
+                    }
+                    if seq_like_fun(xt) {
+                        return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+                    }
+                    return Ok(eval_error_bool(&format!("Attempted to check if a non-tuple value of type {xt:?} is an element of a cartesian product")));
+                };
                 if el.len() != parts.len() {
                     return Ok("false".into());
                 }
@@ -1231,12 +1312,23 @@ impl<'a> Gen<'a> {
         }
         if let Some(v) = self.try_const(s, env) {
             let set = v.as_set()?;
-            if (seq_like_fun(xt) && set.iter().any(|e| matches!(e, Value::Tuple(_))))
-                || (tuple_elems(xt).is_some() && set.iter().any(|e| matches!(e, Value::Fun(_))))
-            {
-                return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+            let mut fits: Vec<&Value> = vec![];
+            let mut clash = None;
+            for e in set {
+                match self.tuple_cmp(xt, &ty_of_value(e)?).map_err(|m| format!("{m}: {}", short(s)))? {
+                    Cmp::Normal if xt.conforms(e) => fits.push(e),
+                    Cmp::Normal | Cmp::Unequal => {}
+                    Cmp::Fails(m) => clash = Some(m),
+                }
             }
-            let fits: Vec<&Value> = set.iter().filter(|e| xt.conforms(e)).collect();
+            if let Some(m) = clash {
+                // TLC stops comparing x with an element it cannot compare it with. If other
+                // elements might match first, whether it stops depends on its order: reject
+                if !fits.is_empty() {
+                    return Err(format!("{m}: {}", short(s)));
+                }
+                return Ok(eval_error_bool(&m));
+            }
             if fits.is_empty() {
                 return Ok("false".into());
             }
@@ -1257,8 +1349,22 @@ impl<'a> Gen<'a> {
         }
         if let SetLit(xs) = s {
             let mut parts = vec![];
+            let mut clash = None;
+            let mut comparable = false;
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
+                match self.tuple_cmp(xt, &t)? {
+                    Cmp::Normal => comparable = true,
+                    Cmp::Unequal => {
+                        parts.push(format!("{{ let _ = {c}; false }}"));
+                        continue;
+                    }
+                    Cmp::Fails(m) => {
+                        clash = Some(m);
+                        parts.push(format!("{{ let _ = {c}; false }}"));
+                        continue;
+                    }
+                }
                 if narrows(&t, xt) {
                     // Compare in the joined type (converting the element could fail at run time)
                     let j = join(xt, &t)?;
@@ -1268,6 +1374,12 @@ impl<'a> Gen<'a> {
                 } else if let Ok(c) = self.coerce_soft(c, &t, xt) {
                     parts.push(format!("{x} == {c}"));
                 }
+            }
+            if let Some(m) = clash {
+                if comparable {
+                    return Err(format!("{m}: {}", short(s)));
+                }
+                return Ok(format!("({} || {})", parts.join(" || "), eval_error_bool(&m)));
             }
             return Ok(if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) });
         }
@@ -2377,6 +2489,23 @@ impl<'a> Gen<'a> {
         let names: Vec<String> = self.atoms.list.iter().enumerate().map(|(i, _)| format!("{:?}", self.atoms.show(i as u32))).collect();
         format!("static ATOMS: [&str; {}] = [{}];\n", names.len(), names.join(", "))
     }
+}
+
+/// How a comparison involving tuples turns out in TLC (see `Gen::tuple_cmp`)
+#[derive(Clone, PartialEq)]
+enum Cmp {
+    /// Compare the values
+    Normal,
+    /// Never equal
+    Unequal,
+    /// TLC stops with this error when it evaluates the comparison
+    Fails(String),
+}
+
+/// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
+/// when it evaluates the comparison, so a branch never taken must not be an error)
+fn eval_error_bool(msg: &str) -> String {
+    format!("{{ let __b: bool = eval_error({msg:?}.to_string()); __b }}")
 }
 
 /// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
