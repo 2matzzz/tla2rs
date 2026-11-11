@@ -462,7 +462,7 @@ impl<'a> Gen<'a> {
     /// (its parameters, then the free variables of `rec_free`): its name and return type. The
     /// return type is found by generating the body until the type settles, starting from a few
     /// guesses; integer ranges that keep growing are widened to unbounded.
-    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, uses_state: bool) -> R<(String, Ty)> {
+    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, reads: &[String], primes: &[String]) -> R<(String, Ty)> {
         let key = (i, tys.clone());
         if let Some(r) = self.rec_done.get(&key) {
             return Ok(r.clone());
@@ -476,12 +476,17 @@ impl<'a> Gen<'a> {
             return Ok((name, t.clone()));
         }
         let free = self.rec_free(rd);
-        let names: Vec<String> = rd.params.iter().chain(&free).cloned().collect();
+        let names: Vec<String> = rd.params.iter().chain(&free).chain(reads).cloned().collect();
         let mut env = Env::default();
-        let mut sig = if uses_state { String::from("s: &State, ") } else { String::new() };
+        let mut sig = String::new();
         for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
             env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
             write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+        }
+        for (k, (x, t)) in primes.iter().zip(&tys[names.len()..]).enumerate() {
+            let a = format!("a{}", names.len() + k);
+            env.primed.insert(x.clone(), (a.clone(), t.clone()));
+            write!(sig, "{a}: {}, ", t.repr()).unwrap();
         }
         let mut last_err = String::new();
         for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool] {
@@ -522,6 +527,53 @@ impl<'a> Gen<'a> {
             }
         }
         Err(format!("recursive operator `{}`: {last_err}", rd.name))
+    }
+
+    /// The variables that the recursive operator `i` reads, and those it reads primed, including
+    /// through the recursive operators it calls
+    fn rec_reads(&self, i: usize) -> R<(Vec<String>, Vec<String>)> {
+        let mut todo = vec![i];
+        let mut seen = BTreeSet::new();
+        let (mut reads, mut primes) = (BTreeSet::new(), BTreeSet::new());
+        while let Some(j) = todo.pop() {
+            if !seen.insert(j) {
+                continue;
+            }
+            let rd = crate::expand::rec_def(j);
+            if rd.body.any(&|e| matches!(e, Expr::Un(UOp::Enabled, _))) {
+                return Err(format!("recursive operator `{}`: ENABLED inside a recursive operator is not supported", rd.name));
+            }
+            self.collect_reads(&rd.body, false, &mut reads, &mut primes, &mut todo);
+        }
+        Ok((reads.into_iter().collect(), primes.into_iter().collect()))
+    }
+
+    fn collect_reads(&self, e: &Expr, primed: bool, reads: &mut BTreeSet<String>, primes: &mut BTreeSet<String>, todo: &mut Vec<usize>) {
+        match e {
+            Expr::Ident(n) if self.is_var(n) => {
+                if primed {
+                    primes.insert(n.clone());
+                } else {
+                    reads.insert(n.clone());
+                }
+            }
+            Expr::Prime(x) => self.collect_reads(x, true, reads, primes, todo),
+            Expr::Un(UOp::Unchanged, x) => {
+                self.collect_reads(x, false, reads, primes, todo);
+                self.collect_reads(x, true, reads, primes, todo);
+            }
+            Expr::RecCall(j, args) => {
+                todo.push(*j);
+                for a in args {
+                    self.collect_reads(a, primed, reads, primes, todo);
+                }
+            }
+            _ => {
+                for c in e.children() {
+                    self.collect_reads(c, primed, reads, primes, todo);
+                }
+            }
+        }
     }
 
     /// The functions generated for recursive operators, with the depth guard they share
@@ -1615,8 +1667,9 @@ impl<'a> Gen<'a> {
                 Self::unchanged_vars(x, &mut names)?;
                 let mut parts = vec![];
                 for v in names {
-                    let (p, _) = env.primed.get(&v).ok_or(format!("UNCHANGED {v} before {v}' is decided"))?;
-                    parts.push(format!("{p} == s.v_{v}"));
+                    let (p, _) = env.primed.get(&v).cloned().ok_or(format!("UNCHANGED {v} before {v}' is decided"))?;
+                    let (c, _) = self.gen(&Ident(v.clone()), env, None)?;
+                    parts.push(format!("{p} == {c}"));
                 }
                 (format!("({})", if parts.is_empty() { "true".into() } else { parts.join(" && ") }), Ty::Bool)
             }
@@ -2134,13 +2187,7 @@ impl<'a> Gen<'a> {
                 // Constant arguments were folded above when the whole call evaluates; otherwise
                 // call a Rust function generated for the operator
                 let rd = crate::expand::rec_def(*i);
-                if rd.body.is_action() {
-                    return Err(format!("recursive operator `{}` refers to primed variables, which is not supported", rd.name));
-                }
-                let uses_state = rd.body.any(&|e| matches!(e, Ident(n) if self.is_var(n)));
-                if uses_state && env.init {
-                    return Err(format!("recursive operator `{}` reads variables in Init, which is not supported", rd.name));
-                }
+                let (reads, primes) = self.rec_reads(*i)?;
                 let mut codes = vec![];
                 let mut tys = vec![];
                 for a in args {
@@ -2157,9 +2204,27 @@ impl<'a> Gen<'a> {
                     codes.push(c);
                     tys.push(t);
                 }
-                let (name, ret) = self.rec_fn(*i, &rd, tys, uses_state)?;
-                let s_arg = if uses_state { "s, " } else { "" };
-                (format!("{name}({s_arg}{})", codes.join(", ")), ret)
+                // So are the variables it reads (in Init, the values assigned so far) and the primed
+                // variables it reads, which must be determined before the call
+                for v in &reads {
+                    let (c, t) = self.gen(&Ident(v.clone()), env, None)?;
+                    let vt = self.var_ty(v);
+                    codes.push(self.coerce(c, &t, &vt)?);
+                    tys.push(vt);
+                }
+                for v in &primes {
+                    let Some((c, t)) = env.primed.get(v).cloned() else {
+                        return Err(format!(
+                            "recursive operator `{}` reads {v}' where the action has not determined it, which is not supported",
+                            rd.name
+                        ));
+                    };
+                    let vt = self.var_ty(v);
+                    codes.push(self.coerce(c, &t, &vt)?);
+                    tys.push(vt);
+                }
+                let (name, ret) = self.rec_fn(*i, &rd, tys, &reads, &primes)?;
+                (format!("{name}({})", codes.join(", ")), ret)
             }
             BoxAction(..) | Fair(..) => return Err("temporal formula in a state expression".into()),
             Num(_) | Str(_) | Bool(_) => unreachable!("constants are folded"),
