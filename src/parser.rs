@@ -43,9 +43,35 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex_module(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![] };
-    p.module()
+    let toks = lex_module(src)?;
+    // Positional subexpression names (`Op!1`, `Op!<<`, `Op!(e)`) need infix /\ and \/ as SANY
+    // reads them: binary and left-associative. Only then are they kept so (see INFIX_JUNCTION)
+    let positional = toks.windows(2).any(|w| matches!(&w[0].tok, Tok::Sym(b) if b == "!") && is_selector(&w[1].tok));
+    NEST_JUNCTIONS.with(|n| n.set(positional));
+    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![] };
+    let r = p.module();
+    NEST_JUNCTIONS.with(|n| n.set(false));
+    r
 }
+
+/// Whether a token after `!` starts a positional subexpression selector
+fn is_selector(t: &Tok) -> bool {
+    matches!(t, Tok::Num(_)) || matches!(t, Tok::Sym(c) if ["<<", ">>", ":", "(", "@"].contains(&c.as_str()))
+}
+
+thread_local! {
+    static NEST_JUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The label around `a /\ b` (and `a \/ b`) written infix, in a module that names
+/// subexpressions by position: the conjunction of the two, which expansion flattens as the parser
+/// otherwise does (`a /\ b /\ c` is one conjunction of three)
+pub const INFIX_JUNCTION: &str = "#infix";
+
+/// The call a positional subexpression name becomes: the operator (Ident or Call) and then the
+/// selectors: Num(n) for `!n`, Ident("<<" / ">>" / ":" / "@"), Tuple(args) for `!(args)`, and a
+/// call of `#label<name>` for a label
+pub const SUBEXPR: &str = "#subexpr";
 
 /// Infix operators without a built-in meaning, which a spec may define (`a ++ b == ...`), with
 /// their precedence (the lower end of the range in the TLA+ table). `:>` and `@@` are defined by
@@ -131,6 +157,10 @@ pub(crate) fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "=>" => BOp::Implies,
         "<=>" => BOp::Equiv,
         "~>" => BOp::LeadsTo,
+        "\\/" | "/\\" if NEST_JUNCTIONS.with(|n| n.get()) => {
+            let j = if op == "/\\" { Expr::And(vec![a, b]) } else { Expr::Or(vec![a, b]) };
+            return Expr::Label(INFIX_JUNCTION.into(), vec![], j.b());
+        }
         "\\/" => {
             return match a {
                 Expr::Or(mut v) => {
@@ -1120,9 +1150,17 @@ impl Parser {
                         }
                     }
                     if j > self.pos + 1 && matches!(&self.toks[j - 1].tok, Tok::Sym(c) if c == ")") && matches!(&self.toks[j].tok, Tok::Sym(c) if c == "::") {
+                        // The parameters are kept in the name, for naming the label with arguments
+                        let ps: Vec<String> = self.toks[self.pos + 1..j]
+                            .iter()
+                            .filter_map(|t| match &t.tok {
+                                Tok::Ident(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect();
                         self.pos = j + 1;
                         let body = self.expr(0)?;
-                        return Ok(Expr::Label(format!("{s}::"), vec![], body.b()));
+                        return Ok(Expr::Label(format!("{s}({})::", ps.join(",")), vec![], body.b()));
                     }
                 }
                 let mut name = s;
@@ -1149,10 +1187,35 @@ impl Parser {
                         _ => break,
                     }
                 }
-                if call || !args.is_empty() {
-                    return Ok(Expr::Call(name, args));
+                let base = if call || !args.is_empty() { Expr::Call(name, args) } else { Expr::Ident(name) };
+                // A positional subexpression name: `Op!1!2`, `Op!<<`, `Op!(e)`, `Op!:`, also
+                // followed by labels
+                if !(self.is("!") && is_selector(self.peek2())) {
+                    return Ok(base);
                 }
-                Ok(Expr::Ident(name))
+                let mut parts = vec![base];
+                while self.is("!") {
+                    let next = self.peek2().clone();
+                    self.pos += 2;
+                    parts.push(match next {
+                        Tok::Num(n) => Expr::Num(n),
+                        Tok::Sym(c) if c == "(" => Expr::Tuple(self.nested(|p| p.comma_list(")"))?),
+                        Tok::Sym(c) if ["<<", ">>", ":", "@"].contains(&c.as_str()) => Expr::Ident(c),
+                        Tok::Ident(l) => {
+                            let mut largs = vec![];
+                            if self.is("(") {
+                                self.pos += 1;
+                                largs = self.nested(|p| p.comma_list(")"))?;
+                            }
+                            Expr::Call(format!("#label{l}"), largs)
+                        }
+                        _ => {
+                            self.pos -= 2;
+                            return self.err("expected a subexpression selector after `!`");
+                        }
+                    });
+                }
+                Ok(Expr::Call(SUBEXPR.into(), parts))
             }
             Tok::Sym(s) => match s.as_str() {
                 "(" => {

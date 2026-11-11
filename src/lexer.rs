@@ -3,6 +3,9 @@
 
 pub type R<T> = Result<T, String>;
 
+/// The start of an error that SANY reports too (TLC then stops with exit 150, before checking)
+pub const SANY: &str = "SANY: ";
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {

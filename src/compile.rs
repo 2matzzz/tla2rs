@@ -634,7 +634,15 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
     let mut startup = vec![];
-    let mut out = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup)?;
+    let mut out = match compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup) {
+        // An error SANY reports too: TLC stops before checking anything
+        Err(e) if e.contains(crate::lexer::SANY) => {
+            let msg = e.replacen(crate::lexer::SANY, "", 1);
+            let msg = format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed.");
+            return Ok(Output { rust: String::new(), warnings: vec![], rejected: Some((msg, 150)) });
+        }
+        r => r?,
+    };
     // What TLC prints when it starts comes before its verdict on the spec
     if let Some((msg, _)) = &mut out.rejected {
         if !startup.is_empty() {

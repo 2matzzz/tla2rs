@@ -2,7 +2,7 @@
 //! Call sites are kept as `Expr::Label` (for trace output and fairness matching).
 
 use crate::ast::*;
-use crate::lexer::R;
+use crate::lexer::{R, SANY};
 use std::collections::HashMap;
 
 #[derive(Clone, Default)]
@@ -235,9 +235,15 @@ impl<'a> Expander<'a> {
                     self.call(n, &d, denv, &[], env)?
                 } else if let Some(d) = self.defs.get(n.as_str()).copied() {
                     self.call(n, d, Env::default(), &[], env)?
+                } else if n.contains('!') && self.label_path(n, env).is_some() {
+                    self.subexpr(e, &[], env)?
                 } else {
                     e.clone()
                 }
+            }
+            Call(n, parts) if n == crate::parser::SUBEXPR => self.subexpr(&parts[0], &parts[1..], env)?,
+            Call(n, args) if n.contains('!') && !env.locals.contains_key(n) && !self.defs.contains_key(n.as_str()) && self.label_path(n, env).is_some() => {
+                self.subexpr(e, &[], env)?
             }
             Call(n, args) => {
                 if let Some((d, denv)) = env.locals.get(n) {
@@ -350,9 +356,239 @@ impl<'a> Expander<'a> {
             }
             BoxAction(a, v) => BoxAction(ex(self, a)?.b(), ex(self, v)?.b()),
             Fair(w, v, a) => Fair(*w, ex(self, v)?.b(), ex(self, a)?.b()),
+            // `a /\ b` written infix (see INFIX_JUNCTION): flattened as the parser otherwise does
+            Label(n, _, b) if n == crate::parser::INFIX_JUNCTION => {
+                let (And(xs) | Or(xs)) = b.as_ref() else { unreachable!() };
+                let (a, c) = (ex(self, &xs[0])?, ex(self, &xs[1])?);
+                match (b.as_ref(), a) {
+                    (And(_), And(mut v)) => {
+                        v.push(c);
+                        And(v)
+                    }
+                    (Or(_), Or(mut v)) => {
+                        v.push(c);
+                        Or(v)
+                    }
+                    (And(_), a) => And(vec![a, c]),
+                    (_, a) => Or(vec![a, c]),
+                }
+            }
             Label(n, args, b) => Label(n.clone(), args.clone(), ex(self, b)?.b()),
         })
     }
+
+    /// For a name `Op!l1!l2` that is not a definition: the longest prefix that is an operator, and
+    /// the labels after it
+    fn label_path(&self, n: &str, env: &Env) -> Option<(String, Vec<String>)> {
+        let parts: Vec<&str> = n.split('!').collect();
+        (1..parts.len()).rev().find_map(|i| {
+            let op = parts[..i].join("!");
+            (env.locals.contains_key(&op) || self.defs.contains_key(op.as_str()))
+                .then(|| (op, parts[i..].iter().map(|l| l.to_string()).collect()))
+        })
+    }
+
+    /// A subexpression of an operator's definition, named by labels (`Op!lab`, `Op(a)!lab(b)`) or
+    /// by position (`Op!1!2`, `Op!<<`, `Op!>>`, `Op!:`, `Op!(e)` for the body of a quantifier
+    /// with its bound variables set to e, and labels after these), as SANY names them. It is
+    /// expanded as a definition whose parameters are those of Op, followed by the bound variables
+    /// and label parameters set along the way.
+    fn subexpr(&mut self, base: &Expr, sels: &[Expr], env: &Env) -> R<Expr> {
+        use Expr::*;
+        let (name, mut args) = match base {
+            Ident(n) => (n.clone(), vec![]),
+            Call(n, a) => (n.clone(), a.clone()),
+            _ => return Err("a subexpression name must start with an operator".into()),
+        };
+        // Labels written as part of the name (`Op!lab`) come first
+        let (op, labels) = if env.locals.contains_key(&name) || self.defs.contains_key(name.as_str()) {
+            (name.clone(), vec![])
+        } else {
+            self.label_path(&name, env).ok_or(format!("unknown operator `{name}`"))?
+        };
+        let (d, denv) = match env.locals.get(&op) {
+            Some((d, denv)) => (d.clone(), with_self(&op, d, denv.clone())),
+            None => ((*self.defs[op.as_str()]).clone(), Env::default()),
+        };
+        if args.len() < d.params.len() {
+            return Err(format!("`{name}`: `{op}` expects {} arguments", d.params.len()));
+        }
+        let mut extra = args.split_off(d.params.len());
+        extra.reverse();
+        let mut steps: Vec<Expr> = labels
+            .into_iter()
+            .map(|l| Call(format!("#label{l}"), vec![]))
+            .chain(sels.iter().cloned())
+            .collect();
+        let mut params = d.params.clone();
+        let mut arity = d.arity.clone();
+        let mut lets: Vec<Vec<Def>> = vec![];
+        let mut cur = d.body.clone();
+        steps.reverse();
+        while let Some(sel) = steps.pop() {
+            match sel {
+                Num(_) | Ident(_) => {
+                    let k = match &sel {
+                        Num(k) => *k as usize,
+                        Ident(c) if c == "<<" => 1,
+                        Ident(c) if c == ">>" => 2,
+                        Ident(c) if c == ":" => {
+                            let Let(defs, body) = strip_labels(&cur).clone() else {
+                                return Err(format!("{SANY}`{name}`: `!:` names the body of a LET"));
+                            };
+                            lets.push(defs);
+                            cur = *body;
+                            continue;
+                        }
+                        _ => return Err(format!("`{name}`: the selector `!@` is not supported")),
+                    };
+                    if let Case(arms, other) = strip_labels(&cur) {
+                        // !i!j: the condition (j = 1) or the value (j = 2) of the i-th arm
+                        let Some(Num(j)) = steps.pop() else { return Err(format!("{SANY}`{name}`: a subexpression of CASE is named !i!j")) };
+                        let arm = match arms.get(k - 1) {
+                            Some((p, v)) => [p.clone(), v.clone()],
+                            None if k == arms.len() + 1 && other.is_some() => [Bool(true), other.as_ref().unwrap().as_ref().clone()],
+                            None => return Err(format!("{SANY}`{name}`: CASE has no arm {k}")),
+                        };
+                        cur = arm.get(j as usize - 1).cloned().ok_or(format!("{SANY}`{name}`: no subexpression {k}!{j} of CASE"))?;
+                        continue;
+                    }
+                    if let Let(defs, body) = strip_labels(&cur).clone() {
+                        if k != 1 {
+                            return Err(format!("{SANY}`{name}`: a LET has one subexpression, its body"));
+                        }
+                        lets.push(defs);
+                        cur = *body;
+                        continue;
+                    }
+                    let parts = operands(&cur).ok_or(format!("`{name}`: cannot name a subexpression of {}", crate::codegen::short(&cur)))?;
+                    cur = parts.get(k.wrapping_sub(1)).cloned().ok_or(format!("{SANY}`{name}`: there is no subexpression {k}"))?;
+                }
+                // !(e, ...): the body of a quantifier (CHOOSE, set or function constructor) with its
+                // bound variables set to e, ...
+                Tuple(vals) => {
+                    let (xs, body) = match strip_labels(&cur) {
+                        Quant(_, bs, body) => (bs.iter().map(|(x, _)| x.clone()).collect::<Vec<_>>(), body.as_ref().clone()),
+                        SetMap(body, bs) => (bs.iter().map(|(x, _)| x.clone()).collect(), body.as_ref().clone()),
+                        Choose(x, _, p) | SetFilter(x, _, p) | FunCons(x, _, p) => (vec![x.clone()], p.as_ref().clone()),
+                        e => return Err(format!("`{name}`: `!(...)` needs a quantifier, not {}", crate::codegen::short(e))),
+                    };
+                    if xs.len() != vals.len() {
+                        return Err(format!("{SANY}`{name}`: {} values for {} bound variables", vals.len(), xs.len()));
+                    }
+                    arity.extend(xs.iter().map(|_| 0));
+                    params.extend(xs);
+                    args.extend(vals);
+                    cur = body;
+                }
+                Call(l, largs) if l.starts_with("#label") => {
+                    let l = &l["#label".len()..];
+                    let mut scope = vec![];
+                    let mut lets2 = vec![];
+                    let Some((ps, body)) = find_label(&cur, l, &mut scope, &mut lets2) else {
+                        return Err(format!("{SANY}`{name}`: no label `{l}`"));
+                    };
+                    if let Some(x) = scope.iter().find(|x| !ps.contains(x)) {
+                        return Err(format!("{SANY}`{name}`: label `{l}` is in the scope of `{x}`, which it does not take as a parameter"));
+                    }
+                    let largs = if largs.is_empty() && !ps.is_empty() {
+                        // Arguments written after the name `Op!lab(a)` were joined with Op's
+                        let n = ps.len().min(extra.len());
+                        (0..n).map(|_| extra.pop().unwrap()).collect()
+                    } else {
+                        largs
+                    };
+                    if largs.len() != ps.len() {
+                        return Err(format!("{SANY}`{name}`: label `{l}` takes {} arguments", ps.len()));
+                    }
+                    lets.extend(lets2);
+                    arity.extend(ps.iter().map(|_| 0));
+                    params.extend(ps);
+                    args.extend(largs);
+                    cur = body;
+                }
+                _ => unreachable!(),
+            }
+        }
+        if !extra.is_empty() {
+            return Err(format!("{SANY}`{name}`: too many arguments"));
+        }
+        for defs in lets.into_iter().rev() {
+            cur = Let(defs, cur.b());
+        }
+        let sub = Def { name: format!("{}#sub", d.name), params, arity, body: cur };
+        self.call(&name, &sub, denv, &args, env)
+    }
+}
+
+/// e without the labels around it (written ones and those of infix /\ and \/)
+fn strip_labels(e: &Expr) -> &Expr {
+    match e {
+        Expr::Label(n, _, b) if n.ends_with("::") => strip_labels(b),
+        e => e,
+    }
+}
+
+/// The operands of e, numbered from 1 by positional subexpression names
+fn operands(e: &Expr) -> Option<Vec<Expr>> {
+    use Expr::*;
+    Some(match strip_labels(e) {
+        Label(_, _, b) => match b.as_ref() {
+            And(v) | Or(v) => v.clone(),
+            _ => return None,
+        },
+        And(v) | Or(v) | Tuple(v) | SetLit(v) => v.clone(),
+        Call(n, a) if !n.starts_with('#') => a.clone(),
+        Bin(_, a, b) | App(a, b) | FunSet(a, b) | BoxAction(a, b) => vec![*a.clone(), *b.clone()],
+        Un(_, x) | Prime(x) | Field(x, _) => vec![*x.clone()],
+        If(c, a, b) => vec![*c.clone(), *a.clone(), *b.clone()],
+        Quant(_, bs, _) | SetMap(_, bs) => bs.iter().map(|(_, s)| s.clone()).collect(),
+        Choose(_, s, _) | SetFilter(_, s, _) | FunCons(_, s, _) => vec![*s.clone()],
+        RecLit(fs) | RecSet(fs) => fs.iter().map(|(_, v)| v.clone()).collect(),
+        _ => return None,
+    })
+}
+
+/// The label `l` in e (not inside another label): its parameters and body. `scope` collects the
+/// bound variables around it and `lets` the LET definitions it is in.
+fn find_label(e: &Expr, l: &str, scope: &mut Vec<String>, lets: &mut Vec<Vec<Def>>) -> Option<(Vec<String>, Expr)> {
+    use Expr::*;
+    if let Label(n, _, b) = e {
+        if let Some(head) = n.strip_suffix("::") {
+            let (ln, ps) = match head.split_once('(') {
+                Some((ln, ps)) => (ln, ps.trim_end_matches(')').split(',').map(|p| p.to_string()).collect()),
+                None => (head, vec![]),
+            };
+            return (ln == l).then(|| (ps, b.as_ref().clone()));
+        }
+    }
+    let (binders, sets, bodies): (Vec<String>, Vec<&Expr>, Vec<&Expr>) = match e {
+        Quant(_, bs, body) | SetMap(body, bs) => (bs.iter().map(|(x, _)| x.clone()).collect(), bs.iter().map(|(_, s)| s).collect(), vec![body]),
+        Choose(x, s, p) | SetFilter(x, s, p) | FunCons(x, s, p) => (vec![x.clone()], vec![s], vec![p]),
+        Let(defs, body) => {
+            lets.push(defs.clone());
+            let r = find_label(body, l, scope, lets);
+            if r.is_none() {
+                lets.pop();
+            }
+            return r;
+        }
+        e => (vec![], e.children(), vec![]),
+    };
+    for s in sets {
+        if let Some(r) = find_label(s, l, scope, lets) {
+            return Some(r);
+        }
+    }
+    let n = scope.len();
+    scope.extend(binders);
+    for b in bodies {
+        if let Some(r) = find_label(b, l, scope, lets) {
+            return Some(r);
+        }
+    }
+    scope.truncate(n);
+    None
 }
 
 /// For a built-in operator taking an operator argument: its position and number of arguments
