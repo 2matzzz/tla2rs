@@ -270,8 +270,8 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
     match name {
         // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
         // for the Toolbox's trace explorer.
-        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" => Ok(true),
-        "Bags" | "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
+        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" | "Bags" => Ok(true),
+        "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
         // TLC picks the subsets at random, so its results cannot be reproduced
         "Randomization" => Err(format!("{how} {name}: TLC chooses its values at random; not supported")),
         _ => Ok(false),
