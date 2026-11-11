@@ -725,9 +725,10 @@ fn expand_one(
     buf: &mut Vec<(State, u32)>,
     fbuf: &mut Vec<(State, u32)>,
     fps: &mut Vec<Vec<Fp>>,
+    careful: bool,
 ) -> Option<Found> {
     let s = unpack(&g.states[head]);
-    let failed = successors(&s, buf);
+    let failed = successors(&s, buf, careful);
     if failed.is_none() && buf.is_empty() && check_deadlock {
         return Some(Found::Deadlock(head as u32));
     }
@@ -813,9 +814,9 @@ fn expand(g: &Graph, lo: usize, hi: usize, seen: &Shards, stop: &std::sync::atom
         if stop.load(Relaxed) {
             break;
         }
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            expand_one(g, head, seen, me, check_deadlock, &mut c, &mut buf, &mut fbuf, &mut fps)
-        }));
+        let r = expand_caught(&mut c, |c| c.generated, |c, careful| {
+            expand_one(g, head, seen, me, check_deadlock, c, &mut buf, &mut fbuf, &mut fps, careful)
+        });
         let found = match r {
             Ok(f) => f,
             Err(p) => Some(Found::Eval(head as u32, describe_panic(p))),
@@ -1178,12 +1179,36 @@ fn out_of_model(sfp: Fp, t: &State, l: u32) -> Option<SFound> {
     Some(SFound { fp: sfp, extra: Some((*t, l)), msg, in_model: false })
 }
 
-/// Computes the successors of s into buf. If that fails, buf keeps the successors computed before
-/// the error, and the error is returned to be raised once they have been processed: TLC checks
-/// each successor as soon as it is generated, so those come first.
-fn successors(s: &State, buf: &mut Vec<(State, u32)>) -> Option<Box<dyn std::any::Any + Send>> {
+/// Computes the successors of s into buf. When `careful` is set and that fails, buf keeps the
+/// successors computed before the error, and the error is returned to be raised once they have
+/// been processed: TLC checks each successor as soon as it is generated, so those come first.
+/// Catching around `next` costs several percent on the hot path, so `expand_caught` first runs
+/// it as is and expands the state again carefully only when `next` failed.
+fn successors(s: &State, buf: &mut Vec<(State, u32)>, careful: bool) -> Option<Box<dyn std::any::Any + Send>> {
     buf.clear();
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, buf))).err()
+    if careful {
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, buf))).err();
+    }
+    next(s, buf);
+    None
+}
+
+/// Runs the expansion of one state, `f(c, careful)`, catching an evaluation error. An error that
+/// left the generated count unchanged came from `next` (every successor is counted before anything
+/// else is done with it), so the state is expanded again carefully (see `successors`).
+#[inline(always)]
+fn expand_caught<C, R>(c: &mut C, generated: fn(&C) -> u64, mut f: impl FnMut(&mut C, bool) -> R) -> std::thread::Result<R> {
+    // One call site for f, so that it is inlined as it was without the retry.
+    let mut careful = false;
+    loop {
+        let before = generated(c);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(c, careful)));
+        if r.is_err() && !careful && generated(c) == before {
+            careful = true;
+            continue;
+        }
+        return r;
+    }
 }
 
 /// Per-thread working storage for `expand_safety_one`.
@@ -1197,10 +1222,18 @@ struct SWork {
 }
 
 /// Expands a single state, pushing newly found states onto c.next.
-fn expand_safety_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+fn expand_safety_one(
+    w: &Packed,
+    sfp: Fp,
+    seen: &Shards,
+    opt: &Opt,
+    c: &mut SChunk,
+    ws: &mut SWork,
+    careful: bool,
+) -> Option<SFound> {
     let s = unpack(w);
     ws.cand.clear();
-    let failed = successors(&s, &mut ws.buf);
+    let failed = successors(&s, &mut ws.buf, careful);
     if failed.is_none() && ws.buf.is_empty() && opt.check_deadlock {
         return Some(SFound::new(sfp, None, SMsg::Deadlock));
     }
@@ -1305,9 +1338,9 @@ fn expand_safety(
             break;
         }
         let (w, sfp) = &frontier[i];
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            expand_safety_one(w, *sfp, seen, opt, &mut c, &mut ws)
-        }));
+        let r = expand_caught(&mut c, |c| c.generated, |c, careful| {
+            expand_safety_one(w, *sfp, seen, opt, c, &mut ws, careful)
+        });
         let found = match r {
             Ok(f) => f,
             Err(p) => Some(SFound::new(*sfp, None, SMsg::Eval(describe_panic(p)))),
@@ -1363,7 +1396,7 @@ fn replay(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
     let mut buf: Vec<(State, u32)> = vec![];
     for want in &chain[1..] {
         // An error raised after the wanted successor was computed (see `successors`) is ignored.
-        let _ = successors(&cur, &mut buf);
+        let _ = successors(&cur, &mut buf, true);
         let hit = buf.iter().find_map(|&(t, l)| {
             let w = pack(&t)?;
             (state_fp(&t, &w) == *want).then_some((t, l))
@@ -1866,9 +1899,9 @@ fn collect_phase(
             break;
         }
         let (w, sfp) = &frontier[i];
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let r = expand_caught(&mut out, |o| o.generated, |out, careful| {
             let s = unpack(w);
-            let failed = successors(&s, &mut buf);
+            let failed = successors(&s, &mut buf, careful);
             if failed.is_none() && buf.is_empty() && opt.check_deadlock {
                 return Some(SFound::new(*sfp, None, SMsg::Deadlock));
             }
@@ -1929,7 +1962,7 @@ fn collect_phase(
                 std::panic::resume_unwind(p);
             }
             None
-        }));
+        });
         let found = match r {
             Ok(f) => f,
             Err(p) => Some(SFound::new(*sfp, None, SMsg::Eval(describe_panic(p)))),
