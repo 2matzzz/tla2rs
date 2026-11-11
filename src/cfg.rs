@@ -10,6 +10,8 @@ pub struct Cfg {
     pub next: Option<String>,
     /// CONSTANT name = value. Values are kept as expressions (model values as Ident)
     pub constants: Vec<(String, Expr)>,
+    /// CONSTANT name <- def and name <- [module] def: (name, module, def)
+    pub substs: Vec<(String, Option<String>, String)>,
     pub invariants: Vec<String>,
     pub properties: Vec<String>,
     pub check_deadlock: Option<bool>,
@@ -64,7 +66,24 @@ pub fn parse_cfg(src: &str) -> R<Cfg> {
                 match &toks[i].tok {
                     Tok::Sym(s) if s == "=" => {}
                     Tok::Sym(s) if s == "<-" => {
-                        return Err(format!("cfg: substitution `{name} <- ...` is not supported yet"))
+                        i += 1;
+                        let mut module = None;
+                        if matches!(&toks[i].tok, Tok::Sym(s) if s == "[") {
+                            let (Tok::Ident(m), Tok::Sym(close)) = (&toks[i + 1].tok, &toks[i + 2].tok) else {
+                                return Err(format!("cfg line {}: expected `[Module]` after `{name} <-`", toks[i].line));
+                            };
+                            if close != "]" {
+                                return Err(format!("cfg line {}: expected `]` after `[{m}`", toks[i].line));
+                            }
+                            module = Some(m.clone());
+                            i += 3;
+                        }
+                        let Tok::Ident(def) = &toks[i].tok else {
+                            return Err(format!("cfg line {}: expected a definition name after `{name} <-`", toks[i].line));
+                        };
+                        c.substs.push((name, module, def.clone()));
+                        i += 1;
+                        continue;
                     }
                     t => return Err(format!("cfg line {}: expected `=` after {name}, got {t:?}", toks[i].line)),
                 }

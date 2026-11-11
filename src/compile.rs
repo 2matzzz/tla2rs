@@ -23,6 +23,62 @@ const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv",
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 
+/// Applies the cfg entries that replace a definition (`Name = value`, `Name <- Def`,
+/// `Name <- [Module] Def` where Name is defined rather than declared) and returns the constants
+/// substituted by a definition, (constant, definition), to be evaluated once the other constants
+/// are known. As in TLC, `[Module]` applies to definitions only, and `Name = value` for a name that
+/// is neither declared nor defined is ignored.
+fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec<(String, String)>> {
+    let def_params = |m: &Module, n: &str| m.defs.iter().rev().find(|d| d.name == n).map(|d| d.params.clone());
+    let mut extra = vec![];
+    for (n, e) in &cfg.constants {
+        if m.constants.contains(n) {
+            continue;
+        }
+        match def_params(m, n) {
+            Some(p) if p.is_empty() => extra.push(Def { name: n.clone(), params: vec![], body: e.clone() }),
+            Some(_) => return Err(format!("cfg: `{n} = ...` replaces an operator that takes arguments")),
+            None => warnings.push(format!("cfg: `{n}` is neither a CONSTANT nor a definition of the spec; ignored")),
+        }
+    }
+    let mut const_substs = vec![];
+    for (n, module, def) in &cfg.substs {
+        if const_substs.iter().any(|(c, _): &(String, String)| c == n) || cfg.constants.iter().any(|(c, _)| c == n) {
+            return Err(format!("cfg: `{n}` is given a value more than once"));
+        }
+        let Some(dp) = def_params(m, def) else {
+            return Err(format!("cfg: `{n} <- {def}`: {def} is not defined"));
+        };
+        if let Some(md) = module {
+            if !m.modules.contains(md) {
+                return Err(format!("cfg: `{n} <- [{md}] {def}`: {md} is not a module of the spec"));
+            }
+        }
+        if m.constants.contains(n) {
+            if let Some(md) = module {
+                return Err(format!("cfg: `{n} <- [{md}] {def}`: [Module] replaces a definition, but {n} is a CONSTANT (TLC leaves it without a value)"));
+            }
+            if !dp.is_empty() {
+                return Err(format!("cfg: `{n} <- {def}`: {def} takes arguments (operator constants are not supported)"));
+            }
+            const_substs.push((n.clone(), def.clone()));
+            continue;
+        }
+        let Some(np) = def_params(m, n) else {
+            return Err(format!("cfg: `{n} <- {def}`: {n} is neither a CONSTANT nor a definition of the spec"));
+        };
+        if np.len() != dp.len() {
+            return Err(format!("cfg: `{n} <- {def}`: they take {} and {} arguments", np.len(), dp.len()));
+        }
+        // Name(p1, ...) == Def(p1, ...); defined last, so it takes precedence
+        let args: Vec<Expr> = np.iter().map(|p| Expr::Ident(p.clone())).collect();
+        let body = if args.is_empty() { Expr::Ident(def.clone()) } else { Expr::Call(def.clone(), args) };
+        extra.push(Def { name: n.clone(), params: np, body });
+    }
+    m.defs.extend(extra);
+    Ok(const_substs)
+}
+
 /// Loads the EXTENDS'd modules whose .tla files sit in the same directory and merges them into one.
 /// Definitions loaded later (from the extending module) take precedence.
 fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
@@ -30,7 +86,7 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
         return Err("EXTENDS nests too deeply".into());
     }
     let m = parse_module(src)?;
-    let mut out = Module { name: m.name.clone(), ..Default::default() };
+    let mut out = Module { name: m.name.clone(), modules: vec![m.name.clone()], ..Default::default() };
     for e in &m.extends {
         match e.as_str() {
             // Sequences only for its tuples; its operators are rejected by name (SEQ_OPS)
@@ -49,6 +105,7 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
                 out.variables.extend(sub.variables);
                 out.defs.extend(sub.defs);
                 out.assumes.extend(sub.assumes);
+                out.modules.extend(sub.modules);
             }
         }
     }
@@ -61,8 +118,9 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
 
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, fp128: bool, metal: bool) -> R<Output> {
     let mut warnings = vec![];
-    let m = load_module(tla, dir, &mut warnings, 0)?;
+    let mut m = load_module(tla, dir, &mut warnings, 0)?;
     let cfg = parse_cfg(cfg_src)?;
+    let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
 
     // Strings and model values
     let mut atoms = Atoms::default();
@@ -82,6 +140,9 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
     {
         let ce = ConstEval { atoms: &atoms, constants: &empty };
         for c in &m.constants {
+            if const_substs.iter().any(|(n, _)| n == c) {
+                continue;
+            }
             let (_, e) = cfg
                 .constants
                 .iter()
@@ -92,6 +153,31 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
     }
 
     let mut ex = Expander::new(&m);
+
+    // CONSTANT c <- Def: c takes the value of Def, which may refer to other constants (including
+    // other substituted ones, so evaluate until nothing changes)
+    let mut pending = const_substs;
+    while !pending.is_empty() {
+        let mut left = vec![];
+        let mut last_err = String::new();
+        for (c, def) in pending.iter() {
+            let e = ex.expand_def(def).map_err(|e| format!("cfg: {c} <- {def}: {e}"))?;
+            let ce = ConstEval { atoms: &atoms, constants: &constants };
+            match ce.eval(&e, &HashMap::new()) {
+                Ok(v) => {
+                    constants.insert(c.clone(), v);
+                }
+                Err(e) => {
+                    last_err = format!("cfg: {c} <- {def}: {def} must be a constant expression ({e})");
+                    left.push((c.clone(), def.clone()));
+                }
+            }
+        }
+        if left.len() == pending.len() {
+            return Err(last_err);
+        }
+        pending = left;
+    }
 
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
     // is false. An expression that cannot be evaluated is an error rather than silently passing.
@@ -713,6 +799,10 @@ fn infer_types(
 ) -> R<HashMap<String, Ty>> {
     let bottom = Ty::Enum(vec![]);
     let mut cur: HashMap<String, Ty> = undeclared.iter().map(|v| (v.clone(), bottom.clone())).collect();
+    // How many times each type grew after its first value. A range that settles within a few rounds
+    // (e.g. `Cardinality(S)` or `x % 3` written into a variable) stays finite; one that keeps
+    // growing (`x + 1`) is widened to unbounded
+    let mut grew: HashMap<String, u32> = HashMap::new();
     for _ in 0..40 {
         let mut g = Gen::new(atoms, constants);
         g.scap = scap;
@@ -729,7 +819,17 @@ fn infer_types(
             let old = cur[v].clone();
             let Some(t) = got.get(v) else { continue };
             let j = join(&old, t).unwrap_or_else(|_| t.clone());
-            let w = widen(&old, &j);
+            let w = if old == bottom || j == old {
+                j
+            } else {
+                let n = grew.entry(v.clone()).or_insert(0);
+                *n += 1;
+                if *n < WIDEN_AFTER {
+                    j
+                } else {
+                    widen(&old, &j)
+                }
+            };
             if w != old {
                 cur.insert(v.clone(), w);
                 changed = true;
@@ -746,6 +846,9 @@ fn infer_types(
     }
     Err(format!("type inference did not settle for {}; add them to TypeOK (or TypeDecl)", undeclared.join(", ")))
 }
+
+/// Rounds of growth after which an inferred integer range is widened to unbounded
+const WIDEN_AFTER: u32 = 3;
 
 /// Widens integers whose range changed from the previous type to unbounded.
 fn widen(old: &Ty, new: &Ty) -> Ty {

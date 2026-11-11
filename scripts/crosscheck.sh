@@ -27,7 +27,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$root/target/release/tla2rs"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-cp "$tla" "$cfg" "$work/"
+# The other modules next to the spec too, for EXTENDS (e.g. an MC.tla that extends the spec)
+cp "$(dirname "$tla")"/*.tla "$cfg" "$work/"
 cd "$work"
 t=$(basename "$tla"); c=$(basename "$cfg")
 
