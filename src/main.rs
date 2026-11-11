@@ -26,6 +26,25 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::Instant;
 
+/// Key of a built checker: every file cargo reads in the generated crate, and the compiler version.
+/// Two SipHash passes with different prefixes give 128 bits.
+fn build_key(dir: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let rustc = Command::new("rustc").arg("-V").output().map(|o| o.stdout).unwrap_or_default();
+    let files: Vec<Vec<u8>> = ["Cargo.toml", "src/main.rs", "build.rs", "metal.m"]
+        .iter()
+        .map(|f| std::fs::read(dir.join(f)).unwrap_or_default())
+        .collect();
+    let half = |salt: u8| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut h);
+        rustc.hash(&mut h);
+        files.hash(&mut h);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", half(0), half(1))
+}
+
 fn usage() -> ! {
     eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched]");
     exit(2)
@@ -150,6 +169,14 @@ fn main() {
     if emit_only {
         return;
     }
+    // TLA2RS_BUILD_CACHE=DIR reuses a checker built earlier from the same sources, so test runs only
+    // compile the specs whose generated code changed
+    let cache = std::env::var_os("TLA2RS_BUILD_CACHE").map(|c| PathBuf::from(c).join(build_key(&dir)));
+    if let Some(hit) = cache.as_ref().map(|c| c.join("checker")).filter(|b| b.is_file()) {
+        eprintln!("tla2rs: reusing the checker in {}", hit.display());
+        let st = Command::new(hit).args(&pass).status().expect("run checker");
+        exit(st.code().unwrap_or(1));
+    }
     let t1 = Instant::now();
     let st = Command::new("cargo")
         .args(["build", "--release", "--quiet", "--offline"])
@@ -162,6 +189,16 @@ fn main() {
     }
     eprintln!("tla2rs: built in {:.1} s", t1.elapsed().as_secs_f64());
     let bin = dir.join("target/release").join(&crate_name);
+    if let Some(c) = &cache {
+        // Copy under a unique name and rename, so a parallel run never sees a half-written file
+        let tmp = c.with_extension(format!("tmp{}", std::process::id()));
+        let stored = std::fs::create_dir_all(&tmp)
+            .and_then(|_| std::fs::copy(&bin, tmp.join("checker")))
+            .and_then(|_| std::fs::rename(&tmp, c));
+        if stored.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
     let st = Command::new(bin).args(&pass).status().expect("run checker");
     exit(st.code().unwrap_or(1));
 }

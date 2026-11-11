@@ -163,7 +163,11 @@ memory.
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
 generated and distinct state counts, counterexample length, and exit code. `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
-`TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`).
+`TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). `all.sh` runs four configurations at a time
+(`JOBS=N` to change). TLC results are kept in `target/crosscheck/tlc` under a hash of the jar, the cfg, the arguments
+and the modules the spec reads, and built checkers in `target/crosscheck/build` under a hash of the generated code,
+so a rerun only runs what changed. A cached TLC result that does not match is checked again with a fresh TLC run.
+`CROSSCHECK_NO_CACHE=1` turns both caches off.
 
 ```
 $ scripts/all.sh
