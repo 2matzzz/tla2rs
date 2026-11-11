@@ -745,6 +745,18 @@ impl ConstEval<'_> {
                 }
                 Value::Set(out.into_iter().map(Value::Rec).collect())
             }
+            // [y \in S |-> e][x] is e at x, without the rest of the function (as TLC evaluates it,
+            // so S may be Nat)
+            App(f, x) if matches!(f.strip(), FunCons(..)) => {
+                let FunCons(y, s, body) = f.strip() else { unreachable!() };
+                let x = self.eval(x, env)?;
+                if !self.member(&x, s, env)? {
+                    return Err("function applied outside its domain".into());
+                }
+                let mut env2 = env.clone();
+                env2.insert(y.clone(), x);
+                self.eval(body, &env2)?
+            }
             App(f, x) => {
                 let f = self.eval(f, env)?;
                 let x = self.eval(x, env)?;

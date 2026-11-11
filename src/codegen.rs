@@ -1086,6 +1086,80 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// Whether `[x \in S |-> e]` over this S is evaluated only where it is applied, as TLC does: S
+    /// cannot be enumerated (Nat, Int, STRING, Seq(T), or a product with one of them) or has more
+    /// elements than a function over part of a type is held as an array for
+    fn lazy_domain(&self, s: &Expr, env: &Env) -> bool {
+        match s.strip() {
+            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) => {
+                !env.locals.contains_key(n) && !self.is_var(n) && !self.ce.constants.contains_key(n)
+            }
+            Expr::Call(f, a) if f == "Seq" && a.len() == 1 => true,
+            Expr::Call(f, parts) if f == "\\X" => parts.iter().any(|p| self.lazy_domain(p, env)),
+            s => matches!(self.try_const(s, env), Some(Value::Set(v)) if v.len() as u64 > DENSE_MAX),
+        }
+    }
+
+    /// The domain of `f` when it is a function evaluated only where it is applied (see
+    /// `lazy_domain`), possibly with EXCEPT
+    fn lazy_fun_domain<'e>(&self, f: &'e Expr, env: &Env) -> Option<&'e Expr> {
+        match f.strip() {
+            Expr::FunCons(_, s, _) if self.lazy_domain(s, env) => Some(s),
+            Expr::Except(b, _) => self.lazy_fun_domain(b, env),
+            _ => None,
+        }
+    }
+
+    /// `f[k]` for a function `f` evaluated only where it is applied (`lazy_fun_domain`), with `k`
+    /// held in the variable `kc` of type `kt`. As in TLC, the argument must be in the domain, and
+    /// EXCEPT replaces the value at its keys.
+    fn lazy_apply(&mut self, f: &Expr, kc: &str, kt: &Ty, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
+        match f.strip() {
+            Expr::FunCons(v, s, body) => {
+                let mem = self.gen_member(kc, kt, s, env)?;
+                let mut env2 = env.clone();
+                env2.locals.insert(v.clone(), (kc.to_string(), kt.clone()));
+                env2.idx.remove(v);
+                let (bc, bt) = self.gen(body, &env2, want)?;
+                let tid = self.ty_id(kt)?;
+                let msg = format!("In applying the function\n{},\nthe first argument is:\n{{}}\nwhich is not in its domain.", lazy_fun_text(v, s));
+                Ok((format!("{{ if !({mem}) {{ eval_error(format!({msg:?}, fmt_{tid}(&{kc}))) }} {bc} }}"), bt))
+            }
+            Expr::Except(base, ups) => {
+                let Some(((path, val), rest)) = ups.split_last() else { return self.lazy_apply(base, kc, kt, env, want) };
+                let prev = Expr::Except(base.clone(), rest.to_vec());
+                let at_name = path.iter().find_map(|p| match p {
+                    Path::Field(n) if n.starts_with('@') => Some(n.clone()),
+                    _ => None,
+                });
+                let steps: Vec<&Path> = path.iter().filter(|p| !matches!(p, Path::Field(n) if n.starts_with('@'))).collect();
+                let [Path::Idx(a)] = steps.as_slice() else {
+                    return Err(format!("EXCEPT with a path of more than one index on a function over a set that cannot be enumerated: {}", short(f)));
+                };
+                let (ac, at) = self.gen(a, env, Some(kt))?;
+                let av = self.fresh("a");
+                // @ is the value before this update at the key it replaces
+                let (pa, pat) = self.lazy_apply(&prev, &av, &at, env, want)?;
+                let mut env2 = env.clone();
+                env2.locals.insert("@".into(), (pa.clone(), pat.clone()));
+                if let Some(n) = at_name {
+                    env2.locals.insert(n, (pa, pat.clone()));
+                }
+                let (vc, vt) = self.gen(val, &env2, want.or(Some(&pat)))?;
+                let (pc, pt) = self.lazy_apply(&prev, kc, kt, env, want)?;
+                let j = join(kt, &at)?;
+                // A key outside the domain leaves the function unchanged, as in TLC
+                let dom = self.lazy_fun_domain(f, env).unwrap().clone();
+                let in_dom = self.gen_member(&av, &at, &dom, env)?;
+                let same = format!("{} == {} && {in_dom}", self.coerce(kc.to_string(), kt, &j)?, self.coerce(av.clone(), &at, &j)?);
+                let t = Self::layout(want, join(&vt, &pt)?);
+                let (vc, pc) = (self.coerce(vc, &vt, &t)?, self.coerce(pc, &pt, &t)?);
+                Ok((format!("{{ let {av} = {ac}; if {same} {{ {vc} }} else {{ {pc} }} }}"), t))
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// The subsets of the set `c` of type `st`, in TLC's order: by size, then by their elements in
     /// order. A set held as an array is mapped onto a bitmask over its elements (in TLC's order).
     fn subsets_iter(&mut self, c: &str, st: &Ty) -> R<String> {
@@ -2473,6 +2547,13 @@ impl<'a> Gen<'a> {
                 let empty = self.s_empty(&st)?;
                 (format!("{{ let mut {acc} = {empty}; {body} {acc} }}"), st)
             }
+            // Over Nat, say (one over a large finite set is built as any other)
+            FunCons(x, s, _) if self.lazy_domain(s, env) && self.try_const(s, env).is_none() => {
+                return Err(format!(
+                    "the function {} is over a set that cannot be enumerated: it is only supported applied to an argument (`f[x]`, also after EXCEPT) or in `x \\in DOMAIN f`, where TLC evaluates it without enumerating its domain",
+                    lazy_fun_text(x, s)
+                ))
+            }
             // [k \in 1..n |-> e] (or over DOMAIN of a sequence) with n from the state is a sequence
             FunCons(x, s, body) if self.try_const(s, env).is_none() && self.seq_domain_len(s, env).is_some() => {
                 let nc = self.seq_domain_len(s, env).unwrap()?;
@@ -2556,6 +2637,13 @@ impl<'a> Gen<'a> {
                     tys.push((k.clone(), t));
                 }
                 (rec_build(&parts), Ty::Rec(tys))
+            }
+            // A function over Nat, Int, STRING, ...: its body, at the argument
+            App(f, x) if self.lazy_fun_domain(f, env).is_some() => {
+                let (xc, xt) = self.gen(x, env, None)?;
+                let k = self.fresh("k");
+                let (c, t) = self.lazy_apply(f, &k, &xt, env, want)?;
+                (format!("{{ let {k} = {xc}; {c} }}"), t)
             }
             App(f, x) => {
                 let (fc, ft) = self.gen(f, env, None)?;
@@ -3250,6 +3338,10 @@ impl<'a> Gen<'a> {
                 ));
             }
             FunSet(d, r) => return self.fun_set_member(x, xt, d, r, s, env),
+            Un(UOp::Domain, f) if self.lazy_fun_domain(f, env).is_some() => {
+                let d = self.lazy_fun_domain(f, env).unwrap().clone();
+                return self.gen_member(x, xt, &d, env);
+            }
             RecSet(fs) => {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
@@ -4957,6 +5049,16 @@ fn pfun_parts(t: &Ty) -> Option<(Ty, Ty)> {
         Ty::Rec(fs) if fs.is_empty() => Some((Ty::Enum(vec![]), Ty::Enum(vec![]))),
         _ => None,
     }
+}
+
+/// `[x \in S |-> ...]` for messages, with the bound variable's name as written
+fn lazy_fun_text(x: &str, s: &Expr) -> String {
+    let x = x.split("__").next().unwrap_or(x);
+    let s = match s.strip() {
+        Expr::Ident(n) => n.clone(),
+        s => short(s),
+    };
+    format!("[{x} \\in {s} |-> ...]")
 }
 
 /// The key and value types of a function over part of a type or of a bag (a count of 1 or more)
