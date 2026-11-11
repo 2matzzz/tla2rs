@@ -90,11 +90,21 @@ impl<'a> Expander<'a> {
         }
         // A RECURSIVE operator called again while its body is being expanded: keep the call
         if self.recursive.iter().any(|r| r == name) && self.stack.contains(&d.name) {
-            if d.arity.iter().any(|&a| a > 0) {
-                return Err(format!("`{name}`: recursive operators with operator parameters are not supported"));
+            // Operator arguments are bound in the definition, which is expanded once for each
+            // combination of operators passed to it
+            let mut key = d.name.clone();
+            let mut args = vec![];
+            for (i, (p, a)) in d.params.iter().zip(raw).enumerate() {
+                if d.arity.get(i).copied().unwrap_or(0) > 0 {
+                    let op = self.op_arg(name, p, d.arity[i], a, caller)?;
+                    key = format!("{key}|{}", op.0.name);
+                    env.subst.remove(p);
+                    env.locals.insert(p.clone(), op);
+                } else {
+                    args.push(self.expand(a, caller)?);
+                }
             }
-            let id = self.rec_id(name, d, &env)?;
-            let args = raw.iter().map(|a| self.expand(a, caller)).collect::<R<_>>()?;
+            let id = self.rec_id(name, &key, d, &env)?;
             return Ok(Expr::RecCall(id, args));
         }
         let mut args = vec![];
@@ -136,18 +146,28 @@ impl<'a> Expander<'a> {
 
     /// The index of the recursive definition `d` (in the environment `env`), expanding it with
     /// fresh parameters the first time
-    fn rec_id(&mut self, name: &str, d: &Def, env: &Env) -> R<usize> {
-        if let Some(&i) = self.rec_ids.get(&d.name) {
+    fn rec_id(&mut self, name: &str, key: &str, d: &Def, env: &Env) -> R<usize> {
+        if let Some(&i) = self.rec_ids.get(key) {
             return Ok(i);
+        }
+        let prefix = format!("{}|", d.name);
+        if self.rec_ids.keys().filter(|k| k.starts_with(&prefix)).count() >= 16 {
+            return Err(format!("`{name}`: the operators passed to it keep changing between recursive calls"));
         }
         let i = REC_DEFS.with(|r| {
             let mut r = r.borrow_mut();
             r.push(RecDef { name: name.to_string(), params: vec![], body: Expr::Bool(true) });
             r.len() - 1
         });
-        self.rec_ids.insert(d.name.clone(), i);
+        self.rec_ids.insert(key.to_string(), i);
         let mut env = env.clone();
-        let params: Vec<String> = d.params.iter().map(|p| self.bind(p, &mut env)).collect();
+        let params: Vec<String> = d
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| d.arity.get(*i).copied().unwrap_or(0) == 0)
+            .map(|(_, p)| self.bind(p, &mut env))
+            .collect();
         self.stack.push(d.name.clone());
         let body = self.expand(&d.body, &env);
         self.stack.pop();
