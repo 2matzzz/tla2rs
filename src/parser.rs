@@ -112,6 +112,16 @@ pub fn is_infix_name(name: &str) -> bool {
 }
 
 /// `a op b` for an infix operator by its normalized name, as the parser builds it
+/// The name of the call an unbounded quantifier or CHOOSE becomes, followed by `\\E`, `\\A` or
+/// `CHOOSE`
+pub const UNBOUNDED: &str = "#unbounded";
+
+/// TLC's error when it evaluates the unbounded quantifier or CHOOSE named `call` (see UNBOUNDED)
+pub fn unbounded_error(call: &str) -> Option<String> {
+    let kind = call.strip_prefix(UNBOUNDED)?;
+    Some(format!("TLC attempted to evaluate an unbounded {kind}.\nMake sure that the expression is of form {kind} x \\in S: P(x)."))
+}
+
 pub fn bin_expr(op: &str, a: Expr, b: Expr) -> Expr {
     bin(op, a, b)
 }
@@ -818,6 +828,26 @@ impl Parser {
         Ok((out, lets))
     }
 
+    /// At the bound variables of `\\E x, y : P` (or \\A, CHOOSE) without a set: the quantifier,
+    /// as a call that stops with TLC's error when it is evaluated (TLC accepts it and fails only
+    /// then). Otherwise None and nothing is consumed.
+    fn unbounded(&mut self, kind: &str) -> R<Option<Expr>> {
+        let mut i = self.pos;
+        loop {
+            if !matches!(&self.toks[i].tok, Tok::Ident(_)) {
+                return Ok(None);
+            }
+            match &self.toks[i + 1].tok {
+                Tok::Sym(c) if c == "," => i += 2,
+                Tok::Sym(c) if c == ":" => break,
+                _ => return Ok(None),
+            }
+        }
+        self.pos = i + 2;
+        self.expr(0)?;
+        Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind}"), vec![])))
+    }
+
     fn prefix(&mut self) -> R<Expr> {
         let t = self.peek().clone();
         match &t {
@@ -855,6 +885,9 @@ impl Parser {
             Tok::Sym(s) if s == "\\E" || s == "\\A" => {
                 let ex = s == "\\E";
                 self.pos += 1;
+                if let Some(e) = self.unbounded(s)? {
+                    return Ok(e);
+                }
                 let (bs, lets) = self.binders_pat()?;
                 self.expect(":")?;
                 let body = self.expr(0)?;
@@ -951,6 +984,9 @@ impl Parser {
                 }
                 "CHOOSE" => {
                     self.pos += 1;
+                    if let Some(e) = self.unbounded("CHOOSE")? {
+                        return Ok(e);
+                    }
                     // CHOOSE <<x, y>> \in S : P binds a fresh name to the tuple
                     let pat = self.tuple_pattern();
                     let x = match &pat {

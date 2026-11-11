@@ -1851,6 +1851,12 @@ impl<'a> Gen<'a> {
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
+                // An unbounded quantifier or CHOOSE: TLC stops when it evaluates one
+                (f, []) if crate::parser::unbounded_error(f).is_some() => {
+                    let t = want.cloned().unwrap_or(if f.ends_with("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
+                    let msg = crate::parser::unbounded_error(f).unwrap();
+                    (format!("{{ let __v: {} = eval_error({msg:?}.to_string()); __v }}", t.repr()), t)
+                }
                 // ToString of a value from the state: a table, indexed by the value's encoding, of
                 // the strings of every value of its type, interned now
                 // ToString of a value from the state: the string of every value of its type is
