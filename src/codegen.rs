@@ -511,8 +511,46 @@ impl<'a> Gen<'a> {
     }
 
     fn s_iter(&mut self, c: &str, st: &Ty) -> R<String> {
-        let eid = self.ty_id(&Self::elem_of(st))?;
+        let et = Self::elem_of(st);
+        let eid = self.ty_id(&et)?;
+        if is_sparse(st) && needs_tlc_order(&et) {
+            // The array is sorted by the Rust order of the elements, which for a set held as a
+            // bitmask is not TLC's: iterate in TLC's order, which decides CHOOSE and the order
+            // successors are generated in
+            let cmp = self.tlc_cmp(&et, "x", "y")?;
+            return Ok(format!(
+                "{{ let mut __v: Vec<{}> = ({c}).iter().collect(); __v.sort_by(|x, y| {cmp}); __v }}.into_iter()",
+                et.repr()
+            ));
+        }
         Ok(if is_sparse(st) { format!("({c}).iter()") } else { format!("bits({c}).map(dec_{eid})") })
+    }
+
+    /// An expression comparing `a` and `b` (references to values of type `t`) in TLC's order
+    fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
+        Ok(match t {
+            Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            Ty::Rec(fs) if needs_tlc_order(t) => {
+                let mut parts = vec![];
+                for (i, (_, ft)) in fs.iter().enumerate() {
+                    parts.push(self.tlc_cmp(ft, &format!("&{a}.{i}"), &format!("&{b}.{i}"))?);
+                }
+                let mut code = parts.pop().unwrap();
+                while let Some(p) = parts.pop() {
+                    code = format!("{p}.then_with(|| {code})");
+                }
+                code
+            }
+            Ty::Fun(_, c) if needs_tlc_order(t) => {
+                let inner = self.tlc_cmp(c, "__fa", "__fb")?;
+                format!("{a}.iter().zip({b}.iter()).map(|(__fa, __fb)| {inner}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)")
+            }
+            Ty::Seq(e) if needs_tlc_order(t) => {
+                let inner = self.tlc_cmp(e, "__fa", "__fb")?;
+                format!("{a}.len.cmp(&{b}.len).then_with(|| {a}.slice().iter().zip({b}.slice().iter()).map(|(__fa, __fb)| {inner}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal))")
+            }
+            _ => format!("{a}.cmp({b})"),
+        })
     }
 
     fn s_card(&mut self, c: &str, st: &Ty) -> String {
@@ -1143,6 +1181,19 @@ impl<'a> Gen<'a> {
                     }
                     _ => unreachable!(),
                 }
+            }
+            // SUBSET S of a set in the state, as a value: a set of sets, in TLC's order
+            Un(UOp::Subset, x) => {
+                let (c, t) = self.gen(x, env, None)?;
+                if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
+                    return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
+                }
+                self.need_subsets = true;
+                let st = Ty::Set(t.clone().into());
+                let acc = self.fresh("acc");
+                let add = self.s_add(&acc, "__t", &st)?;
+                let empty = self.s_empty(&st)?;
+                (format!("{{ let mut {acc} = {empty}; for __t in subsets_tlc({c}) {{ {add} }} {acc} }}"), st)
             }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
@@ -2523,6 +2574,8 @@ impl<'a> Gen<'a> {
 
     pub fn helpers(&mut self) -> R<String> {
         let mut s = String::new();
+        // TLC's order of sets: by size, then by their elements in order
+        s += "fn tlc_set_cmp(a: u128, b: u128) -> std::cmp::Ordering { a.count_ones().cmp(&b.count_ones()).then_with(|| { let d = a ^ b; if d == 0 { std::cmp::Ordering::Equal } else if a & d & d.wrapping_neg() != 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } }) }\n";
         if self.need_subsets {
             // The subsets of a bitmask set in TLC's order: by size, then by their elements in order
             // (the lowest element where two subsets differ belongs to the earlier one)
@@ -2672,7 +2725,8 @@ impl<'a> Gen<'a> {
                 }
                 Ty::Set(e) if is_sparse(&t) => {
                     let eid = self.ty_id(e)?;
-                    format!("format!(\"{{{{{{}}}}}}\", v.iter().map(|x| fmt_{eid}(&x)).collect::<Vec<_>>().join(\", \"))")
+                    let it = self.s_iter("*v", &t)?;
+                    format!("format!(\"{{{{{{}}}}}}\", {it}.map(|x| fmt_{eid}(&x)).collect::<Vec<_>>().join(\", \"))")
                 }
                 Ty::Set(e) => {
                     let eid = self.ty_id(e)?;
@@ -3251,6 +3305,17 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     }
 }
 "#;
+
+/// Whether the Rust order of values of type `t` differs from TLC's: a set held as a bitmask compares
+/// as a number in Rust, but by size and then elements in TLC
+fn needs_tlc_order(t: &Ty) -> bool {
+    match t {
+        Ty::Set(_) => !is_sparse(t),
+        Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
+        Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),
+        _ => false,
+    }
+}
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)
