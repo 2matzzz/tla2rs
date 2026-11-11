@@ -31,8 +31,39 @@ const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec<(String, String)>> {
     let def_params = |m: &Module, n: &str| m.defs.iter().rev().find(|d| d.name == n).map(|d| d.params.clone());
     let mut extra = vec![];
+    // A CONSTANT with parameters becomes a definition: `F <- Def` is F(p, ...) == Def(p, ...), and
+    // `F = v` (which TLC accepts) is F(p, ...) == v
+    let op_arity = |n: &str| m.op_constants.iter().find(|(c, _)| c == n).map(|(_, k)| *k);
+    let fresh = |k: usize| (1..=k).map(|i| format!("#p{i}")).collect::<Vec<_>>();
+    let mut op_done = vec![];
     for (n, e) in &cfg.constants {
-        if m.constants.contains(n) {
+        if let Some(k) = op_arity(n) {
+            extra.push(Def { name: n.clone(), params: fresh(k), arity: vec![0; k], body: e.clone() });
+            op_done.push(n.clone());
+        }
+    }
+    for (n, module, def) in &cfg.substs {
+        let Some(k) = op_arity(n) else { continue };
+        if let Some(md) = module {
+            return Err(format!("cfg: `{n} <- [{md}] {def}`: [Module] replaces a definition, but {n} is a CONSTANT (TLC leaves it without a value)"));
+        }
+        let Some(dp) = def_params(m, def) else {
+            return Err(format!("cfg: `{n} <- {def}`: {def} is not defined"));
+        };
+        if dp.len() != k {
+            return Err(format!("cfg: `{n} <- {def}`: {n} takes {k} arguments and {def} takes {}", dp.len()));
+        }
+        if op_done.contains(n) {
+            return Err(format!("cfg: `{n}` is given a value more than once"));
+        }
+        let ps = fresh(k);
+        let body = Expr::Call(def.clone(), ps.iter().map(|p| Expr::Ident(p.clone())).collect());
+        extra.push(Def { name: n.clone(), params: ps, arity: vec![0; k], body });
+        op_done.push(n.clone());
+    }
+    m.constants.retain(|c| !op_done.contains(c));
+    for (n, e) in &cfg.constants {
+        if m.constants.contains(n) || op_done.contains(n) {
             continue;
         }
         match def_params(m, n) {
@@ -43,6 +74,9 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
     }
     let mut const_substs = vec![];
     for (n, module, def) in &cfg.substs {
+        if op_done.contains(n) {
+            continue;
+        }
         if const_substs.iter().any(|(c, _): &(String, String)| c == n) || cfg.constants.iter().any(|(c, _)| c == n) {
             return Err(format!("cfg: `{n}` is given a value more than once"));
         }
@@ -59,7 +93,7 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
                 return Err(format!("cfg: `{n} <- [{md}] {def}`: [Module] replaces a definition, but {n} is a CONSTANT (TLC leaves it without a value)"));
             }
             if !dp.is_empty() {
-                return Err(format!("cfg: `{n} <- {def}`: {def} takes arguments (operator constants are not supported)"));
+                return Err(format!("cfg: `{n} <- {def}`: {n} takes no arguments and {def} takes {}", dp.len()));
             }
             const_substs.push((n.clone(), def.clone()));
             continue;
@@ -107,9 +141,11 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
                 out.defs.extend(sub.defs);
                 out.assumes.extend(sub.assumes);
                 out.modules.extend(sub.modules);
+                out.op_constants.extend(sub.op_constants);
             }
         }
     }
+    out.op_constants.extend(m.op_constants);
     out.constants.extend(m.constants);
     out.variables.extend(m.variables);
     out.defs.extend(m.defs);

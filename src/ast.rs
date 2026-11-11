@@ -107,6 +107,8 @@ pub struct Module {
     pub assumes: Vec<Assume>,
     /// Names of this module and of the modules it EXTENDS from files next to it
     pub modules: Vec<String>,
+    /// CONSTANTs declared with parameters (`CONSTANT F(_, _)`) and their number of parameters
+    pub op_constants: Vec<(String, usize)>,
 }
 
 /// An ASSUME expression and the position TLC reports on failure (1-based line and column; the end

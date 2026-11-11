@@ -221,7 +221,12 @@ impl Parser {
                 }
                 Tok::Ident(k) if k == "CONSTANT" || k == "CONSTANTS" => {
                     self.pos += 1;
-                    m.constants.extend(self.ident_list()?);
+                    for (c, n) in self.ident_list_arity()? {
+                        if n > 0 {
+                            m.op_constants.push((c.clone(), n));
+                        }
+                        m.constants.push(c);
+                    }
                 }
                 Tok::Ident(k) if k == "VARIABLE" || k == "VARIABLES" => {
                     self.pos += 1;
@@ -249,6 +254,37 @@ impl Parser {
             }
         }
         Ok(m)
+    }
+
+    /// Names with optional parameter lists `F(_, _)`, and the number of parameters of each
+    fn ident_list_arity(&mut self) -> R<Vec<(String, usize)>> {
+        let mut v = vec![];
+        loop {
+            let name = self.ident()?;
+            let mut n = 0;
+            if self.is("(") {
+                self.pos += 1;
+                loop {
+                    match self.peek() {
+                        Tok::Ident(u) if u == "_" => self.pos += 1,
+                        _ => return self.err("expected `_` in the parameters of a CONSTANT"),
+                    }
+                    n += 1;
+                    if self.is(",") {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(")")?;
+            }
+            v.push((name, n));
+            if self.is(",") {
+                self.pos += 1;
+            } else {
+                return Ok(v);
+            }
+        }
     }
 
     fn ident_list(&mut self) -> R<Vec<String>> {
