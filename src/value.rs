@@ -83,8 +83,21 @@ impl Ord for Value {
             (Int(a), Int(b)) => a.cmp(b),
             (Atom(a), Atom(b)) => a.cmp(b),
             (Set(a), Set(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
-            (Fun(a), Fun(b)) => a.iter().cmp(b.iter()),
-            (Rec(a), Rec(b)) => a.iter().cmp(b.iter()),
+            // As TLC: by the size of the domain, then key and value pair by pair
+            (Fun(a), Fun(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
+            // As TLC: by the number of fields, then name and value pair by pair, in TLC's order of
+            // field names
+            (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| {
+                let fa = crate::types::sorted_fields(a.iter().map(|(k, v)| (k.clone(), v)).collect());
+                let fb = crate::types::sorted_fields(b.iter().map(|(k, v)| (k.clone(), v)).collect());
+                for ((ka, va), (kb, vb)) in fa.iter().zip(&fb) {
+                    let c = crate::types::field_cmp(ka, kb).then_with(|| va.cmp(vb));
+                    if c.is_ne() {
+                        return c;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            }),
             (Tuple(a), Tuple(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
             _ => self.rank().cmp(&o.rank()),
         }
@@ -140,7 +153,8 @@ thread_local! {
 
 /// The starts of the error messages for failures that TLC raises too when it evaluates the same
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
-const EVAL_FAILURES: [&str; 9] = [
+const EVAL_FAILURES: [&str; 10] = [
+    "Attempted to check equality of string ",
     "The first argument of BagOfAll should be an operator",
     "Attempted to check if ",
     "The second argument of \\div is 0.",
@@ -296,6 +310,9 @@ impl ConstEval<'_> {
                 }
                 ("ToString", [x]) => {
                     let v = self.eval(x, env)?;
+                    if let Some((a, b)) = disordered_in(&v) {
+                        return Err(crate::types::disordered_error(&a, &b));
+                    }
                     Value::Atom(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v)))
                 }
                 ("TLCEval", [x]) => self.eval(x, env)?,
@@ -812,17 +829,47 @@ impl ConstEval<'_> {
     }
 
     /// Equality as TLC evaluates it: comparing a string with an integer is an error
-    fn tlc_eq(&self, a: &Value, b: &Value) -> R<bool> {
-        let s = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.is_model(*x));
-        if (s(a) && matches!(b, Value::Tuple(_) | Value::Fun(_) | Value::Rec(_) | Value::Set(_)))
-            || (s(b) && matches!(a, Value::Tuple(_) | Value::Fun(_) | Value::Rec(_) | Value::Set(_)))
-        {
-            return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and a non-string)"));
-        }
+    /// a = b as TLC evaluates it, with a on the left: TLC asks a whether it equals b. A string
+    /// asked about a value that is not a string (nor a model value) stops with an error; a tuple
+    /// asked about a string compares it with the string's characters; values that hold strings
+    /// and tuples compare part by part in the same way.
+    pub fn tlc_eq(&self, a: &Value, b: &Value) -> R<bool> {
+        use Value::*;
+        let s = |v: &Value| matches!(v, Atom(x) if !self.atoms.is_model(*x));
         if self.str_int(a, b) {
             return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and an integer)"));
         }
-        Ok(a == b)
+        if s(a) && matches!(b, Tuple(_) | Fun(_) | Rec(_) | Set(_)) {
+            return Err(format!(
+                "Attempted to check equality of string {} with non-string:\n{}",
+                crate::compile::show_value(self.atoms, a),
+                crate::compile::show_value(self.atoms, b)
+            ));
+        }
+        let all = |xs: Vec<(&Value, &Value)>| -> R<bool> {
+            for (x, y) in xs {
+                if !self.tlc_eq(x, y)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        Ok(match (a, b) {
+            (Tuple(t), Atom(x)) if s(b) => {
+                let chars: Vec<Value> = self.atoms.name(*x).chars().map(|c| Atom(self.atoms.intern(false, &c.to_string()))).collect();
+                t.len() == chars.len() && all(t.iter().zip(&chars).collect())?
+            }
+            (Tuple(x), Tuple(y)) => x.len() == y.len() && all(x.iter().zip(y).collect())?,
+            (Set(x), Set(y)) => x.len() == y.len() && all(x.iter().zip(y).collect())?,
+            (Fun(x), Fun(y)) => x.len() == y.len() && x.keys().eq(y.keys()) && all(x.values().zip(y.values()).collect())?,
+            (Rec(x), Rec(y)) => x.len() == y.len() && x.keys().eq(y.keys()) && all(x.values().zip(y.values()).collect())?,
+            // A record is the function over its field names
+            (Rec(r), Fun(_)) | (Fun(_), Rec(r)) => {
+                let as_fun = Fun(r.iter().map(|(k, x)| (Atom(self.atoms.intern(false, k)), x.clone())).collect());
+                if matches!(a, Rec(_)) { self.tlc_eq(&as_fun, b)? } else { self.tlc_eq(a, &as_fun)? }
+            }
+            _ => a == b,
+        })
     }
 
     /// The entries of a bag
@@ -951,7 +998,22 @@ impl ConstEval<'_> {
                 if let Some(e) = set.iter().find(|e| self.str_int(&a, e)) {
                     return Err(format!("Attempted to check equality of {a:?} with {e:?} (a string and an integer)"));
                 }
-                Value::Bool(set.contains(&a) == (op == In))
+                // TLC asks each element whether it equals a, which matters when strings meet
+                // tuples or records meet functions
+                let mixed = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.is_model(*x)) || matches!(v, Value::Tuple(_) | Value::Rec(_) | Value::Fun(_));
+                let inside = if mixed(&a) && set.iter().any(|e| mixed(e) && std::mem::discriminant(e) != std::mem::discriminant(&a)) {
+                    let mut found = false;
+                    for e in set {
+                        if self.tlc_eq(e, &a)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                } else {
+                    set.contains(&a)
+                };
+                Value::Bool(inside == (op == In))
             }
             Subseteq => Value::Bool(a.as_set()?.is_subset(b.as_set()?)),
             Cup => Value::Set(a.as_set()?.union(b.as_set()?).cloned().collect()),
@@ -992,6 +1054,20 @@ pub fn fun_value(m: BTreeMap<Value, Value>) -> Value {
         return Value::Tuple(m.into_values().collect());
     }
     Value::Fun(m)
+}
+
+/// A pair of fields of a record inside v that the spec writes in the order opposite to TLC's
+pub fn disordered_in(v: &Value) -> Option<(String, String)> {
+    match v {
+        Value::Rec(m) => {
+            let names: Vec<&str> = m.keys().map(|k| k.as_str()).collect();
+            crate::types::disordered_fields(&names).or_else(|| m.values().find_map(disordered_in))
+        }
+        Value::Set(s) => s.iter().find_map(disordered_in),
+        Value::Fun(m) => m.iter().find_map(|(k, x)| disordered_in(k).or_else(|| disordered_in(x))),
+        Value::Tuple(t) => t.iter().find_map(disordered_in),
+        _ => None,
+    }
 }
 
 /// The entries of a function value, also of a tuple

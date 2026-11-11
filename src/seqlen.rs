@@ -146,7 +146,9 @@ impl Walk<'_> {
         use Expr::*;
         let mut env2 = env.clone();
         Some(match e {
-            Num(_) | Str(_) | Bool(_) => Len::default(),
+            Num(_) | Bool(_) => Len::default(),
+            // A string becomes a sequence of characters under SelectSeq, SortSeq and \o with a tuple
+            Str(x) => Len::flat(x.chars().count()),
             Ident(n) => match env.get(n) {
                 Some(l) => *l,
                 None if self.vars.contains(n) => self.bound.get(n).copied().unwrap_or_default(),

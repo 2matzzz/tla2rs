@@ -9,6 +9,17 @@
 pub const RUNTIME: &str = r##"
 // ---------------------------------------------------------------- runtime (tla2rs)
 
+/// A search thread, with a stack sized for the states it copies (a state holds its sequences and
+/// sets inline, so long sequences make large states)
+fn spawn_worker<'s, 'e, F, T>(sc: &'s std::thread::Scope<'s, 'e>, f: F) -> std::thread::ScopedJoinHandle<'s, T>
+where
+    F: FnOnce() -> T + Send + 's,
+    T: Send + 's,
+{
+    let stack = (64 * std::mem::size_of::<State>()).max(16 << 20);
+    std::thread::Builder::new().stack_size(stack).spawn_scoped(sc, f).expect("cannot start a search thread")
+}
+
 #[inline(always)]
 fn put(w: &mut [u64], p: &mut u32, mut v: u128, mut n: u32) {
     if n <= 64 {
@@ -1658,7 +1669,7 @@ fn run_safety(opt: &Opt) {
                     .map(|i| {
                         let (x, y) = (i * per, ((i + 1) * per).min(n));
                         let (pt, seen, stop) = (&part, &seen, &stop);
-                        sc.spawn(move || expand_safety(pt, x, y, seen, stop, opt))
+                        spawn_worker(sc, move || expand_safety(pt, x, y, seen, stop, opt))
                     })
                     .collect();
                 for c in pending.drain(..) {
@@ -1985,7 +1996,7 @@ impl Table {
             for w in 0..k {
                 let (lo, hi) = (w * per, ((w + 1) * per).min(SHARDS));
                 let (nt, np) = (&nt, &np);
-                sc.spawn(move || {
+                spawn_worker(sc, move || {
                     let (t, p) = (nt.as_mut_slice(), np.as_mut_slice());
                     let m = slots - 1;
                     for sh in lo..hi {
@@ -2278,7 +2289,7 @@ fn run_safety_batched(opt: &Opt) {
                         .map(|i| {
                             let (x, y) = (i * per, ((i + 1) * per).min(n));
                             let (pt, stop, tbl) = (&part, &stop, &tbl);
-                            sc.spawn(move || collect_phase(pt, x, y, opt, stop, parts, tbl, prev))
+                            spawn_worker(sc, move || collect_phase(pt, x, y, opt, stop, parts, tbl, prev))
                         })
                         .collect();
                     hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
@@ -2314,7 +2325,7 @@ fn run_safety_batched(opt: &Opt) {
                         .iter()
                         .map(|g| {
                             let tbl = &tbl;
-                            sc.spawn(move || {
+                            spawn_worker(sc, move || {
                                 let mut f = vec![0u8; g.iter().map(|v| v.len()).sum()];
                                 let mut off = 0;
                                 for cs in g {
@@ -2338,7 +2349,7 @@ fn run_safety_batched(opt: &Opt) {
                     .map(|(t, (g, f))| {
                         let tbl = &tbl;
                         let (lo, hi) = (t * SHARDS / parts, (t + 1) * SHARDS / parts);
-                        sc.spawn(move || {
+                        spawn_worker(sc, move || {
                             let mut o: (Vec<Qitem>, u64) = (vec![], 0);
                             let mut off = 0;
                             for cs in g {
@@ -2439,7 +2450,7 @@ fn run_liveness(opt: &Opt) {
                 .map(|i| {
                     let (a, b) = (lo + i * per, (lo + (i + 1) * per).min(hi));
                     let (g, seen, stop) = (&g, &seen, &stop);
-                    sc.spawn(move || expand(g, a, b, seen, stop, i, check_deadlock))
+                    spawn_worker(sc, move || expand(g, a, b, seen, stop, i, check_deadlock))
                 })
                 .collect();
             hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()

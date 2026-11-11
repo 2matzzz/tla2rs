@@ -4,7 +4,73 @@
 
 use crate::lexer::R;
 use crate::value::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+
+thread_local! {
+    /// The order in which TLC creates each name (see `compile::tlc_string_ranks`)
+    static FIELD_RANKS: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
+}
+
+pub fn set_field_ranks(r: HashMap<String, usize>) {
+    FIELD_RANKS.with(|f| *f.borrow_mut() = r);
+}
+
+/// The order of record fields. TLC keeps a record's fields sorted by when it first created each
+/// name (its normal form), and compares and prints records in that order; names it creates only
+/// while exploring come last, alphabetically.
+pub fn field_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    FIELD_RANKS.with(|f| {
+        let f = f.borrow();
+        let r = |x: &str| f.get(x).copied().unwrap_or(usize::MAX);
+        r(a).cmp(&r(b)).then_with(|| a.cmp(b))
+    })
+}
+
+thread_local! {
+    /// Pairs of field names that some record in the spec writes in the order opposite to TLC's
+    static DISORDERED: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// Notes the record constructors (`[a |-> ..]`, `[a : ..]`) whose fields are written in an order
+/// other than TLC's: TLC prints such a record in the written order until it first compares it
+/// (which puts it in its normal form), so ToString of it depends on evaluation history
+pub fn note_written_fields(e: &crate::ast::Expr) {
+    if let crate::ast::Expr::RecLit(fs) | crate::ast::Expr::RecSet(fs) = e {
+        for i in 0..fs.len() {
+            for j in i + 1..fs.len() {
+                if field_cmp(&fs[i].0, &fs[j].0).is_gt() {
+                    DISORDERED.with(|d| d.borrow_mut().push((fs[i].0.clone(), fs[j].0.clone())));
+                }
+            }
+        }
+    }
+    for c in e.children() {
+        note_written_fields(c);
+    }
+}
+
+pub fn clear_written_fields() {
+    DISORDERED.with(|d| d.borrow_mut().clear());
+}
+
+/// For a record with these fields, a pair written in the order opposite to TLC's, if any
+pub fn disordered_fields(names: &[&str]) -> Option<(String, String)> {
+    DISORDERED.with(|d| d.borrow().iter().find(|(a, b)| names.contains(&a.as_str()) && names.contains(&b.as_str())).cloned())
+}
+
+/// The error for ToString of such a record
+pub fn disordered_error(a: &str, b: &str) -> String {
+    format!(
+        "ToString of a record with fields `{a}` and `{b}`, which the spec writes as `{a}` before `{b}`: TLC prints a record in the order it was written \
+         until it first compares it, then as `{b}` before `{a}`, so the string depends on when TLC compared it. Write `{b}` before `{a}` to make it definite"
+    )
+}
+
+/// A record's fields in TLC's order
+pub fn sorted_fields<T>(mut fs: Vec<(String, T)>) -> Vec<(String, T)> {
+    fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
+    fs
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum Ty {
@@ -320,7 +386,7 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::Rec(x), Ty::Rec(y)) => {
             // Union of the fields; a field present on only one side becomes optional
             let mut names: Vec<String> = x.iter().chain(y).map(|f| f.0.clone()).collect();
-            names.sort();
+            names.sort_by(|a, b| field_cmp(a, b));
             names.dedup();
             let mut fs = vec![];
             for n in names {
@@ -358,7 +424,7 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::Bag(x), Ty::Bag(y)) => Ty::Bag(join(x, y)?.into()),
         // A function over part of a type joins with one over all of it (or with the empty one)
         (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
-        (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) | (Ty::Fun(d2, c2), Ty::PFun(d1, c1)) if d1 == d2 => Ty::PFun(d1.clone(), join(c1, c2)?.into()),
+        (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) | (Ty::Fun(d2, c2), Ty::PFun(d1, c1)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
         (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if fs.is_empty() => Ty::PFun(d.clone(), c.clone()),
         // <<>> is the empty function, so also the empty bag
         (Ty::Bag(x), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Bag(x)) if fs.is_empty() => Ty::Bag(x.clone()),
@@ -412,14 +478,20 @@ pub fn ty_of_value(v: &Value) -> R<Ty> {
             }
             Ty::Set(t.into())
         }
-        Value::Rec(m) => Ty::Rec(m.iter().map(|(k, x)| Ok((k.clone(), ty_of_value(x)?))).collect::<R<_>>()?),
+        Value::Rec(m) => Ty::Rec(sorted_fields(m.iter().map(|(k, x)| Ok((k.clone(), ty_of_value(x)?))).collect::<R<_>>()?)),
         Value::Fun(m) => {
-            let dom = elem_ty_of_domain(&m.keys().cloned().collect())?;
             let mut c = Ty::Enum(vec![]);
             for x in m.values() {
                 c = join(&c, &ty_of_value(x)?)?;
             }
-            Ty::Fun(dom.into(), c.into())
+            match elem_ty_of_domain(&m.keys().cloned().collect()) {
+                Ok(dom) => Ty::Fun(dom.into(), c.into()),
+                // A domain that is only part of a type: a function over part of that type
+                Err(e) => match ty_of_value(&Value::Set(m.keys().cloned().collect()))? {
+                    Ty::Set(k) if k.size().is_some() => Ty::PFun(k, c.into()),
+                    _ => return Err(e),
+                },
+            }
         }
         Value::Tuple(xs) => tuple_ty(xs.iter().map(ty_of_value).collect::<R<_>>()?)?,
     })
@@ -438,4 +510,116 @@ pub fn elem_ty_of_domain(s: &BTreeSet<Value>) -> R<Ty> {
         return Err(format!("function domain must be a full finite type (e.g. a set of model values or a..b), got {s:?}"));
     }
     Ok(t)
+}
+
+/// Every value of type `t`, for types whose values can be listed: sets of at most `scap`
+/// elements (when held as arrays), sequences of at most `qcap` elements. None when there are more
+/// than `limit` values or the type is unbounded.
+pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<Value>> {
+    use crate::value::fun_value;
+    let out: Vec<Value> = match t {
+        _ if t.size().is_some() && !matches!(t, Ty::Rec(_)) => {
+            if t.size()? > limit as u64 {
+                return None;
+            }
+            t.enumerate()
+        }
+        Ty::Rec(fs) => {
+            let tuple = is_tuple_fields(fs);
+            let mut rows: Vec<Vec<Option<Value>>> = vec![vec![]];
+            for (_, ft) in fs {
+                let (vals, opt) = match ft {
+                    Ty::Opt(i) => (all_values(i, qcap, scap, limit)?, true),
+                    ft => (all_values(ft, qcap, scap, limit)?, false),
+                };
+                let mut next = vec![];
+                for r in &rows {
+                    if opt {
+                        next.push([r.as_slice(), &[None]].concat());
+                    }
+                    for v in &vals {
+                        next.push([r.as_slice(), &[Some(v.clone())]].concat());
+                    }
+                    if next.len() > limit {
+                        return None;
+                    }
+                }
+                rows = next;
+            }
+            rows.into_iter()
+                .map(|r| {
+                    if tuple {
+                        Value::Tuple(r.into_iter().flatten().collect())
+                    } else {
+                        Value::Rec(fs.iter().zip(r).filter_map(|((k, _), v)| v.map(|v| (k.clone(), v))).collect())
+                    }
+                })
+                .collect()
+        }
+        Ty::Set(e) => {
+            let elems = all_values(e, qcap, scap, limit)?;
+            let cap = if is_sparse(t) { scap.min(elems.len()) } else { elems.len() };
+            let mut out: Vec<BTreeSet<Value>> = vec![BTreeSet::new()];
+            for x in &elems {
+                let mut more = vec![];
+                for s in &out {
+                    if s.len() < cap {
+                        let mut s2 = s.clone();
+                        s2.insert(x.clone());
+                        more.push(s2);
+                    }
+                }
+                out.extend(more);
+                if out.len() > limit {
+                    return None;
+                }
+            }
+            out.into_iter().map(Value::Set).collect()
+        }
+        Ty::Fun(d, c) | Ty::PFun(d, c) => {
+            let keys = d.enumerate();
+            let vals = all_values(c, qcap, scap, limit)?;
+            let partial = matches!(t, Ty::PFun(..));
+            let mut maps: Vec<std::collections::BTreeMap<Value, Value>> = vec![Default::default()];
+            for k in &keys {
+                let mut next = vec![];
+                for m in &maps {
+                    if partial {
+                        next.push(m.clone());
+                    }
+                    for v in &vals {
+                        let mut m2 = m.clone();
+                        m2.insert(k.clone(), v.clone());
+                        next.push(m2);
+                    }
+                    if next.len() > limit {
+                        return None;
+                    }
+                }
+                maps = next;
+            }
+            maps.into_iter().map(fun_value).collect()
+        }
+        Ty::Seq(e) => {
+            let elems = all_values(e, qcap, scap, limit)?;
+            let mut out = vec![Value::Tuple(vec![])];
+            let mut last = vec![vec![]];
+            for _ in 0..qcap {
+                let mut next = vec![];
+                for s in &last {
+                    for x in &elems {
+                        next.push([s.as_slice(), &[x.clone()]].concat());
+                    }
+                    if out.len() + next.len() > limit {
+                        return None;
+                    }
+                }
+                out.extend(next.iter().cloned().map(Value::Tuple));
+                last = next;
+            }
+            out
+        }
+        _ => return None,
+    };
+    (out.len() <= limit).then_some(out)
 }
