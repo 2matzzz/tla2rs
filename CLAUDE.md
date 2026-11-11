@@ -11,7 +11,7 @@ It has no crate dependencies.
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, and `-deadlock` are passed on to the
     generated checker, which also accepts them directly
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 259 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 270 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -30,6 +30,7 @@ It has no crate dependencies.
 | `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A tuple is a `Rec` with fields `#01`, `#02`, ... (`tuple_ty`). `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP). `Bag` is a bag, a count per element of an enumerable type (packed as a function to 0..BIG). `PFun` is a function over part of an enumerable type (an optional value per element). `BIG` is an unbounded integer |
 | `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". As in TLC, `\/` and `\E` branch while some variable is still unassigned |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture |
+| `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
 | `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos) |
 
@@ -64,6 +65,28 @@ A line `\* crosscheck: distinct-only` in a cfg makes `scripts/crosscheck.sh` ski
 (`tests/tlc/OrDup.cfg` is an example). A line like `\* crosscheck: rsargs -memlimit 0` passes extra arguments to
 tla2rs only. The default stays strict: generated-count mismatches have caught real bugs before (a difference in when
 `\/` and `\E` branch), so mark only configurations whose gap is understood.
+
+### The order of strings
+
+TLC orders strings by when it first creates them (`UniqueString` ids), not alphabetically, and that order decides how a
+set of strings is enumerated, which element CHOOSE picks, and how sets print. Measured on TLC 2.19 (`tests/tlc/StrRank*`),
+it creates: the strings and model values of the cfg; SANY's built-in names; the identifiers and keywords of each module
+as it parses them (root module first, then the modules it extends or instantiates, breadth first; a string equal to an
+identifier such as an operator name, or to a name in a standard module, takes that identifier's place); a few more
+built-in names; the string literals of each module, dependencies first. `tlc_string_ranks` reproduces this, with the
+standard modules' names in `src/std_modules.rs` (generated from TLC's jar).
+
+Strings created while exploring (by `\o`, `Append`, `ToString`, ...) are not ordered as in TLC: tla2rs computes them at
+compile time and numbers them after the others. Reproducing TLC is not possible in general (Refs #23):
+
+- TLC creates such a string the first time it evaluates the expression, which depends on its evaluation of everything:
+  a definition of constant level that nothing uses changes the order, because TLC evaluates those at startup (with
+  `Words == {"c" \o s : s \in {"a", "b"}}` present, `{x \o "b", x \o "a"}` prints as `{"ca", "cb"}` and CHOOSE picks
+  `"ca"`; without it, `{"cb", "ca"}` and `"cb"`). tla2rs folds constant expressions at compile time and evaluates
+  others in its own order
+- With several workers the order depends on thread scheduling: CHOOSE over `{ToString(n) \o "w" : n \in 1..2000}`
+  after the search created those strings gave `"4w"`, `"1w"`, `"2w"` and `"4w"` in four runs with `-workers 4`, and
+  `"1w"` every time with one worker
 
 ### Liveness counterexamples are not compared
 

@@ -128,6 +128,9 @@ memory.
   collision (an estimate is printed at the end)
 - Liveness checking keeps the whole state graph in memory (about 40 bytes per edge), and the search over its product
   with a property's automaton uses hash maps sized by the reachable product. For invariants only, see Memory above
+- Strings are ordered as TLC orders them (by when TLC first creates them) for strings that appear in the spec, its
+  modules, or the cfg. Strings created during the search (by `\o`, `ToString`, ...) can be ordered differently: TLC's
+  order for those depends on its evaluation order and, with several workers, on scheduling
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks compare only the verdict, counts and exit
   code
