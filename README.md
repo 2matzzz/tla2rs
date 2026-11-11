@@ -34,7 +34,7 @@ cargo build --release
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` sets the capacity of sets whose size is only known at run time
-- `-seqcap N` sets the maximum length of sequences (at most 1024), when the spec does not bound them with
+- `-seqcap N` sets the maximum length of sequences (at most 65535), when the spec does not bound them with
   `Len(x) <= N` in `TypeOK` or a `CONSTRAINT`, or `UNION {[1..n -> S] : n \in 0..N}`. Otherwise the lengths are
   computed from Init and Next until they stop growing (a length test such as `Len(q) < N` in an action bounds `q`
   there); if they keep growing, the length tests in the spec suggest the bound
@@ -114,9 +114,17 @@ memory.
   of up to `-setcap` elements. A sequence holds up to `-seqcap` elements (see above); growing past it is an
   evaluation error
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
-  characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`), `Bags`, `STRING`, and from `TLC` `Print`, `PrintT`,
-  `Assert`, `ToString` (of a value from the state when it is a Boolean, integer, string, model value or tuple of
-  them, with at most 4096 possible values), `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+  characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`, and, giving tuples as in TLC, `SelectSeq`,
+  `SortSeq` and a tuple followed by a string in `\o`), `Bags`, `STRING`, and from `TLC` `Print`, `PrintT`, `Assert`,
+  `ToString`, `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+- Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),
+  and functions over strings print as records. ToString of a value from the state interns the string of every value
+  of its type at compile time, so the type must have at most as many values as the 16-bit string ids leave room for
+  (65536 strings and model values in all). ToString of a record whose fields the spec writes in another order than
+  TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends
+  on when that happens
+- A function over part of a type (and a bag) is an array over the whole type, so that type must be enumerable and
+  have at most 65536 values; a tuple literal has at most 99,999 elements (each is a field of the generated type)
 - Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--` and `|-` are accepted; `Print` and `PrintT` write to stdout as TLC does
