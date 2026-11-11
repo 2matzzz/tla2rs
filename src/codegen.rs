@@ -348,11 +348,17 @@ impl<'a> Gen<'a> {
         }
         let want = elem.map(|e| Ty::Bag(e.clone().into()));
         let (c, t) = self.gen(b, env, want.as_ref())?;
-        // <<>> (the type of a variable that has only been EmptyBag so far) is the empty bag
-        if matches!(&t, Ty::Rec(fs) if fs.is_empty()) {
-            let e = elem.cloned().unwrap_or(Ty::Enum(vec![]));
+        // <<>> (the type of a variable that has only been EmptyBag so far) is the empty bag, and a
+        // tuple of counts is a bag over 1..n
+        if matches!(&t, Ty::Rec(fs) if is_tuple_fields(fs)) {
+            let Ty::Rec(fs) = &t else { unreachable!() };
+            let e = match elem {
+                Some(e) => e.clone(),
+                None if fs.is_empty() => Ty::Enum(vec![]),
+                None => Ty::Int(1, fs.len() as i64),
+            };
             let bt = Ty::Bag(e.clone().into());
-            return Ok((format!("{{ let _ = {c}; {} }}", Self::default_code(&bt)), e));
+            return Ok((self.coerce(c, &t, &bt)?, e));
         }
         let Ty::Bag(e) = &t else { return Err(format!("a bag operator applied to {t:?}, which is not a bag")) };
         match elem {
@@ -707,6 +713,13 @@ impl<'a> Gen<'a> {
     fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
         Ok(match t {
             Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            // A bag compares as the function it is: by the size of its domain, then the domain,
+            // then the counts
+            Ty::Bag(_) => format!(
+                "{{ let (__x, __y) = ({a}, {b}); let __dx: Vec<usize> = (0..__x.len()).filter(|&i| __x[i] > 0).collect(); \
+                 let __dy: Vec<usize> = (0..__y.len()).filter(|&i| __y[i] > 0).collect(); \
+                 __dx.len().cmp(&__dy.len()).then_with(|| __dx.cmp(&__dy)).then_with(|| __dx.iter().map(|&i| __x[i]).cmp(__dy.iter().map(|&i| __y[i]))) }}"
+            ),
             Ty::Rec(fs) if needs_tlc_order(t) => {
                 let mut parts = vec![];
                 for (i, (_, ft)) in fs.iter().enumerate() {
@@ -1023,6 +1036,16 @@ impl<'a> Gen<'a> {
             }
             (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..) | Ty::Seq(_)) if x.is_empty() => Err("empty enum".into()),
             (Ty::Rec(fs), Ty::Bag(_)) if fs.is_empty() => Ok(Self::default_code(to)),
+            // A tuple of counts as a bag over 1..n
+            (Ty::Rec(fs), Ty::Bag(e)) if is_tuple_fields(fs) => {
+                let eid = self.ty_id(e)?;
+                let r = self.fresh("r");
+                let mut s = format!("{{ let {r} = {code}; let mut __o = {}; ", Self::default_code(to));
+                for k in 0..fs.len() {
+                    write!(s, "__o[idx_{eid}({}i64)] = {r}.{k}; ", k + 1).unwrap();
+                }
+                Ok(s + "__o }")
+            }
             // Bags over different element types: move each count to its element's place
             (Ty::Bag(a), Ty::Bag(b)) => {
                 let (aid, bid) = (self.ty_id(a)?, self.ty_id(b)?);
@@ -1288,7 +1311,23 @@ impl<'a> Gen<'a> {
                         rt,
                     )
                 }
-                ("SubBag", _) => return Err("SubBag of a bag from the state is not supported".into()),
+                // Every bag whose counts are at most b's, collected into a set of bags
+                ("SubBag", [b]) => {
+                    let (bc, e) = self.bag_of(b, env, None)?;
+                    let bt = Ty::Bag(e.into());
+                    let st = Ty::Set(bt.clone().into());
+                    let empty = self.s_empty(&st)?;
+                    let add = self.s_add("__s", "__c", &st)?;
+                    (
+                        format!(
+                            "{{ let __b = {bc}; let mut __s = {empty}; let mut __c = {}; loop {{ {add} \
+                             let mut __k = 0; while __k < __b.len() {{ if __c[__k] < __b[__k] {{ __c[__k] += 1; break; }} __c[__k] = 0; __k += 1; }} \
+                             if __k == __b.len() {{ break; }} }} __s }}",
+                            Self::default_code(&bt)
+                        ),
+                        st,
+                    )
+                }
                 // Counted without building the set (which could outgrow a sparse set's capacity)
                 ("Cardinality", [s]) if matches!(s.strip(), Call(f, _) if f == "\\X") && self.try_const(s, env).is_none() => {
                     let Call(_, parts) = s.strip() else { unreachable!() };
@@ -3720,6 +3759,7 @@ fn bag_fun(e: &Ty) -> Ty {
 /// as a number in Rust, but by size and then elements in TLC
 fn needs_tlc_order(t: &Ty) -> bool {
     match t {
+        Ty::Bag(_) => true,
         Ty::Set(_) => !is_sparse(t),
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
         Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),

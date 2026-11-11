@@ -331,6 +331,10 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::Bag(x), Ty::Bag(y)) => Ty::Bag(join(x, y)?.into()),
         // <<>> is the empty function, so also the empty bag
         (Ty::Bag(x), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Bag(x)) if fs.is_empty() => Ty::Bag(x.clone()),
+        // A bag over 1..n is a tuple of counts (SetToBag({1}) = <<1>>)
+        (Ty::Bag(x), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Bag(x)) if is_tuple_fields(fs) && fs.iter().all(|(_, t)| matches!(t, Ty::Int(..))) => {
+            Ty::Bag(join(x, &Ty::Int(1, fs.len() as i64))?.into())
+        }
         _ => return Err(format!("type mismatch: {a:?} vs {b:?}")),
     })
 }
