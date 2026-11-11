@@ -14,8 +14,8 @@ use std::fmt::Write;
 pub struct Output {
     pub rust: String,
     pub warnings: Vec<String>,
-    /// The ASSUME that evaluated to false (worded as TLC reports it). When set, no checker is
-    /// generated.
+    /// The ASSUME that evaluated to false or failed to evaluate (worded as TLC reports it). When
+    /// set, no checker is generated.
     pub assume_failed: Option<String>,
 }
 
@@ -236,6 +236,10 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
                     })
                 }
                 Ok(v) => return Err(format!("ASSUME at {at} is not a boolean: {v:?}")),
+                Err(e) if crate::value::is_eval_failure(&e) => {
+                    let msg = format!("Error: Evaluating assumption {at} failed.\n{e}");
+                    return Ok(Output { rust: String::new(), warnings, assume_failed: Some(msg) });
+                }
                 Err(e) => return Err(format!("cannot evaluate the ASSUME at {at}: {e}")),
             }
         }
