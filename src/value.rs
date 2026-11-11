@@ -136,6 +136,18 @@ impl ConstEval<'_> {
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("Cardinality", [s]) => Value::Int(self.eval(s, env)?.as_set()?.len() as i64),
                 ("IsFiniteSet", [_]) => Value::Bool(true),
+                ("\\X", parts) => {
+                    let mut out: Vec<Vec<Value>> = vec![vec![]];
+                    for s in parts {
+                        let s = self.eval(s, env)?;
+                        let s = s.as_set()?;
+                        if out.len().saturating_mul(s.len()) > ENUM_LIMIT {
+                            return Err("cartesian product too large to enumerate".into());
+                        }
+                        out = out.iter().flat_map(|t| s.iter().map(move |x| [t.as_slice(), &[x.clone()]].concat())).collect();
+                    }
+                    Value::Set(out.into_iter().map(Value::Tuple).collect())
+                }
                 ("Permutations", [x]) => {
                     let elems: Vec<Value> = self.eval(x, env)?.as_set()?.iter().cloned().collect();
                     if elems.len() > 8 {

@@ -514,6 +514,12 @@ impl<'a> Gen<'a> {
                     let hi = if is_sparse(&t) { BIG } else { el.size().unwrap_or(0) as i64 };
                     (self.s_card(&c, &t), Ty::Int(0, hi))
                 }
+                ("\\X", _) => {
+                    return Err(format!(
+                        "the cartesian product \\X over state-dependent sets is only supported on the right of \\in: {}",
+                        short(e)
+                    ))
+                }
                 _ => return Err(format!("unknown operator `{f}`")),
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),

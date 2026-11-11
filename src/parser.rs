@@ -56,6 +56,8 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
         "\\cap" => (8, false, "\\cap"),
         "\\" => (8, false, "\\"),
         ".." => (9, false, ".."),
+        // Cartesian product (10-13 in TLA+). `A \X B \X C` is one 3-ary product; see `expr`
+        "\\X" => (10, false, "\\X"),
         "+" => (10, false, "+"),
         "-" => (10, false, "-"),
         "*" => (13, false, "*"),
@@ -276,6 +278,16 @@ impl Parser {
                 break;
             }
             self.pos += 1;
+            if op == "\\X" {
+                // A \X B \X C is the set of triples, not of pairs whose first element is a pair
+                let mut parts = vec![lhs, self.expr(prec + 1)?];
+                while self.is("\\X") {
+                    self.pos += 1;
+                    parts.push(self.expr(prec + 1)?);
+                }
+                lhs = Expr::Call("\\X".into(), parts);
+                continue;
+            }
             let rhs = self.expr(if right { prec } else { prec + 1 })?;
             lhs = bin(op, lhs, rhs);
         }
