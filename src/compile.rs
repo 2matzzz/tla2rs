@@ -42,7 +42,7 @@ pub fn bounded_seq(e: &Expr) -> Option<(&Expr, &Expr)> {
 /// by TypeOK or discarded by the constraint as in TLC. Without either it is the length of the
 /// longest tuple written in the spec, unless the spec makes sequences grow (Append, \o, Seq),
 /// in which case it stays unknown (0) and using a sequence is an error that asks for a bound.
-fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize) -> R<usize> {
+fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize, init: &Expr, next: &Expr) -> R<usize> {
     fn longest(e: &Expr) -> usize {
         let here = if let Expr::Tuple(xs) = e { xs.len() } else { 0 };
         e.children().into_iter().map(longest).max().unwrap_or(0).max(here)
@@ -117,10 +117,21 @@ fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize) -> 
             }
             best.get()
         };
+        // Otherwise the lengths Init and Next can reach, when they settle
+        let mut settled = || -> R<Option<usize>> {
+            let mut others = vec![];
+            for n in cfg.invariants.iter().chain(&cfg.properties).chain(&cfg.constraints).chain(&cfg.action_constraints).chain(&cfg.view) {
+                others.push(ex.expand_def(n)?);
+            }
+            Ok(crate::seqlen::settled_bound(&m.variables, g.ce.constants, init, next, &others))
+        };
         match bound {
             Some(b) => b.max(lit),
-            None if m.defs.iter().any(|d| grows(&d.body)) => guard().map_or(0, |b| b.max(lit)),
-            None => lit,
+            None => match settled()? {
+                Some(b) => b.max(lit),
+                None if m.defs.iter().any(|d| grows(&d.body)) => guard().map_or(0, |b| b.max(lit)),
+                None => lit,
+            },
         }
     };
     if cap > 255 {
@@ -730,7 +741,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     if setcap > 0 {
         g.scap = setcap;
     }
-    g.qcap = seq_cap(&m, &cfg, &mut ex, &g, seqcap)?;
+    g.qcap = seq_cap(&m, &cfg, &mut ex, &g, seqcap, &init, &next)?;
 
     // Fairness conditions (only relevant when checking properties)
     let mut fair_defs = vec![];

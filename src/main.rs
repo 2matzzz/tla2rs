@@ -18,6 +18,7 @@ mod ltl;
 mod metal;
 mod parser;
 mod runtime;
+mod seqlen;
 mod types;
 mod value;
 
