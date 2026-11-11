@@ -87,9 +87,9 @@ memory.
 
 | | |
 |---|---|
-| Expressions | logic, arithmetic (`+ - * \div %`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A`, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
+| Expressions | logic, arithmetic (`+ - * \div %`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A`, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
 | Actions | `x' = e`, `x' \in S`, `UNCHANGED`, action-level `\/` `\E` `IF` `CASE`, guards that read an already assigned `x'` |
-| Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. A model value may share a type with integers (`1..4 \cup {None}`). `ASSUME` is checked |
+| Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. A model value may share a type with integers (`1..4 \cup {None}`). `Name <- Def` substitutes a definition (also from a module that EXTENDS the spec, such as an MC.tla) for a constant, and `<-` / `=` on a defined name replace that definition. `ASSUME` is checked |
 | Properties | `INVARIANT`. `PROPERTY` supports `<>P`, `[]<>P`, `<>[]P`, `P ~> Q`, `[]P`, and `[][A]_v` (optionally quantified with `\A x \in S :`) |
 | Fairness | `WF_v(A)` (optionally quantified with `\A`). `A` must be a named definition called from `Next` |
 | State space | `CONSTRAINT`, `VIEW`, `SYMMETRY` |
@@ -98,12 +98,14 @@ memory.
 
 - **Every variable needs `x \in S` (or `x \subseteq S`) in `TypeOK`**, with `S` finite and written in terms of
   constants only. This is where the representation (bit width) comes from. If a variable leaves its type, the checker
-  stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant)
+  stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant). A variable missing from
+  `TypeOK` gets a type inferred from Init and Next; an integer range that settles (a `Cardinality`, `x % 3`) stays
+  finite, one that keeps growing becomes unbounded
 - Set elements may have at most 128 possible values. Sets of sets and sets of functions cannot be held as values
   (`SUBSET` and `[S -> T]` in `TypeOK` are fine)
 - Not supported: sequences (tuples whose length changes, and the operators of `Sequences`), a tuple index that is not
   constant, strings mixed with integers in one value, arithmetic on a value that may be a model value, state-dependent `CHOOSE`, recursion, strong fairness (SF),
-  `ENABLED`, `<<A>>_v`, function definitions (`f[x \in S] == ...`), and `<-` in the cfg
+  `ENABLED`, `<<A>>_v`, recursive function definitions, `Name <- [Module] Def` for a CONSTANT, and operator constants
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
   collision (an estimate is printed at the end)
 - Liveness: whether a fair action is enabled is decided by whether the `Next` branch that calls it produces a
