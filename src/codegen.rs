@@ -33,6 +33,9 @@ pub struct Env {
     partial: bool,
     /// Bound variables whose value is known at compile time (an unrolled \\A or recursive call)
     vals: HashMap<String, Value>,
+    /// Inside the function of a recursive operator that assigns variables (`rec_action_fn`, by
+    /// its key): the end of the action returns the state built so far instead of emitting it
+    sink: Option<String>,
 }
 
 pub struct Gen<'a> {
@@ -66,6 +69,11 @@ pub struct Gen<'a> {
     rec_names: HashMap<(usize, Vec<Ty>), String>,
     /// Function name -> its code (the latest version)
     rec_code: std::collections::BTreeMap<String, String>,
+    /// Functions for recursive operators that assign variables, per key (`rec_action_fn`): the
+    /// name, the sets of variables assigned when it returns (bit masks over `vars`), and whether
+    /// these are settled
+    ract: HashMap<String, (String, BTreeSet<u64>, bool)>,
+    ract_progress: Vec<String>,
 }
 
 fn rid(n: &str) -> String {
@@ -94,6 +102,8 @@ impl<'a> Gen<'a> {
             rec_progress: vec![],
             rec_names: HashMap::new(),
             rec_code: std::collections::BTreeMap::new(),
+            ract: HashMap::new(),
+            ract_progress: vec![],
         }
     }
 
@@ -3823,7 +3833,10 @@ impl<'a> Gen<'a> {
             RecCall(i, args) if open && self.rec_assigns(*i, env) => {
                 let vals: Option<Vec<Value>> = args.iter().map(|a| self.try_const(a, env)).collect();
                 let Some(vals) = vals else {
-                    return Err(format!("unsupported action form (a recursive operator whose arguments are not constant): {}", short(h)));
+                    if env.init {
+                        return Err(format!("unsupported action form (a recursive operator whose arguments are not constant, in Init): {}", short(h)));
+                    }
+                    return self.gen_rec_action(*i, args, rest, env, out);
                 };
                 if self.unroll >= 2000 {
                     return Err(format!("recursive operator `{}` in an action recurses more than 2000 levels", crate::expand::rec_def(*i).name));
@@ -4081,6 +4094,126 @@ impl<'a> Gen<'a> {
         self.gen_action(&work, &env2, out)
     }
 
+    /// A recursive operator that assigns variables, called in an action with arguments from the
+    /// state: a Rust function evaluates its body as an action and returns each state it builds,
+    /// with the variables assigned by then (TLC evaluates the call as the body with the arguments
+    /// bound, so the steps and their number are the same). The rest of the action continues from
+    /// each, per set of assigned variables.
+    fn gen_rec_action(&mut self, i: usize, args: &[Expr], rest: &[Expr], env: &Env, out: &mut String) -> R<()> {
+        let rd = crate::expand::rec_def(i);
+        if self.infer.is_some() {
+            // Inferring types: the body a few levels deep shows what the call assigns
+            if self.unroll >= 4 {
+                return self.gen_action(rest, env, out);
+            }
+            let mut b = rd.body.clone();
+            let mut env2 = env.clone();
+            for (p, a) in rd.params.iter().zip(args) {
+                let (c, t) = self.gen(a, env, None).unwrap_or((String::new(), Ty::Enum(vec![])));
+                let y = self.fresh(&format!("{p}_r"));
+                env2.bind(&y, c, t);
+                b = rename_ident(&b, p, &y);
+            }
+            self.unroll += 1;
+            let r = self.gen_action(&[b].into_iter().chain(rest.iter().cloned()).collect::<Vec<_>>(), &env2, out);
+            self.unroll -= 1;
+            return r;
+        }
+        if self.vars.len() > 64 {
+            return Err(format!("recursive operator `{}` assigns variables of a spec with more than 64 variables", rd.name));
+        }
+        let mut codes = vec![];
+        let mut tys = vec![];
+        for a in args {
+            // Integers unbounded, as for `rec_fn`: one function serves n, n - 1, ...
+            let (c, t) = self.gen(a, env, None)?;
+            let w = unbounded_ints(&t);
+            codes.push(self.coerce(c, &t, &w)?);
+            tys.push(w);
+        }
+        let free = self.rec_free(&rd);
+        for x in &free {
+            let (c, t) = env.locals.get(x).cloned().ok_or(format!("recursive operator `{}` reads `{x}`, which is not bound where it is called", rd.name))?;
+            codes.push(c);
+            tys.push(t);
+        }
+        let mask_in = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
+        let (name, masks) = self.rec_action_fn(i, &rd, &free, &tys, mask_in)?;
+        let w0 = env.work.clone().unwrap_or("*s".into());
+        let (w, m) = (self.fresh("w"), self.fresh("m"));
+        writeln!(out, "for (mut {w}, {m}) in {name}(s, {w0}, {}) {{ match {m} {{", codes.join(", ")).unwrap();
+        for mask in masks {
+            writeln!(out, "{mask}u64 => {{").unwrap();
+            let mut env2 = env.clone();
+            env2.work = Some(w.clone());
+            env2.primed = HashMap::new();
+            for (k, (v, t)) in self.vars.iter().enumerate() {
+                if mask >> k & 1 == 1 {
+                    env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t.clone()));
+                }
+            }
+            self.gen_action(rest, &env2, out)?;
+            out.push_str("}\n");
+        }
+        out.push_str("_ => {} } }\n");
+        Ok(())
+    }
+
+    /// The function of `gen_rec_action` for the recursive operator `i` with arguments of types
+    /// `tys` (its parameters, then the identifiers `free` bound at the call site), called with the
+    /// variables in `mask_in` assigned: its name and the sets of variables assigned when it
+    /// returns. A call of itself inside uses the sets found so far, so the body is generated again
+    /// until they settle.
+    fn rec_action_fn(&mut self, i: usize, rd: &crate::expand::RecDef, free: &[String], tys: &[Ty], mask_in: u64) -> R<(String, BTreeSet<u64>)> {
+        let key = format!("{i}|{tys:?}|{mask_in}");
+        if let Some((n, ms, done)) = self.ract.get(&key) {
+            if *done || self.ract_progress.contains(&key) {
+                return Ok((n.clone(), ms.clone()));
+            }
+        } else {
+            if self.ract.keys().filter(|k| k.starts_with(&format!("{i}|"))).count() >= 16 {
+                return Err(format!("recursive operator `{}`: the types of its arguments keep changing between calls", rd.name));
+            }
+            let n = format!("ract_{}", self.ract.len());
+            self.ract.insert(key.clone(), (n, BTreeSet::new(), false));
+        }
+        let name = self.ract[&key].0.clone();
+        let names: Vec<&String> = rd.params.iter().chain(free).collect();
+        let mut env = Env::default();
+        let mut sig = String::from("s: &State, mut __w: State, ");
+        for (k, (x, t)) in names.iter().zip(tys).enumerate() {
+            env.locals.insert(x.to_string(), (format!("a{k}"), t.clone()));
+            write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+        }
+        for (k, (v, t)) in self.vars.iter().enumerate() {
+            if mask_in >> k & 1 == 1 {
+                env.primed.insert(v.clone(), (format!("__w.v_{v}"), t.clone()));
+            }
+        }
+        env.work = Some("__w".into());
+        env.sink = Some(key.clone());
+        loop {
+            let before = self.ract[&key].1.clone();
+            let mut body = String::new();
+            self.ract_progress.push(key.clone());
+            let r = self.gen_action(&[rd.body.clone()], &env, &mut body);
+            self.ract_progress.pop();
+            r?;
+            let f = format!(
+                "#[allow(unused_mut, unused_variables)]\nfn {name}({sig}) -> Vec<(State, u64)> {{ rec_enter({:?}); let mut __res: Vec<(State, u64)> = Vec::new(); {{ {body} }} rec_leave(); __res }}\n",
+                rd.name
+            );
+            self.rec_code.insert(name.clone(), f);
+            let after = self.ract[&key].1.clone();
+            if after == before {
+                if self.ract_progress.is_empty() {
+                    self.ract.get_mut(&key).unwrap().2 = true;
+                }
+                return Ok((name, after));
+            }
+        }
+    }
+
     fn record(&mut self, v: &str, t: Ty) {
         let m = self.infer.as_mut().unwrap();
         let cur = m.remove(v).unwrap_or(Ty::Enum(vec![]));
@@ -4326,6 +4459,12 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_state(&mut self, env: &Env, out: &mut String) -> R<()> {
+        if let Some(key) = &env.sink {
+            let mask = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
+            self.ract.get_mut(key).unwrap().1.insert(mask);
+            writeln!(out, "__res.push(({}, {mask}u64));", env.work.as_ref().unwrap()).unwrap();
+            return Ok(());
+        }
         for (v, _) in &self.vars {
             if env.primed.contains_key(v) || env.partial {
                 continue;
