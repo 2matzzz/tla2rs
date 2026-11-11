@@ -3815,7 +3815,7 @@ impl<'a> Gen<'a> {
                     }
                     // In Init, a condition on what is assigned so far: evaluated as a boolean below
                     None if env.init => {}
-                    None => return Err(format!("unsupported action form (\\A over a set that is not constant): {}", short(h))),
+                    None => return self.gen_forall(bs, body, rest, env, out),
                 }
             }
             // A recursive operator called with constant arguments in an action: its body, with
@@ -3843,6 +3843,49 @@ impl<'a> Gen<'a> {
                 let r = self.gen_action(&with(vec![Label(rd.name.clone(), args.clone(), b.b())]), &env2, out);
                 self.unroll -= 1;
                 return r;
+            }
+            // The elements of `\A x \in S : B` (S from the state) from the i-th on (gen_forall)
+            Call(f, a) if f == FORALL_REST => {
+                let [Ident(key), Ident(x), b, Num(i)] = a.as_slice() else { unreachable!() };
+                let (els, et) = env.locals[key].clone();
+                if self.only_reads_assigned(b, env) {
+                    // Nothing left to assign: B holds for each remaining element
+                    let k = self.fresh("k");
+                    let mut env2 = env.clone();
+                    env2.bind(x, format!("{els}[{k}]"), et);
+                    let c = match self.gen_as(b, &env2, &Ty::Bool) {
+                        Err(_) if self.infer.is_some() => "true".into(),
+                        r => r?,
+                    };
+                    writeln!(out, "if ({i}..{els}.len()).all(|{k}| {c}) {{").unwrap();
+                    self.gen_action(rest, env, out)?;
+                    out.push_str("}\n");
+                    return Ok(());
+                }
+                // The next element may assign: one level per element the set can hold
+                match et.size() {
+                    Some(n) if *i as u64 >= n => return self.gen_action(rest, env, out),
+                    _ if *i == 0 => {}
+                    Some(n) if n <= 16 => {}
+                    _ => {
+                        return Err(format!(
+                            "unsupported action form (\\A over a set from the state whose body assigns a variable for some elements only): {}",
+                            short(b)
+                        ))
+                    }
+                }
+                writeln!(out, "if {els}.len() <= {i} {{").unwrap();
+                let env0 = self.renew_work(env, out);
+                self.gen_action(rest, &env0, out)?;
+                out.push_str("} else {\n");
+                let mut env2 = self.renew_work(env, out);
+                let e = self.fresh("e");
+                writeln!(out, "let {e} = {els}[{i}];").unwrap();
+                env2.bind(x, e, et);
+                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1)]);
+                self.gen_action(&with(vec![b.clone(), next]), &env2, out)?;
+                out.push_str("}\n");
+                return Ok(());
             }
             If(c, a, b) if action => {
                 // A condition known here (as in an unrolled recursive operator): only its branch
@@ -4009,6 +4052,33 @@ impl<'a> Gen<'a> {
         self.gen_action(rest, env, out)?;
         out.push_str("}\n");
         Ok(())
+    }
+
+    /// `\A x \in S : B` that assigns variables, with S from the state. TLC evaluates it as the
+    /// conjunction of B over the elements of S in order: an element can assign the variables not
+    /// assigned yet, and once B only reads what is assigned, it is a test for the remaining
+    /// elements. Over the empty set it is TRUE. Several bound variables nest, the first varying
+    /// fastest.
+    fn gen_forall(&mut self, bs: &[(String, Expr)], body: &Expr, rest: &[Expr], env: &Env, out: &mut String) -> R<()> {
+        let (x, s) = bs.last().unwrap();
+        let inner = if bs.len() > 1 { Expr::Quant(false, bs[..bs.len() - 1].to_vec(), body.clone().b()) } else { body.clone() };
+        let (it, et, ix) = match self.iter_of_indexed(s, env) {
+            Ok(x) => x,
+            Err(_) if self.infer.is_some() => (String::new(), Ty::Enum(vec![]), None),
+            Err(e) => return Err(e),
+        };
+        let els = self.fresh("els");
+        let val = match ix {
+            Some(_) => format!("dec_{}(__e)", self.ty_id(&et)?),
+            None => "__e".into(),
+        };
+        writeln!(out, "let {els}: Vec<{}> = {it}.map(|__e| {val}).collect();", et.repr()).unwrap();
+        let mut env2 = env.clone();
+        let key = self.fresh("#els");
+        env2.bind(&key, els, et);
+        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0)]);
+        let work: Vec<Expr> = std::iter::once(first).chain(rest.iter().cloned()).collect();
+        self.gen_action(&work, &env2, out)
     }
 
     fn record(&mut self, v: &str, t: Ty) {
@@ -5209,6 +5279,9 @@ fn disordered_ty(t: &Ty) -> Option<(String, String)> {
         _ => None,
     }
 }
+
+/// The conjunct standing for the elements after the first in `Gen::gen_forall`
+const FORALL_REST: &str = "#forall-rest";
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)
