@@ -11,7 +11,7 @@ It has no crate dependencies.
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, and `-deadlock` are passed on to the
     generated checker, which also accepts them directly
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 433 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 469 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -26,12 +26,12 @@ It has no crate dependencies.
 
 | File | Role |
 |---|---|
-| `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column |
+| `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also the checks of SANY that tla2rs repeats (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150 |
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
-| `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments |
+| `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first) |
 | `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element). Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
-| `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". As in TLC, `\/` and `\E` branch while some variable is still unassigned |
+| `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
@@ -125,6 +125,65 @@ TLC evaluates `[x \in S |-> e]` lazily. Measured on TLC 2.19 with S = Nat (`test
 tla2rs compiles `f[k]` (also after EXCEPT with one index per update) and `k \in DOMAIN f` to the membership test and
 the body (`Gen::lazy_apply`), also over a constant set of more than 65536 elements (`lazy_domain`), and refuses such a
 function over an infinite set anywhere else. Constant folding applies `[x \in S |-> e][k]` the same way (`value.rs`).
+
+### Tuples compared with strings
+
+TLC asks the value on the left of `=` whether it equals the one on the right. Measured on TLC 2.19
+(`tests/tlc/TupleStr*`): a tuple asked about a string compares itself with the string's characters (`<<"a", "b">> = s`
+is TRUE for s = "ab"), a string asked about a tuple stops with an error, and a model value is unequal to both. For
+`x \in S`, a set written out where it is used asks each element in the order written (`s \in {<<"a", "b">>}` is
+TRUE), while a set from a definition or the state has been sorted, and comparing a string with a tuple then fails.
+`Gen::tuple_str_eq` follows this. One case is not matched: TLC finds `s \in TS \cup {}` TRUE where TS is such a sorted
+set (`s \in TS` fails); tla2rs fails on both.
+
+### What SANY refuses
+
+TLC stops with exit 150 before checking anything when SANY refuses a spec. tla2rs repeats these of SANY's checks
+(measured on SANY 2.19, `tests/tlc/RejSany*`):
+
+- Precedence conflicts: two infix operators whose ranges in the TLA+ table overlap, next to each other without
+  parentheses, unless they are the same operator and it associates (`a + b + c` is fine, `a = b = c`, `a % b % c`,
+  `a /\ b \/ c` and `a * b \div c` are not). The parser checks each operator against the one before it at the same level
+  and the one it is the right operand of (`parser::sany_range`)
+- Names: a bound variable, operator parameter or LET definition named like a CONSTANT or VARIABLE, a definition before
+  it in the module, Nat / Int (when extended), or an enclosing bound variable. A LET definition is in scope only after
+  its own body (`LET i == CHOOSE i \in S : P` is fine). A CHOOSE body extends as far as it can, so a second CHOOSE with
+  the same bound name later on the same line is inside the first and refused
+- Unary minus without Integers (or Reals), `:>` and `@@` without TLC (or Bags, which extends it) unless defined. The
+  other standard modules instantiate theirs LOCALly, so extending them gives nothing
+- String escapes other than `\\ \" \n \t \r \f`
+
+Not repeated: names that clash with definitions of other modules the spec extends, other operators of standard modules
+used without extending them, prefix operators in precedence conflicts, and SANY errors in definitions nothing uses
+(SANY checks every definition; tla2rs finds a bad subexpression name only when it expands it).
+
+### Quantifiers and CHOOSE without a set
+
+`\E x : P`, `\A x : P` and `CHOOSE x : P` parse into a call that fails with TLC's message ("TLC attempted to evaluate an
+unbounded \E") when evaluated; their bodies are dropped. TLC accepts them and fails in the same places
+(`tests/tlc/Unbounded*`): an invariant, an action, the initial predicate, a property, an ASSUME (exit 10). A definition
+that is never used is no error.
+
+### Positional subexpression names
+
+SANY reads infix `/\` and `\/` as binary and left-associative (the first operand of `a /\ b /\ c` is `a /\ b`), while
+the parser flattens them into one conjunction. A module that uses positional names (`!` followed by a number, `<<`,
+`>>`, `:`, `(` or `@`) is parsed with infix junctions kept binary inside an `INFIX_JUNCTION` label, which expansion
+flattens as before. `Op!@` is not supported (SANY refuses it without arguments: "Expected 1 arguments but found 0").
+
+### Actions that assign through `\A` or recursion over values from the state
+
+TLC evaluates `\A x \in S : B` in an action as the conjunction of B over the elements of S in order, and a recursive
+operator as its body with the arguments bound; either can assign variables (`tests/tlc/ForallState*`, `RecState*`,
+counts match TLC). Over a constant set or with constant arguments, tla2rs unrolls them at compile time. Otherwise:
+
+- `\A`: the checker collects the elements when it evaluates the quantifier. While B can still assign a variable, each
+  element is one level of generated code, up to the number of values of the set's element type (refused beyond 16);
+  once B only reads what is assigned, the remaining elements are a test (`Gen::gen_forall`)
+- A recursive operator becomes a Rust function that evaluates its body as an action and returns each state it builds
+  with the bit mask of the variables assigned by then (at most 64 variables). The action continues from each returned
+  state, once per mask. A call of the operator in its own body uses the masks found so far, and the body is generated
+  again until they settle (`Gen::gen_rec_action`, `rec_action_fn`). In Init, arguments must still be constant
 
 ### Liveness counterexamples are not compared
 
