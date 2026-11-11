@@ -2428,8 +2428,25 @@ impl<'a> Gen<'a> {
         // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
         // treats it as a function in [S -> T]; none of these is compiled
         if tuple_elems(xt).is_some() {
-            if matches!(s, FunSet(..)) {
-                return Err(format!("membership of a tuple in a set of functions is not supported: {}", short(s)));
+            // A tuple is the function over 1..n of its elements: in [D -> R] when D is 1..n and
+            // each element is in R
+            if let FunSet(d, r) = s {
+                let n = tuple_elems(xt).unwrap().len();
+                let Some(dv) = self.try_const(d, env) else {
+                    return Err(format!("membership of a tuple in [D -> R] with D from the state is not supported: {}", short(s)));
+                };
+                let one_to_n: BTreeSet<Value> = (1..=n as i64).map(Value::Int).collect();
+                if dv.as_set()? != &one_to_n {
+                    return Ok("false".into());
+                }
+                let els: Vec<Ty> = tuple_elems(xt).unwrap().into_iter().cloned().collect();
+                let mut conj = vec!["true".to_string()];
+                for (k, et) in els.iter().enumerate() {
+                    let e = self.fresh("e");
+                    let inner = self.gen_member(&e, et, r, env)?;
+                    conj.push(format!("{{ let {e} = {x}{}; {inner} }}", rec_field(n, k)));
+                }
+                return Ok(format!("({})", conj.join(" && ")));
             }
             if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
                 || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int"].contains(&n.as_str()))
@@ -2492,8 +2509,18 @@ impl<'a> Gen<'a> {
                     if matches!(xt, Ty::Enum(_)) {
                         return Ok("false".into());
                     }
-                    if seq_like_fun(xt) {
-                        return Err(format!("comparing a function over 1..n with a tuple is not supported: {}", short(s)));
+                    // A function over 1..n is the tuple of its values
+                    if let Ty::Fun(d, c) = xt {
+                        if seq_domain(d) != Some(parts.len()) {
+                            return Ok("false".into());
+                        }
+                        let mut conj = vec![];
+                        for (i, part) in parts.iter().enumerate() {
+                            let e = self.fresh("e");
+                            let inner = self.gen_member(&e, c, part, env)?;
+                            conj.push(format!("{{ let {e} = {x}[{i}]; {inner} }}"));
+                        }
+                        return Ok(format!("({})", conj.join(" && ")));
                     }
                     return Ok(eval_error_bool(&format!("Attempted to check if a non-tuple value of type {xt:?} is an element of a cartesian product")));
                 };
@@ -3992,12 +4019,6 @@ fn unbounded_ints(t: &Ty) -> Ty {
         Ty::Fun(d, c) => Ty::Fun(d.clone(), unbounded_ints(c).into()),
         t => t.clone(),
     }
-}
-
-/// A function whose domain is 1..n, which TLA+ considers equal to the tuple of its values. Mixing
-/// the two is rejected rather than compared as unequal.
-fn seq_like_fun(t: &Ty) -> bool {
-    matches!(t, Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(1, _)))
 }
 
 impl Env {
