@@ -100,6 +100,8 @@ pub struct Module {
     pub defs: Vec<Def>,
     /// ASSUME / ASSUMPTION. As in TLC, a false assumption is an error before exploration starts
     pub assumes: Vec<Assume>,
+    /// Names of this module and of the modules it EXTENDS from files next to it
+    pub modules: Vec<String>,
 }
 
 /// An ASSUME expression and the position TLC reports on failure (1-based line and column; the end

@@ -379,9 +379,58 @@ impl ConstEval<'_> {
                 _ => return Err("field of a non-record".into()),
             },
             Tuple(xs) => Value::Tuple(xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?),
-            Except(..) | At | Let(..) | Prime(_) | BoxAction(..) | Fair(..) => {
+            Except(f, ups) => {
+                let mut v = self.eval(f, env)?;
+                for (path, val) in ups {
+                    // The expander appends the name of this update's @ as a field step starting with @
+                    let at = path.iter().find_map(|p| match p {
+                        Path::Field(k) if k.starts_with('@') => Some(k.clone()),
+                        _ => None,
+                    });
+                    let steps: Vec<&Path> = path.iter().filter(|p| !matches!(p, Path::Field(k) if k.starts_with('@'))).collect();
+                    v = self.except_at(v, &steps, val, at.as_deref(), env)?;
+                }
+                v
+            }
+            At | Let(..) | Prime(_) | BoxAction(..) | Fair(..) => {
                 return Err("not a constant expression".into())
             }
+        })
+    }
+
+    /// `[v EXCEPT !<steps> = val]` for one update. As in TLC, an index outside the domain leaves the
+    /// value unchanged
+    fn except_at(&self, v: Value, steps: &[&Path], val: &Expr, at: Option<&str>, env: &HashMap<String, Value>) -> R<Value> {
+        let Some((step, rest)) = steps.split_first() else {
+            let mut env2 = env.clone();
+            if let Some(a) = at {
+                env2.insert(a.to_string(), v);
+            }
+            return self.eval(val, &env2);
+        };
+        Ok(match (step, v) {
+            (Path::Idx(i), Value::Fun(mut m)) => {
+                let k = self.eval(i, env)?;
+                if let Some(old) = m.remove(&k) {
+                    m.insert(k, self.except_at(old, rest, val, at, env)?);
+                }
+                Value::Fun(m)
+            }
+            (Path::Idx(i), Value::Tuple(mut t)) => {
+                let k = self.eval(i, env)?.as_int()?;
+                if k >= 1 && (k as usize) <= t.len() {
+                    let old = t[k as usize - 1].clone();
+                    t[k as usize - 1] = self.except_at(old, rest, val, at, env)?;
+                }
+                Value::Tuple(t)
+            }
+            (Path::Field(n), Value::Rec(mut m)) => {
+                if let Some(old) = m.remove(n) {
+                    m.insert(n.clone(), self.except_at(old, rest, val, at, env)?);
+                }
+                Value::Rec(m)
+            }
+            (_, v) => return Err(format!("EXCEPT path does not match the value {v:?}")),
         })
     }
 
