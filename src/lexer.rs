@@ -43,12 +43,58 @@ fn normalize_backslash(word: &str) -> String {
     }
 }
 
-#[allow(unused_assignments)]
 pub fn lex(src: &str) -> R<Vec<Token>> {
+    lex_from(src, false)
+}
+
+/// Lexes a module: as in TLC, anything before the `---- MODULE` line and after the module's
+/// closing `====` is ignored (it need not even be valid TLA+ text).
+pub fn lex_module(src: &str) -> R<Vec<Token>> {
+    lex_from(src, true)
+}
+
+/// The position of the first `----` run followed by `MODULE`
+fn module_start(cs: &[char]) -> Option<usize> {
+    let mut i = 0;
+    while i + 4 <= cs.len() {
+        if cs[i..i + 4].iter().all(|&c| c == '-') {
+            let mut j = i;
+            while j < cs.len() && cs[j] == '-' {
+                j += 1;
+            }
+            while j < cs.len() && cs[j].is_whitespace() {
+                j += 1;
+            }
+            if cs[j..].starts_with(&['M', 'O', 'D', 'U', 'L', 'E']) {
+                return Some(i);
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+#[allow(unused_assignments)]
+fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
     let cs: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
     let (mut i, mut line, mut col) = (0usize, 1usize, 0usize);
     let mut line_has_tok = false;
+    if module {
+        // Skip to the header, keeping line numbers
+        let start = module_start(&cs).unwrap_or(0);
+        while i < start {
+            if cs[i] == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+            i += 1;
+        }
+    }
     macro_rules! adv {
         () => {{
             if cs[i] == '\n' {
@@ -170,8 +216,12 @@ pub fn lex(src: &str) -> R<Vec<Token>> {
             }
             Tok::Sym(sym.to_string())
         };
+        let end = module && tok == Tok::Sym("====".into());
         out.push(Token { tok, line: tl, col: tc, first });
         line_has_tok = true;
+        if end {
+            break;
+        }
     }
     out.push(Token { tok: Tok::Eof, line, col: 0, first: true });
     Ok(out)

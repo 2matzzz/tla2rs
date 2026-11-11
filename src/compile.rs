@@ -186,16 +186,17 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     let m = parse_module(src)?;
     let mut out = Module { name: m.name.clone(), modules: vec![m.name.clone()], ..Default::default() };
     for e in &m.extends {
+        if standard_module(e, "EXTENDS")? {
+            out.extends.push(e.clone());
+            continue;
+        }
         match e.as_str() {
-            "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" => out.extends.push(e.clone()),
             // Apalache type annotations and Gen are not used
             "Apalache" => {}
             _ => {
                 let path = dir.join(format!("{e}.tla"));
-                let Ok(sub_src) = std::fs::read_to_string(&path) else {
-                    warnings.push(format!("EXTENDS {e}: module not found next to the spec (only Naturals / Integers / FiniteSets are built in)"));
-                    continue;
-                };
+                let sub_src = std::fs::read_to_string(&path)
+                    .map_err(|_| format!("EXTENDS {e}: module not found next to the spec"))?;
                 let sub = load_module(&sub_src, dir, warnings, depth + 1)?;
                 out.extends.extend(sub.extends);
                 out.constants.extend(sub.constants);
@@ -214,7 +215,123 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     out.variables.extend(m.variables);
     out.defs.extend(m.defs);
     out.assumes.extend(m.assumes);
+    out.local_defs.extend(m.local_defs);
+    for inst in &m.instances {
+        instantiate(&mut out, inst, dir, warnings, depth)?;
+    }
     Ok(out)
+}
+
+/// Whether `name` is a standard module that tla2rs provides itself (an error for the standard
+/// modules it does not support)
+fn standard_module(name: &str, how: &str) -> R<bool> {
+    match name {
+        // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
+        // for the Toolbox's trace explorer.
+        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" => Ok(true),
+        "Bags" | "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
+        // TLC picks the subsets at random, so its results cannot be reproduced
+        "Randomization" => Err(format!("{how} {name}: TLC chooses its values at random; not supported")),
+        _ => Ok(false),
+    }
+}
+
+/// Counts instances, to give the definitions of each one unique names
+static INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Adds the definitions of an instance of a module. Each definition D of the instantiated module
+/// becomes a hidden definition that takes the module's constants and variables as leading
+/// parameters, so that expanding a call substitutes them without capturing bound variables. The
+/// visible definition (D for an unnamed instance, N!D for `N(p) == INSTANCE ...`) calls it with
+/// the WITH substitutions (a constant or variable without one stands for the same name here). As
+/// in TLC, the ASSUMEs of the instantiated module are not checked.
+fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<()> {
+    let mname = &inst.module;
+    if standard_module(mname, "INSTANCE")? {
+        if let Some(n) = &inst.name {
+            return Err(format!("`{n} == INSTANCE {mname}`: a named instance of a standard module is not supported"));
+        }
+        out.extends.push(mname.clone());
+        return Ok(());
+    }
+    let path = dir.join(format!("{mname}.tla"));
+    let src = std::fs::read_to_string(&path).map_err(|_| format!("INSTANCE {mname}: module not found next to the spec"))?;
+    let mm = load_module(&src, dir, warnings, depth + 1)?;
+    out.extends.extend(mm.extends.iter().cloned());
+    let k = INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let arity_of = |c: &str| mm.op_constants.iter().find(|(n, _)| n == c).map_or(0, |(_, a)| *a);
+    let params: Vec<(String, usize)> =
+        mm.constants.iter().map(|c| (c.clone(), arity_of(c))).chain(mm.variables.iter().map(|v| (v.clone(), 0))).collect();
+    for (x, _) in &inst.subs {
+        if !params.iter().any(|(p, _)| p == x) {
+            return Err(format!("INSTANCE {mname} WITH {x} <- ...: {x} is not a CONSTANT or VARIABLE of {mname}"));
+        }
+    }
+    let raw = |d: &str| format!("{mname}#i{k}#{d}");
+    let names: HashSet<&str> = mm.defs.iter().map(|d| d.name.as_str()).collect();
+    let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone())).collect();
+    fn rename(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]) -> Expr {
+        match e {
+            Expr::Ident(n) if names.contains(n.as_str()) => {
+                if pargs.is_empty() { Expr::Ident(raw(n)) } else { Expr::Call(raw(n), pargs.to_vec()) }
+            }
+            Expr::Call(n, args) if names.contains(n.as_str()) => {
+                let mut a = pargs.to_vec();
+                a.extend(args.iter().map(|x| rename(x, names, raw, pargs)));
+                Expr::Call(raw(n), a)
+            }
+            _ => crate::codegen::map_children(e, &|c| rename(c, names, raw, pargs)),
+        }
+    }
+    for d in &mm.defs {
+        let mut ps: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
+        ps.extend(d.params.iter().cloned());
+        let mut arity: Vec<usize> = params.iter().map(|(_, a)| *a).collect();
+        arity.extend(d.arity.iter().copied());
+        out.defs.push(Def { name: raw(&d.name), params: ps, arity, body: rename(&d.body, &names, &raw, &pargs) });
+    }
+    for r in &mm.recursive {
+        if names.contains(r.as_str()) {
+            out.recursive.push(raw(r));
+        } else {
+            out.recursive.push(r.clone());
+        }
+    }
+    // What each constant and variable of the instantiated module stands for here
+    let known = |n: &str| {
+        out.constants.iter().any(|c| c == n) || out.variables.iter().any(|v| v == n) || out.defs.iter().any(|d| d.name == n)
+    };
+    let mut args = vec![];
+    for (p, _) in &params {
+        match inst.subs.iter().find(|(x, _)| x == p) {
+            Some((_, e)) => args.push(e.clone()),
+            None if known(p) || inst.params.contains(p) => args.push(Expr::Ident(p.clone())),
+            None => return Err(format!("INSTANCE {mname}: {p} has no WITH substitution and is not declared or defined here")),
+        }
+    }
+    for d in &mm.defs {
+        if mm.local_defs.contains(&d.name) || d.name.contains('#') {
+            continue;
+        }
+        let mut call_args = args.clone();
+        call_args.extend(d.params.iter().map(|p| Expr::Ident(p.clone())));
+        let body = if call_args.is_empty() { Expr::Ident(raw(&d.name)) } else { Expr::Call(raw(&d.name), call_args) };
+        let (name, params, arity) = match &inst.name {
+            None => (d.name.clone(), d.params.clone(), d.arity.clone()),
+            Some(n) => {
+                let mut ps = inst.params.clone();
+                ps.extend(d.params.iter().cloned());
+                let mut ar = vec![0; inst.params.len()];
+                ar.extend(d.arity.iter().copied());
+                (format!("{n}!{}", d.name), ps, ar)
+            }
+        };
+        if out.defs.iter().any(|x| x.name == name) {
+            return Err(format!("INSTANCE {mname}: `{name}` is defined both here and in {mname}"));
+        }
+        out.defs.push(Def { name, params, arity, body });
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,16 +542,33 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     // Temporal properties
     let mut props: Vec<(String, u8, String, String)> = vec![];
     let mut action_props: Vec<(String, String, String)> = vec![];
+    let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
+        let whole = parts.len() == 1;
         for (disp, kind, p, q, env) in parts {
+            // As TLC does, []P for a state predicate P is checked as an invariant while exploring,
+            // and a state predicate on its own only on the initial states. TLC names a part of a
+            // property by its position in the source, which tla2rs does not keep.
+            let part_name = if whole && disp == *name { disp.clone() } else { format!("{disp} (a part)") };
+            if (kind == 4 && !has_enabled(&p)) || kind == 6 {
+                let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
+                if kind == 4 {
+                    let i = inv_list.len() + 1000;
+                    writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {pc} }}").unwrap();
+                    inv_list.push(format!("({part_name:?}, inv_{i} as fn(&State) -> bool)"));
+                } else {
+                    init_props.push((part_name, pc));
+                }
+                continue;
+            }
             if kind == 5 {
                 let env = g.env_step(env);
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 let qc = g.gen_as(&q.unwrap(), &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
-                action_props.push((disp, pc, qc));
+                action_props.push((part_name, pc, qc));
                 continue;
             }
             let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
@@ -452,6 +586,24 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         writeln!(prop_code, "fn aprop_{i}(s: &State, t: &State) -> bool {{ {pc} || {qc} }}").unwrap();
         aprop_list.push(format!("({disp:?}, aprop_{i} as fn(&State, &State) -> bool)"));
     }
+    let mut iprop_list = vec![];
+    for (i, (disp, pc)) in init_props.iter().enumerate() {
+        writeln!(prop_code, "fn iprop_{i}(s: &State) -> bool {{ {pc} }}").unwrap();
+        iprop_list.push(format!("({disp:?}, iprop_{i} as fn(&State) -> bool)"));
+    }
+    // ACTION_CONSTRAINT: like CONSTRAINT, but on the step from a state to its successor
+    let mut acons = vec![];
+    for name in &cfg.action_constraints {
+        let e = ex.expand_def(name)?;
+        let env = g.env_step(Gen::env_next());
+        acons.push(g.gen_as(&e, &env, &Ty::Bool).map_err(|m| format!("action constraint {name}: {m}"))?);
+    }
+    writeln!(
+        prop_code,
+        "#[allow(unused_variables)]\nfn action_constraint(s: &State, t: &State) -> bool {{ {} }}",
+        if acons.is_empty() { "true".into() } else { acons.join(" && ") }
+    )
+    .unwrap();
     // CONSTRAINT: states that violate it are discarded (as in TLC, they are neither counted nor
     // checked against invariants)
     let mut cons = vec![];
@@ -543,6 +695,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     let fair_names: Vec<String> = g.fair.iter().map(|f| format!("{:?}", f.display)).collect();
     writeln!(src, "static FAIR: &[&str] = &[{}];", fair_names.join(", ")).unwrap();
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
+    writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "const LIVENESS: bool = {};", !props.is_empty()).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
@@ -846,6 +999,10 @@ type PropPart = (String, u8, Expr, Option<Expr>, crate::codegen::Env);
 
 /// Splits a property into checkable forms: 0: <>P, 1: []<>P, 2: <>[]P, 3: P ~> Q, 4: []P (state
 /// predicate), 5: [][A]_v.
+fn has_enabled(e: &Expr) -> bool {
+    e.any(&|y| matches!(y, Expr::Un(UOp::Enabled, _)))
+}
+
 fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, out: &mut Vec<PropPart>) -> R<()> {
     use Expr::*;
     let temporal = |x: &Expr| x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..)));
@@ -882,16 +1039,22 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
                 Ok(out.push((disp, 3, a.as_ref().clone(), Some(b.as_ref().clone()), cenv)))
             }
             p if !temporal(p) && !p.is_action() => Ok(out.push((disp, 4, p.clone(), None, cenv))),
-            // [][A]_v: every transition is an A step or leaves v unchanged
+            // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since v
+            // need not be a tuple of variables, e.g. under a refinement mapping)
             BoxAction(a, v) if !temporal(a) => {
-                Ok(out.push((disp, 5, a.as_ref().clone(), Some(Un(UOp::Unchanged, v.clone())), cenv)))
+                let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
+                Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), cenv)))
             }
             _ => Err(format!("property {name}: unsupported form {}", short(e))),
         },
         Bin(BOp::LeadsTo, a, b) if !temporal(a) && !temporal(b) => {
             Ok(out.push((disp, 3, a.as_ref().clone(), Some(b.as_ref().clone()), cenv)))
         }
-        _ => Err(format!("property {name}: only <>P, []<>P, <>[]P, P ~> Q and []P are supported ({})", short(e))),
+        // A state predicate: TLC checks it on the initial states
+        p if !temporal(p) && !p.is_action() && !has_enabled(p) && !p.any(&|y| matches!(y, BoxAction(..) | Fair(..))) => {
+            Ok(out.push((disp, 6, p.clone(), None, cenv)))
+        }
+        _ => Err(format!("property {name}: only <>P, []<>P, <>[]P, P ~> Q, []P and state predicates are supported ({})", short(e))),
     }
 }
 

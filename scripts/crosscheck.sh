@@ -38,7 +38,7 @@ summarize() {
   local f="$1"
   local res
   local span='line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+'
-  res=$(grep -oE "Invariant [A-Za-z0-9_]+ is violated|Evaluating invariant [A-Za-z0-9_]+ failed|Action property [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption $span is false|Evaluating assumption $span failed|No error has been found" "$f" | head -1 || true)
+  res=$(grep -oE "Invariant [A-Za-z0-9_]+ is violated|Evaluating invariant [A-Za-z0-9_]+ failed|Action property [A-Za-z0-9_]+ is violated|Property [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption $span is false|Evaluating assumption $span failed|No error has been found" "$f" | head -1 || true)
   # If none of the above matched but there is an Error: line, treat it as an evaluation error.
   # The message may differ from TLC's (TLC can also stop on an internal exception), so compare
   # only the kind (and the exit code below)
@@ -95,6 +95,11 @@ norm() { case "$1" in 0|10|11|12|13|75|76|255) echo "$1" ;; *) echo error ;; esa
 a="$a
 exit=$(norm $rc_tlc)"; b="$b
 exit=$(norm $rc_rs)"
+# `\* crosscheck: ignore-exit` skips the exit-code comparison, for a case where TLC reports an
+# error but exits with 0 (an error in a temporal property on an initial state)
+if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*ignore-exit' "$c"; then
+  a=$(echo "$a" | grep -v '^exit='); b=$(echo "$b" | grep -v '^exit=')
+fi
 if [[ $verdict_only == 1 ]]; then
   a=$(echo "$a" | head -1); b=$(echo "$b" | head -1)
 elif [[ $distinct_only == 1 ]]; then

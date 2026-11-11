@@ -77,10 +77,10 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 |---|---|
 | 式 | 論理・算術（`+ - * \div % ^`）・比較、列（`Seq`・`Len`・`Append`・`Head`・`Tail`・`SubSeq`・`SelectSeq`・`\o`・添字、タプルと 1..n 上の関数は同じ値）、値としての集合の集合・関数の集合、`IF` / `CASE` / `LET`、`\E` / `\A`（`<<x, y>> \in S` も）、`CHOOSE`（状態にある集合からも、TLC と同じ要素を選ぶ）、`RECURSIVE` の演算子と再帰する関数の定義、演算子の引数と `LAMBDA`、仕様が定義する中置演算子（`a \oplus b == ...`）、TLC の `Assert` / `Print` / `PrintT` / `:>` / `@@`、状態にある集合の `UNION` / `SUBSET` / `\X`、集合（リテラル・`\cup \cap \`・`\subseteq`・`{x \in S : P}`・`{e : x \in S}`・`Cardinality`・`SUBSET`）、関数（`[x \in S |-> e]`・`[x \in S, y \in T |-> e]`・再帰しない定義 `f[x \in S] == e`・`f[x]`・`[f EXCEPT ![a] = @ + 1]`・`[S -> T]`）、レコード（`[a |-> 1]`・`r.a`・`[a : S]`・`!.a`）、長さの決まったタプル（`<<a, b>>`・定数の添字の `t[1]`・`![k][1]`・`A \X B`） |
 | アクション | `x' = e`、`x' \in S`、`UNCHANGED`、アクションの層の `\/` `\E` `IF` `CASE`、代入済みの `x'` を読むガード |
-| 仕様 | `SPECIFICATION`（`Init /\ [][Next]_v /\ 公平性`）または `INIT` / `NEXT`。`CONSTANT` はモデル値・数・文字列・真偽・その集合。モデル値は整数と同じ型に混ぜてよい（`1..4 \cup {None}`）。その値の算術はモデル値のときだけ評価エラーになる。変数は整数と文字列を持ち替えてもよく、両者を比べると TLC と同じく評価エラーになる。cfg の `Name <- Def` で定数に定義を代入できる（仕様を EXTENDS する MC.tla などの定義でもよい）。定義の名前に `<-` や `=` を書くとその定義を置き換える。`ASSUME` も確かめる |
-| 性質 | `INVARIANT`。`PROPERTY` は `<>P` `[]<>P` `<>[]P` `P ~> Q` `[]P` `[][A]_v`（`\A x \in S :` で量化してもよい） |
+| 仕様 | `SPECIFICATION`（`Init /\ [][Next]_v /\ 公平性`）または `INIT` / `NEXT`。`CONSTANT` はモデル値・自然数・文字列・真偽と、それらの集合（TLC と同じく何重に入れ子にしてもよい）。モデル値は整数と同じ型に混ぜてよい（`1..4 \cup {None}`）。その値の算術はモデル値のときだけ評価エラーになる。変数は整数と文字列を持ち替えてもよく、両者を比べると TLC と同じく評価エラーになる。cfg の `Name <- Def` で定数に定義を代入できる（仕様を EXTENDS する MC.tla などの定義でもよい）。定義の名前に `<-` や `=` を書くとその定義を置き換える。`ASSUME` も確かめる。`INSTANCE`（名前なし、`LOCAL`、`N!Op` で使う `N(p) == INSTANCE M WITH x <- e`）。定理・証明・`USE` / `HIDE` は TLC と同じく読み飛ばす |
+| 性質 | `INVARIANT`。`PROPERTY` は `<>P` `[]<>P` `<>[]P` `P ~> Q` `[]P`（TLC と同じく不変条件として調べる）`[][A]_v`、状態の述語（初期状態で調べる）。`\A x \in S :` で量化してもよい |
 | 公平性 | `WF_v(A)`（`\A` で量化してもよい）。`A` は名前の付いた定義で、`Next` から呼ばれていること |
-| 状態空間 | `CONSTRAINT`、`VIEW`、`SYMMETRY` |
+| 状態空間 | `CONSTRAINT`、`ACTION_CONSTRAINT`、`VIEW`、`SYMMETRY`（`TYPE` / `TYPE_CONSTRAINT` は TLC と同じく受け付けて何もしない） |
 
 ### 制約
 

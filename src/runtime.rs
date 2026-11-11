@@ -606,6 +606,42 @@ fn check_out_of_model(t: &State) -> Option<SMsg> {
     }
 }
 
+/// Checks the action properties ([][A]_v) on the step s -> t. TLC does this on every successor,
+/// after it is added (if new) and its invariants are checked.
+fn check_action_props(s: &State, t: &State) -> Option<SMsg> {
+    for (name, f) in ACTION_PROPS {
+        match std::panic::catch_unwind(|| f(s, t)) {
+            Ok(true) => {}
+            Ok(false) => return Some(SMsg::Action(name)),
+            Err(p) => return Some(SMsg::ActionEval(name, describe_panic(p))),
+        }
+    }
+    None
+}
+
+/// The error raised by `next`, raised again once the successors computed before it have been
+/// processed (see `successors`). It is reported with the behavior up to the state being expanded.
+struct NextFailed(Box<dyn std::any::Any + Send>);
+
+fn raise_next(p: Box<dyn std::any::Any + Send>) -> ! {
+    std::panic::resume_unwind(Box::new(NextFailed(p)))
+}
+
+/// What an error caught while expanding a state means: an error in `next` or a value outside the
+/// declared type (reported with the behavior up to the state being expanded), or anything else
+/// raised while processing a successor, such as evaluating the CONSTRAINT or the VIEW (for which
+/// TLC shows no behavior). Returns the error and whether it is shown with a behavior.
+fn classify(p: Box<dyn std::any::Any + Send>) -> (EvalErr, bool) {
+    match p.downcast::<NextFailed>() {
+        Ok(n) => (describe_panic(n.0), true),
+        Err(p) => {
+            let e = describe_panic(p);
+            let traced = matches!(e, EvalErr::Type(_));
+            (e, traced)
+        }
+    }
+}
+
 /// Prints the message for a detected error and returns the exit code. `in_model` is false for a
 /// state outside the CONSTRAINT.
 fn report_msg(msg: &SMsg, in_model: bool) -> i32 {
@@ -628,9 +664,19 @@ fn report_msg(msg: &SMsg, in_model: bool) -> i32 {
             println!("Error: Action property {name} is violated.");
             13
         }
-        SMsg::Eval(e) => {
+        SMsg::ActionEval(name, e) => {
+            println!("Error: Evaluating action property {name} failed.\n{}", e.msg());
+            eval_code(e)
+        }
+        SMsg::Eval(e) | SMsg::Untraced(e) => {
             report_eval(e);
             eval_code(e)
+        }
+        SMsg::Live(what, e) => {
+            report_eval(e);
+            println!("  (while evaluating {what})");
+            // TLC stops with an unexpected exception, and exits with 255 whatever the error
+            255
         }
         SMsg::OutOfType => {
             report_eval(&EvalErr::Type("a variable".into()));
@@ -698,6 +744,8 @@ enum Found {
     Succ(u32, State, u32, SMsg, bool),
     /// An evaluation error while expanding the parent state.
     Eval(u32, EvalErr),
+    /// An error for which TLC shows no behavior (SMsg::Untraced or SMsg::Live).
+    Live(SMsg),
     Deadlock(u32),
 }
 
@@ -740,61 +788,26 @@ fn expand_one(
     if failed.is_none() && buf.is_empty() && check_deadlock {
         return Some(Found::Deadlock(head as u32));
     }
-    // Liveness: for each WF instance, the targets (fingerprints) of its <<A>>_v steps and whether
-    // it is enabled.
-    if LIVENESS {
-        let en_off = c.live.enab.len() as u32;
-        for i in 0..FAIR.len() {
-            fps[i].clear();
-            fbuf.clear();
-            fair_succ(&s, i, fbuf);
-            let mut enabled = false;
-            for (t, _) in fbuf.iter() {
-                if fair_sub_changed(i, &s, t) {
-                    enabled = true;
-                    if let Some(w) = pack(t) {
-                        fps[i].push(state_fp(t, &w));
-                    }
-                }
-            }
-            if enabled {
-                c.live.enab.push(i as u32);
-            }
-        }
-        let n = c.live.enab.len() as u32 - en_off;
-        if n > 0 {
-            c.live.en.push((head as u32, en_off, n));
-        }
-    }
     let sfp = if LIVENESS { state_fp(&s, &g.states[head]) } else { 0 };
+    // The edges of this state; their fairness tags are filled in once fairness is evaluated
+    let first_edge = c.live.edges.len();
     for &(t, l) in buf.iter() {
         c.generated += 1;
-        // States that violate CONSTRAINT are not added (as in TLC, they are not counted as
-        // distinct), but their invariants are checked.
-        if !constraint(&t) {
-            if let Some(msg) = check_out_of_model(&t) {
+        // States outside the CONSTRAINT are not added (as in TLC, they are not counted as
+        // distinct), but their invariants and the action properties are checked.
+        if !in_model(&s, &t) {
+            if let Some(msg) = check_out_of_model(&t).or_else(|| check_action_props(&s, &t)) {
                 return Some(Found::Succ(head as u32, t, l, msg, false));
             }
             continue;
         }
-        for (name, f) in ACTION_PROPS {
-            if !f(&s, &t) {
-                return Some(Found::Succ(head as u32, t, l, SMsg::Action(name), true));
-            }
-        }
+        let act = check_action_props(&s, &t);
         let Some(w) = pack(&t) else {
             return Some(Found::Succ(head as u32, t, l, pack_failed(0, t, l).msg, true));
         };
         let tfp = state_fp(&t, &w);
         if LIVENESS && tfp != sfp {
-            let off = c.live.tags.len() as u32;
-            for i in 0..FAIR.len() {
-                if fps[i].contains(&tfp) {
-                    c.live.tags.push(i as u32);
-                }
-            }
-            let n = c.live.tags.len() as u32 - off;
-            c.live.edges.push((head as u32, tfp, l, off, n));
+            c.live.edges.push((head as u32, tfp, l, 0, 0));
         }
         if seen.insert(tfp) {
             c.states.push(w);
@@ -804,10 +817,74 @@ fn expand_one(
                 Ok(Some(inv)) => return Some(Found::New(me, c.states.len() - 1, SMsg::Inv(inv))),
                 Err((inv, e)) => return Some(Found::New(me, c.states.len() - 1, SMsg::InvEval(inv, e))),
             }
+            // TLC evaluates the state predicates of the temporal properties on each new state
+            if let Some(m) = eval_props(&t) {
+                return Some(Found::Live(m));
+            }
+        }
+        if let Some(m) = act {
+            return Some(Found::Succ(head as u32, t, l, m, true));
         }
     }
     if let Some(p) = failed {
-        std::panic::resume_unwind(p);
+        raise_next(p);
+    }
+    // Liveness: for each WF instance, the targets (fingerprints) of its <<A>>_v steps and whether
+    // it is enabled. TLC evaluates these after the successors.
+    if LIVENESS {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let en_off = c.live.enab.len() as u32;
+            for i in 0..FAIR.len() {
+                fps[i].clear();
+                fbuf.clear();
+                fair_succ(&s, i, fbuf);
+                let mut enabled = false;
+                for (t, _) in fbuf.iter() {
+                    if fair_sub_changed(i, &s, t) {
+                        enabled = true;
+                        if let Some(w) = pack(t) {
+                            fps[i].push(state_fp(t, &w));
+                        }
+                    }
+                }
+                if enabled {
+                    c.live.enab.push(i as u32);
+                }
+            }
+            let n = c.live.enab.len() as u32 - en_off;
+            if n > 0 {
+                c.live.en.push((head as u32, en_off, n));
+            }
+        }));
+        if let Err(p) = r {
+            return Some(Found::Live(SMsg::Live("fairness".into(), describe_panic(p))));
+        }
+        for k in first_edge..c.live.edges.len() {
+            let tfp = c.live.edges[k].1;
+            let off = c.live.tags.len() as u32;
+            for i in 0..FAIR.len() {
+                if fps[i].contains(&tfp) {
+                    c.live.tags.push(i as u32);
+                }
+            }
+            let n = c.live.tags.len() as u32 - off;
+            c.live.edges[k].3 = off;
+            c.live.edges[k].4 = n;
+        }
+    }
+    None
+}
+
+/// Evaluates the state predicates of the temporal properties on s, returning an error if one
+/// fails to evaluate.
+fn eval_props(s: &State) -> Option<SMsg> {
+    for (name, _, p, q) in PROPS {
+        if let Err(e) = std::panic::catch_unwind(|| {
+            p(s);
+            q(s);
+        }) {
+            return Some(SMsg::Live(format!("temporal property {name}"), describe_panic(e)));
+        }
     }
     None
 }
@@ -827,7 +904,10 @@ fn expand(g: &Graph, lo: usize, hi: usize, seen: &Shards, stop: &std::sync::atom
         });
         let found = match r {
             Ok(f) => f,
-            Err(p) => Some(Found::Eval(head as u32, describe_panic(p))),
+            Err(p) => Some(match classify(p) {
+                (e, true) => Found::Eval(head as u32, e),
+                (e, false) => Found::Live(SMsg::Untraced(e)),
+            }),
         };
         if found.is_some() {
             c.found = found;
@@ -1094,6 +1174,17 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                 stop(e, &format!("evaluating invariant {inv} on an initial state"), generated, out.len())
             }
         }
+        // A PROPERTY that is a state predicate holds if it holds in every initial state
+        for (name, f) in INIT_PROPS {
+            match std::panic::catch_unwind(|| f(&s)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!("Error: Property {name} is violated by the initial state:\n{}", show(&s));
+                    std::process::exit(13);
+                }
+                Err(p) => stop(describe_panic(p), &format!("evaluating property {name} on an initial state"), generated, out.len()),
+            }
+        }
         if w.is_none() && (in_model || TYPE_INV_SUBSUMED) {
             let e = EvalErr::Type("an initial state".into());
             report_eval(&e);
@@ -1130,7 +1221,15 @@ enum SMsg {
     InvEval(&'static str, EvalErr),
     Deadlock,
     Action(&'static str),
+    /// Evaluating an action property failed.
+    ActionEval(&'static str, EvalErr),
     Eval(EvalErr),
+    /// An error while evaluating the CONSTRAINT, the ACTION_CONSTRAINT or the VIEW on a successor.
+    /// TLC shows no behavior for it.
+    Untraced(EvalErr),
+    /// An error while evaluating fairness or a temporal property on the liveness path (what was
+    /// being evaluated). TLC shows no behavior for it.
+    Live(String, EvalErr),
     OutOfType,
 }
 
@@ -1186,10 +1285,18 @@ fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
     SFound::new(sfp, Some((t, l)), msg)
 }
 
-/// A successor outside the CONSTRAINT that stops the search (see `check_out_of_model`).
-fn out_of_model(sfp: Fp, t: &State, l: u32) -> Option<SFound> {
-    let msg = check_out_of_model(t)?;
+/// A successor outside the CONSTRAINT or the ACTION_CONSTRAINT that stops the search: its
+/// invariants (see `check_out_of_model`), then the action properties of the step.
+fn out_of_model(s: &State, sfp: Fp, t: &State, l: u32) -> Option<SFound> {
+    let msg = check_out_of_model(t).or_else(|| check_action_props(s, t))?;
     Some(SFound { fp: sfp, extra: Some((*t, l)), msg, in_model: false })
+}
+
+/// Whether the step s -> t stays in the model: t satisfies the CONSTRAINT and the step the
+/// ACTION_CONSTRAINT.
+#[inline]
+fn in_model(s: &State, t: &State) -> bool {
+    constraint(t) && action_constraint(s, t)
 }
 
 /// Computes the successors of s into buf. When `careful` is set and that fails, buf keeps the
@@ -1265,10 +1372,13 @@ fn expand_safety_one(
     }
     c.generated = examined;
     match stopped {
-        Err(p) => std::panic::resume_unwind(p),
+        Err(p) => match classify(p) {
+            (e, false) => Some(SFound::new(sfp, None, SMsg::Untraced(e))),
+            (e, true) => std::panic::panic_any(e),
+        },
         Ok(Some(f)) => Some(f),
         Ok(None) => match failed {
-            Some(p) => std::panic::resume_unwind(p),
+            Some(p) => raise_next(p),
             None => None,
         },
     }
@@ -1279,22 +1389,21 @@ fn expand_safety_one(
 fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
     for (i, &(ref t, l)) in ws.buf.iter().enumerate() {
         c.generated += 1;
-        if !constraint(t) {
-            if let Some(f) = out_of_model(sfp, t, l) {
+        if !in_model(s, t) {
+            if let Some(f) = out_of_model(s, sfp, t, l) {
                 return Some(f);
             }
             continue;
         }
-        for (name, f) in ACTION_PROPS {
-            if !f(s, t) {
-                return Some(SFound::new(sfp, Some((*t, l)), SMsg::Action(name)));
-            }
-        }
+        // A violated action property is reported after t is added (if new) and its invariants are
+        // checked, as TLC does: t stays a candidate, and the search stops after it.
+        let act = check_action_props(s, t).map(|m| SFound::new(sfp, Some((*t, l)), m));
         // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
         // duplicate then goes unreported, as TLC checks invariants only on new states.
         let (tfp, tw) = if HAS_VIEW {
             match fresh_fp(t, Some(&mut ws.mine)) {
                 Some(Some(fp)) => (fp, None),
+                Some(None) if act.is_some() => return act,
                 Some(None) => continue,
                 None if pack(t).is_none() => return Some(pack_failed(sfp, *t, l)),
                 None => type_error("VIEW value", ""),
@@ -1303,11 +1412,19 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
             let Some(tw) = pack(t) else {
                 return Some(pack_failed(sfp, *t, l));
             };
-            let Some(fp) = fresh_state_fp(t, &tw, &mut ws.mine) else { continue };
+            let Some(fp) = fresh_state_fp(t, &tw, &mut ws.mine) else {
+                if act.is_some() {
+                    return act;
+                }
+                continue;
+            };
             (fp, Some(tw))
         };
         seen.prefetch(tfp);
         ws.cand.push((i, tfp, tw));
+        if act.is_some() {
+            return act;
+        }
     }
     None
 }
@@ -1356,7 +1473,10 @@ fn expand_safety(
         });
         let found = match r {
             Ok(f) => f,
-            Err(p) => Some(SFound::new(*sfp, None, SMsg::Eval(describe_panic(p)))),
+            Err(p) => Some(match classify(p) {
+                (e, true) => SFound::new(*sfp, None, SMsg::Eval(e)),
+                (e, false) => SFound::new(*sfp, None, SMsg::Untraced(e)),
+            }),
         };
         if found.is_some() {
             c.found = found;
@@ -1575,7 +1695,8 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if pseudo {
         generated += 1;
     }
-    let shown = report_trace(seen, &f);
+    // TLC shows no behavior for an error in the CONSTRAINT, the VIEW, or the liveness checks
+    let shown = if matches!(f.msg, SMsg::Untraced(_) | SMsg::Live(..)) { 0 } else { report_trace(seen, &f) };
     if pseudo && shown > 0 {
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
     }
@@ -1920,22 +2041,21 @@ fn collect_phase(
             }
             for &(t, l) in buf.iter() {
                 out.generated += 1;
-                if !constraint(&t) {
-                    if let Some(f) = out_of_model(*sfp, &t, l) {
+                if !in_model(&s, &t) {
+                    if let Some(f) = out_of_model(&s, *sfp, &t, l) {
                         return Some(f);
                     }
                     continue;
                 }
-                for (name, f) in ACTION_PROPS {
-                    if !f(&s, &t) {
-                        return Some(SFound::new(*sfp, Some((t, l)), SMsg::Action(name)));
-                    }
-                }
+                // As in `fingerprint_successors`, a violated action property stops the search after
+                // t is collected (and its invariants are checked)
+                let act = check_action_props(&s, &t).map(|m| SFound::new(*sfp, Some((t, l)), m));
                 // As in `fingerprint_successors`: with a VIEW, a duplicate is dropped before it is
                 // packed.
                 let (tfp, tw) = if HAS_VIEW {
                     match fresh_fp(&t, Some(&mut mine)) {
                         Some(Some(fp)) => (fp, pack(&t)),
+                        Some(None) if act.is_some() => return act,
                         Some(None) => continue,
                         None if pack(&t).is_none() => return Some(pack_failed(*sfp, t, l)),
                         None => type_error("VIEW value", ""),
@@ -1944,7 +2064,12 @@ fn collect_phase(
                     let Some(tw) = pack(&t) else {
                         return Some(pack_failed(*sfp, t, l));
                     };
-                    let Some(fp) = fresh_state_fp(&t, &tw, &mut mine) else { continue };
+                    let Some(fp) = fresh_state_fp(&t, &tw, &mut mine) else {
+                        if act.is_some() {
+                            return act;
+                        }
+                        continue;
+                    };
                     (fp, Some(tw))
                 };
                 let inv = if tw.is_some() { eval_invariants(&t) } else { Ok(None) };
@@ -1955,6 +2080,9 @@ fn collect_phase(
                 if bad && (HAS_VIEW || !PERMS.is_empty()) {
                     let has = |v: &Vec<Cand>| v.iter().any(|c| c.fp == tfp);
                     if tbl.contains(tfp) || prev.iter().flatten().any(has) || out.parts.iter().any(has) {
+                        if act.is_some() {
+                            return act;
+                        }
                         continue;
                     }
                 }
@@ -1970,15 +2098,21 @@ fn collect_phase(
                     Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
                     Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
                 }
+                if act.is_some() {
+                    return act;
+                }
             }
             if let Some(p) = failed {
-                std::panic::resume_unwind(p);
+                raise_next(p);
             }
             None
         });
         let found = match r {
             Ok(f) => f,
-            Err(p) => Some(SFound::new(*sfp, None, SMsg::Eval(describe_panic(p)))),
+            Err(p) => Some(match classify(p) {
+                (e, true) => SFound::new(*sfp, None, SMsg::Eval(e)),
+                (e, false) => SFound::new(*sfp, None, SMsg::Untraced(e)),
+            }),
         };
         if found.is_some() {
             out.found = found;
@@ -2233,6 +2367,14 @@ fn run_liveness(opt: &Opt) {
     let mut g = Graph { states: Vec::new(), parent: Vec::new() };
     let seen = Shards::new(false);
     let (inits, mut generated) = initial_states();
+    // TLC evaluates the temporal properties on the initial states once they are all computed
+    for (s, _, _) in &inits {
+        if let Some(m) = eval_props(s) {
+            let code = report_msg(&m, true);
+            println!("{generated} states generated, {n} distinct states found, {n} states left on queue.", n = inits.len());
+            std::process::exit(code);
+        }
+    }
     for (_, w, fp) in inits {
         if seen.insert(fp) {
             g.states.push(w);
@@ -2298,13 +2440,15 @@ fn run_liveness(opt: &Opt) {
                 }
                 Found::Succ(p, t, l, msg, in_model) => {
                     // A new state that could not be packed counts as one state too (to match TLC).
-                    if in_model && !matches!(msg, SMsg::Action(_)) {
+                    if in_model && matches!(msg, SMsg::Inv(_) | SMsg::InvEval(..) | SMsg::OutOfType) {
                         distinct += 1;
                     }
                     let code = report_msg(&msg, in_model);
                     g.print_trace(p, Some((&t, l)));
                     code
                 }
+                // TLC shows no behavior for these
+                Found::Live(m) => report_msg(&m, true),
                 Found::Eval(p, e) => {
                     let pseudo = matches!(e, EvalErr::Type(_));
                     let code = report_msg(&SMsg::Eval(e), true);

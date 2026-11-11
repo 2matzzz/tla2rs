@@ -2,7 +2,7 @@
 //! lists are delimited by column.
 
 use crate::ast::*;
-use crate::lexer::{lex, Tok, Token, R};
+use crate::lexer::{lex_module, Tok, Token, R};
 
 static EOF: Tok = Tok::Eof;
 
@@ -20,8 +20,15 @@ pub struct Parser {
 
 const KEYWORDS: &[&str] = &[
     "THEN", "ELSE", "OTHER", "IN", "EXCEPT", "LET", "IF", "CASE", "CHOOSE", "MODULE", "EXTENDS",
-    "CONSTANT", "CONSTANTS", "VARIABLE", "VARIABLES", "ASSUME", "THEOREM", "LOCAL",
+    "CONSTANT", "CONSTANTS", "VARIABLE", "VARIABLES", "ASSUME", "THEOREM", "LOCAL", "INSTANCE", "WITH",
 ];
+
+/// Module-level statements that TLC parses and does not evaluate: theorems and the like, with their
+/// proofs, and USE / HIDE
+const PROOF_UNITS: &[&str] = &["THEOREM", "LEMMA", "PROPOSITION", "COROLLARY", "AXIOM", "USE", "HIDE"];
+
+/// Tokens that can start a line of a proof at the left margin
+const PROOF_LINE_STARTS: &[&str] = &["PROOF", "BY", "OBVIOUS", "OMITTED", "QED", "USE", "HIDE", "DEF", "DEFS"];
 
 /// Number of characters a token spans in the source (to report ASSUME positions the way TLC does)
 fn tok_width(t: &Tok) -> usize {
@@ -34,7 +41,7 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0 };
+    let mut p = Parser { toks: lex_module(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0 };
     p.module()
 }
 
@@ -278,21 +285,30 @@ impl Parser {
                     let span = (a.line, a.col + 1, b.line, b.col + tok_width(&b.tok));
                     m.assumes.push(Assume { module: m.name.clone(), expr, span });
                 }
-                Tok::Ident(k) if k == "THEOREM" || k == "AXIOM" => {
+                Tok::Ident(k) if PROOF_UNITS.contains(&k.as_str()) => self.skip_proof_unit(),
+                Tok::Ident(k) if k == "INSTANCE" => {
                     self.pos += 1;
-                    self.expr(0)?;
+                    let inst = self.instance(None, vec![])?;
+                    m.instances.push(inst);
                 }
-                Tok::Ident(k) if k == "LOCAL" => self.pos += 1,
+                Tok::Ident(k) if k == "LOCAL" => {
+                    self.pos += 1;
+                    if let Tok::Ident(n) = &self.raw().tok {
+                        if n != "INSTANCE" {
+                            m.local_defs.push(n.clone());
+                        }
+                    }
+                }
                 Tok::Ident(k) if k == "RECURSIVE" => {
                     self.pos += 1;
                     for (n, _) in self.ident_list_arity()? {
                         self.recursive.push(n);
                     }
                 }
-                Tok::Ident(_) => {
-                    let d = self.def()?;
-                    m.defs.extend(d);
-                }
+                Tok::Ident(_) => match self.def()? {
+                    Ok(d) => m.defs.extend(d),
+                    Err(inst) => m.instances.push(inst),
+                },
                 _ => return self.err("unexpected token at module level"),
             }
         }
@@ -353,7 +369,59 @@ impl Parser {
         Ok(v)
     }
 
-    fn def(&mut self) -> R<Vec<Def>> {
+    /// Skips a theorem-like statement and its proof: everything up to the next line that starts at
+    /// or left of the statement's column, other than a proof step (`<1>...`) or a proof keyword
+    fn skip_proof_unit(&mut self) {
+        let col = self.raw().col;
+        self.pos += 1;
+        loop {
+            let t = self.raw();
+            match &t.tok {
+                Tok::Eof => return,
+                Tok::Sym(s) if s == "====" || s == "----" => return,
+                _ => {}
+            }
+            if t.first && t.col <= col {
+                let continues = match &t.tok {
+                    Tok::Sym(s) => s == "<",
+                    Tok::Ident(k) => PROOF_LINE_STARTS.contains(&k.as_str()),
+                    _ => false,
+                };
+                if !continues {
+                    return;
+                }
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// The rest of an INSTANCE statement after the keyword: `M [WITH x <- e, ...]`
+    fn instance(&mut self, name: Option<String>, params: Vec<String>) -> R<Instance> {
+        let module = self.ident()?;
+        let mut subs = vec![];
+        if self.is_kw("WITH") {
+            self.pos += 1;
+            loop {
+                let x = match self.peek().clone() {
+                    Tok::Ident(x) => x,
+                    _ => return self.err("expected a name in a WITH substitution (operator symbols are not supported)"),
+                };
+                self.pos += 1;
+                self.expect("<-")?;
+                let e = self.expr(0)?;
+                subs.push((x, e));
+                if self.is(",") {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(Instance { name, params, module, subs })
+    }
+
+    /// A definition, or (as Err) a definition of an instance `N(p) == INSTANCE M ...`
+    fn def(&mut self) -> R<Result<Vec<Def>, Instance>> {
         let name = self.ident()?;
         // An infix operator definition `a ++ b == e`
         if let Some((_, op)) = user_infix(self.peek()) {
@@ -361,7 +429,7 @@ impl Parser {
             let b = self.ident()?;
             self.expect("==")?;
             let body = self.expr(0)?;
-            return Ok(vec![Def { name: op.to_string(), params: vec![name, b], arity: vec![0, 0], body }]);
+            return Ok(Ok(vec![Def { name: op.to_string(), params: vec![name, b], arity: vec![0, 0], body }]));
         }
         let mut params = vec![];
         let mut arity = vec![];
@@ -406,13 +474,20 @@ impl Parser {
             let body = self.expr(0)?;
             let _ = at;
             if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
-                return Ok(self.rec_fun(name, bs, body));
+                return Ok(Ok(self.rec_fun(name, bs, body)));
             }
-            return Ok(vec![Def { name, params, arity, body: fun_cons(bs, body) }]);
+            return Ok(Ok(vec![Def { name, params, arity, body: fun_cons(bs, body) }]));
         }
         self.expect("==")?;
+        if self.is_kw("INSTANCE") {
+            self.pos += 1;
+            if arity.iter().any(|&a| a > 0) {
+                return self.err("an instance with operator parameters is not supported");
+            }
+            return Ok(Err(self.instance(Some(name), params)?));
+        }
         let body = self.expr(0)?;
-        Ok(vec![Def { name, params, arity, body }])
+        Ok(Ok(vec![Def { name, params, arity, body }]))
     }
 
     /// A recursive function definition `f[x \in S] == e` becomes the recursive operator
@@ -632,7 +707,10 @@ impl Parser {
                             }
                             continue;
                         }
-                        defs.extend(self.def()?);
+                        match self.def()? {
+                            Ok(d) => defs.extend(d),
+                            Err(_) => return self.err("INSTANCE inside LET is not supported"),
+                        }
                     }
                     self.pos += 1;
                     let body = self.expr(0)?;
@@ -737,12 +815,28 @@ impl Parser {
                     self.expect(")")?;
                     return Ok(Expr::Fair(s.starts_with("WF_"), Expr::Ident(s[3..].into()).b(), a.b()));
                 }
-                if self.is("(") {
-                    self.pos += 1;
-                    let args = self.nested(|p| p.comma_list(")"))?;
-                    return Ok(Expr::Call(s, args));
+                let mut name = s;
+                let mut args = vec![];
+                let mut call = false;
+                loop {
+                    if self.is("(") {
+                        self.pos += 1;
+                        args.extend(self.nested(|p| p.comma_list(")"))?);
+                        call = true;
+                    }
+                    // An operator of an instance: `N!Op`, `N(a)!Op(b)` (the arguments are joined)
+                    match (self.peek(), self.peek2()) {
+                        (Tok::Sym(b), Tok::Ident(op)) if b == "!" => {
+                            name = format!("{name}!{op}");
+                            self.pos += 2;
+                        }
+                        _ => break,
+                    }
                 }
-                Ok(Expr::Ident(s))
+                if call || !args.is_empty() {
+                    return Ok(Expr::Call(name, args));
+                }
+                Ok(Expr::Ident(name))
             }
             Tok::Sym(s) => match s.as_str() {
                 "(" => {

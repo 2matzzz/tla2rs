@@ -115,6 +115,19 @@ pub struct Module {
     /// Operators declared RECURSIVE (also in LET), and the operators that recursive function
     /// definitions are turned into
     pub recursive: Vec<String>,
+    /// INSTANCE statements and definitions `N(p) == INSTANCE M WITH ...`
+    pub instances: Vec<Instance>,
+    /// Definitions declared LOCAL (not visible to a module that instantiates this one)
+    pub local_defs: Vec<String>,
+}
+
+/// `[LOCAL] INSTANCE M WITH x <- e, ...` (no name) or `N(p, ...) == INSTANCE M WITH ...`
+#[derive(Clone, Debug)]
+pub struct Instance {
+    pub name: Option<String>,
+    pub params: Vec<String>,
+    pub module: String,
+    pub subs: Vec<(String, Expr)>,
 }
 
 /// An ASSUME expression and the position TLC reports on failure (1-based line and column; the end
