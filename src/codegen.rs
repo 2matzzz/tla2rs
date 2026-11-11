@@ -801,6 +801,27 @@ impl<'a> Gen<'a> {
         Ok(if is_sparse(st) { format!("{acc}.insert({x});") } else { format!("{acc} |= bit_{eid}({x});") })
     }
 
+    /// The subsets of the set `c` of type `st`, in TLC's order: by size, then by their elements in
+    /// order. A set held as an array is mapped onto a bitmask over its elements (in TLC's order).
+    fn subsets_iter(&mut self, c: &str, st: &Ty) -> R<String> {
+        if !matches!(st, Ty::Set(_)) {
+            return Err(format!("SUBSET of {st:?}"));
+        }
+        self.need_subsets = true;
+        if !is_sparse(st) {
+            return Ok(format!("subsets_tlc({c}).into_iter()"));
+        }
+        let it = self.s_iter(c, st)?;
+        let et = Self::elem_of(st);
+        let empty = self.s_empty(st)?;
+        let add = self.s_add("__s", "__e[__i as usize]", st)?;
+        Ok(format!(
+            "{{ let __e: Vec<{}> = {it}.collect(); let __n = __e.len(); \
+             subsets_tlc(if __n >= 128 {{ u128::MAX }} else {{ (1u128 << __n) - 1 }}).into_iter().map(move |__m| {{ let mut __s = {empty}; for __i in bits(__m) {{ {add} }} __s }}) }}",
+            et.repr()
+        ))
+    }
+
     fn s_iter(&mut self, c: &str, st: &Ty) -> R<String> {
         let et = Self::elem_of(st);
         let eid = self.ty_id(&et)?;
@@ -1796,15 +1817,12 @@ impl<'a> Gen<'a> {
             // SUBSET S of a set in the state, as a value: a set of sets, in TLC's order
             Un(UOp::Subset, x) => {
                 let (c, t) = self.gen(x, env, None)?;
-                if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
-                    return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
-                }
-                self.need_subsets = true;
+                let it = self.subsets_iter(&c, &t)?;
                 let st = Ty::Set(t.clone().into());
                 let acc = self.fresh("acc");
                 let add = self.s_add(&acc, "__t", &st)?;
                 let empty = self.s_empty(&st)?;
-                (format!("{{ let mut {acc} = {empty}; for __t in subsets_tlc({c}) {{ {add} }} {acc} }}"), st)
+                (format!("{{ let mut {acc} = {empty}; for __t in {it} {{ {add} }} {acc} }}"), st)
             }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
@@ -2526,11 +2544,8 @@ impl<'a> Gen<'a> {
         }
         if let Expr::Un(UOp::Subset, x) = s {
             let (c, t) = self.gen(x, env, None)?;
-            if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
-                return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
-            }
-            self.need_subsets = true;
-            return Ok((format!("subsets_tlc({c}).into_iter()"), t, None));
+            let it = self.subsets_iter(&c, &t)?;
+            return Ok((it, t, None));
         }
         if let Expr::Bin(BOp::Range, a, b) = s {
             let (ac, (alo, _)) = self.gen_int(a, env)?;
