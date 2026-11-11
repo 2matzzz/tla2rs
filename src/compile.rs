@@ -222,10 +222,34 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
 /// Loads the EXTENDS'd modules whose .tla files sit in the same directory and merges them into one.
 /// Definitions loaded later (from the extending module) take precedence.
 fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
+    load_parsed(parse_module(src)?, dir, warnings, depth)
+}
+
+thread_local! {
+    /// Modules nested in the modules loaded so far, by name
+    static NESTED: std::cell::RefCell<HashMap<String, Module>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The module `name` for EXTENDS or INSTANCE: one nested in a loaded module, or else the file next
+/// to the spec
+fn find_module(name: &str, how: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
+    if let Some(m) = NESTED.with(|n| n.borrow().get(name).cloned()) {
+        return load_parsed(m, dir, warnings, depth);
+    }
+    let path = dir.join(format!("{name}.tla"));
+    let src = std::fs::read_to_string(&path).map_err(|_| format!("{how} {name}: module not found next to the spec"))?;
+    load_module(&src, dir, warnings, depth)
+}
+
+fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
     if depth > 16 {
         return Err("EXTENDS nests too deeply".into());
     }
-    let m = parse_module(src)?;
+    NESTED.with(|n| {
+        for inner in &m.nested {
+            n.borrow_mut().insert(inner.name.clone(), inner.clone());
+        }
+    });
     let mut out = Module { name: m.name.clone(), modules: vec![m.name.clone()], ..Default::default() };
     for e in &m.extends {
         if standard_module(e, "EXTENDS")? {
@@ -236,10 +260,7 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
             // Apalache type annotations and Gen are not used
             "Apalache" => {}
             _ => {
-                let path = dir.join(format!("{e}.tla"));
-                let sub_src = std::fs::read_to_string(&path)
-                    .map_err(|_| format!("EXTENDS {e}: module not found next to the spec"))?;
-                let sub = load_module(&sub_src, dir, warnings, depth + 1)?;
+                let sub = find_module(e, "EXTENDS", dir, warnings, depth + 1)?;
                 out.extends.extend(sub.extends);
                 out.constants.extend(sub.constants);
                 out.variables.extend(sub.variables);
@@ -296,9 +317,7 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
         out.extends.push(mname.clone());
         return Ok(());
     }
-    let path = dir.join(format!("{mname}.tla"));
-    let src = std::fs::read_to_string(&path).map_err(|_| format!("INSTANCE {mname}: module not found next to the spec"))?;
-    let mm = load_module(&src, dir, warnings, depth + 1)?;
+    let mm = find_module(mname, "INSTANCE", dir, warnings, depth + 1)?;
     out.extends.extend(mm.extends.iter().cloned());
     let k = INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let arity_of = |c: &str| mm.op_constants.iter().find(|(n, _)| n == c).map_or(0, |(_, a)| *a);

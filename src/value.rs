@@ -120,11 +120,19 @@ impl Value {
 
 pub const ENUM_LIMIT: usize = 1 << 20;
 
-/// How deep a recursive operator may call itself, both when evaluated at compile time and in the
-/// generated checker. TLC stops with a stack overflow at a depth that depends on its JVM stack and
-/// on the operator's body: measured between 800 and 900 levels for `1 + Sum(k - 1)`, and between
-/// 500 and 700 for a body with two LETs. Erring on the side of an error, deeper is an error here.
-pub const REC_LIMIT: u32 = 500;
+/// How deep a recursive operator may call itself when evaluated at compile time (on a thread with
+/// a 1 GB stack). TLC stops with a stack overflow at a depth that depends on its JVM stack and on
+/// the operator's body (measured between 500 and 900 levels for small bodies). The limit here only
+/// has to catch a recursion that never ends: a recursion that ends computes the value TLA+ gives
+/// it, so tla2rs should not stop where TLC succeeds. It goes deeper than TLC instead, which means
+/// a recursion between TLC's depth and this one passes here where TLC reports a stack overflow.
+/// The generated checker limits by the stack it uses rather than by depth (see REC_STACK_BYTES).
+pub const REC_LIMIT: u32 = 50_000;
+
+/// How much stack recursive operators may use in the generated checker, on top of where the
+/// first call started: well under the 2 MB a worker thread has, and enough for thousands of
+/// levels (more than TLC reaches)
+pub const REC_STACK_BYTES: usize = 1 << 20;
 
 thread_local! {
     static REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -802,7 +810,7 @@ impl ConstEval<'_> {
         match self.eval(q, env)? {
             Value::Tuple(t) => Ok(t),
             Value::Atom(a) if !self.atoms.is_model(a) => {
-                Err(format!("`{op}` on strings is not supported (only Len of a string is)"))
+                Err(format!("`{op}` on strings is not supported (\\o, Len, Head, Tail, Append, and SubSeq are)"))
             }
             v => Err(format!("`{op}` of {v:?}, which is not a sequence")),
         }

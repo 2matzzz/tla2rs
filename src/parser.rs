@@ -54,7 +54,7 @@ const USER_INFIX: &[(&str, u8)] = &[
     ("\\propto", 5), ("\\sqsubseteq", 5), ("\\sqsupseteq", 5), ("\\uplus", 9), ("\\sqcap", 9),
     ("\\sqcup", 9), ("##", 9), ("$$", 9), ("\\wr", 9), ("\\oplus", 10), ("++", 10), ("%%", 10),
     ("\\ominus", 11), ("\\otimes", 13), ("\\oslash", 13), ("\\odot", 13), ("**", 13), ("//", 13),
-    ("&&", 13), ("\\star", 13), ("\\bullet", 13), ("||", 13), ("^^", 14),
+    ("&&", 13), ("\\star", 13), ("\\bullet", 13), ("||", 13), ("^^", 14), ("--", 11), ("|-", 5),
 ];
 
 fn user_infix(t: &Tok) -> Option<(u8, &'static str)> {
@@ -281,8 +281,16 @@ impl Parser {
         loop {
             match self.raw().tok.clone() {
                 Tok::Eof => break,
-                Tok::Sym(s) if s == "====" => break,
+                Tok::Sym(s) if s == "====" => {
+                    // Consumed, so that a nested module ends here and the enclosing one goes on
+                    self.pos += 1;
+                    break;
+                }
                 Tok::Sym(s) if s == "----" => self.pos += 1,
+                Tok::Ident(k) if k == "MODULE" => {
+                    let inner = self.module()?;
+                    m.nested.push(inner);
+                }
                 Tok::Ident(k) if k == "EXTENDS" => {
                     self.pos += 1;
                     m.extends = self.ident_list()?;
@@ -447,6 +455,13 @@ impl Parser {
     /// A definition, or (as Err) a definition of an instance `N(p) == INSTANCE M ...`
     fn def(&mut self) -> R<Result<Vec<Def>, Instance>> {
         let name = self.ident()?;
+        // A postfix operator definition `a ^+ == e`
+        if let Some(op) = ["^+", "^*", "^#"].iter().find(|o| self.is(o)) {
+            self.pos += 1;
+            self.expect("==")?;
+            let body = self.expr(0)?;
+            return Ok(Ok(vec![Def { name: op.to_string(), params: vec![name], arity: vec![0], body }]));
+        }
         // An infix operator definition `a ++ b == e`
         if let Some((_, op)) = user_infix(self.peek()) {
             self.pos += 1;
@@ -811,6 +826,12 @@ impl Parser {
     fn postfix(&mut self) -> R<Expr> {
         let mut e = self.primary()?;
         loop {
+            // The postfix operators a spec may define (a ^+ == ...)
+            if let Some(op) = ["^+", "^*", "^#"].iter().find(|o| self.is(o)) {
+                self.pos += 1;
+                e = Expr::Call(op.to_string(), vec![e]);
+                continue;
+            }
             if self.is("'") {
                 self.pos += 1;
                 e = Expr::Prime(e.b());
