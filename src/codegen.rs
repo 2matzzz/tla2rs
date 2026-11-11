@@ -1343,8 +1343,29 @@ impl<'a> Gen<'a> {
                 let (fc, ft) = self.gen(f, env, None)?;
                 if let Ty::Rec(fs) = &ft {
                     if is_tuple_fields(fs) {
-                        let k = self.tuple_index(x, env, fs.len())?;
-                        return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                        if self.try_const(x, env).is_some() {
+                            let k = self.tuple_index(x, env, fs.len())?;
+                            return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                        }
+                        // An index from the state: the elements as one type, chosen at run time
+                        let mut t = Ty::Enum(vec![]);
+                        for (_, ft) in fs {
+                            t = join(&t, ft).map_err(|e| format!("indexing a tuple with an index that is not constant needs elements of one type: {e}"))?;
+                        }
+                        let (ic, _) = self.gen_int(x, env)?;
+                        let (r, i) = (self.fresh("r"), self.fresh("i"));
+                        let mut arms = String::new();
+                        for (k, (_, ft)) in fs.iter().enumerate() {
+                            let c = self.coerce(format!("{r}.{k}"), ft, &t)?;
+                            write!(arms, "{} => {c}, ", k + 1).unwrap();
+                        }
+                        return Ok((
+                            format!(
+                                "{{ let {r} = {fc}; let {i}: i64 = {ic}; match {i} {{ {arms}_ => eval_error(format!(\"Attempted to apply a tuple of length {} to the index {{}}\", {i})) }} }}",
+                                fs.len()
+                            ),
+                            t,
+                        ));
                     }
                 }
                 if let Ty::Seq(e) = &ft {
