@@ -759,10 +759,12 @@ struct LiveChunk {
     /// covers them.
     edges: Vec<(u32, Fp, u32, u64, u64)>,
     /// (state, fairness conditions whose <<A>>_v is enabled there, action atoms that hold on its
-    /// stuttering step)
-    en: Vec<(u32, u64, u64)>,
-    /// Working storage: the successors of the state being expanded that became edges
+    /// stuttering step, state atoms evaluated when it is expanded)
+    en: Vec<(u32, u64, u64, u64)>,
+    /// Working storage: the successors of the state being expanded that became edges, and those
+    /// that are new
     pend: Vec<usize>,
+    newk: Vec<usize>,
 }
 
 struct Chunk {
@@ -794,6 +796,7 @@ fn expand_one(
     let sfp = if LIVENESS { state_fp(&s, &g.states[head]) } else { 0 };
     let first_edge = c.live.edges.len();
     c.live.pend.clear();
+    c.live.newk.clear();
     for (k, &(t, l)) in buf.iter().enumerate() {
         c.generated += 1;
         // States outside the CONSTRAINT are not added (as in TLC, they are not counted as
@@ -822,12 +825,8 @@ fn expand_one(
                 Ok(Some(inv)) => return Some(Found::New(me, c.states.len() - 1, SMsg::Inv(inv))),
                 Err((inv, e)) => return Some(Found::New(me, c.states.len() - 1, SMsg::InvEval(inv, e))),
             }
-            // TLC evaluates the state predicates of the temporal properties on each new state
             if LIVENESS {
-                match state_bits(&t) {
-                    Ok(b) => c.sbits.push(b),
-                    Err(m) => return Some(Found::Live(m)),
-                }
+                c.live.newk.push(k);
             }
         }
         if let Some(m) = act {
@@ -837,22 +836,10 @@ fn expand_one(
     if let Some(p) = failed {
         raise_next(p);
     }
-    // TLC evaluates fairness after the successors: which <<A>>_v are enabled, and the action atoms
-    // on the stuttering step
+    // After the successors, in TLC's order: the action atoms and fairness steps of each step
+    // (including stuttering), then the state atoms of this state that are not in the tableau and
+    // which fair actions are enabled, then the tableau's state atoms of the new successors
     if LIVENESS {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut en = 0u64;
-            for (i, (_, enabled, _)) in FAIRS.iter().enumerate() {
-                if enabled(&s) {
-                    en |= 1 << i;
-                }
-            }
-            en
-        }));
-        let en = match r {
-            Ok(en) => en,
-            Err(p) => return Some(Found::Live(SMsg::Live("fairness".into(), describe_panic(p)))),
-        };
         for j in 0..c.live.pend.len() {
             let t = &buf[c.live.pend[j]].0;
             match step_bits(&s, t) {
@@ -868,15 +855,41 @@ fn expand_one(
             Ok((a, _)) => a,
             Err(m) => return Some(Found::Live(m)),
         };
-        c.live.en.push((head as u32, en, stut));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut en = 0u64;
+            for (i, (_, enabled, _)) in FAIRS.iter().enumerate() {
+                if enabled(&s) {
+                    en |= 1 << i;
+                }
+            }
+            en
+        }));
+        let en = match r {
+            Ok(en) => en,
+            Err(p) => return Some(Found::Live(SMsg::Live("fairness".into(), describe_panic(p)))),
+        };
+        let cbits = match state_bits(&s, !SATOMS_TABLEAU) {
+            Ok(b) => b,
+            Err(m) => return Some(Found::Live(m)),
+        };
+        c.live.en.push((head as u32, en, stut, cbits));
+        for j in 0..c.live.newk.len() {
+            match state_bits(&buf[c.live.newk[j]].0, SATOMS_TABLEAU) {
+                Ok(b) => c.sbits.push(b),
+                Err(m) => return Some(Found::Live(m)),
+            }
+        }
     }
     None
 }
 
-/// The state atoms of the temporal properties that hold in s
-fn state_bits(s: &State) -> Result<u64, SMsg> {
+/// The state atoms of the temporal properties among `mask` that hold in s
+fn state_bits(s: &State, mask: u64) -> Result<u64, SMsg> {
     let mut b = 0u64;
     for (i, f) in SATOMS.iter().enumerate() {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
         match std::panic::catch_unwind(|| f(s)) {
             Ok(true) => b |= 1 << i,
             Ok(false) => {}
@@ -2386,10 +2399,10 @@ fn run_liveness(opt: &Opt) {
     let mut g = Graph { states: Vec::new(), parent: Vec::new(), sbits: Vec::new() };
     let seen = Shards::new(false);
     let (inits, mut generated) = initial_states();
-    // TLC evaluates the temporal properties on the initial states once they are all computed
+    // TLC evaluates the tableau's state atoms on the initial states once they are all computed
     let mut ibits = vec![];
     for (s, _, _) in &inits {
-        match state_bits(s) {
+        match state_bits(s, SATOMS_TABLEAU) {
             Ok(b) => ibits.push(b),
             Err(m) => {
                 let code = report_msg(&m, true);
@@ -2858,9 +2871,10 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
     for i in 0..n {
         st.off[i + 1] += st.off[i];
     }
-    for &(s, en, stut) in &live.en {
+    for &(s, en, stut, cbits) in &live.en {
         st.fen[s as usize] = en;
         st.stut[s as usize] = stut;
+        st.sbits[s as usize] |= cbits;
     }
     drop(live);
     let inits: Vec<u32> = (0..n as u32).filter(|&i| g.parent[i as usize].0 == u32::MAX).collect();
