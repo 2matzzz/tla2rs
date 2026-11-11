@@ -507,11 +507,16 @@ impl<'a> Gen<'a> {
     /// The functions generated for recursive operators, with the depth guard they share
     pub fn rec_functions(&self) -> String {
         let mut s = format!(
-            "thread_local! {{ static REC_DEPTH: std::cell::Cell<u32> = const {{ std::cell::Cell::new(0) }}; }}\n\
-             fn rec_enter(name: &str) {{ REC_DEPTH.with(|d| {{ let n = d.get() + 1; if n > {} {{ d.set(0); eval_error(format!(\"`{{name}}` recursed more than {} levels deep (TLC overflows its stack)\")) }} d.set(n); }}) }}\n\
+            "thread_local! {{ static REC_DEPTH: std::cell::Cell<u32> = const {{ std::cell::Cell::new(0) }}; \
+             static REC_BASE: std::cell::Cell<usize> = const {{ std::cell::Cell::new(0) }}; }}\n\
+             // The stack used since the outermost call is measured from the address of a local (a\n\
+             // local variable: the address of a literal would be a static)\n\
+             fn rec_enter(name: &str) {{ let marker = 0u8; let here = std::hint::black_box(&marker) as *const u8 as usize; REC_DEPTH.with(|d| {{ let n = d.get() + 1; \
+             if n == 1 {{ REC_BASE.with(|b| b.set(here)); }} \
+             if REC_BASE.with(|b| b.get()).abs_diff(here) > {} {{ d.set(0); eval_error(format!(\"`{{name}}` recursed {{n}} levels deep and ran out of stack (TLC overflows its stack at a smaller depth)\")) }} \
+             d.set(n); }}) }}\n\
              fn rec_leave() {{ REC_DEPTH.with(|d| d.set(d.get() - 1)) }}\n",
-            crate::value::REC_LIMIT,
-            crate::value::REC_LIMIT
+            crate::value::REC_STACK_BYTES
         );
         for c in self.rec_code.values() {
             s += c;
