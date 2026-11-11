@@ -15,7 +15,7 @@ tla2rs: generated .tla2rs/Peterson-Live/src/main.rs in 4 ms
 tla2rs: built in 1.3 s
 63 states generated, 34 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 10.
-Temporal properties hold (3 properties, 2 fairness instances, 62 edges).
+Temporal properties hold (3 properties, 2 fairness conditions, 62 edges).
 Model checking completed. No error has been found.
 ```
 
@@ -68,9 +68,12 @@ not finish.
 5. **Runtime** (`runtime.rs`): BFS, level by level, with each level split across threads. States are bit-packed to fit
    their types, and the visited set holds only 64-bit fingerprints. A state of 64 bits or fewer has a reversible
    fingerprint, so it cannot collide
-6. **Liveness**: each edge is recorded with the fairness instance it belongs to (e.g. `WF(Create(d1))`). After the
-   search, the checker takes the SCCs of the subgraph made of states that can keep violating the property and looks
-   for a fair one (or fair stuttering). Counterexamples are lassos, as in TLC
+6. **Liveness** (`live.rs`, `ltl.rs`): a property becomes a formula over state predicates, `ENABLED`, and action
+   predicates, whose negation is turned into a Büchi automaton (tableau). During the search each state records which
+   predicates hold and which fair actions are enabled, and each edge which action predicates and fair actions it
+   satisfies. Afterwards the checker looks for a strongly connected component of the product of the state graph and
+   the automaton that is accepting and fair (WF: a step of the action or a state where it is disabled; SF: a step, or
+   no state where it is enabled, narrowing the component otherwise). Counterexamples are lassos printed as TLC does
 
 ### Memory
 
@@ -95,8 +98,8 @@ memory.
 | Expressions | logic, arithmetic (`+ - * \div % ^`), comparison, sequences (`Seq`, `Len`, `Append`, `Head`, `Tail`, `SubSeq`, `SelectSeq`, `\o`, indexing, a tuple and a function over 1..n being the same value), sets of sets and of functions as values, `IF` / `CASE` / `LET`, `\E` / `\A` (also `<<x, y>> \in S`), `CHOOSE` (also over sets in the state, picking what TLC picks), `RECURSIVE` operators and recursive function definitions, operator parameters and `LAMBDA`, infix operators defined by the spec (`a \oplus b == ...`), `Assert` / `Print` / `PrintT` / `:>` / `@@` from TLC, `UNION`, `SUBSET` and `\X` of sets in the state, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
 | Actions | `x' = e`, `x' \in S`, `UNCHANGED`, action-level `\/` `\E` `IF` `CASE`, guards that read an already assigned `x'` |
 | Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, natural numbers, strings, booleans, or sets of them, nested to any depth (as in TLC). A model value may share a type with integers (`1..4 \cup {None}`), and arithmetic on such a value is an evaluation error only when it is a model value; a variable may also hold an integer or a string, and comparing the two is an evaluation error, as in TLC. `Name <- Def` substitutes a definition (also from a module that EXTENDS the spec, such as an MC.tla) for a constant, and `<-` / `=` on a defined name replace that definition. `ASSUME` is checked. `INSTANCE` (unnamed, `LOCAL`, and `N(p) == INSTANCE M WITH x <- e` used as `N!Op`). Theorems, proofs, `USE` / `HIDE` are skipped, as TLC does |
-| Properties | `INVARIANT`. `PROPERTY` supports `<>P`, `[]<>P`, `<>[]P`, `P ~> Q`, `[]P` (checked as an invariant, as TLC does), `[][A]_v`, and a state predicate (checked on the initial states), optionally quantified with `\A x \in S :` |
-| Fairness | `WF_v(A)` (optionally quantified with `\A`). `A` must be a named definition called from `Next` |
+| Properties | `INVARIANT` (may use `ENABLED`). `PROPERTY` takes temporal formulas built from state predicates, `ENABLED A`, action predicates (`<<A>>_v`, `[A]_v`), `[]`, `<>`, `~>`, `/\ \/ ~ => <=>`, `WF` / `SF`, and `\A` / `\E` over constant sets (also of records). As in TLC, `[]P` for a state predicate P is checked as an invariant, `[][A]_v` while exploring, and a state predicate on the initial states |
+| Fairness | `WF_v(A)` and `SF_v(A)`, on named or inline actions, optionally quantified with `\A`. Whether `<<A>>_v` is enabled is decided on A itself, as in TLC |
 | State space | `CONSTRAINT`, `ACTION_CONSTRAINT`, `VIEW`, `SYMMETRY` (`TYPE` / `TYPE_CONSTRAINT` are accepted and ignored, as in TLC) |
 
 ### Limitations
@@ -115,17 +118,15 @@ memory.
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
   reason), sets that may hold both strings and integers, functions over part of a type (`[S -> T]` with S in the
   state, `:>` / `@@` other than `(d :> e) @@ f`, `Permutations` of a set in the state, `SubBag` of a bag in the
-  state), user-defined prefix and postfix operators, recursive operators with operator parameters, strong fairness
-  (SF), `ENABLED`, `<<A>>_v`, and `Name <- [Module] Def` for a CONSTANT (TLC rejects it too)
+  state), user-defined prefix and postfix operators, recursive operators with operator parameters, and
+  `Name <- [Module] Def` for a CONSTANT (TLC rejects it too)
 - Recursion deeper than 500 levels is an evaluation error. TLC overflows its stack somewhere between 500 and 900
   levels depending on the operator, so a recursion between those depths can pass in TLC and fail here
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
   collision (an estimate is printed at the end)
-- Liveness: whether a fair action is enabled is decided by whether the `Next` branch that calls it produces a
-  successor. If `Next` narrows the call (`A /\ extra condition`), enabledness is underestimated and a spurious
-  counterexample may appear (the checker never wrongly reports that a property holds)
-- Liveness checking keeps the whole state graph in memory (about 24 bytes per edge). For invariants only, see Memory
-  above
+- Liveness checking keeps the whole state graph in memory (about 40 bytes per edge), and the search over its product
+  with a property's automaton uses hash maps sized by the reachable product. For invariants only, see Memory above
+- A liveness counterexample is a valid lasso, but not always the one TLC prints (its length can differ)
 - With `VIEW` and `SYMMETRY` together, the distinct count can be lower than TLC's. TLC sometimes keeps states with
   identical views as separate states (its choice of representative depends on the state itself), while tla2rs folds
   by orbits of the view. With only one of the two, counts match TLC exactly
@@ -157,4 +158,3 @@ ok    examples/TwoPhase.cfg
 
 - Sequences (`Sequences`) and sets of sets
 - Take constants as run-time arguments, so changing the configuration does not need a rebuild
-- Strong fairness

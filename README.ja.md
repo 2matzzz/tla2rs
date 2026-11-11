@@ -14,7 +14,7 @@ tla2rs: generated .tla2rs/Peterson-Live/src/main.rs in 4 ms
 tla2rs: built in 1.3 s
 63 states generated, 34 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 10.
-Temporal properties hold (3 properties, 2 fairness instances, 62 edges).
+Temporal properties hold (3 properties, 2 fairness conditions, 62 edges).
 Model checking completed. No error has been found.
 ```
 
@@ -68,8 +68,10 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 状態の幅やモデルの大きさに関わらず、メモリは「指紋の表 + 上限ぶんのキュー」に収まる。
 
 時相の性質を調べるときは SCC 探索のために状態グラフ全体が要るので、こちらは全部メモリに置く
-6. **液性**：辺に「どの公平性のインスタンス（`WF(Create(d1))` など）の遷移か」を付けて記録し、探索の後で
-   性質を破り続けられる状態だけの部分グラフの SCC を取り、公平なもの（または公平な足踏み）を探す。反例は TLC と同じラッソで出す
+6. **液性**（`live.rs`、`ltl.rs`）：性質を状態の述語・`ENABLED`・アクションの述語からなる式にし、その否定をタブロー法で Büchi オートマトンにする。
+   探索中に、各状態ではどの述語が成り立ちどの公平なアクションが有効か、各辺ではどのアクションの述語と公平なアクションを満たすかを記録する。
+   探索の後で、状態グラフとオートマトンの積の強連結成分のうち、受理条件と公平性を満たすものを探す（WF はそのアクションの遷移か無効な状態があればよい。
+   SF は遷移があるか有効な状態が無いこと。満たさなければ有効な状態を除いて成分を絞り直す）。反例は TLC と同じ書式のラッソで出す
 
 ## 対応している範囲
 
@@ -78,8 +80,8 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 | 式 | 論理・算術（`+ - * \div % ^`）・比較、列（`Seq`・`Len`・`Append`・`Head`・`Tail`・`SubSeq`・`SelectSeq`・`\o`・添字、タプルと 1..n 上の関数は同じ値）、値としての集合の集合・関数の集合、`IF` / `CASE` / `LET`、`\E` / `\A`（`<<x, y>> \in S` も）、`CHOOSE`（状態にある集合からも、TLC と同じ要素を選ぶ）、`RECURSIVE` の演算子と再帰する関数の定義、演算子の引数と `LAMBDA`、仕様が定義する中置演算子（`a \oplus b == ...`）、TLC の `Assert` / `Print` / `PrintT` / `:>` / `@@`、状態にある集合の `UNION` / `SUBSET` / `\X`、集合（リテラル・`\cup \cap \`・`\subseteq`・`{x \in S : P}`・`{e : x \in S}`・`Cardinality`・`SUBSET`）、関数（`[x \in S |-> e]`・`[x \in S, y \in T |-> e]`・再帰しない定義 `f[x \in S] == e`・`f[x]`・`[f EXCEPT ![a] = @ + 1]`・`[S -> T]`）、レコード（`[a |-> 1]`・`r.a`・`[a : S]`・`!.a`）、長さの決まったタプル（`<<a, b>>`・定数の添字の `t[1]`・`![k][1]`・`A \X B`） |
 | アクション | `x' = e`、`x' \in S`、`UNCHANGED`、アクションの層の `\/` `\E` `IF` `CASE`、代入済みの `x'` を読むガード |
 | 仕様 | `SPECIFICATION`（`Init /\ [][Next]_v /\ 公平性`）または `INIT` / `NEXT`。`CONSTANT` はモデル値・自然数・文字列・真偽と、それらの集合（TLC と同じく何重に入れ子にしてもよい）。モデル値は整数と同じ型に混ぜてよい（`1..4 \cup {None}`）。その値の算術はモデル値のときだけ評価エラーになる。変数は整数と文字列を持ち替えてもよく、両者を比べると TLC と同じく評価エラーになる。cfg の `Name <- Def` で定数に定義を代入できる（仕様を EXTENDS する MC.tla などの定義でもよい）。定義の名前に `<-` や `=` を書くとその定義を置き換える。`ASSUME` も確かめる。`INSTANCE`（名前なし、`LOCAL`、`N!Op` で使う `N(p) == INSTANCE M WITH x <- e`）。定理・証明・`USE` / `HIDE` は TLC と同じく読み飛ばす |
-| 性質 | `INVARIANT`。`PROPERTY` は `<>P` `[]<>P` `<>[]P` `P ~> Q` `[]P`（TLC と同じく不変条件として調べる）`[][A]_v`、状態の述語（初期状態で調べる）。`\A x \in S :` で量化してもよい |
-| 公平性 | `WF_v(A)`（`\A` で量化してもよい）。`A` は名前の付いた定義で、`Next` から呼ばれていること |
+| 性質 | `INVARIANT`（`ENABLED` を使ってよい）。`PROPERTY` は状態の述語・`ENABLED A`・アクションの述語（`<<A>>_v`、`[A]_v`）を `[]` `<>` `~>` `/\ \/ ~ => <=>`、`WF` / `SF`、定数の集合（レコードの集合も）の上の `\A` / `\E` で組んだ時相の式。TLC と同じく、状態の述語 P の `[]P` は不変条件として、`[][A]_v` は探索中に、状態の述語は初期状態で調べる |
+| 公平性 | `WF_v(A)` と `SF_v(A)`。A は名前の付いた定義でも式そのものでもよく、`\A` で量化してもよい。`<<A>>_v` が有効かは TLC と同じく A そのもので決める |
 | 状態空間 | `CONSTRAINT`、`ACTION_CONSTRAINT`、`VIEW`、`SYMMETRY`（`TYPE` / `TYPE_CONSTRAINT` は TLC と同じく受け付けて何もしない） |
 
 ### 制約
@@ -90,12 +92,11 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 - 要素の型が 128 通りまでの集合はビットマスク、それより大きいもの（集合の集合を含む）は `-setcap` 個までの整列した配列。列は `-seqcap` 個まで（上記）で、超えると評価エラー
 - 標準モジュール：`Naturals`、`Integers`、`FiniteSets`、`Sequences`（`SortSeq` も。文字列は `\o`・`Len`・`Head`・`Tail`・`Append`・`SubSeq` では文字の列）、`Bags`、`TLC` の `Print`・`PrintT`・`Assert`・`ToString`（定数の式で）・`TLCEval`・`Any`・`:>`・`@@`・`Permutations`
 - 未対応：2 要素以上の `RandomElement`、`JavaTime`、`TLCGet` / `TLCSet`（いずれも理由を添えて拒否する）、文字列と整数を両方持ちうる集合、型の一部だけを定義域にする関数（状態にある S での `[S -> T]`、`(d :> e) @@ f` 以外の `:>` / `@@`、状態にある集合の `Permutations`、状態にあるバッグの `SubBag`）、
-  仕様が定義する前置・後置の演算子、演算子の引数をとる再帰演算子、強公平性（SF）、`ENABLED`、`<<A>>_v`、CONSTANT への `Name <- [Module] Def`（TLC も受け付けない）
+  仕様が定義する前置・後置の演算子、演算子の引数をとる再帰演算子、CONSTANT への `Name <- [Module] Def`（TLC も受け付けない）
 - 再帰が 500 段を超えると評価エラーにする。TLC は演算子によって 500〜900 段のどこかでスタックがあふれるので、その間の深さの再帰は TLC で通ってここで止まることがある
 - 状態が 64 bit を超えると訪問済みは指紋で持つので、TLC と同じく衝突の確率がわずかにある（終わりに見積もりを出す）
-- 液性：公平性つきのアクションが有効かどうかは、それを呼ぶ `Next` の分岐が後続状態を作るかで決める。
-  `Next` の中で `A /\ 追加の条件` のように絞って呼ぶと「有効」を少なく見積もり、偽の反例が出ることがある（誤って「成り立つ」とは言わない）
-- 液性検査は状態グラフ全体（辺 1 本 24 byte 程度）をメモリに置く。不変条件だけなら上の「メモリ」のとおり
+- 液性検査は状態グラフ全体（辺 1 本 40 byte 程度）をメモリに置き、性質のオートマトンとの積の探索には、たどり着く積の大きさのハッシュ表を使う。不変条件だけなら上の「メモリ」のとおり
+- 液性の反例は正しいラッソだが、TLC が出すものと同じとは限らない（長さが違うことがある）
 - `VIEW` と `SYMMETRY` を同時に使うと、distinct 数が TLC より少なくなる。TLC はビューの値が一致する状態を
   別物として残すことがあるため（代表状態の選び方が状態そのものに依る）。tla2rs はビューの軌道で畳む。
   どちらか片方だけなら TLC と完全に一致する
@@ -125,4 +126,3 @@ ok    examples/TwoPhase.cfg
 
 - 列（`Sequences`）と、集合の集合
 - 定数を実行時の引数にして、構成を変えるたびのビルドを省く
-- 強公平性
