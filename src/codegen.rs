@@ -1022,7 +1022,25 @@ impl<'a> Gen<'a> {
                 }
                 (code + ")", Ty::Rec(tys))
             }
-            Choose(..) => return Err("CHOOSE over state-dependent sets is not supported yet".into()),
+            Choose(x, s, p) => {
+                // The first element in iteration order that satisfies p. Sets iterate in TLC's
+                // order of values (ascending integers, strings and model values in order of first
+                // appearance, records and tuples element by element), so this is TLC's choice
+                let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                let mut env2 = env.clone();
+                let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                let pc = self.gen_as(p, &env2, &Ty::Bool)?;
+                let val = env2.locals[x].0.clone();
+                let r = self.fresh("r");
+                (
+                    format!(
+                        "{{ let mut {r}: Option<{}> = None; for {lx} in {it} {{ if {pc} {{ {r} = Some({val}); break; }} }} \
+                         match {r} {{ Some(v) => v, None => eval_error(\"Attempted to compute the value of an expression of form CHOOSE x \\\\in S: P, but no element of S satisfied P.\".into()) }} }}",
+                        et.repr()
+                    ),
+                    et,
+                )
+            }
             FunSet(..) | RecSet(..) => {
                 return Err("this set is only supported on the right of \\in (or must be constant)".into())
             }
