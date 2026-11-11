@@ -12,6 +12,7 @@ mod codegen;
 mod compile;
 mod expand;
 mod lexer;
+mod std_modules;
 mod live;
 mod ltl;
 mod metal;

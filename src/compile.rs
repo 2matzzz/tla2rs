@@ -253,6 +253,14 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     });
     let mut out = Module { name: m.name.clone(), modules: vec![m.name.clone()], ..Default::default() };
     for e in &m.extends {
+        if e == "RealTime" {
+            real_time(&mut out);
+            continue;
+        }
+        if e == "Reals" {
+            reals(&mut out);
+            continue;
+        }
         if standard_module(e, "EXTENDS")? {
             out.extends.push(e.clone());
             continue;
@@ -293,10 +301,199 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
         // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
         // for the Toolbox's trace explorer.
         "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" | "Bags" => Ok(true),
-        "RealTime" => Err(format!("{how} {name}: the standard module {name} is not supported yet")),
+        // Handled by `real_time` (EXTENDS only)
+        "RealTime" => Err(format!("{how} {name}: only EXTENDS RealTime is supported")),
         // TLC picks the subsets at random, so its results cannot be reproduced
         "Randomization" => Err(format!("{how} {name}: TLC chooses its values at random; not supported")),
         _ => Ok(false),
+    }
+}
+
+/// The order in which TLC creates the strings it knows before it starts exploring: TLC orders
+/// strings by when it first creates them. Measured on TLC 2.19: the strings and model values of
+/// the cfg; SANY's built-in names; the identifiers and keywords of each module as it parses them,
+/// root module first and then the modules it extends or instantiates, breadth first; a few more
+/// built-in names; then the string literals of each module, dependencies before the modules that
+/// use them. Strings created later (by \o, ToString, ...) follow, in the order TLC happens to
+/// create them, which tla2rs does not reproduce (see CLAUDE.md).
+fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<String, usize> {
+    let mut order: Vec<String> = vec![];
+    fn cfg_values(e: &Expr, order: &mut Vec<String>) {
+        match e {
+            Expr::Str(x) => order.push(x.clone()),
+            Expr::Ident(n) => {
+                if let Some(mv) = n.strip_prefix("@model:") {
+                    order.push(mv.to_string());
+                }
+            }
+            _ => {}
+        }
+        for c in e.children() {
+            cfg_values(c, order);
+        }
+    }
+    for (_, v) in &cfg.constants {
+        cfg_values(v, &mut order);
+    }
+    for b in ["ENABLED", "UNCHANGED", "SUBSET", "UNION", "DOMAIN", "STRING", "FALSE", "TRUE", "BOOLEAN"] {
+        order.push(b.into());
+    }
+    // (identifiers, dependencies, strings) of a module, from its file next to the spec or from
+    // TLC's standard modules
+    let module = |src: Option<&str>, name: &str| -> (Vec<String>, Vec<String>, Vec<String>) {
+        let src = match src {
+            Some(x) => Some(x.to_string()),
+            None => std::fs::read_to_string(dir.join(format!("{name}.tla"))).ok(),
+        };
+        let Some(src) = src else {
+            return match crate::std_modules::STD_MODULES.iter().find(|m| m.0 == name) {
+                Some((_, deps, ids, strs)) => (
+                    ids.iter().map(|x| x.to_string()).collect(),
+                    deps.iter().map(|x| x.to_string()).collect(),
+                    strs.iter().map(|x| x.to_string()).collect(),
+                ),
+                None => (vec![], vec![], vec![]),
+            };
+        };
+        let toks = crate::lexer::lex_module(&src).unwrap_or_default();
+        let (mut ids, mut deps, mut strs) = (vec![], vec![], vec![]);
+        for (i, t) in toks.iter().enumerate() {
+            match &t.tok {
+                crate::lexer::Tok::Ident(w) if w == "MODULE" => {}
+                crate::lexer::Tok::Ident(w) => {
+                    // SANY reads WF_v as WF_ and v
+                    let w = if (w.starts_with("WF_") || w.starts_with("SF_")) && w.len() > 3 { &w[3..] } else { w.as_str() };
+                    ids.push(w.to_string());
+                    let prev = |k: usize| i.checked_sub(k).and_then(|j| toks.get(j)).map(|t| &t.tok);
+                    let after_extends = {
+                        let mut j = i;
+                        loop {
+                            match j.checked_sub(1).and_then(|k| toks.get(k)).map(|t| &t.tok) {
+                                Some(crate::lexer::Tok::Sym(c)) if c == "," => j = j.saturating_sub(2),
+                                Some(crate::lexer::Tok::Ident(k)) if k == "EXTENDS" => break true,
+                                _ => break false,
+                            }
+                        }
+                    };
+                    if (after_extends || matches!(prev(1), Some(crate::lexer::Tok::Ident(k)) if k == "INSTANCE")) && !deps.contains(&w.to_string()) {
+                        deps.push(w.to_string());
+                    }
+                }
+                crate::lexer::Tok::Str(x) => strs.push(x.clone()),
+                _ => {}
+            }
+        }
+        (ids, deps, strs)
+    };
+    let root_name = crate::lexer::lex_module(root)
+        .ok()
+        .and_then(|t| t.iter().position(|x| x.tok == crate::lexer::Tok::Ident("MODULE".into())).and_then(|i| t.get(i + 1)).map(|x| x.tok.clone()));
+    let root_name = match root_name {
+        Some(crate::lexer::Tok::Ident(n)) => n,
+        _ => String::new(),
+    };
+    let mut mods: HashMap<String, (Vec<String>, Vec<String>, Vec<String>)> = HashMap::new();
+    mods.insert(root_name.clone(), module(Some(root), &root_name));
+    // Identifiers, modules breadth first
+    let mut queue = vec![root_name.clone()];
+    let mut h = 0;
+    while h < queue.len() {
+        let name = queue[h].clone();
+        h += 1;
+        if !mods.contains_key(&name) {
+            let m = module(None, &name);
+            mods.insert(name.clone(), m);
+        }
+        let (ids, deps, _) = mods[&name].clone();
+        order.extend(ids);
+        for d in deps {
+            if !queue.contains(&d) {
+                queue.push(d);
+            }
+        }
+    }
+    for b in ["SF_", "WF_", "LAMBDA"] {
+        order.push(b.into());
+    }
+    // String literals, dependencies first
+    fn literals(name: &str, mods: &HashMap<String, (Vec<String>, Vec<String>, Vec<String>)>, done: &mut Vec<String>, order: &mut Vec<String>) {
+        done.push(name.to_string());
+        let Some((_, deps, strs)) = mods.get(name) else { return };
+        for d in deps {
+            if !done.contains(d) {
+                literals(d, mods, done, order);
+            }
+        }
+        order.extend(strs.iter().cloned());
+    }
+    literals(&root_name, &mods, &mut vec![], &mut order);
+    let mut ranks = HashMap::new();
+    for (i, x) in order.into_iter().enumerate() {
+        ranks.entry(x).or_insert(i);
+    }
+    ranks
+}
+
+/// RealTime: Reals (for TLC, Integers) and the variable `now`. TLC cannot check RTBound and RTnow
+/// (they quantify over Real, and RTBound uses \EE), so their bodies are left undefined: using them
+/// is refused (see `uses_real_time`)
+fn real_time(out: &mut Module) {
+    reals(out);
+    out.modules.push("RealTime".into());
+    if !out.variables.iter().any(|v| v == "now") {
+        out.variables.push("now".into());
+    }
+    for (name, params) in [("RTBound", vec!["A", "v", "D", "E"]), ("RTnow", vec!["v"])] {
+        out.defs.push(Def {
+            name: name.into(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+            arity: vec![0; params.len()],
+            body: Expr::Call(format!("#{name}"), vec![]),
+        });
+    }
+}
+
+/// Reals: for TLC, Integers, with the dummy Real == "Reals" of its Reals module (so using Real as
+/// a set is an error, as in TLC)
+fn reals(out: &mut Module) {
+    out.extends.push("Reals".into());
+    if !out.defs.iter().any(|d| d.name == "Real") {
+        out.defs.push(Def { name: "Real".into(), params: vec![], arity: vec![], body: Expr::Str("Reals".into()) });
+    }
+}
+
+/// Whether e uses RealTime's RTBound or RTnow
+fn uses_real_time(e: &Expr) -> bool {
+    e.any(&|x| matches!(x, Expr::Label(n, ..) if n == "RTBound" || n == "RTnow"))
+}
+
+/// The operators of the standard modules and their numbers of arguments, for a named instance
+/// (`S == INSTANCE Sequences` used as `S!Len(s)`)
+fn std_ops(m: &str) -> &'static [(&'static str, usize)] {
+    const NAT: &[(&str, usize)] = &[
+        ("Nat", 0), ("+", 2), ("-", 2), ("*", 2), ("^", 2), ("<", 2), (">", 2), ("<=", 2), (">=", 2), ("%", 2),
+        ("\\div", 2), ("..", 2),
+    ];
+    const INT: &[(&str, usize)] = &[
+        ("Nat", 0), ("Int", 0), ("+", 2), ("-", 2), ("*", 2), ("^", 2), ("<", 2), (">", 2), ("<=", 2), (">=", 2),
+        ("%", 2), ("\\div", 2), ("..", 2),
+    ];
+    match m {
+        "Naturals" => NAT,
+        "Integers" | "Reals" => INT,
+        "Sequences" => &[
+            ("Seq", 1), ("Len", 1), ("\\o", 2), ("Append", 2), ("Head", 1), ("Tail", 1), ("SubSeq", 3), ("SelectSeq", 2),
+        ],
+        "FiniteSets" => &[("IsFiniteSet", 1), ("Cardinality", 1)],
+        "TLC" => &[
+            ("Print", 2), ("PrintT", 1), ("Assert", 2), ("JavaTime", 0), ("TLCGet", 1), ("TLCSet", 2), (":>", 2), ("@@", 2),
+            ("Permutations", 1), ("SortSeq", 2), ("RandomElement", 1), ("Any", 0), ("ToString", 1), ("TLCEval", 1),
+        ],
+        "Bags" => &[
+            ("IsABag", 1), ("BagToSet", 1), ("SetToBag", 1), ("BagIn", 2), ("EmptyBag", 0), ("\\oplus", 2), ("\\ominus", 2),
+            ("BagUnion", 1), ("\\sqsubseteq", 2), ("SubBag", 1), ("BagCardinality", 1), ("CopiesIn", 2),
+        ],
+        _ => &[],
     }
 }
 
@@ -312,10 +509,25 @@ static INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<()> {
     let mname = &inst.module;
     if standard_module(mname, "INSTANCE")? {
-        if let Some(n) = &inst.name {
-            return Err(format!("`{n} == INSTANCE {mname}`: a named instance of a standard module is not supported"));
-        }
         out.extends.push(mname.clone());
+        // A named instance: N!Op stands for the module's Op
+        if let Some(n) = &inst.name {
+            for &(op, k) in std_ops(mname) {
+                let ps: Vec<String> = (1..=k).map(|i| format!("#a{i}")).collect();
+                let args: Vec<Expr> = ps.iter().map(|p| Expr::Ident(p.clone())).collect();
+                let body = if op.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    if k == 0 { Expr::Ident(op.into()) } else { Expr::Call(op.into(), args) }
+                } else {
+                    let mut it = args.into_iter();
+                    crate::parser::bin(op, it.next().unwrap(), it.next().unwrap())
+                };
+                let mut params = inst.params.clone();
+                params.extend(ps);
+                let mut arity = inst.arity.clone();
+                arity.extend(vec![0; k]);
+                out.defs.push(Def { name: format!("{n}!{op}"), params, arity, body });
+            }
+        }
         return Ok(());
     }
     let mm = find_module(mname, "INSTANCE", dir, warnings, depth + 1)?;
@@ -383,7 +595,16 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
             Some(n) => {
                 let mut ps = inst.params.clone();
                 ps.extend(d.params.iter().cloned());
-                let mut ar = vec![0; inst.params.len()];
+                let mut ar = inst.arity.clone();
+                // An instance hoisted out of a LET takes the names its substitutions mention; one
+                // that names an operator with arguments is passed as that operator
+                if n.contains("#let") {
+                    for (i, p) in inst.params.iter().enumerate() {
+                        if let Some(def) = out.defs.iter().rev().find(|x| x.name == *p) {
+                            ar[i] = def.params.len();
+                        }
+                    }
+                }
                 ar.extend(d.arity.iter().copied());
                 (format!("{n}!{}", d.name), ps, ar)
             }
@@ -403,16 +624,29 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     let cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
 
-    // Strings and model values
-    let mut atoms = Atoms::default();
+    // Strings and model values. Strings are numbered in the order TLC creates them (TLC orders
+    // strings that way), as far as that order is known before exploring
+    let mut seen = Atoms::default();
     for d in &m.defs {
-        collect_strings(&d.body, &mut atoms);
+        collect_strings(&d.body, &mut seen);
     }
     for (_, v) in &cfg.constants {
-        collect_strings(v, &mut atoms);
+        collect_strings(v, &mut seen);
     }
     for a in &m.assumes {
-        collect_strings(&a.expr, &mut atoms);
+        collect_strings(&a.expr, &mut seen);
+    }
+    let ranks = tlc_string_ranks(tla, &cfg, dir);
+    let mut strings: Vec<String> = (0..seen.len() as u32).filter(|&a| !seen.is_model(a)).map(|a| seen.name(a)).collect();
+    strings.sort_by_key(|x| ranks.get(x).copied().unwrap_or(usize::MAX));
+    let atoms = Atoms::default();
+    for x in &strings {
+        atoms.intern(false, x);
+    }
+    for a in 0..seen.len() as u32 {
+        if seen.is_model(a) {
+            atoms.intern(true, &seen.name(a));
+        }
     }
 
     // Constants
@@ -488,6 +722,9 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     }
 
     let (init, next, fairness) = resolve_spec(&m, &cfg, &mut ex)?;
+    if uses_real_time(&init) || uses_real_time(&next) || fairness.iter().any(uses_real_time) {
+        return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
+    }
 
     let mut g = Gen::new(&atoms, &constants);
     if setcap > 0 {
@@ -594,6 +831,10 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
+        if uses_real_time(&e) {
+            let msg = format!("Error: TLC cannot handle the temporal formula {name} (RTBound / RTnow of RealTime)");
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
+        }
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
         let whole = parts.len() == 1;
