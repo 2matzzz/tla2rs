@@ -1159,6 +1159,22 @@ impl<'a> Gen<'a> {
                         t,
                     )
                 }
+                // Counted without building the set (which could outgrow a sparse set's capacity)
+                ("Cardinality", [s]) if matches!(s.strip(), Call(f, _) if f == "\\X") && self.try_const(s, env).is_none() => {
+                    let Call(_, parts) = s.strip() else { unreachable!() };
+                    let mut codes = vec![];
+                    for p in parts {
+                        let (c, _) = self.gen(&Call("Cardinality".into(), vec![p.clone()]), env, None)?;
+                        codes.push(format!("({c})"));
+                    }
+                    (format!("({})", codes.join(" * ")), Ty::Int(0, BIG))
+                }
+                ("Cardinality", [s]) if matches!(s.strip(), Bin(BOp::Range, ..)) && self.try_const(s, env).is_none() => {
+                    let Bin(_, a, b) = s.strip() else { unreachable!() };
+                    let (ac, (alo, _)) = self.gen_int(a, env)?;
+                    let (bc, (_, bhi)) = self.gen_int(b, env)?;
+                    (format!("(({bc}) - ({ac}) + 1).max(0)"), Ty::Int(0, (bhi as i128 - alo as i128 + 1).clamp(0, BIG as i128) as i64))
+                }
                 ("Cardinality", [s]) if matches!(s.strip(), Un(UOp::Subset, _)) && self.try_const(s, env).is_none() => {
                     let Un(_, x) = s.strip() else { unreachable!() };
                     let (c, t) = self.gen(x, env, None)?;
@@ -1173,11 +1189,19 @@ impl<'a> Gen<'a> {
                     let hi = if is_sparse(&t) { BIG } else { el.size().unwrap_or(0) as i64 };
                     (self.s_card(&c, &t), Ty::Int(0, hi))
                 }
+                // A product of sets from the state, as a value: its tuples collected into a set
                 ("\\X", _) => {
-                    return Err(format!(
-                        "the cartesian product \\X over state-dependent sets is only supported on the right of \\in: {}",
-                        short(e)
-                    ))
+                    let (it, et, ix) = self.iter_of_indexed(e, env)?;
+                    let st = Ty::Set(et.clone().into());
+                    let acc = self.fresh("acc");
+                    let x = self.fresh("x");
+                    let val = match ix {
+                        Some(_) => format!("dec_{}({x})", self.ty_id(&et)?),
+                        None => x.clone(),
+                    };
+                    let add = self.s_add(&acc, &val, &st)?;
+                    let empty = self.s_empty(&st)?;
+                    (format!("{{ let mut {acc} = {empty}; for {x} in {it} {{ {add} }} {acc} }}"), st)
                 }
                 // A string from the state as a sequence of characters: the result for every string
                 // the operand can be is computed here, and looked up at run time
@@ -1878,6 +1902,13 @@ impl<'a> Gen<'a> {
                 let neg = if op == NotIn { "!" } else { "" };
                 (format!("{neg}{{ let {x} = {xc}; {m} }}"), Ty::Bool)
             }
+            // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
+            Subseteq if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int") => {
+                let (ac, at) = self.gen(a, env, None)?;
+                let x = self.fresh("x");
+                let m = self.gen_member(&x, &at, &Expr::Un(UOp::Subset, b.clone().into()), env)?;
+                (format!("{{ let {x} = {ac}; {m} }}"), Ty::Bool)
+            }
             Subseteq => {
                 let (ac, at) = self.gen(a, env, None)?;
                 let (bc, bt) = self.gen(b, env, Some(&at))?;
@@ -1899,7 +1930,16 @@ impl<'a> Gen<'a> {
                 (self.s_bin(op, &ac, &bc, &t), t)
             }
             LeadsTo => return Err("~> in a state expression".into()),
-            Range => return Err("a..b with state-dependent bounds is only supported after \\in or \\E".into()),
+            // a..b with bounds from the state, as a value: a set over the integers both bounds can be
+            Range => {
+                let (ac, (alo, _)) = self.gen_int(a, env)?;
+                let (bc, (_, bhi)) = self.gen_int(b, env)?;
+                let st = Ty::Set(Ty::Int(alo, bhi.max(alo)).into());
+                let acc = self.fresh("acc");
+                let add = self.s_add(&acc, "__k", &st)?;
+                let empty = self.s_empty(&st)?;
+                (format!("{{ let mut {acc} = {empty}; for __k in ({ac})..=({bc}) {{ {add} }} {acc} }}"), st)
+            }
             Add | Sub | Mul | Div | Mod => {
                 let (ac, (alo, ahi)) = self.gen_int(a, env)?;
                 let (bc, (blo, bhi)) = self.gen_int(b, env)?;
@@ -2054,7 +2094,8 @@ impl<'a> Gen<'a> {
                 let e = self.fresh("e");
                 let inner = self.gen_member(&e, et, t, env)?;
                 let it = self.s_iter(x, xt)?;
-                return Ok(format!("{it}.all(|{e}| {inner})"));
+                // Bound first: an iterator borrowing x must not outlive the block x lives in
+                return Ok(format!("{{ let __all = {it}.all(|{e}| {inner}); __all }}"));
             }
             FunSet(d, r) => {
                 let Ty::Fun(dt, ct) = xt else { return Ok("false".into()) };
