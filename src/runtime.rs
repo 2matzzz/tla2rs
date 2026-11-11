@@ -1844,7 +1844,9 @@ fn part_of(fp: Fp, parts: usize) -> usize {
 }
 
 /// Phase 1: generates successors, computes their fingerprints, filters duplicates, checks
-/// invariants, and queues them. Never touches the shared table.
+/// invariants, and queues them. Never writes to the shared table; `tbl` and `prev` (the previous
+/// batch, not inserted yet) are only read when a candidate would stop the search.
+#[allow(clippy::too_many_arguments)]
 fn collect_phase(
     frontier: &[Qitem],
     lo: usize,
@@ -1852,6 +1854,8 @@ fn collect_phase(
     opt: &Opt,
     stop: &std::sync::atomic::AtomicBool,
     parts: usize,
+    tbl: &Table,
+    prev: &[Vec<Vec<Cand>>],
 ) -> Collected {
     use std::sync::atomic::Ordering::Relaxed;
     let mut out = Collected { parts: (0..parts).map(|_| vec![]).collect(), generated: 0, found: None };
@@ -1881,11 +1885,36 @@ fn collect_phase(
                         return Some(SFound::new(*sfp, Some((t, l)), SMsg::Action(name)));
                     }
                 }
-                let Some(tw) = pack(&t) else {
+                // As in `fingerprint_successors`: with a VIEW, a duplicate is dropped before it is
+                // packed.
+                let (tfp, tw) = if HAS_VIEW {
+                    match fresh_fp(&t, Some(&mut mine)) {
+                        Some(Some(fp)) => (fp, pack(&t)),
+                        Some(None) => continue,
+                        None if pack(&t).is_none() => return Some(pack_failed(*sfp, t, l)),
+                        None => type_error("VIEW value", ""),
+                    }
+                } else {
+                    let Some(tw) = pack(&t) else {
+                        return Some(pack_failed(*sfp, t, l));
+                    };
+                    let Some(fp) = fresh_state_fp(&t, &tw, &mut mine) else { continue };
+                    (fp, Some(tw))
+                };
+                let inv = if tw.is_some() { eval_invariants(&t) } else { Ok(None) };
+                // TLC checks only new states. With a VIEW or a SYMMETRY, a state already visited
+                // under the same fingerprint can be a different one, so before stopping, look the
+                // candidate up among the states visited or collected so far.
+                let bad = tw.is_none() || !matches!(inv, Ok(None));
+                if bad && (HAS_VIEW || !PERMS.is_empty()) {
+                    let has = |v: &Vec<Cand>| v.iter().any(|c| c.fp == tfp);
+                    if tbl.contains(tfp) || prev.iter().flatten().any(has) || out.parts.iter().any(has) {
+                        continue;
+                    }
+                }
+                let Some(tw) = tw else {
                     return Some(pack_failed(*sfp, t, l));
                 };
-                let Some(tfp) = fresh_state_fp(&t, &tw, &mut mine) else { continue };
-                let inv = eval_invariants(&t);
                 out.parts[part_of(tfp, parts)].push(Cand { w: tw, fp: tfp, pred: *sfp });
                 // Stop generating once a violating state is found (so we stop at the same count as
                 // the non-batched path). This candidate also goes into the table in phase 3, so the
@@ -2035,12 +2064,13 @@ fn run_safety_batched(opt: &Opt) {
                 done += n;
                 let k = if n < 1024 { 1 } else { opt.workers.min(n) };
                 let per = n.div_ceil(k);
+                let prev: &[Vec<Vec<Cand>>] = pending.as_ref().map_or(&[], |(b, _)| b.as_slice());
                 let collected: Vec<Collected> = std::thread::scope(|sc| {
                     let hs: Vec<_> = (0..k)
                         .map(|i| {
                             let (x, y) = (i * per, ((i + 1) * per).min(n));
-                            let (pt, stop) = (&part, &stop);
-                            sc.spawn(move || collect_phase(pt, x, y, opt, stop, parts))
+                            let (pt, stop, tbl) = (&part, &stop, &tbl);
+                            sc.spawn(move || collect_phase(pt, x, y, opt, stop, parts, tbl, prev))
                         })
                         .collect();
                     hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
@@ -2124,7 +2154,10 @@ fn run_safety_batched(opt: &Opt) {
             }
             // Count after every batch, so that `reserve` for the next batch sees the current total.
             tbl.count_added(added);
-            if found_err.is_some() {
+            // The batch that found the error goes through phases 2 and 3 on the next round, so
+            // that the states collected before it (the error state among them) are counted and in
+            // the table for the trace.
+            if found_err.is_some() && carried.is_none() {
                 break;
             }
             if last.elapsed().as_secs() >= 10 {
