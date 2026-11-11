@@ -37,7 +37,7 @@ impl Len {
 }
 
 /// Longest sequence length tracked; beyond it the lengths are taken not to settle
-const LIMIT: usize = 255;
+const LIMIT: usize = 1024;
 
 struct Walk<'a> {
     vars: &'a [String],

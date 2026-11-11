@@ -3853,7 +3853,7 @@ impl<'a> Gen<'a> {
                 *at = None;
                 let inner = self.unpack_value(e, &mut None)?;
                 format!(
-                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u8; ss }}",
+                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u16; ss }}",
                     Self::default_code(t)
                 )
             }
@@ -4091,7 +4091,7 @@ enum Cmp {
 pub const SQ_RUNTIME: &str = r#"
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Sq<T: Copy + Ord + ConstDefault, const N: usize> {
-    len: u8,
+    len: u16,
     items: [T; N],
 }
 impl<T: Copy + Ord + ConstDefault, const N: usize> ConstDefault for Sq<T, N> {
