@@ -16,6 +16,7 @@ pub struct Cfg {
     pub properties: Vec<String>,
     pub check_deadlock: Option<bool>,
     pub constraints: Vec<String>,
+    pub action_constraints: Vec<String>,
     pub view: Option<String>,
     pub symmetry: Option<String>,
 }
@@ -31,8 +32,8 @@ pub fn parse_cfg(src: &str) -> R<Cfg> {
                     s.as_str(),
                     "SPECIFICATION" | "INIT" | "NEXT" | "CONSTANT" | "CONSTANTS" | "INVARIANT"
                         | "INVARIANTS" | "PROPERTY" | "PROPERTIES" | "CHECK_DEADLOCK" | "SYMMETRY"
-                        | "VIEW" | "CONSTRAINT" | "CONSTRAINTS" | "ACTION_CONSTRAINT" | "ALIAS"
-                        | "POSTCONDITION"
+                        | "VIEW" | "CONSTRAINT" | "CONSTRAINTS" | "ACTION_CONSTRAINT" | "ACTION_CONSTRAINTS"
+                        | "TYPE" | "TYPE_CONSTRAINT" | "ALIAS" | "POSTCONDITION"
                 ) =>
             {
                 Some(s.clone())
@@ -60,6 +61,13 @@ pub fn parse_cfg(src: &str) -> R<Cfg> {
             "PROPERTY" | "PROPERTIES" => c.properties.push(name),
             "CHECK_DEADLOCK" => c.check_deadlock = Some(name == "TRUE"),
             "CONSTRAINT" | "CONSTRAINTS" => c.constraints.push(name),
+            "ACTION_CONSTRAINT" | "ACTION_CONSTRAINTS" => c.action_constraints.push(name),
+            // TLC accepts these and does nothing with them
+            "TYPE" | "TYPE_CONSTRAINT" => {}
+            // Later TLC versions read these; TLC 2.19 does not know them and stops with an error
+            "ALIAS" | "POSTCONDITION" => {
+                return Err(format!("cfg line {}: {section} is not a section TLC 2.19 accepts", toks[i - 1].line))
+            }
             "VIEW" => c.view = Some(name),
             "SYMMETRY" => c.symmetry = Some(name),
             "CONSTANT" | "CONSTANTS" => {
@@ -103,10 +111,8 @@ fn cfg_value(toks: &[crate::lexer::Token], mut i: usize) -> R<(Expr, usize)> {
     i += 1;
     Ok(match t {
         Tok::Num(n) => (Expr::Num(*n), i),
-        Tok::Sym(s) if s == "-" => match &toks[i].tok {
-            Tok::Num(n) => (Expr::Num(-n), i + 1),
-            t => return Err(format!("cfg: bad number {t:?}")),
-        },
+        // TLC accepts only natural numbers here
+        Tok::Sym(s) if s == "-" => return Err("cfg: TLC does not accept a negative number as a constant value".into()),
         Tok::Str(s) => (Expr::Str(s.clone()), i),
         Tok::Ident(s) if s == "TRUE" || s == "FALSE" => (Expr::Bool(s == "TRUE"), i),
         // Model value. Prefixed with `@model:` to keep it distinct from constant names

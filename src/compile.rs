@@ -425,16 +425,33 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     // Temporal properties
     let mut props: Vec<(String, u8, String, String)> = vec![];
     let mut action_props: Vec<(String, String, String)> = vec![];
+    let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
+        let whole = parts.len() == 1;
         for (disp, kind, p, q, env) in parts {
+            // As TLC does, []P for a state predicate P is checked as an invariant while exploring,
+            // and a state predicate on its own only on the initial states. TLC names a part of a
+            // property by its position in the source, which tla2rs does not keep.
+            let part_name = if whole && disp == *name { disp.clone() } else { format!("{disp} (a part)") };
+            if (kind == 4 && !has_enabled(&p)) || kind == 6 {
+                let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
+                if kind == 4 {
+                    let i = inv_list.len() + 1000;
+                    writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {pc} }}").unwrap();
+                    inv_list.push(format!("({part_name:?}, inv_{i} as fn(&State) -> bool)"));
+                } else {
+                    init_props.push((part_name, pc));
+                }
+                continue;
+            }
             if kind == 5 {
                 let env = g.env_step(env);
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 let qc = g.gen_as(&q.unwrap(), &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
-                action_props.push((disp, pc, qc));
+                action_props.push((part_name, pc, qc));
                 continue;
             }
             let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
@@ -452,6 +469,24 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         writeln!(prop_code, "fn aprop_{i}(s: &State, t: &State) -> bool {{ {pc} || {qc} }}").unwrap();
         aprop_list.push(format!("({disp:?}, aprop_{i} as fn(&State, &State) -> bool)"));
     }
+    let mut iprop_list = vec![];
+    for (i, (disp, pc)) in init_props.iter().enumerate() {
+        writeln!(prop_code, "fn iprop_{i}(s: &State) -> bool {{ {pc} }}").unwrap();
+        iprop_list.push(format!("({disp:?}, iprop_{i} as fn(&State) -> bool)"));
+    }
+    // ACTION_CONSTRAINT: like CONSTRAINT, but on the step from a state to its successor
+    let mut acons = vec![];
+    for name in &cfg.action_constraints {
+        let e = ex.expand_def(name)?;
+        let env = g.env_step(Gen::env_next());
+        acons.push(g.gen_as(&e, &env, &Ty::Bool).map_err(|m| format!("action constraint {name}: {m}"))?);
+    }
+    writeln!(
+        prop_code,
+        "#[allow(unused_variables)]\nfn action_constraint(s: &State, t: &State) -> bool {{ {} }}",
+        if acons.is_empty() { "true".into() } else { acons.join(" && ") }
+    )
+    .unwrap();
     // CONSTRAINT: states that violate it are discarded (as in TLC, they are neither counted nor
     // checked against invariants)
     let mut cons = vec![];
@@ -543,6 +578,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     let fair_names: Vec<String> = g.fair.iter().map(|f| format!("{:?}", f.display)).collect();
     writeln!(src, "static FAIR: &[&str] = &[{}];", fair_names.join(", ")).unwrap();
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
+    writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "const LIVENESS: bool = {};", !props.is_empty()).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
@@ -846,6 +882,10 @@ type PropPart = (String, u8, Expr, Option<Expr>, crate::codegen::Env);
 
 /// Splits a property into checkable forms: 0: <>P, 1: []<>P, 2: <>[]P, 3: P ~> Q, 4: []P (state
 /// predicate), 5: [][A]_v.
+fn has_enabled(e: &Expr) -> bool {
+    e.any(&|y| matches!(y, Expr::Un(UOp::Enabled, _)))
+}
+
 fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, out: &mut Vec<PropPart>) -> R<()> {
     use Expr::*;
     let temporal = |x: &Expr| x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..)));
@@ -882,16 +922,22 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
                 Ok(out.push((disp, 3, a.as_ref().clone(), Some(b.as_ref().clone()), cenv)))
             }
             p if !temporal(p) && !p.is_action() => Ok(out.push((disp, 4, p.clone(), None, cenv))),
-            // [][A]_v: every transition is an A step or leaves v unchanged
+            // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since v
+            // need not be a tuple of variables, e.g. under a refinement mapping)
             BoxAction(a, v) if !temporal(a) => {
-                Ok(out.push((disp, 5, a.as_ref().clone(), Some(Un(UOp::Unchanged, v.clone())), cenv)))
+                let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
+                Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), cenv)))
             }
             _ => Err(format!("property {name}: unsupported form {}", short(e))),
         },
         Bin(BOp::LeadsTo, a, b) if !temporal(a) && !temporal(b) => {
             Ok(out.push((disp, 3, a.as_ref().clone(), Some(b.as_ref().clone()), cenv)))
         }
-        _ => Err(format!("property {name}: only <>P, []<>P, <>[]P, P ~> Q and []P are supported ({})", short(e))),
+        // A state predicate: TLC checks it on the initial states
+        p if !temporal(p) && !p.is_action() && !has_enabled(p) && !p.any(&|y| matches!(y, BoxAction(..) | Fair(..))) => {
+            Ok(out.push((disp, 6, p.clone(), None, cenv)))
+        }
+        _ => Err(format!("property {name}: only <>P, []<>P, <>[]P, P ~> Q, []P and state predicates are supported ({})", short(e))),
     }
 }
 
