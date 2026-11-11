@@ -113,6 +113,29 @@ pub fn is_sparse(t: &Ty) -> bool {
 
 pub const SET_BITS: u64 = 128;
 
+/// A function over part of a type (or a bag) whose domain type has at most this many values is an
+/// array over the whole type; over a larger or unbounded type it is sparse
+pub const DENSE_MAX: u64 = 1 << 16;
+
+/// Whether a function over part of a type, or a bag, is sparse: held as the sorted set of its
+/// (key, value) pairs (`fun_pairs`) instead of an array over its whole domain type
+pub fn is_sparse_fun(t: &Ty) -> bool {
+    match t {
+        Ty::PFun(d, _) | Ty::Bag(d) => d.size().is_none_or(|n| n > DENSE_MAX),
+        _ => false,
+    }
+}
+
+/// The type a sparse function or bag is held as: a sparse set of <<key, value>> pairs, which sorts
+/// by key first, so a key's pair is found by binary search (a bag holds only positive counts)
+pub fn fun_pairs(t: &Ty) -> Ty {
+    match t {
+        Ty::PFun(d, c) => Ty::Set(Ty::Rec(vec![(tuple_field(0), d.as_ref().clone()), (tuple_field(1), c.as_ref().clone())]).into()),
+        Ty::Bag(e) => Ty::Set(Ty::Rec(vec![(tuple_field(0), e.as_ref().clone()), (tuple_field(1), Ty::Int(1, BIG))]).into()),
+        _ => unreachable!(),
+    }
+}
+
 /// Number of integers in lo..hi
 fn int_count(lo: i64, hi: i64) -> Option<u64> {
     u64::try_from((hi as i128 - lo as i128 + 1).max(0)).ok()
@@ -207,6 +230,7 @@ impl Ty {
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
             Ty::Set(e) if is_sparse(self) => format!("SSet<{}, SCAP>", e.repr()),
             Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),
+            Ty::Bag(_) | Ty::PFun(..) if is_sparse_fun(self) => fun_pairs(self).repr(),
             Ty::Bag(e) => format!("[i64; {}]", e.size().unwrap_or(0)),
             Ty::PFun(d, c) => format!("[(bool, {}); {}]", c.repr(), d.size().unwrap_or(0)),
             Ty::Set(_) => "u128".into(),
@@ -336,9 +360,9 @@ impl Ty {
             }
             (Ty::Fun(d, c), Value::Tuple(xs)) if seq_domain(d) == Some(xs.len()) => xs.iter().all(|x| c.conforms(x)),
             (Ty::Seq(e), Value::Tuple(xs)) => xs.iter().all(|x| e.conforms(x)),
-            (Ty::PFun(d, c), v) => crate::value::as_fun(v).is_some_and(|m| m.iter().all(|(k, x)| d.enc(k).is_some() && c.conforms(x))),
+            (Ty::PFun(d, c), v) => crate::value::as_fun(v).is_some_and(|m| m.iter().all(|(k, x)| d.conforms(k) && c.conforms(x))),
             (Ty::Bag(e), v) => crate::value::as_fun(v)
-                .is_some_and(|m| m.iter().all(|(k, c)| e.enc(k).is_some() && matches!(c, Value::Int(n) if *n > 0))),
+                .is_some_and(|m| m.iter().all(|(k, c)| e.conforms(k) && matches!(c, Value::Int(n) if *n > 0))),
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
@@ -487,9 +511,9 @@ pub fn ty_of_value(v: &Value) -> R<Ty> {
             match elem_ty_of_domain(&m.keys().cloned().collect()) {
                 Ok(dom) => Ty::Fun(dom.into(), c.into()),
                 // A domain that is only part of a type: a function over part of that type
-                Err(e) => match ty_of_value(&Value::Set(m.keys().cloned().collect()))? {
-                    Ty::Set(k) if k.size().is_some() => Ty::PFun(k, c.into()),
-                    _ => return Err(e),
+                Err(_) => match ty_of_value(&Value::Set(m.keys().cloned().collect()))? {
+                    Ty::Set(k) => Ty::PFun(k, c.into()),
+                    _ => unreachable!(),
                 },
             }
         }
@@ -577,6 +601,9 @@ pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<
             out.into_iter().map(Value::Set).collect()
         }
         Ty::Fun(d, c) | Ty::PFun(d, c) => {
+            if d.size().is_none_or(|n| n > limit as u64) {
+                return None;
+            }
             let keys = d.enumerate();
             let vals = all_values(c, qcap, scap, limit)?;
             let partial = matches!(t, Ty::PFun(..));

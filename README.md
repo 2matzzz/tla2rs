@@ -33,7 +33,8 @@ cargo build --release
 - `-workers N` sets the number of search threads (default: number of CPUs)
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
-- `-setcap N` sets the capacity of sets whose size is only known at run time
+- `-setcap N` sets the capacity of sets whose size is only known at run time, and of the domains of functions and bags
+  over large types (see Limitations)
 - `-seqcap N` sets the maximum length of sequences (at most 65535), when the spec does not bound them with
   `Len(x) <= N` in `TypeOK` or a `CONSTRAINT`, or `UNION {[1..n -> S] : n \in 0..N}`. Otherwise the lengths are
   computed from Init and Next until they stop growing (a length test such as `Len(q) < N` in an action bounds `q`
@@ -61,8 +62,8 @@ not finish.
 2. **Expansion** (`expand.rs`): every operator definition is inlined. Bound variables are renamed to avoid capture,
    and each call site keeps a trace (name and arguments)
 3. **Types** (`types.rs`): a finite type per variable, taken from `x \in S` / `x \subseteq S` in `TypeOK`.
-   Strings and model values become `u16`, integers `i64`, records and tuples Rust tuples, functions arrays, and sets
-   `u128` bitmasks
+   Strings and model values become `u16`, integers `i64`, records and tuples Rust tuples, functions arrays (or sorted
+   (key, value) pairs over a large domain type), and sets `u128` bitmasks
 4. **Code generation** (`codegen.rs`): constant subexpressions are evaluated at compile time and become literals.
    Actions are generated in continuation-passing style, threading "the remaining conjuncts" through; every `\/`,
    `\E`, and `IF` becomes a branch, and `x' = e` becomes a `let`
@@ -96,7 +97,7 @@ memory.
 
 | | |
 |---|---|
-| Expressions | logic, arithmetic (`+ - * \div % ^`), comparison, sequences (`Seq`, `Len`, `Append`, `Head`, `Tail`, `SubSeq`, `SelectSeq`, `\o`, indexing, a tuple and a function over 1..n being the same value), sets of sets and of functions as values, `IF` / `CASE` / `LET`, `\E` / `\A` (also `<<x, y>> \in S`), `CHOOSE` (also over sets in the state, picking what TLC picks), `RECURSIVE` operators (also with `ENABLED` inside) and recursive function definitions, operator parameters and `LAMBDA`, infix operators defined by the spec (`a \oplus b == ...`), `Assert` / `Print` / `PrintT` / `:>` / `@@` from TLC, `UNION`, `SUBSET` and `\X` of sets in the state, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, also with `<<a, b>> \in S` among them, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a` or `r["a"]`, `[a : S]`, `!.a`), labels (`l :: e`), numbers in base 2, 8 and 16 (`\b101`, `\o17`, `\hFF`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
+| Expressions | logic, arithmetic (`+ - * \div % ^`), comparison, sequences (`Seq`, `Len`, `Append`, `Head`, `Tail`, `SubSeq`, `SelectSeq`, `\o`, indexing, a tuple and a function over 1..n being the same value), sets of sets and of functions as values, `IF` / `CASE` / `LET`, `\E` / `\A` (also `<<x, y>> \in S`), `CHOOSE` (also over sets in the state, picking what TLC picks), `RECURSIVE` operators (also with `ENABLED` inside) and recursive function definitions, operator parameters and `LAMBDA`, infix operators defined by the spec (`a \oplus b == ...`), `Assert` / `Print` / `PrintT` / `:>` / `@@` from TLC, `UNION`, `SUBSET` and `\X` of sets in the state, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, also with `<<a, b>> \in S` among them, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`; a function over Nat, Int, STRING, `Seq(S)` or a set of more than 65536 elements, such as `[n \in Nat \|-> 2 * n][k]`, is evaluated only where it is applied, as TLC does), records (`[a \|-> 1]`, `r.a` or `r["a"]`, `[a : S]`, `!.a`), labels (`l :: e`), numbers in base 2, 8 and 16 (`\b101`, `\o17`, `\hFF`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
 | Actions | `x' = e`, `x' \in S`, `UNCHANGED` (of any expression), action-level `\/` `\E` `IF` `CASE`, `\A` over a constant set, `[A]_v`, recursive operators called with constant arguments, guards that read an already assigned `x'`, `ENABLED` (also in Init) |
 | Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`, split as TLC splits it: through conjunctions and definitions without arguments, also of an instance; its other temporal conjuncts, such as `[]P`, are not checked, but temporal properties are checked under them, as in TLC) or `INIT` / `NEXT`. `CONSTANT` values may be model values, natural numbers, strings, booleans, or sets of them, nested to any depth (as in TLC). A model value may share a type with integers (`1..4 \cup {None}`), and arithmetic on such a value is an evaluation error only when it is a model value; a variable may also hold an integer or a string, and comparing the two is an evaluation error, as in TLC. `Name <- Def` substitutes a definition (also from a module that EXTENDS the spec, such as an MC.tla) for a constant, and `<-` / `=` on a defined name replace that definition. `ASSUME` is checked. `INSTANCE` (unnamed, `LOCAL`, `N(p) == INSTANCE M WITH x <- e` used as `N!Op`, also with operator parameters, inside LET, of standard modules as in `S!Len`, and with operator symbols in `WITH`). `EXTENDS RealTime` gives the variable `now`; RTnow and RTBound are treated as TLC treats them (not checked in SPECIFICATION, refused once there is a temporal property), and `Real` is the string `"Reals"`, so using it as a set is an evaluation error. `ASSUME` and `THEOREM` may name their formula (`ASSUME A == ...`). Theorems, proofs, `USE` / `HIDE` are skipped, as TLC does |
 | Properties | `INVARIANT` (may use `ENABLED`). `PROPERTY` takes temporal formulas built from state predicates, `ENABLED A`, action predicates (`<<A>>_v`, `[A]_v`), `[]`, `<>`, `~>`, `/\ \/ ~ =>`, `IF`, `WF` / `SF`, and `\A` / `\E` over constant sets (also of records). As in TLC, `[]P` for a state predicate P is checked as an invariant, `[][A]_v` while exploring, and a state predicate on the initial states. Formulas TLC refuses (SANY's level rules, an action not in the form `<>[]A` or `[]<>A`, `<=>` between temporal formulas, a quantifier over a non-constant set) are refused with TLC's message and exit code |
@@ -123,8 +124,15 @@ memory.
   (65536 strings and model values in all). ToString of a record whose fields the spec writes in another order than
   TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends
   on when that happens
-- A function over part of a type (and a bag) is an array over the whole type, so that type must be enumerable and
-  have at most 65536 values; a tuple literal has at most 99,999 elements (each is a field of the generated type)
+- A function over part of a type (and a bag) is an array over the whole type when the type has at most 65536 values.
+  Over a larger or unbounded type (Nat, a large integer range, sets, records of those) it is the sorted list of its
+  (key, value) pairs, which holds at most `-setcap` keys (`Cardinality(DOMAIN f) <= K` in `TypeOK` raises that bound);
+  more keys are an evaluation error. A tuple literal has at most 99,999 elements (each is a field of the generated
+  type)
+- A function over a set that cannot be enumerated (Nat, Int, STRING, `Seq(S)`) is supported only applied to an argument
+  (also after EXCEPT with one index per update) or in `x \in DOMAIN f`, where TLC evaluates it without enumerating its
+  domain. Used as a value (assigned to a variable, compared, printed, passed to `ToString`) it is refused: TLC stops
+  with an error on most such uses, and prints its source text for `ToString`
 - Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC

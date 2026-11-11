@@ -463,6 +463,47 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
     }
 }
 
+/// A function over part of a large type (or a bag over one), held as the set of its (key, value)
+/// pairs. The pairs sort by key first and no two share a key, so a key is found by binary search.
+impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize> SSet<(K, V), N> {
+    #[inline]
+    fn find(&self, k: &K) -> Result<usize, usize> {
+        self.slice().binary_search_by(|p| p.0.cmp(k))
+    }
+    #[inline]
+    fn get(&self, k: &K) -> Option<V> {
+        self.find(k).ok().map(|i| self.items[i].1)
+    }
+    #[inline]
+    fn put(&mut self, k: K, v: V) {
+        match self.find(&k) {
+            Ok(i) => self.items[i].1 = v,
+            Err(i) => {
+                let n = self.len as usize;
+                if n == N {
+                    eval_error(format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
+                }
+                self.items.copy_within(i..n, i + 1);
+                self.items[i] = (k, v);
+                self.len += 1;
+            }
+        }
+    }
+    fn with_put(mut self, k: K, v: V) -> Self {
+        self.put(k, v);
+        self
+    }
+    #[inline]
+    fn del(&mut self, k: &K) {
+        if let Ok(i) = self.find(k) {
+            let n = self.len as usize;
+            self.items.copy_within(i + 1..n, i);
+            self.items[n - 1] = <(K, V)>::DEFAULT;
+            self.len -= 1;
+        }
+    }
+}
+
 #[cold]
 fn type_error(what: &str, v: &str) -> ! {
     std::panic::panic_any(EvalErr::Type(format!("{what} {v} is outside the type declared in TypeOK")))

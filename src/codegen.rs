@@ -56,6 +56,8 @@ pub struct Gen<'a> {
     pub qcap: usize,
     /// During type inference, collects the types of assigned values
     pub infer: Option<HashMap<String, Ty>>,
+    /// During type inference, the first error met computing a value assigned to each variable
+    pub infer_errs: HashMap<String, String>,
     /// Rust functions for recursive operators, per (RecDef index, argument types): name and return
     /// type once settled
     rec_done: HashMap<(usize, Vec<Ty>), (String, Ty)>,
@@ -87,6 +89,7 @@ impl<'a> Gen<'a> {
             scap: 8,
             qcap: 0,
             infer: None,
+            infer_errs: HashMap::new(),
             rec_done: HashMap::new(),
             rec_progress: vec![],
             rec_names: HashMap::new(),
@@ -120,20 +123,19 @@ impl<'a> Gen<'a> {
                 }
                 self.ty_id(e)?;
             }
-            Ty::PFun(d, c) => {
-                let n = d.size().ok_or("a function over part of a type that is not enumerable is not supported")?;
-                if n > 1 << 16 {
-                    return Err(format!("a function over part of a type of {n} values is not supported (give the domain a smaller type in TypeOK)"));
+            // Over a large or unbounded type: the set of its (key, value) pairs
+            Ty::PFun(_, c) | Ty::Bag(c) if is_sparse_fun(t) => {
+                if matches!(t, Ty::PFun(..)) && c.size() == Some(0) {
+                    return Err("a function over part of a large type whose values have no type yet".into());
                 }
+                self.ty_id(&fun_pairs(t))?;
+            }
+            Ty::PFun(d, c) => {
                 self.ty_id(d)?;
                 self.ty_id(c)?;
                 self.ty_id(&pfun_repr(d, c))?;
             }
             Ty::Bag(e) => {
-                let n = e.size().ok_or("a bag of elements of a type that is not enumerable is not supported")?;
-                if n > 1 << 16 {
-                    return Err(format!("a bag over a type of {n} values is not supported (give the elements a smaller type in TypeOK)"));
-                }
                 self.ty_id(e)?;
                 self.ty_id(&bag_fun(e))?;
             }
@@ -442,6 +444,13 @@ impl<'a> Gen<'a> {
         let Some(dv) = self.try_const(d, env) else {
             // D from the state: compare it with the domain of x, then test the values
             let (dom_c, dom_t, vals) = match xt {
+                Ty::PFun(dt, _) | Ty::Bag(dt) if is_sparse_fun(xt) => {
+                    let st = Ty::Set(dt.clone());
+                    let empty = self.s_empty(&st)?;
+                    let add = self.s_add("__s", "__k", &st)?;
+                    let v = in_r(self, "__v", &fun_kv(xt).1)?;
+                    (format!("{{ let mut __s = {empty}; for (__k, _) in ({x}).iter() {{ {add} }} __s }}"), st, format!("({x}).iter().all(|(_, __v)| {v})"))
+                }
                 Ty::Fun(dt, ct) => {
                     let st = Ty::Set(dt.clone());
                     let all = Value::Set(dt.enumerate().into_iter().collect());
@@ -504,6 +513,15 @@ impl<'a> Gen<'a> {
                 }
                 let all = in_r(self, "__v", ct)?;
                 format!("{x}.iter().all(|&__v| {all})")
+            }
+            // A sparse one: as many keys as D has elements, each in D
+            Ty::PFun(dt, _) | Ty::Bag(dt) if is_sparse_fun(xt) => {
+                if dom.len() > self.scap || dom.iter().any(|k| !dt.conforms(k)) {
+                    return Ok("false".into());
+                }
+                let dl = self.lit(&Value::Set(dom.clone()), &Ty::Set(dt.clone()))?;
+                let all = in_r(self, "__v", &fun_kv(xt).1)?;
+                format!("{{ let __d = {dl}; ({x}).len as usize == {} && ({x}).iter().all(|(__k, __v)| __d.contains(&__k) && {all}) }}", dom.len())
             }
             // Present keys must be exactly the domain
             Ty::PFun(dt, _) | Ty::Bag(dt) => {
@@ -593,8 +611,12 @@ impl<'a> Gen<'a> {
     fn bag_domain(&mut self, b: &Expr, env: &Env) -> R<(String, Ty)> {
         let (bc, e) = self.bag_of(b, env, None)?;
         let st = Ty::Set(e.clone().into());
-        let eid = self.ty_id(&e)?;
         let empty = self.s_empty(&st)?;
+        if is_sparse_fun(&Ty::Bag(e.clone().into())) {
+            let add = self.s_add("__s", "__k", &st)?;
+            return Ok((format!("{{ let __b = {bc}; let mut __s = {empty}; for (__k, _) in __b.iter() {{ {add} }} __s }}"), st));
+        }
+        let eid = self.ty_id(&e)?;
         let add = self.s_add("__s", &format!("dec_{eid}(__i as u64)"), &st)?;
         Ok((format!("{{ let __b = {bc}; let mut __s = {empty}; for __i in 0..__b.len() {{ if __b[__i] > 0 {{ {add} }} }} __s }}"), st))
     }
@@ -963,7 +985,7 @@ impl<'a> Gen<'a> {
         for p in path {
             cur = match (p, &cur) {
                 (Path::Field(k), _) if k.starts_with('@') => continue,
-                (Path::Idx(_), Ty::Fun(_, c)) => c.as_ref().clone(),
+                (Path::Idx(_), Ty::Fun(_, c) | Ty::PFun(_, c)) => c.as_ref().clone(),
                 (Path::Idx(_), Ty::Seq(e)) => e.as_ref().clone(),
                 (Path::Field(k), Ty::Rec(fs)) => match &fs.iter().find(|(n, _)| n == k)?.1 {
                     Ty::Opt(i) => i.as_ref().clone(),
@@ -981,6 +1003,7 @@ impl<'a> Gen<'a> {
         match (p, t) {
             (Path::Field(k), _) if k.starts_with('@') => Self::set_path_type(t, rest, new),
             (Path::Idx(_), Ty::Fun(d, c)) => Ty::Fun(d.clone(), Self::set_path_type(c, rest, new).into()),
+            (Path::Idx(_), Ty::PFun(d, c)) => Ty::PFun(d.clone(), Self::set_path_type(c, rest, new).into()),
             (Path::Idx(_), Ty::Seq(e)) => Ty::Seq(Self::set_path_type(e, rest, new).into()),
             (Path::Field(k), Ty::Rec(fs)) => Ty::Rec(
                 fs.iter()
@@ -1016,6 +1039,125 @@ impl<'a> Gen<'a> {
     fn s_add(&mut self, acc: &str, x: &str, st: &Ty) -> R<String> {
         let eid = self.ty_id(&Self::elem_of(st))?;
         Ok(if is_sparse(st) { format!("{acc}.insert({x});") } else { format!("{acc} |= bit_{eid}({x});") })
+    }
+
+    /// Statement setting the value at key `k` of `acc`, a function over part of a type or a bag of
+    /// type `ft` (a count of 0 takes the element out of a bag). `k` is in the key type's
+    /// representation.
+    fn fun_put(&mut self, acc: &str, k: &str, v: &str, ft: &Ty) -> R<String> {
+        let (kt, _) = fun_kv(ft);
+        Ok(match ft {
+            Ty::PFun(..) if is_sparse_fun(ft) => format!("{acc}.put({k}, {v});"),
+            Ty::Bag(_) if is_sparse_fun(ft) => format!("{{ let (__k, __n): (_, i64) = ({k}, {v}); if __n > 0 {{ {acc}.put(__k, __n); }} else {{ {acc}.del(&__k); }} }}"),
+            Ty::PFun(..) => format!("{acc}[idx_{}({k})] = (true, {v});", self.ty_id(&kt)?),
+            _ => format!("{acc}[idx_{}({k})] = {v};", self.ty_id(&kt)?),
+        })
+    }
+
+    /// The count of `k` in the bag `b` (a place) of type `bt`: 0 when it is not in it
+    fn bag_count(&mut self, b: &str, k: &str, bt: &Ty) -> R<String> {
+        if is_sparse_fun(bt) {
+            return Ok(format!("{b}.get(&{k}).unwrap_or(0)"));
+        }
+        let eid = self.ty_id(&fun_kv(bt).0)?;
+        Ok(format!("{{ let __i = enc_{eid}({k}); if __i == u64::MAX {{ 0 }} else {{ {b}[__i as usize] }} }}"))
+    }
+
+    /// An iterator over the (key, value) entries of `f` (a place), a function over part of a type
+    /// or a bag of type `ft`. With `ordered`, in TLC's order of the keys (a sparse one is sorted
+    /// by the Rust order of its keys, which differs for some key types).
+    fn fun_iter(&mut self, f: &str, ft: &Ty, ordered: bool) -> R<String> {
+        let (kt, vt) = fun_kv(ft);
+        if is_sparse_fun(ft) {
+            if ordered && needs_tlc_order(&kt) {
+                let cmp = self.tlc_cmp(&kt, "(&__x.0)", "(&__y.0)")?;
+                return Ok(format!(
+                    "{{ let mut __v: Vec<({}, {})> = ({f}).iter().collect(); __v.sort_by(|__x, __y| {cmp}); __v }}.into_iter()",
+                    kt.repr(),
+                    vt.repr()
+                ));
+            }
+            return Ok(format!("({f}).iter()"));
+        }
+        let kid = self.ty_id(&kt)?;
+        Ok(match ft {
+            Ty::PFun(..) => format!("({f}).iter().enumerate().filter(|(_, __p)| __p.0).map(|(__i, __p)| (dec_{kid}(__i as u64), __p.1))"),
+            _ => format!("({f}).iter().enumerate().filter(|(_, __c)| **__c > 0).map(|(__i, __c)| (dec_{kid}(__i as u64), *__c))"),
+        })
+    }
+
+    /// Whether `[x \in S |-> e]` over this S is evaluated only where it is applied, as TLC does: S
+    /// cannot be enumerated (Nat, Int, STRING, Seq(T), or a product with one of them) or has more
+    /// elements than a function over part of a type is held as an array for
+    fn lazy_domain(&self, s: &Expr, env: &Env) -> bool {
+        match s.strip() {
+            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) => {
+                !env.locals.contains_key(n) && !self.is_var(n) && !self.ce.constants.contains_key(n)
+            }
+            Expr::Call(f, a) if f == "Seq" && a.len() == 1 => true,
+            Expr::Call(f, parts) if f == "\\X" => parts.iter().any(|p| self.lazy_domain(p, env)),
+            s => matches!(self.try_const(s, env), Some(Value::Set(v)) if v.len() as u64 > DENSE_MAX),
+        }
+    }
+
+    /// The domain of `f` when it is a function evaluated only where it is applied (see
+    /// `lazy_domain`), possibly with EXCEPT
+    fn lazy_fun_domain<'e>(&self, f: &'e Expr, env: &Env) -> Option<&'e Expr> {
+        match f.strip() {
+            Expr::FunCons(_, s, _) if self.lazy_domain(s, env) => Some(s),
+            Expr::Except(b, _) => self.lazy_fun_domain(b, env),
+            _ => None,
+        }
+    }
+
+    /// `f[k]` for a function `f` evaluated only where it is applied (`lazy_fun_domain`), with `k`
+    /// held in the variable `kc` of type `kt`. As in TLC, the argument must be in the domain, and
+    /// EXCEPT replaces the value at its keys.
+    fn lazy_apply(&mut self, f: &Expr, kc: &str, kt: &Ty, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
+        match f.strip() {
+            Expr::FunCons(v, s, body) => {
+                let mem = self.gen_member(kc, kt, s, env)?;
+                let mut env2 = env.clone();
+                env2.locals.insert(v.clone(), (kc.to_string(), kt.clone()));
+                env2.idx.remove(v);
+                let (bc, bt) = self.gen(body, &env2, want)?;
+                let tid = self.ty_id(kt)?;
+                let msg = format!("In applying the function\n{},\nthe first argument is:\n{{}}\nwhich is not in its domain.", lazy_fun_text(v, s));
+                Ok((format!("{{ if !({mem}) {{ eval_error(format!({msg:?}, fmt_{tid}(&{kc}))) }} {bc} }}"), bt))
+            }
+            Expr::Except(base, ups) => {
+                let Some(((path, val), rest)) = ups.split_last() else { return self.lazy_apply(base, kc, kt, env, want) };
+                let prev = Expr::Except(base.clone(), rest.to_vec());
+                let at_name = path.iter().find_map(|p| match p {
+                    Path::Field(n) if n.starts_with('@') => Some(n.clone()),
+                    _ => None,
+                });
+                let steps: Vec<&Path> = path.iter().filter(|p| !matches!(p, Path::Field(n) if n.starts_with('@'))).collect();
+                let [Path::Idx(a)] = steps.as_slice() else {
+                    return Err(format!("EXCEPT with a path of more than one index on a function over a set that cannot be enumerated: {}", short(f)));
+                };
+                let (ac, at) = self.gen(a, env, Some(kt))?;
+                let av = self.fresh("a");
+                // @ is the value before this update at the key it replaces
+                let (pa, pat) = self.lazy_apply(&prev, &av, &at, env, want)?;
+                let mut env2 = env.clone();
+                env2.locals.insert("@".into(), (pa.clone(), pat.clone()));
+                if let Some(n) = at_name {
+                    env2.locals.insert(n, (pa, pat.clone()));
+                }
+                let (vc, vt) = self.gen(val, &env2, want.or(Some(&pat)))?;
+                let (pc, pt) = self.lazy_apply(&prev, kc, kt, env, want)?;
+                let j = join(kt, &at)?;
+                // A key outside the domain leaves the function unchanged, as in TLC
+                let dom = self.lazy_fun_domain(f, env).unwrap().clone();
+                let in_dom = self.gen_member(&av, &at, &dom, env)?;
+                let same = format!("{} == {} && {in_dom}", self.coerce(kc.to_string(), kt, &j)?, self.coerce(av.clone(), &at, &j)?);
+                let t = Self::layout(want, join(&vt, &pt)?);
+                let (vc, pc) = (self.coerce(vc, &vt, &t)?, self.coerce(pc, &pt, &t)?);
+                Ok((format!("{{ let {av} = {ac}; if {same} {{ {vc} }} else {{ {pc} }} }}"), t))
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// The subsets of the set `c` of type `st`, in TLC's order: by size, then by their elements in
@@ -1059,6 +1201,21 @@ impl<'a> Gen<'a> {
     fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
         Ok(match t {
             Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            // A sparse function or bag: its pairs sort by key, so the Rust order of the set of pairs
+            // is TLC's (by the size of the domain, then key and value pair by pair) when it is so
+            // for keys and values
+            Ty::PFun(..) | Ty::Bag(_) if is_sparse_fun(t) => {
+                let (kt, vt) = fun_kv(t);
+                if !needs_tlc_order(&kt) && !needs_tlc_order(&vt) {
+                    return Ok(format!("{a}.cmp({b})"));
+                }
+                let kc = self.tlc_cmp(&kt, "(&__p.0)", "(&__q.0)")?;
+                let vc = self.tlc_cmp(&vt, "(&__p.1)", "(&__q.1)")?;
+                let (ix, iy) = (self.fun_iter("__x", t, true)?, self.fun_iter("__y", t, true)?);
+                format!(
+                    "{{ let (__x, __y) = ({a}, {b}); __x.len.cmp(&__y.len).then_with(|| {ix}.zip({iy}).map(|(__p, __q)| {kc}.then_with(|| {vc})).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
+                )
+            }
             // A function over part of a type, as TLC compares functions: by the size of the
             // domain, then key and value pair by pair
             Ty::PFun(_, c) => {
@@ -1187,6 +1344,7 @@ impl<'a> Gen<'a> {
     /// Default value of a type (used for omitted fields and unused SSet slots)
     fn default_code(t: &Ty) -> String {
         match t {
+            Ty::Bag(_) | Ty::PFun(..) if is_sparse_fun(t) => Self::default_code(&fun_pairs(t)),
             Ty::Bag(e) => format!("[0i64; {}]", e.size().unwrap_or(0)),
             Ty::PFun(d, c) => Self::default_code(&pfun_repr(d, c)),
             Ty::Bool => "false".into(),
@@ -1209,6 +1367,15 @@ impl<'a> Gen<'a> {
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
             (Value::Atom(a), _) => format!("{a}u16"),
+            (v, Ty::PFun(..) | Ty::Bag(_)) if is_sparse_fun(t) && crate::value::as_fun(v).is_some() => {
+                self.ty_id(t)?;
+                let (kt, vt) = fun_kv(t);
+                let mut code = Self::default_code(t);
+                for (k, x) in crate::value::as_fun(v).unwrap() {
+                    code = format!("{code}.with_put({}, {})", self.lit(&k, &kt)?, self.lit(&x, &vt)?);
+                }
+                code
+            }
             (v, Ty::PFun(d, c)) if crate::value::as_fun(v).is_some() => {
                 self.ty_id(t)?;
                 let m = crate::value::as_fun(v).unwrap();
@@ -1400,6 +1567,36 @@ impl<'a> Gen<'a> {
             }
             (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..) | Ty::Seq(_)) if x.is_empty() => Err("empty enum".into()),
             (Ty::Rec(fs), Ty::Bag(_) | Ty::PFun(..)) if fs.is_empty() => Ok(Self::default_code(to)),
+            // To or from a sparse function or bag: entry by entry
+            (Ty::Fun(..) | Ty::PFun(..), Ty::PFun(..)) | (Ty::Bag(_), Ty::Bag(_)) if is_sparse_fun(from) || is_sparse_fun(to) => {
+                let (f, o) = (self.fresh("f"), self.fresh("o"));
+                let (it, fk, fv) = match from {
+                    Ty::Fun(d, c) => {
+                        let did = self.ty_id(d)?;
+                        (format!("{f}.iter().enumerate().map(|(__i, &__v)| (dec_{did}(__i as u64), __v))"), d.as_ref().clone(), c.as_ref().clone())
+                    }
+                    _ => {
+                        let (fk, fv) = fun_kv(from);
+                        (self.fun_iter(&f, from, false)?, fk, fv)
+                    }
+                };
+                let (tk, tv) = fun_kv(to);
+                let kc = self.coerce("__k".into(), &fk, &tk)?;
+                let vc = self.coerce("__v".into(), &fv, &tv)?;
+                let put = self.fun_put(&o, &kc, &vc, to)?;
+                Ok(format!("{{ let {f} = {code}; let mut {o} = {}; for (__k, __v) in {it} {{ {put} }} {o} }}", Self::default_code(to)))
+            }
+            (Ty::Rec(fs), Ty::Bag(e)) if is_tuple_fields(fs) && is_sparse_fun(to) => {
+                let r = self.fresh("r");
+                let mut s = format!("{{ let {r} = {code}; let mut __o = {}; ", Self::default_code(to));
+                for (k, (_, ft)) in fs.iter().enumerate() {
+                    let n = k as i64 + 1;
+                    let kc = self.coerce(format!("{n}i64"), &Ty::Int(n, n), e)?;
+                    let vc = self.coerce(format!("{r}{}", rec_field(fs.len(), k)), ft, &Ty::Int(-BIG, BIG))?;
+                    s += &self.fun_put("__o", &kc, &vc, to)?;
+                }
+                Ok(s + "__o }")
+            }
             // A function over all of a type as one over part of it, and between partial functions
             (Ty::Fun(d1, c1), Ty::PFun(d2, c2)) if d1 != d2 => {
                 let mid = Ty::PFun(d1.clone(), c2.clone());
@@ -1694,8 +1891,8 @@ impl<'a> Gen<'a> {
                     let (vc, vt) = self.gen(v, env, None)?;
                     let ft = Ty::PFun(dt.clone().into(), vt.into());
                     self.ty_id(&ft)?;
-                    let did = self.ty_id(&dt)?;
-                    (format!("{{ let mut __o = {}; __o[idx_{did}({dc})] = (true, {vc}); __o }}", Self::default_code(&ft)), ft)
+                    let put = self.fun_put("__o", &dc, &vc, &ft)?;
+                    (format!("{{ let mut __o = {}; {put} __o }}", Self::default_code(&ft)), ft)
                 }
                 // f @@ g: f where it is defined, g elsewhere
                 ("@@", [a, b]) => {
@@ -1706,6 +1903,9 @@ impl<'a> Gen<'a> {
                     let ft = Ty::PFun(join(&ad, &bd)?.into(), join(&acod, &bcod)?.into());
                     let ac = self.coerce(ac, &at, &ft)?;
                     let bc = self.coerce(bc, &bt, &ft)?;
+                    if is_sparse_fun(&ft) {
+                        return Ok((format!("{{ let (mut __a, __b) = ({ac}, {bc}); for (__k, __v) in __b.iter() {{ if __a.get(&__k).is_none() {{ __a.put(__k, __v); }} }} __a }}"), ft));
+                    }
                     (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for __i in 0..__a.len() {{ if !__a[__i].0 {{ __a[__i] = __b[__i]; }} }} __a }}"), ft)
                 }
                 // Permutations of a set from the state: every bijection of it onto itself
@@ -1714,14 +1914,14 @@ impl<'a> Gen<'a> {
                     let Ty::Set(et) = &t else { return Err("Permutations of a non-set".into()) };
                     let ft = Ty::PFun(et.clone(), et.clone());
                     let st = Ty::Set(ft.clone().into());
-                    let eid = self.ty_id(et)?;
                     let it = self.s_iter(&c, &t)?;
                     let empty = self.s_empty(&st)?;
                     let add = self.s_add("__s", "__f", &st)?;
+                    let put = self.fun_put("__f", "__e[__k]", "__e[__p[__k]]", &ft)?;
                     (
                         format!(
                             "{{ let __e: Vec<{}> = {it}.collect(); let mut __s = {empty}; let mut __p: Vec<usize> = (0..__e.len()).collect(); \
-                             loop {{ let mut __f = {}; for __k in 0..__e.len() {{ __f[idx_{eid}(__e[__k])] = (true, __e[__p[__k]]); }} {add} \
+                             loop {{ let mut __f = {}; for __k in 0..__e.len() {{ {put} }} {add} \
                              let mut __k = __p.len(); while __k > 1 && __p[__k - 2] >= __p[__k - 1] {{ __k -= 1; }} if __k <= 1 {{ break; }} \
                              let mut __l = __p.len() - 1; while __p[__l] <= __p[__k - 2] {{ __l -= 1; }} __p.swap(__k - 2, __l); __p[__k - 1..].reverse(); }} __s }}",
                             et.repr(),
@@ -1761,16 +1961,16 @@ impl<'a> Gen<'a> {
                     let Ty::Set(e) = &t else { return Err("SetToBag of a non-set".into()) };
                     let bt = Ty::Bag(e.clone());
                     self.ty_id(&bt)?;
-                    let eid = self.ty_id(e)?;
                     let it = self.s_iter(&c, &t)?;
-                    (format!("{{ let mut __b = {}; for __x in {it} {{ __b[idx_{eid}(__x)] = 1; }} __b }}", Self::default_code(&bt)), bt)
+                    let put = self.fun_put("__b", "__x", "1", &bt)?;
+                    (format!("{{ let mut __b = {}; for __x in {it} {{ {put} }} __b }}", Self::default_code(&bt)), bt)
                 }
                 ("BagToSet", [b]) => self.bag_domain(b, env)?,
                 ("BagIn" | "CopiesIn", [x, b]) => {
                     let (bc, e) = self.bag_of(b, env, None)?;
-                    let eid = self.ty_id(&e)?;
                     let xc = self.gen_as(x, env, &e)?;
-                    let get = format!("{{ let __b = {bc}; let __i = enc_{eid}({xc}); if __i == u64::MAX {{ 0 }} else {{ __b[__i as usize] }} }}");
+                    let count = self.bag_count("__b", "__x", &Ty::Bag(e.into()))?;
+                    let get = format!("{{ let __b = {bc}; let __x = {xc}; {count} }}");
                     if f == "BagIn" {
                         (format!("({get} > 0)"), Ty::Bool)
                     } else {
@@ -1785,6 +1985,16 @@ impl<'a> Gen<'a> {
                     let (bc, _) = self.bag_of(b, env, Some(&e))?;
                     let bt = Ty::Bag(e.into());
                     self.ty_id(&bt)?;
+                    if is_sparse_fun(&bt) {
+                        return Ok(match f.as_str() {
+                            "\\oplus" => (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for (__k, __c) in __b.iter() {{ let __n = __a.get(&__k).unwrap_or(0) + __c; __a.put(__k, __n); }} __a }}"), bt),
+                            "\\ominus" => (
+                                format!("{{ let (mut __a, __b) = ({ac}, {bc}); for (__k, __c) in __b.iter() {{ let __n = __a.get(&__k).unwrap_or(0) - __c; if __n > 0 {{ __a.put(__k, __n); }} else {{ __a.del(&__k); }} }} __a }}"),
+                                bt,
+                            ),
+                            _ => (format!("{{ let (__a, __b) = ({ac}, {bc}); let __le = __a.iter().all(|(__k, __c)| __c <= __b.get(&__k).unwrap_or(0)); __le }}"), Ty::Bool),
+                        });
+                    }
                     match f.as_str() {
                         "\\oplus" => (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for __i in 0..__a.len() {{ __a[__i] += __b[__i]; }} __a }}"), bt),
                         "\\ominus" => (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for __i in 0..__a.len() {{ __a[__i] = (__a[__i] - __b[__i]).max(0); }} __a }}"), bt),
@@ -1815,7 +2025,10 @@ impl<'a> Gen<'a> {
                     (format!("{{ let __b = {c}; let _ = &__b; let __r: bool = {test}; __r }}"), Ty::Bool)
                 }
                 ("BagCardinality", [b]) => {
-                    let (bc, _) = self.bag_of(b, env, None)?;
+                    let (bc, e) = self.bag_of(b, env, None)?;
+                    if is_sparse_fun(&Ty::Bag(e.into())) {
+                        return Ok((format!("{{ let __b = {bc}; let __n: i64 = __b.iter().map(|(_, __c)| __c).sum(); __n }}"), Ty::Int(0, BIG)));
+                    }
                     (format!("{{ let __b = {bc}; let __n: i64 = __b.iter().sum(); __n }}"), Ty::Int(0, BIG))
                 }
                 ("BagUnion", [s]) => {
@@ -1823,6 +2036,12 @@ impl<'a> Gen<'a> {
                     let Ty::Set(bt) = &t else { return Err("BagUnion of a non-set".into()) };
                     let Ty::Bag(_) = bt.as_ref() else { return Err("BagUnion of a set of values that are not bags".into()) };
                     let it = self.s_iter(&c, &t)?;
+                    if is_sparse_fun(bt) {
+                        return Ok((
+                            format!("{{ let mut __a = {}; for __b in {it} {{ for (__k, __c) in __b.iter() {{ let __n = __a.get(&__k).unwrap_or(0) + __c; __a.put(__k, __n); }} }} __a }}", Self::default_code(bt)),
+                            bt.as_ref().clone(),
+                        ));
+                    }
                     (format!("{{ let mut __a = {}; for __b in {it} {{ for __i in 0..__a.len() {{ __a[__i] += __b[__i]; }} }} __a }}", Self::default_code(bt)), bt.as_ref().clone())
                 }
                 ("BagOfAll", [Lambda(ps, body), b]) if ps.len() == 1 => {
@@ -1838,6 +2057,13 @@ impl<'a> Gen<'a> {
                     if let Some(msg) = crate::value::bag_of_all_literal(self.atoms, body) {
                         return Ok((format!("{{ let _ = {bc}; let __v: {} = eval_error({msg:?}.to_string()); __v }}", rt.repr()), rt));
                     }
+                    let bt = Ty::Bag(e.into());
+                    if is_sparse_fun(&bt) || is_sparse_fun(&rt) {
+                        let it = self.fun_iter("__b", &bt, false)?;
+                        let count = self.bag_count("__r", "__y", &rt)?;
+                        let put = self.fun_put("__r", "__y", &format!("{count} + __c"), &rt)?;
+                        return Ok((format!("{{ let __b = {bc}; let mut __r = {}; for ({x}, __c) in {it} {{ let __y = {yc}; {put} }} __r }}", Self::default_code(&rt)), rt));
+                    }
                     (
                         format!("{{ let __b = {bc}; let mut __r = {}; for __i in 0..__b.len() {{ if __b[__i] > 0 {{ let {x} = dec_{eid}(__i as u64); __r[idx_{yid}({yc})] += __b[__i]; }} }} __r }}", Self::default_code(&rt)),
                         rt,
@@ -1849,6 +2075,22 @@ impl<'a> Gen<'a> {
                     let bt = Ty::Bag(e.into());
                     let st = Ty::Set(bt.clone().into());
                     let empty = self.s_empty(&st)?;
+                    if is_sparse_fun(&bt) {
+                        // A counter per element of b, each counting up to its count in b
+                        let add = self.s_add("__s", "__g", &st)?;
+                        let (kt, _) = fun_kv(&bt);
+                        return Ok((
+                            format!(
+                                "{{ let __b = {bc}; let __e: Vec<({}, i64)> = __b.iter().collect(); let mut __s = {empty}; let mut __c = vec![0i64; __e.len()]; \
+                                 loop {{ let mut __g = {}; for __k in 0..__e.len() {{ if __c[__k] > 0 {{ __g.put(__e[__k].0, __c[__k]); }} }} {add} \
+                                 let mut __k = 0; while __k < __e.len() {{ if __c[__k] < __e[__k].1 {{ __c[__k] += 1; break; }} __c[__k] = 0; __k += 1; }} \
+                                 if __k == __e.len() {{ break; }} }} __s }}",
+                                kt.repr(),
+                                Self::default_code(&bt)
+                            ),
+                            st,
+                        ));
+                    }
                     let add = self.s_add("__s", "__c", &st)?;
                     (
                         format!(
@@ -2044,8 +2286,12 @@ impl<'a> Gen<'a> {
                 if let Ty::PFun(d, _) = &ft {
                     let (fc, _) = self.gen(f, env, None)?;
                     let st = Ty::Set(d.clone());
-                    let did = self.ty_id(d)?;
                     let empty = self.s_empty(&st)?;
+                    if is_sparse_fun(&ft) {
+                        let add = self.s_add("__s", "__k", &st)?;
+                        return Ok((format!("{{ let __f = {fc}; let mut __s = {empty}; for (__k, _) in __f.iter() {{ {add} }} __s }}"), st));
+                    }
+                    let did = self.ty_id(d)?;
                     let add = self.s_add("__s", &format!("dec_{did}(__i as u64)"), &st)?;
                     return Ok((format!("{{ let __f = {fc}; let mut __s = {empty}; for __i in 0..__f.len() {{ if __f[__i].0 {{ {add} }} }} __s }}"), st));
                 }
@@ -2301,6 +2547,13 @@ impl<'a> Gen<'a> {
                 let empty = self.s_empty(&st)?;
                 (format!("{{ let mut {acc} = {empty}; {body} {acc} }}"), st)
             }
+            // Over Nat, say (one over a large finite set is built as any other)
+            FunCons(x, s, _) if self.lazy_domain(s, env) && self.try_const(s, env).is_none() => {
+                return Err(format!(
+                    "the function {} is over a set that cannot be enumerated: it is only supported applied to an argument (`f[x]`, also after EXCEPT) or in `x \\in DOMAIN f`, where TLC evaluates it without enumerating its domain",
+                    lazy_fun_text(x, s)
+                ))
+            }
             // [k \in 1..n |-> e] (or over DOMAIN of a sequence) with n from the state is a sequence
             FunCons(x, s, body) if self.try_const(s, env).is_none() && self.seq_domain_len(s, env).is_some() => {
                 let nc = self.seq_domain_len(s, env).unwrap()?;
@@ -2321,9 +2574,13 @@ impl<'a> Gen<'a> {
                 let (bc, bt) = self.gen(body, &env2, None)?;
                 let ft = Ty::PFun(et.clone().into(), bt.into());
                 self.ty_id(&ft)?;
-                let eid = self.ty_id(&et)?;
                 let key = env2.locals[x].0.clone();
-                (format!("{{ let mut __o = {}; for {lx} in {it} {{ __o[idx_{eid}({key})] = (true, {bc}); }} __o }}", Self::default_code(&ft)), ft)
+                let put = if is_sparse_fun(&ft) {
+                    self.fun_put("__o", &key, &bc, &ft)?
+                } else {
+                    format!("__o[idx_{}({key})] = (true, {bc});", self.ty_id(&et)?)
+                };
+                (format!("{{ let mut __o = {}; for {lx} in {it} {{ {put} }} __o }}", Self::default_code(&ft)), ft)
             }
             FunCons(x, s, body) => {
                 let dv = self.ce.eval(s, &HashMap::new()).map_err(|m| format!("function domain must be constant: {m}"))?;
@@ -2381,6 +2638,13 @@ impl<'a> Gen<'a> {
                 }
                 (rec_build(&parts), Ty::Rec(tys))
             }
+            // A function over Nat, Int, STRING, ...: its body, at the argument
+            App(f, x) if self.lazy_fun_domain(f, env).is_some() => {
+                let (xc, xt) = self.gen(x, env, None)?;
+                let k = self.fresh("k");
+                let (c, t) = self.lazy_apply(f, &k, &xt, env, want)?;
+                (format!("{{ let {k} = {xc}; {c} }}"), t)
+            }
             App(f, x) => {
                 let (fc, ft) = self.gen(f, env, None)?;
                 if let Ty::Rec(fs) = &ft {
@@ -2413,6 +2677,20 @@ impl<'a> Gen<'a> {
                 if let Ty::Seq(e) = &ft {
                     let (ic, _) = self.gen_int(x, env)?;
                     return Ok((format!("({fc}).at({ic})"), e.as_ref().clone()));
+                }
+                if let (Ty::PFun(d, c), true) = (&ft, is_sparse_fun(&ft)) {
+                    let xc = self.gen_as(x, env, d)?;
+                    return Ok((
+                        format!("{{ let __f = {fc}; match __f.get(&{xc}) {{ Some(__v) => __v, None => eval_error(\"Attempted to apply a function to an argument not in its domain\".into()) }} }}"),
+                        c.as_ref().clone(),
+                    ));
+                }
+                if let (Ty::Bag(e), true) = (&ft, is_sparse_fun(&ft)) {
+                    let xc = self.gen_as(x, env, e)?;
+                    return Ok((
+                        format!("{{ let __b = {fc}; match __b.get(&{xc}) {{ Some(__c) => __c, None => eval_error(\"Attempted to apply a bag to an element not in it\".into()) }} }}"),
+                        Ty::Int(1, BIG),
+                    ));
                 }
                 if let Ty::PFun(d, c) = &ft {
                     let did = self.ty_id(d)?;
@@ -2536,6 +2814,24 @@ impl<'a> Gen<'a> {
                                         conds.push(format!("{iv} != u64::MAX"));
                                         place = format!("{place}[{iv} as usize]");
                                     }
+                                }
+                                cur = c.as_ref().clone();
+                            }
+                            // A function over part of a type: a key outside its domain leaves it
+                            // unchanged, as in TLC
+                            (Path::Idx(i), Ty::PFun(d, c)) => {
+                                let ic = self.gen_as(i, env, d)?;
+                                let iv = self.fresh("i");
+                                if is_sparse_fun(&cur) {
+                                    // Looked up only once the steps before it are known to apply
+                                    write!(s, "let {iv} = {ic}; ").unwrap();
+                                    conds.push(format!("({place}).find(&{iv}).is_ok()"));
+                                    place = format!("{place}.items[({place}).find(&{iv}).unwrap()].1");
+                                } else {
+                                    let did = self.ty_id(d)?;
+                                    write!(s, "let {iv} = enc_{did}({ic}); ").unwrap();
+                                    conds.push(format!("{iv} != u64::MAX && {place}[{iv} as usize].0"));
+                                    place = format!("{place}[{iv} as usize].1");
                                 }
                                 cur = c.as_ref().clone();
                             }
@@ -2845,6 +3141,9 @@ impl<'a> Gen<'a> {
                 format!("{{ let __n: i64 = {c}; if __n < i64::MIN + 65536 {{ eval_error(format!(\"Attempted to use the model value {{}} as an integer\", ATOMS[(__n - i64::MIN) as usize])) }} __n }}"),
                 (lo, hi),
             )),
+            // No value has this type (an element of the empty tuple, say), so the code cannot
+            // produce one: it stops, and still runs to report that
+            Ty::Enum(v) if v.is_empty() => Ok((format!("{{ let __u: i64 = {{ let _ = {c}; unreachable!() }}; __u }}"), (0, 0))),
             t => Err(format!("expected an integer, got {t:?} in {e:?}")),
         }
     }
@@ -2917,12 +3216,12 @@ impl<'a> Gen<'a> {
             let rval = if rix.is_some() { format!("dec_{rid_}(__r)") } else { "__r".to_string() };
             let ft = Ty::PFun(det.clone(), rt.clone().into());
             self.ty_id(&ft)?;
-            let did = self.ty_id(det)?;
+            let put = self.fun_put("__f", "__d[__k]", "__r[__c[__k]]", &ft)?;
             let dit = self.s_iter(&dc, &dty)?;
             let code = format!(
                 "{{ let __d: Vec<{}> = {dit}.collect(); let __r: Vec<{}> = {rit}.map(|__r| {rval}).collect(); let mut __v: Vec<{}> = Vec::new(); \
                  if !__r.is_empty() || __d.is_empty() {{ let mut __c = vec![0usize; __d.len()]; loop {{ let mut __f = {}; \
-                 for __k in 0..__d.len() {{ __f[idx_{did}(__d[__k])] = (true, __r[__c[__k]]); }} __v.push(__f); \
+                 for __k in 0..__d.len() {{ {put} }} __v.push(__f); \
                  let mut __k = __d.len(); loop {{ if __k == 0 {{ break; }} __k -= 1; __c[__k] += 1; if __c[__k] < __r.len() {{ break; }} __c[__k] = 0; if __k == 0 {{ __k = usize::MAX; break; }} }} \
                  if __k == usize::MAX || __d.is_empty() {{ break; }} }} }} __v }}.into_iter()",
                 det.repr(),
@@ -3010,7 +3309,25 @@ impl<'a> Gen<'a> {
                 // Bound first: an iterator borrowing x must not outlive the block x lives in
                 return Ok(format!("{{ let __all = {it}.all(|{e}| {inner}); __all }}"));
             }
-            FunSet(d, r) if matches!(xt, Ty::PFun(..)) => {
+            // A sparse function: its keys in D and its values in R, and as many keys as D has
+            // elements, which needs D finite (TLC fails to compare a domain with Nat, Int or STRING)
+            FunSet(d, r) if matches!(xt, Ty::PFun(..)) && is_sparse_fun(xt) && self.try_const(d, env).is_none() => {
+                if let Ident(n) = d.strip() {
+                    if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.locals.contains_key(n) {
+                        let dt = Ty::Set(fun_kv(xt).0.into());
+                        let (dc, _) = self.gen(&Un(UOp::Domain, Ident("#f".into()).b()), &{
+                            let mut e2 = env.clone();
+                            e2.locals.insert("#f".into(), (x.to_string(), xt.clone()));
+                            e2
+                        }, None)?;
+                        let did = self.ty_id(&dt)?;
+                        let msg = format!("Attempted to check equality of the set {{}} with the value:\n{n}");
+                        return Ok(format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{did}(&{dc}))); __b }}"));
+                    }
+                }
+                return self.fun_set_member(x, xt, d, r, s, env);
+            }
+            FunSet(d, r) if matches!(xt, Ty::PFun(..)) && !is_sparse_fun(xt) => {
                 let Ty::PFun(dt, ct) = xt else { unreachable!() };
                 let did = self.ty_id(dt)?;
                 let (e, k) = (self.fresh("e"), self.fresh("k"));
@@ -3021,6 +3338,10 @@ impl<'a> Gen<'a> {
                 ));
             }
             FunSet(d, r) => return self.fun_set_member(x, xt, d, r, s, env),
+            Un(UOp::Domain, f) if self.lazy_fun_domain(f, env).is_some() => {
+                let d = self.lazy_fun_domain(f, env).unwrap().clone();
+                return self.gen_member(x, xt, &d, env);
+            }
             RecSet(fs) => {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
@@ -3466,8 +3787,11 @@ impl<'a> Gen<'a> {
                 if let Some(v) = self.target(lhs, env) {
                     let t = self.var_ty(&v);
                     if self.infer.is_some() {
-                        if let Ok((_, rt)) = self.gen(rhs, env, Some(&t)) {
-                            self.record(&v, rt);
+                        match self.gen(rhs, env, Some(&t)) {
+                            Ok((_, rt)) => self.record(&v, rt),
+                            Err(e) => {
+                                self.infer_errs.entry(v.clone()).or_insert(e);
+                            }
                         }
                         let mut env2 = env.clone();
                         env2.primed.insert(v, ("__inferred".into(), t));
@@ -3498,8 +3822,11 @@ impl<'a> Gen<'a> {
                 if let Some(v) = self.target(lhs, env) {
                     let t = self.var_ty(&v);
                     if self.infer.is_some() {
-                        if let Ok((_, et)) = self.iter_of(s, env) {
-                            self.record(&v, et);
+                        match self.iter_of(s, env) {
+                            Ok((_, et)) => self.record(&v, et),
+                            Err(e) => {
+                                self.infer_errs.entry(v.clone()).or_insert(e);
+                            }
                         }
                         let mut env2 = env.clone();
                         env2.primed.insert(v, ("__inferred".into(), t));
@@ -3998,6 +4325,21 @@ impl<'a> Gen<'a> {
                         names.join(", ")
                     )
                 }
+                // A sparse function or bag, entry by entry in TLC's order of keys: << >> when empty
+                // (TLC's spelling for an empty function), a tuple over 1..n
+                Ty::PFun(..) | Ty::Bag(_) if is_sparse_fun(&t) => {
+                    let (kt, vt) = fun_kv(&t);
+                    let (kid, vid) = (self.ty_id(&kt)?, self.ty_id(&vt)?);
+                    let it = self.fun_iter("v", &t, true)?;
+                    let ints = matches!(kt, Ty::Int(..));
+                    format!(
+                        "let ks: Vec<(String, String)> = {it}.map(|(k, x)| (fmt_{kid}(&k), fmt_{vid}(&x))).collect(); \
+                         if ks.is_empty() {{ return \"<< >>\".into(); }} \
+                         if {ints} && ks.iter().enumerate().all(|(j, (k, _))| *k == (j + 1).to_string()) {{ \
+                         return format!(\"<<{{}}>>\", ks.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>().join(\", \")); }} \
+                         format!(\"({{}})\", ks.iter().map(|(k, x)| format!(\"{{}} :> {{}}\", k, x)).collect::<Vec<_>>().join(\" @@ \"))"
+                    )
+                }
                 // A bag prints as the function it is: << >> when empty (TLC's spelling for an empty
                 // function), a tuple over 1..n
                 Ty::PFun(d, c) => {
@@ -4139,6 +4481,9 @@ impl<'a> Gen<'a> {
     /// so shift amounts are baked in. After the first value whose size is only known at runtime
     /// (a sparse set), `at` becomes None and the code falls back to threading the offset.
     fn pack_value(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
+        if is_sparse_fun(t) {
+            return self.pack_value(c, &fun_pairs(t), out, at);
+        }
         if let Ty::Bag(e) = t {
             return self.pack_value(c, &bag_fun(e), out, at);
         }
@@ -4242,6 +4587,9 @@ impl<'a> Gen<'a> {
     /// permuted value. A function's entry j is read from the argument that `pm` maps to j, and a
     /// sparse set's elements are written in the order of their permuted values.
     fn pack_perm(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
+        if is_sparse_fun(t) {
+            return self.pack_perm(c, &fun_pairs(t), out, at);
+        }
         if let Ty::Bag(e) = t {
             return self.pack_perm(c, &bag_fun(e), out, at);
         }
@@ -4335,6 +4683,9 @@ impl<'a> Gen<'a> {
     }
 
     fn unpack_value(&mut self, t: &Ty, at: &mut Option<u32>) -> R<String> {
+        if is_sparse_fun(t) {
+            return self.unpack_value(&fun_pairs(t), at);
+        }
         if let Ty::Bag(e) = t {
             return self.unpack_value(&bag_fun(e), at);
         }
@@ -4493,6 +4844,9 @@ impl<'a> Gen<'a> {
 
     /// Expression applying the model-value permutation pm to value c of type t
     fn perm_code(&mut self, c: &str, t: &Ty) -> R<String> {
+        if is_sparse_fun(t) {
+            return self.perm_code(c, &fun_pairs(t));
+        }
         if let Ty::Bag(e) = t {
             return self.perm_code(c, &bag_fun(e));
         }
@@ -4694,6 +5048,25 @@ fn pfun_parts(t: &Ty) -> Option<(Ty, Ty)> {
         Ty::PFun(d, c) | Ty::Fun(d, c) => Some((d.as_ref().clone(), c.as_ref().clone())),
         Ty::Rec(fs) if fs.is_empty() => Some((Ty::Enum(vec![]), Ty::Enum(vec![]))),
         _ => None,
+    }
+}
+
+/// `[x \in S |-> ...]` for messages, with the bound variable's name as written
+fn lazy_fun_text(x: &str, s: &Expr) -> String {
+    let x = x.split("__").next().unwrap_or(x);
+    let s = match s.strip() {
+        Expr::Ident(n) => n.clone(),
+        s => short(s),
+    };
+    format!("[{x} \\in {s} |-> ...]")
+}
+
+/// The key and value types of a function over part of a type or of a bag (a count of 1 or more)
+fn fun_kv(t: &Ty) -> (Ty, Ty) {
+    match t {
+        Ty::PFun(d, c) => (d.as_ref().clone(), c.as_ref().clone()),
+        Ty::Bag(e) => (e.as_ref().clone(), Ty::Int(1, BIG)),
+        _ => unreachable!(),
     }
 }
 
