@@ -263,6 +263,72 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// `a = b` when one side is a tuple (or sequence) and the other may be a string. TLC asks the
+    /// value on the left: a tuple compares itself with the characters of a string, element by
+    /// element; a string asked about a tuple stops with an error. A model value is unequal to both,
+    /// and an integer cannot be compared with a tuple. None when neither side is such a pair.
+    fn tuple_str_eq(&mut self, ac: &str, at: &Ty, bc: &str, bt: &Ty, env: &Env) -> R<Option<String>> {
+        let tupleish = |t: &Ty| tuple_elems(t).is_some() || matches!(t, Ty::Seq(_));
+        let atoms_of = |t: &Ty| match t {
+            Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.clone(),
+            _ => vec![],
+        };
+        if tupleish(at) && self.has_str(bt) {
+            let (t, s) = (self.fresh("t"), self.fresh("s"));
+            let mut chain = String::new();
+            for a in atoms_of(bt) {
+                if self.atoms.is_model(a) {
+                    continue;
+                }
+                let chars: Vec<String> = self.atoms.name(a).chars().map(|c| c.to_string()).collect();
+                let elems: Vec<(String, Ty)> = match at {
+                    Ty::Seq(e) => (0..chars.len()).map(|i| (format!("{t}.at({})", i + 1), e.as_ref().clone())).collect(),
+                    _ => {
+                        let es = tuple_elems(at).unwrap();
+                        let n = es.len();
+                        es.into_iter().enumerate().map(|(i, e)| (format!("{t}{}", rec_field(n, i)), e.clone())).collect()
+                    }
+                };
+                let mut parts = vec![];
+                match at {
+                    Ty::Seq(_) => parts.push(format!("{t}.len as usize == {}", chars.len())),
+                    _ if elems.len() != chars.len() => parts.push("false".into()),
+                    _ => {}
+                }
+                if parts.iter().all(|p| p != "false") {
+                    for ((code, et), ch) in elems.iter().zip(&chars) {
+                        self.atoms.intern(false, ch);
+                        let mut env2 = env.clone();
+                        env2.bind("#elem", code.clone(), et.clone());
+                        let eq = Expr::Bin(BOp::Eq, Expr::Ident("#elem".into()).b(), Expr::Str(ch.clone()).b());
+                        parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
+                    }
+                }
+                let lit = self.lit(&Value::Atom(a), bt)?;
+                write!(chain, "if {s} == {lit} {{ {} }} else ", parts.join(" && ")).unwrap();
+            }
+            let other = if matches!(bt, Ty::IntAtom(..)) {
+                let tid = self.ty_id(bt)?;
+                let msg = "Attempted to check equality of a tuple with {}";
+                format!("if {s} >= i64::MIN + 65536 {{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{s}))); __b }} else {{ false }}")
+            } else {
+                "false".into()
+            };
+            return Ok(Some(format!("{{ let {t} = {ac}; let {s} = {bc}; {chain}{{ {other} }} }}")));
+        }
+        if self.has_str(at) && tupleish(bt) {
+            let s = self.fresh("s");
+            let models: Vec<String> =
+                atoms_of(at).into_iter().filter(|&a| self.atoms.is_model(a)).map(|a| self.lit(&Value::Atom(a), at)).collect::<R<_>>()?;
+            let (tid, bid) = (self.ty_id(at)?, self.ty_id(bt)?);
+            let msg = "Attempted to check equality of string {} with non-string:\n{}";
+            let fail = format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{s}), fmt_{bid}(&__q))); __b }}");
+            let unequal = if models.is_empty() { "false".to_string() } else { models.iter().map(|m| format!("{s} == {m}")).collect::<Vec<_>>().join(" || ") };
+            return Ok(Some(format!("{{ let {s} = {ac}; let __q = {bc}; if {unequal} {{ false }} else {fail} }}")));
+        }
+        Ok(None)
+    }
+
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
         self.ty_id(t)
     }
@@ -2164,7 +2230,11 @@ impl<'a> Gen<'a> {
                     let (ac, at) = self.gen(a, env, None)?;
                     let (bc, bt) = self.gen(b, env, None)?;
                     let (Ty::Enum(da), Ty::Enum(db)) = (&at, &bt) else {
-                        return Err(format!("`{f}` of a string and a value that is not a string"));
+                        // TLC stops with an error when it evaluates this
+                        let Ty::Enum(da) = &at else { unreachable!() };
+                        let bid = self.ty_id(&bt)?;
+                        let msg = "Evaluating an expression of the form t \\o s when s is not a string:\n{}";
+                        return Ok((format!("{{ let _ = {ac}; let __b = {bc}; let __v: u16 = eval_error(format!({msg:?}, fmt_{bid}(&__b))); __v }}"), Ty::Enum(da.clone())));
                     };
                     self.string_table(f, &ac, &[(da.clone(), None), (db.clone(), Some(bc))])?
                 }
@@ -3016,6 +3086,9 @@ impl<'a> Gen<'a> {
             Eq | Neq => {
                 let (ac, at) = self.gen(a, env, None)?;
                 let (bc, bt) = self.gen(b, env, Some(&at))?;
+                if let Some(c) = self.tuple_str_eq(&ac, &at, &bc, &bt, env)? {
+                    return Ok((if op == Eq { c } else { format!("!{c}") }, Ty::Bool));
+                }
                 // Still evaluate both sides, which may stop with an error as in TLC
                 match self.tuple_cmp(&at, &bt)? {
                     Cmp::Normal => {}
@@ -3265,6 +3338,32 @@ impl<'a> Gen<'a> {
     /// `x \in S`, where the value of x is already held in the variable named by `x`.
     fn gen_member(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
+        // A set written out where it is used, holding tuples and x a string or the other way
+        // round: TLC asks each element, in the order written, whether it equals x (a set from a
+        // definition or the state is sorted first, and comparing then fails)
+        if let SetLit(xs) = s {
+            let elems: Vec<(String, Ty)> = xs.iter().map(|e| self.gen(e, env, Some(xt))).collect::<R<_>>().unwrap_or_default();
+            let mut special = false;
+            let mut parts = vec![];
+            for (c, t) in &elems {
+                match self.tuple_str_eq(c, t, x, xt, env)? {
+                    Some(code) => {
+                        special = true;
+                        parts.push(code);
+                    }
+                    None => {
+                        let mut env2 = env.clone();
+                        env2.bind("#elem", c.clone(), t.clone());
+                        env2.bind("#x", x.to_string(), xt.clone());
+                        let eq = Bin(BOp::Eq, Ident("#elem".into()).b(), Ident("#x".into()).b());
+                        parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
+                    }
+                }
+            }
+            if special {
+                return Ok(format!("({})", parts.join(" || ")));
+            }
+        }
         let s = s.strip();
         // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
         // treats it as a function in [S -> T]; none of these is compiled
