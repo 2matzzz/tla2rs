@@ -430,7 +430,61 @@ impl<'a> Gen<'a> {
             _ => {}
         }
         let Some(dv) = self.try_const(d, env) else {
-            return Err(format!("membership in [D -> R] with D from the state is not supported for {xt:?}: {}", short(s)));
+            // D from the state: compare it with the domain of x, then test the values
+            let (dom_c, dom_t, vals) = match xt {
+                Ty::Fun(dt, ct) => {
+                    let st = Ty::Set(dt.clone());
+                    let all = Value::Set(dt.enumerate().into_iter().collect());
+                    let v = in_r(self, "__v", ct)?;
+                    (self.lit(&all, &st)?, st, format!("{x}.iter().all(|&__v| {v})"))
+                }
+                Ty::PFun(dt, _) | Ty::Bag(dt) => {
+                    let st = Ty::Set(dt.clone());
+                    let did = self.ty_id(dt)?;
+                    let empty = self.s_empty(&st)?;
+                    let add = self.s_add("__s", &format!("dec_{did}(__i as u64)"), &st)?;
+                    let (present, val, vt) = match xt {
+                        Ty::PFun(_, ct) => ("__p.0", "__p.1", ct.as_ref().clone()),
+                        _ => ("(__p > 0)", "__p", Ty::Int(1, crate::types::BIG)),
+                    };
+                    let v = in_r(self, val, &vt)?;
+                    (
+                        format!("{{ let mut __s = {empty}; for (__i, &__p) in {x}.iter().enumerate() {{ if {present} {{ {add} }} }} __s }}"),
+                        st,
+                        format!("{x}.iter().all(|&__p| !{present} || {v})"),
+                    )
+                }
+                Ty::Rec(fs) => {
+                    let ids: Vec<u32> = fs.iter().map(|(k, _)| self.atoms.intern(false, k)).collect();
+                    let mut sorted = ids.clone();
+                    sorted.sort();
+                    let st = Ty::Set(Ty::Enum(sorted).into());
+                    let empty = self.s_empty(&st)?;
+                    let mut build = format!("let mut __s = {empty}; ");
+                    let mut conj = vec!["true".to_string()];
+                    for (i, (_, ft)) in fs.iter().enumerate() {
+                        let fp = format!("{x}{}", rec_field(fs.len(), i));
+                        let add = self.s_add("__s", &format!("{}u16", ids[i]), &st)?;
+                        match ft {
+                            Ty::Opt(inner) => {
+                                write!(build, "if {fp}.0 {{ {add} }} ").unwrap();
+                                let m = in_r(self, &format!("{fp}.1"), inner)?;
+                                conj.push(format!("(!{fp}.0 || {m})"));
+                            }
+                            ft => {
+                                build.push_str(&add);
+                                conj.push(in_r(self, &fp, ft)?);
+                            }
+                        }
+                    }
+                    (format!("{{ {build} __s }}"), st, format!("({})", conj.join(" && ")))
+                }
+                _ => return Err(format!("membership of {xt:?} in [D -> R] is not supported: {}", short(s))),
+            };
+            let (dc, dt) = self.gen(d, env, Some(&dom_t))?;
+            let t = join(&dt, &dom_t)?;
+            let same = format!("({} == {})", self.coerce(dc, &dt, &t)?, self.coerce(dom_c, &dom_t, &t)?);
+            return Ok(format!("({same} && {vals})"));
         };
         let dom = dv.as_set()?.clone();
         Ok(match xt {
