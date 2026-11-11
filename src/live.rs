@@ -28,7 +28,8 @@ pub struct FairDef {
 /// constant sets, and on actions written inline)
 pub fn collect_fair(e: &Expr, env: &HashMap<String, Value>, g: &Gen, out: &mut Vec<FairDef>) -> R<()> {
     match e {
-        Expr::Label(_, _, b) => collect_fair(b, env, g, out),
+        // TLC does not look into a label written in the spec
+        Expr::Label(_, _, b) if !e.is_user_label() => collect_fair(b, env, g, out),
         Expr::And(xs) => xs.iter().try_for_each(|x| collect_fair(x, env, g, out)),
         Expr::Quant(false, bs, body) => {
             let mut err = Ok(());
@@ -111,7 +112,7 @@ impl Atoms {
 
 /// Whether e has temporal structure (as opposed to being one state or action predicate)
 fn temporal(e: &Expr) -> bool {
-    e.any(&|x| matches!(x, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::Bin(BOp::LeadsTo, ..) | Expr::Fair(..)))
+    e.any(&|x| matches!(x, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::Bin(BOp::LeadsTo, ..) | Expr::Fair(..)) || x.is_unchecked_temporal())
 }
 
 /// Whether e is an action (primes, UNCHANGED or [A]_v outside ENABLED)
@@ -143,7 +144,7 @@ fn is_box(e: &Expr) -> bool {
 
 /// The level of e (0 constant or state, 2 action, 3 temporal), checking the rules of TLA+ that SANY
 /// enforces on temporal formulas
-fn sany_level(e: &Expr) -> Result<u8, String> {
+pub(crate) fn sany_level(e: &Expr) -> Result<u8, String> {
     use Expr::*;
     Ok(match e {
         Label(n, _, b) if n == ANGLE => {
@@ -474,6 +475,14 @@ impl TExpr {
 /// Turns a property into TLC's form, as tlc2.tool.liveness.Liveness.astToLive does
 fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Atoms) -> R<Result<TExpr, Rejected>> {
     use Expr::*;
+    // TLC cannot handle a temporal formula under a label written in the spec
+    let mut x = e;
+    while let Label(_, _, b) = x {
+        if x.is_user_label() && temporal(b) {
+            return Ok(Err(Rejected(format!("TLC cannot handle the temporal formula {}", short(e)), 255)));
+        }
+        x = b;
+    }
     let e = e.strip();
     if !temporal(e) {
         if let Bool(b) = e {
@@ -584,13 +593,16 @@ fn fair_texpr(f: &FairDef) -> TExpr {
 /// an error if a part of a disjunct of its normal form has an action but is not <>[]A or []<>A;
 /// otherwise the state atoms that end up in the tableau (TLC evaluates those on a state when it is
 /// generated, and the others when the state is expanded)
-fn tlc_plan(fair: &[FairDef], props: &[TExpr]) -> Result<u64, Rejected> {
+fn tlc_plan(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> Result<u64, Rejected> {
     if props.is_empty() {
         return Ok(0);
     }
     let mut conj = vec![];
     for f in fair {
         TExpr::add(&mut conj, fair_texpr(f), true);
+    }
+    for a in assumed {
+        TExpr::add(&mut conj, a.clone(), true);
     }
     let neg = if props.len() == 1 {
         TExpr::Neg(props[0].clone().into())
@@ -630,14 +642,22 @@ fn tlc_plan(fair: &[FairDef], props: &[TExpr]) -> Result<u64, Rejected> {
 }
 
 /// Generated code for the liveness checks: the atoms, the fairness conditions, and an automaton per
-/// property part. `parts` are (name, formula, constant bindings).
-/// A formula TLC rejects comes back as Ok(Err(..)).
-pub fn compile(g: &mut Gen, fair: &[FairDef], parts: &[(String, Expr, HashMap<String, Value>)]) -> R<Result<String, Rejected>> {
+/// property part. `assumed` are the spec's temporal conjuncts other than fairness (with their
+/// constant bindings), under which each part is checked; `parts` are (name, formula, constant
+/// bindings). A formula TLC rejects comes back as Ok(Err(..)).
+pub fn compile(
+    g: &mut Gen,
+    fair: &[FairDef],
+    assumed: &[(Expr, HashMap<String, Value>)],
+    parts: &[(String, Expr, HashMap<String, Value>)],
+) -> R<Result<String, Rejected>> {
+    // The spec's temporal conjuncts matter only when there are properties to check
+    let assumed = if parts.is_empty() { &[][..] } else { assumed };
     let mut atoms = Atoms::default();
     let mut src = String::new();
     let mut props = vec![];
     // SANY's rules on temporal formulas (TLC stops with exit code 150 before checking anything)
-    for (_, e, _) in parts {
+    for e in parts.iter().map(|p| &p.1).chain(assumed.iter().map(|a| &a.0)) {
         if let Err(m) = sany_level(e) {
             return Ok(Err(Rejected(m, 150)));
         }
@@ -649,13 +669,25 @@ pub fn compile(g: &mut Gen, fair: &[FairDef], parts: &[(String, Expr, HashMap<St
             Err(r) => return Ok(Err(r)),
         }
     }
-    let tableau = match tlc_plan(fair, &texprs) {
+    let mut atexprs = vec![];
+    for (e, env) in assumed {
+        match to_texpr(g, e, env, &mut atoms).map_err(|m| format!("spec: {m}"))? {
+            Ok(t) => atexprs.push(t),
+            Err(r) => return Ok(Err(r)),
+        }
+    }
+    let tableau = match tlc_plan(fair, &atexprs, &texprs) {
         Ok(t) => t,
         Err(r) => return Ok(Err(r)),
     };
     for ((name, _, _), t) in parts.iter().zip(&texprs) {
         let f = t.to_ltl();
-        let (nodes, nacc) = automaton(&f.not(), 4096).map_err(|m| format!("property {name}: {m}"))?;
+        let neg = if atexprs.is_empty() {
+            f.not()
+        } else {
+            Ltl::And(atexprs.iter().map(|a| a.to_ltl()).chain([f.not()]).collect())
+        };
+        let (nodes, nacc) = automaton(&neg, 4096).map_err(|m| format!("property {name}: {m}"))?;
         let mut ns = vec![];
         for n in &nodes {
             let (mut sp, mut sn, mut ap, mut an) = (0u64, 0u64, 0u64, 0u64);

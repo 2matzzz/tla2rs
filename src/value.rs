@@ -149,6 +149,17 @@ pub const REC_STACK_BYTES: usize = 1 << 20;
 
 thread_local! {
     static REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// While set, what Print and PrintT print: one line each, as the values printed on it (TLC
+    /// prints those of the constant definitions and ASSUMEs when it starts)
+    pub static PRINTED: std::cell::RefCell<Option<Vec<Vec<Value>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn record_print(line: Vec<Value>) {
+    PRINTED.with(|p| {
+        if let Some(v) = p.borrow_mut().as_mut() {
+            v.push(line);
+        }
+    });
 }
 
 /// The starts of the error messages for failures that TLC raises too when it evaluates the same
@@ -462,12 +473,15 @@ impl ConstEval<'_> {
                     Value::Tuple(out)
                 }
                 ("PrintT", [x]) => {
-                    self.eval(x, env)?;
+                    let x = self.eval(x, env)?;
+                    record_print(vec![x]);
                     Value::Bool(true)
                 }
                 ("Print", [x, v]) => {
-                    self.eval(x, env)?;
-                    self.eval(v, env)?
+                    let x = self.eval(x, env)?;
+                    let v = self.eval(v, env)?;
+                    record_print(vec![x, v.clone()]);
+                    v
                 }
                 ("\\X", parts) => {
                     let mut out: Vec<Vec<Value>> = vec![vec![]];
