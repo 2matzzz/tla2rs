@@ -618,7 +618,7 @@ fn report_msg(msg: &SMsg, in_model: bool) -> i32 {
         }
         SMsg::Action(name) => {
             println!("Error: Action property {name} is violated.");
-            12
+            13
         }
         SMsg::Eval(e) => {
             report_eval(e);

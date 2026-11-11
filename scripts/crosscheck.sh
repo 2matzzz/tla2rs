@@ -38,7 +38,7 @@ summarize() {
   local f="$1"
   local res
   local span='line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+'
-  res=$(grep -oE "Invariant [A-Za-z0-9_]+ is violated|Evaluating invariant [A-Za-z0-9_]+ failed|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption $span is false|Evaluating assumption $span failed|No error has been found" "$f" | head -1 || true)
+  res=$(grep -oE "Invariant [A-Za-z0-9_]+ is violated|Evaluating invariant [A-Za-z0-9_]+ failed|Action property [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption $span is false|Evaluating assumption $span failed|No error has been found" "$f" | head -1 || true)
   # If none of the above matched but there is an Error: line, treat it as an evaluation error.
   # The message may differ from TLC's (TLC can also stop on an internal exception), so compare
   # only the kind (and the exit code below)
