@@ -5,28 +5,40 @@ use crate::ast::*;
 use crate::lexer::R;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Strings and model values. At runtime they are u16 ids.
+/// Strings and model values. At runtime they are u16 ids. Interning goes through a shared
+/// reference, since evaluating a constant expression can build a new string (`"ab" \o "c"`).
 #[derive(Default, Debug)]
 pub struct Atoms {
-    pub list: Vec<(bool, String)>, // (is model value, name)
-    map: HashMap<(bool, String), u32>,
+    list: std::cell::RefCell<Vec<(bool, String)>>, // (is model value, name)
+    map: std::cell::RefCell<HashMap<(bool, String), u32>>,
 }
 
 impl Atoms {
-    pub fn intern(&mut self, model: bool, s: &str) -> u32 {
-        if let Some(&i) = self.map.get(&(model, s.to_string())) {
+    pub fn intern(&self, model: bool, s: &str) -> u32 {
+        if let Some(&i) = self.map.borrow().get(&(model, s.to_string())) {
             return i;
         }
-        let i = self.list.len() as u32;
-        self.list.push((model, s.to_string()));
-        self.map.insert((model, s.to_string()), i);
+        let mut list = self.list.borrow_mut();
+        let i = list.len() as u32;
+        list.push((model, s.to_string()));
+        self.map.borrow_mut().insert((model, s.to_string()), i);
         i
     }
     pub fn get(&self, model: bool, s: &str) -> Option<u32> {
-        self.map.get(&(model, s.to_string())).copied()
+        self.map.borrow().get(&(model, s.to_string())).copied()
+    }
+    pub fn len(&self) -> usize {
+        self.list.borrow().len()
+    }
+    pub fn is_model(&self, a: u32) -> bool {
+        self.list.borrow()[a as usize].0
+    }
+    pub fn name(&self, a: u32) -> String {
+        self.list.borrow()[a as usize].1.clone()
     }
     pub fn show(&self, a: u32) -> String {
-        let (m, s) = &self.list[a as usize];
+        let l = self.list.borrow();
+        let (m, s) = &l[a as usize];
         if *m {
             s.clone()
         } else {
@@ -164,6 +176,16 @@ impl ConstEval<'_> {
             Label(_, _, b) => self.eval(b, env)?,
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("Cardinality", [s]) => Value::Int(self.eval(s, env)?.as_set()?.len() as i64),
+                // TLC picks an element of its own choosing; only a single element is the same in
+                // every run
+                ("RandomElement", [s]) => {
+                    let v = self.eval(s, env)?;
+                    let set = v.as_set()?;
+                    if set.len() != 1 {
+                        return Err(format!("RandomElement of a set of {} elements: TLC picks one at random, so it is not supported", set.len()));
+                    }
+                    set.iter().next().unwrap().clone()
+                }
                 ("IsFiniteSet", [s]) => {
                     self.eval(s, env)?.as_set()?;
                     Value::Bool(true)
@@ -204,9 +226,45 @@ impl ConstEval<'_> {
                 // Len reads here (an operator building a new string has no atom for it)
                 ("Len", [q]) => match self.eval(q, env)? {
                     Value::Tuple(t) => Value::Int(t.len() as i64),
-                    Value::Atom(a) if !self.atoms.list[a as usize].0 => Value::Int(self.atoms.list[a as usize].1.chars().count() as i64),
+                    Value::Atom(a) if !self.atoms.is_model(a) => Value::Int(self.atoms.name(a).chars().count() as i64),
                     v => return Err(format!("Len of {v:?}, which is not a sequence")),
                 },
+                // TLC treats a string as a sequence of characters for these operators, and their
+                // results are strings again
+                ("Append" | "Head" | "Tail" | "SubSeq" | "\\o", _) if self.is_str(&args[0], env) => {
+                    let a = self.str_arg(&args[0], env)?;
+                    let chars: Vec<char> = a.chars().collect();
+                    let out: String = match (f.as_str(), args.as_slice()) {
+                        ("Append", [_, x]) => a.clone() + &self.str_arg(x, env)?,
+                        ("\\o", [_, b]) => a.clone() + &self.str_arg(b, env)?,
+                        ("Head", _) => chars.first().ok_or("Attempted to apply Head to the empty sequence.")?.to_string(),
+                        ("Tail", _) => {
+                            if chars.is_empty() {
+                                return Err("Attempted to apply Tail to the empty sequence.".into());
+                            }
+                            chars[1..].iter().collect()
+                        }
+                        ("SubSeq", [_, m, n]) => {
+                            let (m, n) = (self.eval(m, env)?.as_int()?, self.eval(n, env)?.as_int()?);
+                            if m > n {
+                                String::new()
+                            } else if m < 1 || m > chars.len() as i64 {
+                                return Err("The second argument of SubSeq must be in the domain of its first argument.".into());
+                            } else if n > chars.len() as i64 {
+                                return Err("The third argument of SubSeq must be in the domain of its first argument.".into());
+                            } else {
+                                chars[(m - 1) as usize..n as usize].iter().collect()
+                            }
+                        }
+                        _ => return Err(format!("`{f}` with {} arguments", args.len())),
+                    };
+                    Value::Atom(self.atoms.intern(false, &out))
+                }
+                ("ToString", [x]) => {
+                    let v = self.eval(x, env)?;
+                    Value::Atom(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v)))
+                }
+                ("TLCEval", [x]) => self.eval(x, env)?,
                 ("Append", [q, x]) => {
                     let mut t = self.seq(q, env, "Append")?;
                     t.push(self.eval(x, env)?);
@@ -281,7 +339,7 @@ impl ConstEval<'_> {
                     let mut out = BTreeSet::new();
                     let mut idx: Vec<usize> = (0..elems.len()).collect();
                     loop {
-                        out.insert(Value::Fun(elems.iter().cloned().zip(idx.iter().map(|&i| elems[i].clone())).collect()));
+                        out.insert(fun_value(elems.iter().cloned().zip(idx.iter().map(|&i| elems[i].clone())).collect()));
                         // Next permutation (lexicographic)
                         let Some(k) = (0..idx.len().saturating_sub(1)).rev().find(|&k| idx[k] < idx[k + 1]) else { break };
                         let l = (k + 1..idx.len()).rev().find(|&l| idx[k] < idx[l]).unwrap();
@@ -328,11 +386,13 @@ impl ConstEval<'_> {
             // `x \in Nat` / `x \in Int` (common in assumptions). The set itself can't be built, so
             // only test membership
             Bin(op @ (BOp::In | BOp::NotIn), x, set)
-                if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int")
+                if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int" || n == "Any")
                     && !env.contains_key(n) && !self.constants.contains_key(n)) =>
             {
                 let Ident(n) = set.strip() else { unreachable!() };
                 let inside = match self.eval(x, env)? {
+                    // TLC's Any contains every value
+                    _ if n == "Any" => true,
                     Value::Int(v) => n == "Int" || v >= 0,
                     _ => false,
                 };
@@ -345,6 +405,12 @@ impl ConstEval<'_> {
                         let s = self.eval(&a[0], env)?;
                         let s = s.as_set()?;
                         t.iter().all(|e| s.contains(e))
+                    }
+                    // A string is a sequence of one-character strings
+                    Value::Atom(c) if !self.atoms.is_model(c) => {
+                        let s = self.eval(&a[0], env)?;
+                        let s = s.as_set()?;
+                        self.atoms.name(c).chars().all(|ch| self.atoms.get(false, &ch.to_string()).is_some_and(|i| s.contains(&Value::Atom(i))))
                     }
                     _ => false,
                 };
@@ -595,24 +661,43 @@ impl ConstEval<'_> {
 
     /// Whether a and b are a string and an integer, which TLC does not compare
     fn str_int(&self, a: &Value, b: &Value) -> bool {
-        let s = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.list[*x as usize].0);
+        let s = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.is_model(*x));
         let i = |v: &Value| matches!(v, Value::Int(_));
         (s(a) && i(b)) || (i(a) && s(b))
     }
 
     /// Equality as TLC evaluates it: comparing a string with an integer is an error
     fn tlc_eq(&self, a: &Value, b: &Value) -> R<bool> {
+        let s = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.is_model(*x));
+        if (s(a) && matches!(b, Value::Tuple(_) | Value::Fun(_) | Value::Rec(_) | Value::Set(_)))
+            || (s(b) && matches!(a, Value::Tuple(_) | Value::Fun(_) | Value::Rec(_) | Value::Set(_)))
+        {
+            return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and a non-string)"));
+        }
         if self.str_int(a, b) {
             return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and an integer)"));
         }
         Ok(a == b)
     }
 
+    /// Whether `e` evaluates to a string
+    fn is_str(&self, e: &Expr, env: &HashMap<String, Value>) -> bool {
+        matches!(self.eval(e, env), Ok(Value::Atom(a)) if !self.atoms.is_model(a))
+    }
+
+    /// The text of a string-valued expression
+    fn str_arg(&self, e: &Expr, env: &HashMap<String, Value>) -> R<String> {
+        match self.eval(e, env)? {
+            Value::Atom(a) if !self.atoms.is_model(a) => Ok(self.atoms.name(a)),
+            v => Err(format!("expected a string, got {v:?}")),
+        }
+    }
+
     /// The elements of a sequence value (a tuple)
     fn seq(&self, q: &Expr, env: &HashMap<String, Value>, op: &str) -> R<Vec<Value>> {
         match self.eval(q, env)? {
             Value::Tuple(t) => Ok(t),
-            Value::Atom(a) if !self.atoms.list[a as usize].0 => {
+            Value::Atom(a) if !self.atoms.is_model(a) => {
                 Err(format!("`{op}` on strings is not supported (only Len of a string is)"))
             }
             v => Err(format!("`{op}` of {v:?}, which is not a sequence")),

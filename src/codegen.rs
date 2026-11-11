@@ -177,7 +177,7 @@ impl<'a> Gen<'a> {
     /// Whether a value of type `t` may be a string
     fn has_str(&self, t: &Ty) -> bool {
         match t {
-            Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.iter().any(|&a| !self.atoms.list[a as usize].0),
+            Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.iter().any(|&a| !self.atoms.is_model(a)),
             _ => false,
         }
     }
@@ -238,7 +238,7 @@ impl<'a> Gen<'a> {
     fn tuple_vs(&self, t: &Ty) -> R<Cmp> {
         Ok(match t {
             Ty::Enum(v) if v.is_empty() => Cmp::Normal,
-            Ty::Enum(v) if v.iter().all(|&a| self.atoms.list[a as usize].0) => Cmp::Unequal,
+            Ty::Enum(v) if v.iter().all(|&a| self.atoms.is_model(a)) => Cmp::Unequal,
             // A sequence, or a function over 1..n, compares with a tuple as TLA+ identifies them; a
             // function over other integers is unequal to it
             Ty::Seq(_) => Cmp::Normal,
@@ -264,6 +264,75 @@ impl<'a> Gen<'a> {
             },
             _ => None,
         }
+    }
+
+    /// `op` (Len, Head, Tail, Append, \o) on strings from the state: a match over every string the
+    /// operands can be, with each result string interned now. A model value is an error, as in
+    /// TLC (it is not a sequence).
+    fn string_table(&mut self, op: &str, a: &str, operands: &[(Vec<u32>, Option<String>)]) -> R<(String, Ty)> {
+        let atoms = self.atoms;
+        let text = |x: u32| -> Option<String> { (!atoms.is_model(x)).then(|| atoms.name(x)) };
+        let cases: Vec<Vec<u32>> = match operands {
+            [(da, _)] => da.iter().map(|&x| vec![x]).collect(),
+            [(da, _), (db, _)] => da.iter().flat_map(|&x| db.iter().map(move |&y| vec![x, y])).collect(),
+            _ => unreachable!(),
+        };
+        if cases.len() > 4096 {
+            return Err(format!("`{op}` over {} combinations of strings is not supported", cases.len()));
+        }
+        let b = operands.get(1).and_then(|(_, c)| c.clone());
+        let mut arms = String::new();
+        let mut res_ids = vec![];
+        let mut lens = vec![];
+        let msg = format!("`{op}` of a value that is not a string");
+        for c in &cases {
+            let pat = match c.len() {
+                1 => format!("{}", c[0]),
+                _ => format!("({}, {})", c[0], c[1]),
+            };
+            let (Some(x), y) = (text(c[0]), c.get(1).map(|&y| text(y))) else {
+                write!(arms, "{pat} => eval_error({msg:?}.to_string()), ").unwrap();
+                continue;
+            };
+            if matches!(y, Some(None)) {
+                write!(arms, "{pat} => eval_error({msg:?}.to_string()), ").unwrap();
+                continue;
+            }
+            let y = y.flatten();
+            let chars: Vec<char> = x.chars().collect();
+            let out: Result<String, &str> = match op {
+                "Head" => chars.first().map(|c| c.to_string()).ok_or("Attempted to apply Head to the empty sequence."),
+                "Tail" => if chars.is_empty() { Err("Attempted to apply Tail to the empty sequence.") } else { Ok(chars[1..].iter().collect()) },
+                "Append" | "\\o" => Ok(x.clone() + &y.unwrap()),
+                _ => Ok(String::new()),
+            };
+            let body = match (op, out) {
+                ("Len", _) => {
+                    lens.push(chars.len() as i64);
+                    format!("{}i64", chars.len())
+                }
+                (_, Ok(s)) => {
+                    let id = self.atoms.intern(false, &s);
+                    res_ids.push(id);
+                    format!("{id}u16")
+                }
+                (_, Err(m)) => format!("arith_error({m:?}.to_string())"),
+            };
+            write!(arms, "{pat} => {body}, ").unwrap();
+        }
+        let scrut = match &b {
+            Some(bc) => format!("({a}, {bc})"),
+            None => a.to_string(),
+        };
+        // Any other value lies outside the operand's type, which packing reports too
+        let code = format!("(match {scrut} {{ {arms}_ => type_error(\"string\", \"\") }})");
+        Ok(if op == "Len" {
+            (code, Ty::Int(lens.iter().copied().min().unwrap_or(0), lens.iter().copied().max().unwrap_or(0)))
+        } else {
+            res_ids.sort();
+            res_ids.dedup();
+            (code, Ty::Enum(res_ids))
+        })
     }
 
     /// The value of `q` as a sequence (converting a tuple or a function over 1..n), and its type
@@ -986,6 +1055,11 @@ impl<'a> Gen<'a> {
                 }
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
+                ("TLCEval", [x]) => self.gen(x, env, want)?,
+                ("ToString", _) => return Err("ToString of a value from the state is not supported: it builds a string the checker has no value for".into()),
+                ("RandomElement", [SetLit(xs)]) if xs.len() == 1 => self.gen(&xs[0], env, want)?,
+                ("RandomElement", _) => return Err("RandomElement over a set from the state is not supported: TLC picks an element at random".into()),
+                ("TLCGet" | "TLCSet", _) => return Err(format!("{f} is not supported: it reads or writes TLC's search state")),
                 ("IsFiniteSet", [s]) => {
                     let (c, t) = self.gen(s, env, None)?;
                     if !matches!(t, Ty::Set(_)) {
@@ -1065,6 +1139,21 @@ impl<'a> Gen<'a> {
                         "the cartesian product \\X over state-dependent sets is only supported on the right of \\in: {}",
                         short(e)
                     ))
+                }
+                // A string from the state as a sequence of characters: the result for every string
+                // the operand can be is computed here, and looked up at run time
+                ("Len" | "Head" | "Tail", [q]) if matches!(self.gen(q, env, None), Ok((_, Ty::Enum(_)))) => {
+                    let (c, t) = self.gen(q, env, None)?;
+                    let Ty::Enum(d) = &t else { unreachable!() };
+                    self.string_table(f, &c, &[(d.clone(), None)])?
+                }
+                ("Append" | "\\o", [a, b]) if matches!(self.gen(a, env, None), Ok((_, Ty::Enum(_)))) => {
+                    let (ac, at) = self.gen(a, env, None)?;
+                    let (bc, bt) = self.gen(b, env, None)?;
+                    let (Ty::Enum(da), Ty::Enum(db)) = (&at, &bt) else {
+                        return Err(format!("`{f}` of a string and a value that is not a string"));
+                    };
+                    self.string_table(f, &ac, &[(da.clone(), None), (db.clone(), Some(bc))])?
                 }
                 ("Len", [q]) => {
                     let (c, t) = self.gen(q, env, None)?;
@@ -1970,6 +2059,7 @@ impl<'a> Gen<'a> {
                 });
             }
             Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
+            Ident(n) if n == "Any" => return Ok("true".into()),
             Ident(n) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
             }
@@ -3246,8 +3336,8 @@ impl<'a> Gen<'a> {
     }
 
     pub fn atoms_table(&self) -> String {
-        let names: Vec<String> = self.atoms.list.iter().enumerate().map(|(i, _)| format!("{:?}", self.atoms.show(i as u32))).collect();
-        let strs: Vec<String> = self.atoms.list.iter().map(|(model, _)| (!model).to_string()).collect();
+        let names: Vec<String> = (0..self.atoms.len()).map(|i| format!("{:?}", self.atoms.show(i as u32))).collect();
+        let strs: Vec<String> = (0..self.atoms.len()).map(|i| (!self.atoms.is_model(i as u32)).to_string()).collect();
         format!(
             "static ATOMS: [&str; {}] = [{}];\nstatic IS_STR: [bool; {}] = [{}];\n\
              // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\

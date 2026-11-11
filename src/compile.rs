@@ -628,8 +628,14 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         let e = ex.expand_def(sym)?;
         let v = g.ce.eval(&e, &HashMap::new()).map_err(|m| format!("SYMMETRY {sym}: {m}"))?;
         for f in v.as_set()? {
-            let Value::Fun(m) = f else { return Err(format!("SYMMETRY {sym} must be a set of permutations")) };
-            let mut t: Vec<u16> = (0..atoms.list.len() as u16).collect();
+            let m = match f {
+                Value::Fun(m) => m.clone(),
+                // The permutation of the empty set is the empty function, <<>>
+                Value::Tuple(t) if t.is_empty() => Default::default(),
+                _ => return Err(format!("SYMMETRY {sym} must be a set of permutations of model values or strings")),
+            };
+            let m = &m;
+            let mut t: Vec<u16> = (0..atoms.len() as u16).collect();
             for (a, b) in m {
                 let (Value::Atom(a), Value::Atom(b)) = (a, b) else {
                     return Err(format!("SYMMETRY {sym}: only permutations of model values / strings are supported"));
