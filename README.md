@@ -115,13 +115,15 @@ memory.
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
   characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`), `Bags`, and from `TLC` `Print`, `PrintT`,
   `Assert`, `ToString` (in constant expressions), `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+- Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
+  part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
+  infix operators `--` and `|-` are accepted; `Print` and `PrintT` write to stdout as TLC does
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
-  reason), sets that may hold both strings and integers, functions over part of a type (`[S -> T]` with S in the
-  state, `:>` / `@@` other than `(d :> e) @@ f`, `Permutations` of a set in the state, `SubBag` of a bag in the
-  state), user-defined prefix and postfix operators, recursive operators with operator parameters, and
+  reason), sets that may hold both strings and integers, recursive operators with operator parameters, and
   `Name <- [Module] Def` for a CONSTANT (TLC rejects it too)
-- Recursion deeper than 500 levels is an evaluation error. TLC overflows its stack somewhere between 500 and 900
-  levels depending on the operator, so a recursion between those depths can pass in TLC and fail here
+- Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
+  body; 50,000 levels at compile time). TLC overflows its JVM stack much earlier (500 to 900 levels for small
+  bodies), so a recursion between the two depths passes here where TLC reports a stack overflow
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
   collision (an estimate is printed at the end)
 - Liveness checking keeps the whole state graph in memory (about 40 bytes per edge), and the search over its product

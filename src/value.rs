@@ -810,7 +810,7 @@ impl ConstEval<'_> {
         match self.eval(q, env)? {
             Value::Tuple(t) => Ok(t),
             Value::Atom(a) if !self.atoms.is_model(a) => {
-                Err(format!("`{op}` on strings is not supported (only Len of a string is)"))
+                Err(format!("`{op}` on strings is not supported (\\o, Len, Head, Tail, Append, and SubSeq are)"))
             }
             v => Err(format!("`{op}` of {v:?}, which is not a sequence")),
         }

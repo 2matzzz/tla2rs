@@ -988,7 +988,7 @@ impl<'a> Gen<'a> {
         if let (Some(a), Some(b)) = (tuple_elems(from), tuple_elems(to)) {
             if a.len() != b.len() {
                 return Err(format!(
-                    "tuples of different lengths ({} and {}); sequences are not supported yet",
+                    "a tuple of length {} used where a tuple of length {} is expected",
                     a.len(),
                     b.len()
                 ));
