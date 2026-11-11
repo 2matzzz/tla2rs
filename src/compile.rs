@@ -1600,7 +1600,9 @@ fn infer_types(
         if !changed {
             for v in undeclared {
                 if cur[v] == bottom {
-                    return Err(format!("cannot infer the type of `{v}`; add `{v} \\in S` to TypeOK (or TypeDecl)"));
+                    // Why no value could be computed for it, if that is known
+                    let why = g.infer_errs.get(v).map(|e| format!(" ({e})")).unwrap_or_default();
+                    return Err(format!("cannot infer the type of `{v}`; add `{v} \\in S` to TypeOK (or TypeDecl){why}"));
                 }
             }
             return Ok(cur);
@@ -1631,6 +1633,8 @@ pub fn widen(old: &Ty, new: &Ty) -> Ty {
         (Ty::Opt(a), Ty::Opt(b)) => Ty::Opt(widen(a, b).into()),
         (a, Ty::Opt(b)) => Ty::Opt(widen(a, b).into()),
         (Ty::Fun(_, a), Ty::Fun(d, b)) => Ty::Fun(d.clone(), widen(a, b).into()),
+        // The values of a function over part of a type (its domain grows only with the keys)
+        (Ty::Fun(_, a) | Ty::PFun(_, a), Ty::PFun(d, b)) => Ty::PFun(d.clone(), widen(a, b).into()),
         (Ty::Set(a), Ty::Set(b)) => Ty::Set(widen(a, b).into()),
         _ => new.clone(),
     }
