@@ -1005,7 +1005,9 @@ impl<'a> Gen<'a> {
                 }
                 let mut env2 = env.clone();
                 let mut heads = vec![];
-                for (x, s) in bs {
+                // The first bound variable varies fastest, as in TLC (which matters for where an
+                // evaluation error stops the search)
+                for (x, s) in bs.iter().rev() {
                     let (it, et, ix) = self.iter_of_indexed(s, &env2)?;
                     let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
                     heads.push((it, lx));
@@ -1775,7 +1777,10 @@ impl<'a> Gen<'a> {
                 }
                 let mut env2 = env.clone();
                 let mut closes = 0;
-                for (x, s) in bs {
+                // TLC varies the first bound variable fastest: `\E x \in S, y \in T` loops over T
+                // outside and S inside. The sets cannot refer to the other variables (SANY rejects
+                // that), so the order of the loops is free
+                for (x, s) in bs.iter().rev() {
                     let (it, et, ix) = match self.iter_of_indexed(s, &env2) {
                         Ok(x) => x,
                         // During inference, proceed past sets of still-unknown type, treating the
