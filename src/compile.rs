@@ -293,6 +293,7 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
             }
         }
     }
+    missing_std_ops(&m, &out)?;
     out.op_constants.extend(m.op_constants);
     out.recursive.extend(m.recursive);
     out.constants.extend(m.constants);
@@ -304,6 +305,36 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
         instantiate(&mut out, inst, dir, warnings, depth)?;
     }
     Ok(out)
+}
+
+/// SANY refuses an operator of a standard module that the module does not extend (directly or
+/// through the modules it extends, whose standard modules are in `ext.extends`): unary minus
+/// without Integers, `:>` and `@@` without TLC (unless the spec defines them). The standard
+/// modules other than Integers, Reals and Bags instantiate theirs LOCALly, which exports nothing.
+fn missing_std_ops(m: &Module, ext: &Module) -> R<()> {
+    let has = |n: &str| ext.extends.iter().any(|e| e == n);
+    let defined = |n: &str| m.defs.iter().chain(&ext.defs).any(|d| d.name == n);
+    let mut missing = vec![];
+    if !has("Integers") && !has("Reals") {
+        missing.push(("-.", Expr::Un(UOp::Neg, Expr::Bool(true).b())));
+    }
+    for op in [":>", "@@"] {
+        // Bags extends TLC
+        if !has("TLC") && !has("Bags") && !defined(op) {
+            missing.push((op, Expr::Call(op.into(), vec![])));
+        }
+    }
+    let same = |x: &Expr, pat: &Expr| match (x, pat) {
+        (Expr::Un(UOp::Neg, _), Expr::Un(UOp::Neg, _)) => true,
+        (Expr::Call(a, args), Expr::Call(b, _)) => a == b && args.len() == 2,
+        _ => false,
+    };
+    for e in m.defs.iter().map(|d| &d.body).chain(m.assumes.iter().map(|a| &a.expr)) {
+        if let Some((op, _)) = missing.iter().find(|(_, pat)| e.any(&|x| same(x, pat))) {
+            return Err(format!("{}Could not find declaration or definition of symbol '{op}' in module {}.", crate::lexer::SANY, m.name));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `name` is a standard module that tla2rs provides itself (an error for the standard
@@ -634,7 +665,15 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
     let mut startup = vec![];
-    let mut out = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup)?;
+    let mut out = match compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup) {
+        // An error SANY reports too: TLC stops before checking anything
+        Err(e) if e.contains(crate::lexer::SANY) => {
+            let msg = e.replacen(crate::lexer::SANY, "", 1);
+            let msg = format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed.");
+            return Ok(Output { rust: String::new(), warnings: vec![], rejected: Some((msg, 150)) });
+        }
+        r => r?,
+    };
     // What TLC prints when it starts comes before its verdict on the spec
     if let Some((msg, _)) = &mut out.rejected {
         if !startup.is_empty() {

@@ -3,6 +3,9 @@
 
 pub type R<T> = Result<T, String>;
 
+/// The start of an error that SANY reports too (TLC then stops with exit 150, before checking)
+pub const SANY: &str = "SANY: ";
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
@@ -164,7 +167,10 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                     s.push(match cs[i] {
                         'n' => '\n',
                         't' => '\t',
-                        x => x,
+                        'r' => '\r',
+                        'f' => '\x0c',
+                        x @ ('\\' | '"') => x,
+                        x => return Err(format!("{SANY}Lexical error at line {line}: the escape \\{x} in a string")),
                     });
                 } else {
                     s.push(cs[i]);

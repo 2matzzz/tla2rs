@@ -2,7 +2,7 @@
 //! lists are delimited by column.
 
 use crate::ast::*;
-use crate::lexer::{lex_module, Tok, Token, R};
+use crate::lexer::{lex_module, Tok, Token, R, SANY};
 
 static EOF: Tok = Tok::Eof;
 
@@ -43,9 +43,113 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex_module(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![] };
-    p.module()
+    let toks = lex_module(src)?;
+    // Positional subexpression names (`Op!1`, `Op!<<`, `Op!(e)`) need infix /\ and \/ as SANY
+    // reads them: binary and left-associative. Only then are they kept so (see INFIX_JUNCTION)
+    let positional = toks.windows(2).any(|w| matches!(&w[0].tok, Tok::Sym(b) if b == "!") && is_selector(&w[1].tok));
+    NEST_JUNCTIONS.with(|n| n.set(positional));
+    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![] };
+    let r = p.module();
+    NEST_JUNCTIONS.with(|n| n.set(false));
+    let m = r?;
+    check_bound_names(&m)?;
+    Ok(m)
 }
+
+/// SANY refuses a bound variable, operator parameter or LET definition named like a symbol in
+/// scope: a CONSTANT or VARIABLE of the module, a definition before it, Nat or Int from the
+/// standard modules extended, or an enclosing bound variable (also one in the same quantifier).
+/// Names from other modules the spec extends are not checked.
+fn check_bound_names(m: &Module) -> R<()> {
+    fn bind(x: &str, scope: &mut Vec<String>) -> R<()> {
+        if !x.contains('#') && scope.iter().any(|y| y == x) {
+            return Err(format!("{SANY}Multiply-defined symbol '{x}': this definition or declaration conflicts with another one in scope."));
+        }
+        scope.push(x.to_string());
+        Ok(())
+    }
+    fn walk(e: &Expr, scope: &[String]) -> R<()> {
+        use Expr::*;
+        let mut inner = scope.to_vec();
+        match e {
+            Quant(_, bs, body) | SetMap(body, bs) => {
+                for (_, s) in bs {
+                    walk(s, scope)?;
+                }
+                for (x, _) in bs {
+                    bind(x, &mut inner)?;
+                }
+                walk(body, &inner)
+            }
+            Choose(x, s, p) | SetFilter(x, s, p) | FunCons(x, s, p) => {
+                walk(s, scope)?;
+                bind(x, &mut inner)?;
+                walk(p, &inner)
+            }
+            Let(defs, body) => {
+                // A LET definition is in scope after its own body (`LET i == CHOOSE i \in S : P`)
+                for d in defs {
+                    let mut ps = inner.clone();
+                    for p in &d.params {
+                        bind(p, &mut ps)?;
+                    }
+                    walk(&d.body, &ps)?;
+                    bind(&d.name, &mut inner)?;
+                }
+                walk(body, &inner)
+            }
+            Lambda(ps, body) => {
+                for p in ps {
+                    bind(p, &mut inner)?;
+                }
+                walk(body, &inner)
+            }
+            e => e.children().into_iter().try_for_each(|c| walk(c, scope)),
+        }
+    }
+    let mut scope: Vec<String> = m.constants.iter().chain(&m.variables).cloned().collect();
+    scope.extend(m.op_constants.iter().map(|(n, _)| n.clone()));
+    let ext = |n: &[&str]| m.extends.iter().any(|e| n.contains(&e.as_str()));
+    if ext(&["Naturals", "Integers", "Reals"]) {
+        scope.push("Nat".into());
+    }
+    if ext(&["Integers", "Reals"]) {
+        scope.push("Int".into());
+    }
+    for d in &m.defs {
+        let mut ps = scope.clone();
+        for p in &d.params {
+            bind(p, &mut ps)?;
+        }
+        walk(&d.body, &ps)?;
+        if !scope.contains(&d.name) {
+            scope.push(d.name.clone());
+        }
+    }
+    for a in &m.assumes {
+        walk(&a.expr, &scope)?;
+    }
+    m.nested.iter().try_for_each(check_bound_names)
+}
+
+/// Whether a token after `!` starts a positional subexpression selector
+fn is_selector(t: &Tok) -> bool {
+    matches!(t, Tok::Num(_)) || matches!(t, Tok::Sym(c) if ["<<", ">>", ":", "(", "@"].contains(&c.as_str()))
+}
+
+thread_local! {
+    static NEST_JUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The label around `a /\ b` (and `a \/ b`) written infix, in a module that names
+/// subexpressions by position: the conjunction of the two, which expansion flattens as the parser
+/// otherwise does (`a /\ b /\ c` is one conjunction of three)
+pub const INFIX_JUNCTION: &str = "#infix";
+
+/// The call a positional subexpression name becomes: the operator (Ident or Call) and then the
+/// selectors: Num(n) for `!n`, Ident("<<" / ">>" / ":" / "@"), Tuple(args) for `!(args)`, and a
+/// call of `#label<name>` for a label
+pub const SUBEXPR: &str = "#subexpr";
 
 /// Infix operators without a built-in meaning, which a spec may define (`a ++ b == ...`), with
 /// their precedence (the lower end of the range in the TLA+ table). `:>` and `@@` are defined by
@@ -106,9 +210,58 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
     })
 }
 
+/// The precedence range of an infix operator in the TLA+ table (by its normalized name) and
+/// whether it associates to the left. SANY refuses two operators whose ranges overlap next to each
+/// other without parentheses, unless they are the same operator and it associates.
+fn sany_range(op: &str) -> Option<(u8, u8, bool)> {
+    Some(match op {
+        "=>" => (1, 1, false),
+        "<=>" | "~>" | "-+->" => (2, 2, false),
+        "\\/" | "/\\" => (3, 3, true),
+        "=" | "#" | "<" | ">" | "<=" | ">=" | "\\in" | "\\notin" | "\\subseteq" | "|-" => (5, 5, false),
+        "\\prec" | "\\succ" | "\\preceq" | "\\succeq" | "\\sim" | "\\simeq" | "\\approx" | "\\cong" | "\\asymp" => (5, 5, false),
+        "\\doteq" | "\\propto" | "\\sqsubseteq" | "\\sqsupseteq" => (5, 5, false),
+        "@@" => (6, 6, true),
+        ":>" | "<:" => (7, 7, false),
+        "\\cup" | "\\cap" => (8, 8, true),
+        "\\" => (8, 8, false),
+        ".." => (9, 9, false),
+        "!!" => (9, 13, false),
+        "??" | "##" | "$$" | "\\uplus" | "\\sqcap" | "\\sqcup" => (9, 13, true),
+        "\\wr" => (9, 14, false),
+        "\\X" => (10, 13, true),
+        "+" | "++" | "\\oplus" => (10, 10, true),
+        "%" => (10, 11, false),
+        "%%" | "||" => (10, 11, true),
+        "-" | "--" | "\\ominus" => (11, 11, true),
+        "*" | "**" | "\\o" | "&&" | "\\otimes" | "\\odot" | "\\star" | "\\bullet" | "\\bigcirc" => (13, 13, true),
+        "\\div" | "//" | "\\oslash" => (13, 13, false),
+        "^" | "^^" => (14, 14, false),
+        _ => return None,
+    })
+}
+
+/// Whether SANY refuses `a op1 b op2 c` without parentheses (see `sany_range`)
+fn precedence_conflict(op1: &str, op2: &str) -> bool {
+    match (sany_range(op1), sany_range(op2)) {
+        (Some((l1, h1, assoc)), Some((l2, h2, _))) => l1 <= h2 && l2 <= h1 && !(op1 == op2 && assoc),
+        _ => false,
+    }
+}
+
 /// Whether `name` is an infix operator the parser knows (by its normalized name)
 pub fn is_infix_name(name: &str) -> bool {
     infix(&Tok::Sym(name.to_string())).is_some_and(|(_, _, n)| n == name)
+}
+
+/// The name of the call an unbounded quantifier or CHOOSE becomes, followed by `\\E`, `\\A` or
+/// `CHOOSE`
+pub const UNBOUNDED: &str = "#unbounded";
+
+/// TLC's error when it evaluates the unbounded quantifier or CHOOSE named `call` (see UNBOUNDED)
+pub fn unbounded_error(call: &str) -> Option<String> {
+    let kind = call.strip_prefix(UNBOUNDED)?;
+    Some(format!("TLC attempted to evaluate an unbounded {kind}.\nMake sure that the expression is of form {kind} x \\in S: P(x)."))
 }
 
 /// `a op b` for an infix operator by its normalized name, as the parser builds it
@@ -121,6 +274,10 @@ pub(crate) fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "=>" => BOp::Implies,
         "<=>" => BOp::Equiv,
         "~>" => BOp::LeadsTo,
+        "\\/" | "/\\" if NEST_JUNCTIONS.with(|n| n.get()) => {
+            let j = if op == "/\\" { Expr::And(vec![a, b]) } else { Expr::Or(vec![a, b]) };
+            return Expr::Label(INFIX_JUNCTION.into(), vec![], j.b());
+        }
         "\\/" => {
             return match a {
                 Expr::Or(mut v) => {
@@ -693,12 +850,23 @@ impl Parser {
     }
 
     pub fn expr(&mut self, min: u8) -> R<Expr> {
+        self.expr_in(min, None)
+    }
+
+    /// An expression whose operators bind at least as tightly as `min`; `parent` is the infix
+    /// operator it is the right operand of
+    fn expr_in(&mut self, min: u8, parent: Option<&'static str>) -> R<Expr> {
         let mut lhs = self.prefix()?;
+        let mut prev: Option<&'static str> = None;
         loop {
             let Some((prec, right, op)) = infix(self.peek()) else { break };
             if prec < min {
                 break;
             }
+            if let Some(other) = [prev, parent].into_iter().flatten().find(|o| precedence_conflict(o, op)) {
+                return self.err(&format!("{SANY}Precedence conflict between ops {other} and {op}."));
+            }
+            prev = Some(op);
             self.pos += 1;
             if op == "\\X" {
                 // A \X B \X C is the set of triples, not of pairs whose first element is a pair
@@ -710,7 +878,7 @@ impl Parser {
                 lhs = Expr::Call("\\X".into(), parts);
                 continue;
             }
-            let rhs = self.expr(if right { prec } else { prec + 1 })?;
+            let rhs = self.expr_in(if right { prec } else { prec + 1 }, Some(op))?;
             lhs = bin(op, lhs, rhs);
         }
         Ok(lhs)
@@ -818,6 +986,26 @@ impl Parser {
         Ok((out, lets))
     }
 
+    /// At the bound variables of `\\E x, y : P` (or \\A, CHOOSE) without a set: the quantifier,
+    /// as a call that stops with TLC's error when it is evaluated (TLC accepts it and fails only
+    /// then). Otherwise None and nothing is consumed.
+    fn unbounded(&mut self, kind: &str) -> R<Option<Expr>> {
+        let mut i = self.pos;
+        loop {
+            if !matches!(&self.toks[i].tok, Tok::Ident(_)) {
+                return Ok(None);
+            }
+            match &self.toks[i + 1].tok {
+                Tok::Sym(c) if c == "," => i += 2,
+                Tok::Sym(c) if c == ":" => break,
+                _ => return Ok(None),
+            }
+        }
+        self.pos = i + 2;
+        self.expr(0)?;
+        Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind}"), vec![])))
+    }
+
     fn prefix(&mut self) -> R<Expr> {
         let t = self.peek().clone();
         match &t {
@@ -855,6 +1043,9 @@ impl Parser {
             Tok::Sym(s) if s == "\\E" || s == "\\A" => {
                 let ex = s == "\\E";
                 self.pos += 1;
+                if let Some(e) = self.unbounded(s)? {
+                    return Ok(e);
+                }
                 let (bs, lets) = self.binders_pat()?;
                 self.expect(":")?;
                 let body = self.expr(0)?;
@@ -951,6 +1142,9 @@ impl Parser {
                 }
                 "CHOOSE" => {
                     self.pos += 1;
+                    if let Some(e) = self.unbounded("CHOOSE")? {
+                        return Ok(e);
+                    }
                     // CHOOSE <<x, y>> \in S : P binds a fresh name to the tuple
                     let pat = self.tuple_pattern();
                     let x = match &pat {
@@ -1084,9 +1278,17 @@ impl Parser {
                         }
                     }
                     if j > self.pos + 1 && matches!(&self.toks[j - 1].tok, Tok::Sym(c) if c == ")") && matches!(&self.toks[j].tok, Tok::Sym(c) if c == "::") {
+                        // The parameters are kept in the name, for naming the label with arguments
+                        let ps: Vec<String> = self.toks[self.pos + 1..j]
+                            .iter()
+                            .filter_map(|t| match &t.tok {
+                                Tok::Ident(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect();
                         self.pos = j + 1;
                         let body = self.expr(0)?;
-                        return Ok(Expr::Label(format!("{s}::"), vec![], body.b()));
+                        return Ok(Expr::Label(format!("{s}({})::", ps.join(",")), vec![], body.b()));
                     }
                 }
                 let mut name = s;
@@ -1113,10 +1315,35 @@ impl Parser {
                         _ => break,
                     }
                 }
-                if call || !args.is_empty() {
-                    return Ok(Expr::Call(name, args));
+                let base = if call || !args.is_empty() { Expr::Call(name, args) } else { Expr::Ident(name) };
+                // A positional subexpression name: `Op!1!2`, `Op!<<`, `Op!(e)`, `Op!:`, also
+                // followed by labels
+                if !(self.is("!") && is_selector(self.peek2())) {
+                    return Ok(base);
                 }
-                Ok(Expr::Ident(name))
+                let mut parts = vec![base];
+                while self.is("!") {
+                    let next = self.peek2().clone();
+                    self.pos += 2;
+                    parts.push(match next {
+                        Tok::Num(n) => Expr::Num(n),
+                        Tok::Sym(c) if c == "(" => Expr::Tuple(self.nested(|p| p.comma_list(")"))?),
+                        Tok::Sym(c) if ["<<", ">>", ":", "@"].contains(&c.as_str()) => Expr::Ident(c),
+                        Tok::Ident(l) => {
+                            let mut largs = vec![];
+                            if self.is("(") {
+                                self.pos += 1;
+                                largs = self.nested(|p| p.comma_list(")"))?;
+                            }
+                            Expr::Call(format!("#label{l}"), largs)
+                        }
+                        _ => {
+                            self.pos -= 2;
+                            return self.err("expected a subexpression selector after `!`");
+                        }
+                    });
+                }
+                Ok(Expr::Call(SUBEXPR.into(), parts))
             }
             Tok::Sym(s) => match s.as_str() {
                 "(" => {

@@ -33,6 +33,9 @@ pub struct Env {
     partial: bool,
     /// Bound variables whose value is known at compile time (an unrolled \\A or recursive call)
     vals: HashMap<String, Value>,
+    /// Inside the function of a recursive operator that assigns variables (`rec_action_fn`, by
+    /// its key): the end of the action returns the state built so far instead of emitting it
+    sink: Option<String>,
 }
 
 pub struct Gen<'a> {
@@ -66,6 +69,11 @@ pub struct Gen<'a> {
     rec_names: HashMap<(usize, Vec<Ty>), String>,
     /// Function name -> its code (the latest version)
     rec_code: std::collections::BTreeMap<String, String>,
+    /// Functions for recursive operators that assign variables, per key (`rec_action_fn`): the
+    /// name, the sets of variables assigned when it returns (bit masks over `vars`), and whether
+    /// these are settled
+    ract: HashMap<String, (String, BTreeSet<u64>, bool)>,
+    ract_progress: Vec<String>,
 }
 
 fn rid(n: &str) -> String {
@@ -94,6 +102,8 @@ impl<'a> Gen<'a> {
             rec_progress: vec![],
             rec_names: HashMap::new(),
             rec_code: std::collections::BTreeMap::new(),
+            ract: HashMap::new(),
+            ract_progress: vec![],
         }
     }
 
@@ -261,6 +271,72 @@ impl<'a> Gen<'a> {
             Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(..)) => Cmp::Unequal,
             _ => Cmp::Fails(format!("Attempted to compare a tuple with a value of type {t:?}")),
         })
+    }
+
+    /// `a = b` when one side is a tuple (or sequence) and the other may be a string. TLC asks the
+    /// value on the left: a tuple compares itself with the characters of a string, element by
+    /// element; a string asked about a tuple stops with an error. A model value is unequal to both,
+    /// and an integer cannot be compared with a tuple. None when neither side is such a pair.
+    fn tuple_str_eq(&mut self, ac: &str, at: &Ty, bc: &str, bt: &Ty, env: &Env) -> R<Option<String>> {
+        let tupleish = |t: &Ty| tuple_elems(t).is_some() || matches!(t, Ty::Seq(_));
+        let atoms_of = |t: &Ty| match t {
+            Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.clone(),
+            _ => vec![],
+        };
+        if tupleish(at) && self.has_str(bt) {
+            let (t, s) = (self.fresh("t"), self.fresh("s"));
+            let mut chain = String::new();
+            for a in atoms_of(bt) {
+                if self.atoms.is_model(a) {
+                    continue;
+                }
+                let chars: Vec<String> = self.atoms.name(a).chars().map(|c| c.to_string()).collect();
+                let elems: Vec<(String, Ty)> = match at {
+                    Ty::Seq(e) => (0..chars.len()).map(|i| (format!("{t}.at({})", i + 1), e.as_ref().clone())).collect(),
+                    _ => {
+                        let es = tuple_elems(at).unwrap();
+                        let n = es.len();
+                        es.into_iter().enumerate().map(|(i, e)| (format!("{t}{}", rec_field(n, i)), e.clone())).collect()
+                    }
+                };
+                let mut parts = vec![];
+                match at {
+                    Ty::Seq(_) => parts.push(format!("{t}.len as usize == {}", chars.len())),
+                    _ if elems.len() != chars.len() => parts.push("false".into()),
+                    _ => {}
+                }
+                if parts.iter().all(|p| p != "false") {
+                    for ((code, et), ch) in elems.iter().zip(&chars) {
+                        self.atoms.intern(false, ch);
+                        let mut env2 = env.clone();
+                        env2.bind("#elem", code.clone(), et.clone());
+                        let eq = Expr::Bin(BOp::Eq, Expr::Ident("#elem".into()).b(), Expr::Str(ch.clone()).b());
+                        parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
+                    }
+                }
+                let lit = self.lit(&Value::Atom(a), bt)?;
+                write!(chain, "if {s} == {lit} {{ {} }} else ", parts.join(" && ")).unwrap();
+            }
+            let other = if matches!(bt, Ty::IntAtom(..)) {
+                let tid = self.ty_id(bt)?;
+                let msg = "Attempted to check equality of a tuple with {}";
+                format!("if {s} >= i64::MIN + 65536 {{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{s}))); __b }} else {{ false }}")
+            } else {
+                "false".into()
+            };
+            return Ok(Some(format!("{{ let {t} = {ac}; let {s} = {bc}; {chain}{{ {other} }} }}")));
+        }
+        if self.has_str(at) && tupleish(bt) {
+            let s = self.fresh("s");
+            let models: Vec<String> =
+                atoms_of(at).into_iter().filter(|&a| self.atoms.is_model(a)).map(|a| self.lit(&Value::Atom(a), at)).collect::<R<_>>()?;
+            let (tid, bid) = (self.ty_id(at)?, self.ty_id(bt)?);
+            let msg = "Attempted to check equality of string {} with non-string:\n{}";
+            let fail = format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{s}), fmt_{bid}(&__q))); __b }}");
+            let unequal = if models.is_empty() { "false".to_string() } else { models.iter().map(|m| format!("{s} == {m}")).collect::<Vec<_>>().join(" || ") };
+            return Ok(Some(format!("{{ let {s} = {ac}; let __q = {bc}; if {unequal} {{ false }} else {fail} }}")));
+        }
+        Ok(None)
     }
 
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
@@ -1785,6 +1861,12 @@ impl<'a> Gen<'a> {
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
+                // An unbounded quantifier or CHOOSE: TLC stops when it evaluates one
+                (f, []) if crate::parser::unbounded_error(f).is_some() => {
+                    let t = want.cloned().unwrap_or(if f.ends_with("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
+                    let msg = crate::parser::unbounded_error(f).unwrap();
+                    (format!("{{ let __v: {} = eval_error({msg:?}.to_string()); __v }}", t.repr()), t)
+                }
                 // ToString of a value from the state: a table, indexed by the value's encoding, of
                 // the strings of every value of its type, interned now
                 // ToString of a value from the state: the string of every value of its type is
@@ -2164,7 +2246,11 @@ impl<'a> Gen<'a> {
                     let (ac, at) = self.gen(a, env, None)?;
                     let (bc, bt) = self.gen(b, env, None)?;
                     let (Ty::Enum(da), Ty::Enum(db)) = (&at, &bt) else {
-                        return Err(format!("`{f}` of a string and a value that is not a string"));
+                        // TLC stops with an error when it evaluates this
+                        let Ty::Enum(da) = &at else { unreachable!() };
+                        let bid = self.ty_id(&bt)?;
+                        let msg = "Evaluating an expression of the form t \\o s when s is not a string:\n{}";
+                        return Ok((format!("{{ let _ = {ac}; let __b = {bc}; let __v: u16 = eval_error(format!({msg:?}, fmt_{bid}(&__b))); __v }}"), Ty::Enum(da.clone())));
                     };
                     self.string_table(f, &ac, &[(da.clone(), None), (db.clone(), Some(bc))])?
                 }
@@ -3016,6 +3102,9 @@ impl<'a> Gen<'a> {
             Eq | Neq => {
                 let (ac, at) = self.gen(a, env, None)?;
                 let (bc, bt) = self.gen(b, env, Some(&at))?;
+                if let Some(c) = self.tuple_str_eq(&ac, &at, &bc, &bt, env)? {
+                    return Ok((if op == Eq { c } else { format!("!{c}") }, Ty::Bool));
+                }
                 // Still evaluate both sides, which may stop with an error as in TLC
                 match self.tuple_cmp(&at, &bt)? {
                     Cmp::Normal => {}
@@ -3265,6 +3354,32 @@ impl<'a> Gen<'a> {
     /// `x \in S`, where the value of x is already held in the variable named by `x`.
     fn gen_member(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
+        // A set written out where it is used, holding tuples and x a string or the other way
+        // round: TLC asks each element, in the order written, whether it equals x (a set from a
+        // definition or the state is sorted first, and comparing then fails)
+        if let SetLit(xs) = s {
+            let elems: Vec<(String, Ty)> = xs.iter().map(|e| self.gen(e, env, Some(xt))).collect::<R<_>>().unwrap_or_default();
+            let mut special = false;
+            let mut parts = vec![];
+            for (c, t) in &elems {
+                match self.tuple_str_eq(c, t, x, xt, env)? {
+                    Some(code) => {
+                        special = true;
+                        parts.push(code);
+                    }
+                    None => {
+                        let mut env2 = env.clone();
+                        env2.bind("#elem", c.clone(), t.clone());
+                        env2.bind("#x", x.to_string(), xt.clone());
+                        let eq = Bin(BOp::Eq, Ident("#elem".into()).b(), Ident("#x".into()).b());
+                        parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
+                    }
+                }
+            }
+            if special {
+                return Ok(format!("({})", parts.join(" || ")));
+            }
+        }
         let s = s.strip();
         // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
         // treats it as a function in [S -> T]; none of these is compiled
@@ -3710,7 +3825,7 @@ impl<'a> Gen<'a> {
                     }
                     // In Init, a condition on what is assigned so far: evaluated as a boolean below
                     None if env.init => {}
-                    None => return Err(format!("unsupported action form (\\A over a set that is not constant): {}", short(h))),
+                    None => return self.gen_forall(bs, body, rest, env, out),
                 }
             }
             // A recursive operator called with constant arguments in an action: its body, with
@@ -3718,7 +3833,10 @@ impl<'a> Gen<'a> {
             RecCall(i, args) if open && self.rec_assigns(*i, env) => {
                 let vals: Option<Vec<Value>> = args.iter().map(|a| self.try_const(a, env)).collect();
                 let Some(vals) = vals else {
-                    return Err(format!("unsupported action form (a recursive operator whose arguments are not constant): {}", short(h)));
+                    if env.init {
+                        return Err(format!("unsupported action form (a recursive operator whose arguments are not constant, in Init): {}", short(h)));
+                    }
+                    return self.gen_rec_action(*i, args, rest, env, out);
                 };
                 if self.unroll >= 2000 {
                     return Err(format!("recursive operator `{}` in an action recurses more than 2000 levels", crate::expand::rec_def(*i).name));
@@ -3738,6 +3856,49 @@ impl<'a> Gen<'a> {
                 let r = self.gen_action(&with(vec![Label(rd.name.clone(), args.clone(), b.b())]), &env2, out);
                 self.unroll -= 1;
                 return r;
+            }
+            // The elements of `\A x \in S : B` (S from the state) from the i-th on (gen_forall)
+            Call(f, a) if f == FORALL_REST => {
+                let [Ident(key), Ident(x), b, Num(i)] = a.as_slice() else { unreachable!() };
+                let (els, et) = env.locals[key].clone();
+                if self.only_reads_assigned(b, env) {
+                    // Nothing left to assign: B holds for each remaining element
+                    let k = self.fresh("k");
+                    let mut env2 = env.clone();
+                    env2.bind(x, format!("{els}[{k}]"), et);
+                    let c = match self.gen_as(b, &env2, &Ty::Bool) {
+                        Err(_) if self.infer.is_some() => "true".into(),
+                        r => r?,
+                    };
+                    writeln!(out, "if ({i}..{els}.len()).all(|{k}| {c}) {{").unwrap();
+                    self.gen_action(rest, env, out)?;
+                    out.push_str("}\n");
+                    return Ok(());
+                }
+                // The next element may assign: one level per element the set can hold
+                match et.size() {
+                    Some(n) if *i as u64 >= n => return self.gen_action(rest, env, out),
+                    _ if *i == 0 => {}
+                    Some(n) if n <= 16 => {}
+                    _ => {
+                        return Err(format!(
+                            "unsupported action form (\\A over a set from the state whose body assigns a variable for some elements only): {}",
+                            short(b)
+                        ))
+                    }
+                }
+                writeln!(out, "if {els}.len() <= {i} {{").unwrap();
+                let env0 = self.renew_work(env, out);
+                self.gen_action(rest, &env0, out)?;
+                out.push_str("} else {\n");
+                let mut env2 = self.renew_work(env, out);
+                let e = self.fresh("e");
+                writeln!(out, "let {e} = {els}[{i}];").unwrap();
+                env2.bind(x, e, et);
+                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1)]);
+                self.gen_action(&with(vec![b.clone(), next]), &env2, out)?;
+                out.push_str("}\n");
+                return Ok(());
             }
             If(c, a, b) if action => {
                 // A condition known here (as in an unrolled recursive operator): only its branch
@@ -3904,6 +4065,153 @@ impl<'a> Gen<'a> {
         self.gen_action(rest, env, out)?;
         out.push_str("}\n");
         Ok(())
+    }
+
+    /// `\A x \in S : B` that assigns variables, with S from the state. TLC evaluates it as the
+    /// conjunction of B over the elements of S in order: an element can assign the variables not
+    /// assigned yet, and once B only reads what is assigned, it is a test for the remaining
+    /// elements. Over the empty set it is TRUE. Several bound variables nest, the first varying
+    /// fastest.
+    fn gen_forall(&mut self, bs: &[(String, Expr)], body: &Expr, rest: &[Expr], env: &Env, out: &mut String) -> R<()> {
+        let (x, s) = bs.last().unwrap();
+        let inner = if bs.len() > 1 { Expr::Quant(false, bs[..bs.len() - 1].to_vec(), body.clone().b()) } else { body.clone() };
+        let (it, et, ix) = match self.iter_of_indexed(s, env) {
+            Ok(x) => x,
+            Err(_) if self.infer.is_some() => (String::new(), Ty::Enum(vec![]), None),
+            Err(e) => return Err(e),
+        };
+        let els = self.fresh("els");
+        let val = match ix {
+            Some(_) => format!("dec_{}(__e)", self.ty_id(&et)?),
+            None => "__e".into(),
+        };
+        writeln!(out, "let {els}: Vec<{}> = {it}.map(|__e| {val}).collect();", et.repr()).unwrap();
+        let mut env2 = env.clone();
+        let key = self.fresh("#els");
+        env2.bind(&key, els, et);
+        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0)]);
+        let work: Vec<Expr> = std::iter::once(first).chain(rest.iter().cloned()).collect();
+        self.gen_action(&work, &env2, out)
+    }
+
+    /// A recursive operator that assigns variables, called in an action with arguments from the
+    /// state: a Rust function evaluates its body as an action and returns each state it builds,
+    /// with the variables assigned by then (TLC evaluates the call as the body with the arguments
+    /// bound, so the steps and their number are the same). The rest of the action continues from
+    /// each, per set of assigned variables.
+    fn gen_rec_action(&mut self, i: usize, args: &[Expr], rest: &[Expr], env: &Env, out: &mut String) -> R<()> {
+        let rd = crate::expand::rec_def(i);
+        if self.infer.is_some() {
+            // Inferring types: the body a few levels deep shows what the call assigns
+            if self.unroll >= 4 {
+                return self.gen_action(rest, env, out);
+            }
+            let mut b = rd.body.clone();
+            let mut env2 = env.clone();
+            for (p, a) in rd.params.iter().zip(args) {
+                let (c, t) = self.gen(a, env, None).unwrap_or((String::new(), Ty::Enum(vec![])));
+                let y = self.fresh(&format!("{p}_r"));
+                env2.bind(&y, c, t);
+                b = rename_ident(&b, p, &y);
+            }
+            self.unroll += 1;
+            let r = self.gen_action(&[b].into_iter().chain(rest.iter().cloned()).collect::<Vec<_>>(), &env2, out);
+            self.unroll -= 1;
+            return r;
+        }
+        if self.vars.len() > 64 {
+            return Err(format!("recursive operator `{}` assigns variables of a spec with more than 64 variables", rd.name));
+        }
+        let mut codes = vec![];
+        let mut tys = vec![];
+        for a in args {
+            // Integers unbounded, as for `rec_fn`: one function serves n, n - 1, ...
+            let (c, t) = self.gen(a, env, None)?;
+            let w = unbounded_ints(&t);
+            codes.push(self.coerce(c, &t, &w)?);
+            tys.push(w);
+        }
+        let free = self.rec_free(&rd);
+        for x in &free {
+            let (c, t) = env.locals.get(x).cloned().ok_or(format!("recursive operator `{}` reads `{x}`, which is not bound where it is called", rd.name))?;
+            codes.push(c);
+            tys.push(t);
+        }
+        let mask_in = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
+        let (name, masks) = self.rec_action_fn(i, &rd, &free, &tys, mask_in)?;
+        let w0 = env.work.clone().unwrap_or("*s".into());
+        let (w, m) = (self.fresh("w"), self.fresh("m"));
+        writeln!(out, "for (mut {w}, {m}) in {name}(s, {w0}, {}) {{ match {m} {{", codes.join(", ")).unwrap();
+        for mask in masks {
+            writeln!(out, "{mask}u64 => {{").unwrap();
+            let mut env2 = env.clone();
+            env2.work = Some(w.clone());
+            env2.primed = HashMap::new();
+            for (k, (v, t)) in self.vars.iter().enumerate() {
+                if mask >> k & 1 == 1 {
+                    env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t.clone()));
+                }
+            }
+            self.gen_action(rest, &env2, out)?;
+            out.push_str("}\n");
+        }
+        out.push_str("_ => {} } }\n");
+        Ok(())
+    }
+
+    /// The function of `gen_rec_action` for the recursive operator `i` with arguments of types
+    /// `tys` (its parameters, then the identifiers `free` bound at the call site), called with the
+    /// variables in `mask_in` assigned: its name and the sets of variables assigned when it
+    /// returns. A call of itself inside uses the sets found so far, so the body is generated again
+    /// until they settle.
+    fn rec_action_fn(&mut self, i: usize, rd: &crate::expand::RecDef, free: &[String], tys: &[Ty], mask_in: u64) -> R<(String, BTreeSet<u64>)> {
+        let key = format!("{i}|{tys:?}|{mask_in}");
+        if let Some((n, ms, done)) = self.ract.get(&key) {
+            if *done || self.ract_progress.contains(&key) {
+                return Ok((n.clone(), ms.clone()));
+            }
+        } else {
+            if self.ract.keys().filter(|k| k.starts_with(&format!("{i}|"))).count() >= 16 {
+                return Err(format!("recursive operator `{}`: the types of its arguments keep changing between calls", rd.name));
+            }
+            let n = format!("ract_{}", self.ract.len());
+            self.ract.insert(key.clone(), (n, BTreeSet::new(), false));
+        }
+        let name = self.ract[&key].0.clone();
+        let names: Vec<&String> = rd.params.iter().chain(free).collect();
+        let mut env = Env::default();
+        let mut sig = String::from("s: &State, mut __w: State, ");
+        for (k, (x, t)) in names.iter().zip(tys).enumerate() {
+            env.locals.insert(x.to_string(), (format!("a{k}"), t.clone()));
+            write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+        }
+        for (k, (v, t)) in self.vars.iter().enumerate() {
+            if mask_in >> k & 1 == 1 {
+                env.primed.insert(v.clone(), (format!("__w.v_{v}"), t.clone()));
+            }
+        }
+        env.work = Some("__w".into());
+        env.sink = Some(key.clone());
+        loop {
+            let before = self.ract[&key].1.clone();
+            let mut body = String::new();
+            self.ract_progress.push(key.clone());
+            let r = self.gen_action(&[rd.body.clone()], &env, &mut body);
+            self.ract_progress.pop();
+            r?;
+            let f = format!(
+                "#[allow(unused_mut, unused_variables)]\nfn {name}({sig}) -> Vec<(State, u64)> {{ rec_enter({:?}); let mut __res: Vec<(State, u64)> = Vec::new(); {{ {body} }} rec_leave(); __res }}\n",
+                rd.name
+            );
+            self.rec_code.insert(name.clone(), f);
+            let after = self.ract[&key].1.clone();
+            if after == before {
+                if self.ract_progress.is_empty() {
+                    self.ract.get_mut(&key).unwrap().2 = true;
+                }
+                return Ok((name, after));
+            }
+        }
     }
 
     fn record(&mut self, v: &str, t: Ty) {
@@ -4151,6 +4459,12 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_state(&mut self, env: &Env, out: &mut String) -> R<()> {
+        if let Some(key) = &env.sink {
+            let mask = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
+            self.ract.get_mut(key).unwrap().1.insert(mask);
+            writeln!(out, "__res.push(({}, {mask}u64));", env.work.as_ref().unwrap()).unwrap();
+            return Ok(());
+        }
         for (v, _) in &self.vars {
             if env.primed.contains_key(v) || env.partial {
                 continue;
@@ -5104,6 +5418,9 @@ fn disordered_ty(t: &Ty) -> Option<(String, String)> {
         _ => None,
     }
 }
+
+/// The conjunct standing for the elements after the first in `Gen::gen_forall`
+const FORALL_REST: &str = "#forall-rest";
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)

@@ -164,7 +164,7 @@ fn record_print(line: Vec<Value>) {
 
 /// The starts of the error messages for failures that TLC raises too when it evaluates the same
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
-const EVAL_FAILURES: [&str; 10] = [
+const EVAL_FAILURES: [&str; 11] = [
     "Attempted to check equality of string ",
     "The first argument of BagOfAll should be an operator",
     "Attempted to check if ",
@@ -175,6 +175,7 @@ const EVAL_FAILURES: [&str; 10] = [
     "function applied outside its domain",
     "tuple index out of range",
     "no field ",
+    "TLC attempted to evaluate an unbounded ",
 ];
 
 /// TLC passes an operator whose body is a number or string literal to BagOfAll as that value, and
@@ -223,6 +224,7 @@ impl ConstEval<'_> {
             }
             Label(_, _, b) => self.eval(b, env)?,
             Call(f, args) => match (f.as_str(), args.as_slice()) {
+                (f, []) if crate::parser::unbounded_error(f).is_some() => return Err(crate::parser::unbounded_error(f).unwrap()),
                 ("Cardinality", [s]) => Value::Int(self.eval(s, env)?.as_set()?.len() as i64),
                 // TLC picks an element of its own choosing; only a single element is the same in
                 // every run
