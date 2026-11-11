@@ -70,18 +70,6 @@ impl<'a> Expander<'a> {
         Ok(Expr::Label(name.into(), vec![], body.b()))
     }
 
-    /// Expands a definition with parameters, renaming the formals to fresh names
-    pub fn expand_params(&mut self, name: &str) -> R<(Vec<String>, Expr)> {
-        let d = self.defs.get(name).copied().ok_or(format!("no definition named `{name}`"))?;
-        let mut env = Env::default();
-        let mut names = vec![];
-        for p in &d.params {
-            names.push(self.bind(p, &mut env));
-        }
-        let body = self.expand(&d.body, &env)?;
-        Ok((names, Expr::Label(name.into(), vec![], body.b())))
-    }
-
     pub fn expand_top(&mut self, e: &Expr) -> R<Expr> {
         self.expand(e, &Env::default())
     }

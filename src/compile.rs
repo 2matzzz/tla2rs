@@ -475,11 +475,12 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     }
     g.qcap = seq_cap(&m, &cfg, &mut ex, &g, seqcap)?;
 
-    // Enumerate fairness instances (only relevant when checking properties)
+    // Fairness conditions (only relevant when checking properties)
+    let mut fair_defs = vec![];
     if !cfg.properties.is_empty() {
         for f in &fairness {
             let f = ex.expand_top(f)?;
-            collect_fair(&f, &HashMap::new(), &mut g, &m.variables, &mut warnings)?;
+            crate::live::collect_fair(&f, &HashMap::new(), &g, &mut fair_defs)?;
         }
     }
 
@@ -550,21 +551,6 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
     g.gen_action(&[next], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
-    // Compile each fair action on its own, so that ENABLED and "this transition is an A step" are
-    // decided by the action's actual semantics
-    let mut fair_ops: Vec<String> = vec![];
-    for f in &g.fair {
-        if !fair_ops.contains(&f.name) {
-            fair_ops.push(f.name.clone());
-        }
-    }
-    let mut fair_code = String::new();
-    for (k, name) in fair_ops.iter().enumerate() {
-        let (params, body) = ex.expand_params(name)?;
-        let code = g.gen_fair_fn(k, name, &params, &body).map_err(|e| format!("fairness on `{name}`: {e}"))?;
-        fair_code += &code;
-    }
-    fair_code += &g.gen_fair_dispatch(&fair_ops)?;
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
@@ -583,7 +569,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     }
 
     // Temporal properties
-    let mut props: Vec<(String, u8, String, String)> = vec![];
+    let mut live_parts: Vec<(String, Expr, HashMap<String, Value>)> = vec![];
     let mut action_props: Vec<(String, String, String)> = vec![];
     let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
@@ -591,12 +577,17 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
         let whole = parts.len() == 1;
-        for (disp, kind, p, q, env) in parts {
+        for (disp, kind, p, q, venv) in parts {
+            if kind == 7 {
+                live_parts.push((disp, p, venv));
+                continue;
+            }
+            let env = crate::live::bind_env(&mut g, &venv).map_err(|m| format!("property {name}: {m}"))?;
             // As TLC does, []P for a state predicate P is checked as an invariant while exploring,
             // and a state predicate on its own only on the initial states. TLC names a part of a
             // property by its position in the source, which tla2rs does not keep.
             let part_name = if whole && disp == *name { disp.clone() } else { format!("{disp} (a part)") };
-            if (kind == 4 && !has_enabled(&p)) || kind == 6 {
+            if kind == 4 || kind == 6 {
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 if kind == 4 {
                     let i = inv_list.len() + 1000;
@@ -614,16 +605,11 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
                 action_props.push((part_name, pc, qc));
                 continue;
             }
-            let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
-            let qc = match q {
-                Some(q) => g.gen_as(&q, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?,
-                None => "true".into(),
-            };
-            props.push((disp, kind, pc, qc));
+            unreachable!();
         }
     }
+    let live_code = crate::live::compile(&mut g, &fair_defs, &live_parts)?;
     let mut prop_code = String::new();
-    let mut prop_list = vec![];
     let mut aprop_list = vec![];
     for (i, (disp, pc, qc)) in action_props.iter().enumerate() {
         writeln!(prop_code, "fn aprop_{i}(s: &State, t: &State) -> bool {{ {pc} || {qc} }}").unwrap();
@@ -655,10 +641,6 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         cons.push(g.gen_as(&e, &Gen::env_next(), &Ty::Bool).map_err(|m| format!("constraint {name}: {m}"))?);
     }
     writeln!(prop_code, "fn constraint(s: &State) -> bool {{ {} }}", if cons.is_empty() { "true".into() } else { cons.join(" && ") }).unwrap();
-    for (i, (disp, kind, pc, qc)) in props.iter().enumerate() {
-        writeln!(prop_code, "fn prop_{i}_p(s: &State) -> bool {{ {pc} }}\nfn prop_{i}_q(s: &State) -> bool {{ {qc} }}").unwrap();
-        prop_list.push(format!("({disp:?}, {kind}u8, prop_{i}_p as fn(&State) -> bool, prop_{i}_q as fn(&State) -> bool)"));
-    }
 
     let pack = g.gen_pack()?;
     // VIEW and SYMMETRY
@@ -737,15 +719,11 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     writeln!(src, "fn next(s: &State, out: &mut Vec<(State, u32)>) {{\n{next_code}}}").unwrap();
     src += &inv_code;
     src += &prop_code;
-    src += &fair_code;
+    src += &live_code;
     writeln!(src, "const TYPE_INVARIANT: &str = {tname:?};").unwrap();
     writeln!(src, "const TYPE_INV_SUBSUMED: bool = {type_inv_subsumed};").unwrap();
-    writeln!(src, "static PROPS: &[(&str, u8, fn(&State) -> bool, fn(&State) -> bool)] = &[{}];", prop_list.join(", ")).unwrap();
-    let fair_names: Vec<String> = g.fair.iter().map(|f| format!("{:?}", f.display)).collect();
-    writeln!(src, "static FAIR: &[&str] = &[{}];", fair_names.join(", ")).unwrap();
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
-    writeln!(src, "const LIVENESS: bool = {};", !props.is_empty()).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
@@ -968,71 +946,6 @@ fn walk_spec(
     Ok(())
 }
 
-/// Enumerates (is_weak, operator, arguments) triples from a fairness formula.
-fn collect_fair(
-    e: &Expr,
-    env: &HashMap<String, Value>,
-    g: &mut Gen,
-    vars: &[String],
-    warnings: &mut Vec<String>,
-) -> R<()> {
-    match e {
-        Expr::Label(_, _, b) => collect_fair(b, env, g, vars, warnings),
-        Expr::And(xs) => {
-            for x in xs {
-                collect_fair(x, env, g, vars, warnings)?;
-            }
-            Ok(())
-        }
-        Expr::Quant(false, bs, body) => {
-            let mut err = Ok(());
-            g.ce.clone().each_binding(bs, env, &mut |env2| {
-                if let Err(m) = collect_fair(body, env2, g, vars, warnings) {
-                    err = Err(m);
-                    return Ok(false);
-                }
-                Ok(true)
-            })?;
-            err
-        }
-        Expr::Fair(weak, sub, a) => {
-            if !weak {
-                return Err("strong fairness (SF) is not supported yet".into());
-            }
-            let mut sv = vec![];
-            sub_vars(sub, &mut sv)?;
-            for v in &sv {
-                if !vars.contains(v) {
-                    return Err(format!("WF subscript `{v}` is not a variable"));
-                }
-            }
-            let _ = &warnings;
-            let Expr::Label(name, args, _) = a.as_ref() else {
-                return Err(format!("fairness on an unnamed action is not supported yet; give it a definition ({})", short(a)));
-            };
-            let vals: Vec<Value> = args.iter().map(|x| g.ce.eval(x, env)).collect::<R<_>>()?;
-            let shown: Vec<String> = vals.iter().map(|v| show_value(g.atoms, v)).collect();
-            let disp = if shown.is_empty() { format!("WF({name})") } else { format!("WF({name}({}))", shown.join(", ")) };
-            g.fair.push(crate::codegen::FairInst { name: name.clone(), args: vals, display: disp, sub: sv });
-            Ok(())
-        }
-        _ => Err(format!("unsupported fairness formula: {}", short(e))),
-    }
-}
-
-fn sub_vars(e: &Expr, out: &mut Vec<String>) -> R<()> {
-    match e.strip() {
-        Expr::Ident(n) => out.push(n.clone()),
-        Expr::Tuple(xs) => {
-            for x in xs {
-                sub_vars(x, out)?;
-            }
-        }
-        e => return Err(format!("unsupported WF subscript {}", short(e))),
-    }
-    Ok(())
-}
-
 pub fn show_value(atoms: &Atoms, v: &Value) -> String {
     match v {
         Value::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
@@ -1045,23 +958,36 @@ pub fn show_value(atoms: &Atoms, v: &Value) -> String {
     }
 }
 
-type PropPart = (String, u8, Expr, Option<Expr>, crate::codegen::Env);
+type PropPart = (String, u8, Expr, Option<Expr>, HashMap<String, Value>);
 
 /// Splits a property into checkable forms: 0: <>P, 1: []<>P, 2: <>[]P, 3: P ~> Q, 4: []P (state
 /// predicate), 5: [][A]_v.
-fn has_enabled(e: &Expr) -> bool {
-    e.any(&|y| matches!(y, Expr::Un(UOp::Enabled, _)))
+/// Splits a property into the parts TLC checks separately: (name, kind, formula, second formula,
+/// constant bindings). Kinds: 4 []P with P a state predicate (an invariant), 5 [][A]_v (an action
+/// property, with v' = v as the second formula), 6 a state predicate (checked on the initial
+/// states), 7 anything else (a liveness formula).
+/// Whether e is an action (has primes or UNCHANGED outside ENABLED)
+fn action_level(e: &Expr) -> bool {
+    match e {
+        Expr::Prime(_) | Expr::Un(UOp::Unchanged, _) => true,
+        Expr::Un(UOp::Enabled, _) => false,
+        _ => e.children().into_iter().any(action_level),
+    }
 }
 
 fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, out: &mut Vec<PropPart>) -> R<()> {
     use Expr::*;
-    let temporal = |x: &Expr| x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..)));
-    let mut cenv = Gen::env_next();
+    let temporal = |x: &Expr| {
+        x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..) | BoxAction(..) | Fair(..)))
+    };
     let mut tag = String::new();
-    for (k, v) in env {
-        let lit = crate::codegen::lit_for(g, v)?;
-        cenv.bind(k, lit.0, lit.1);
-        tag += &format!("{}={}", k.split("__").next().unwrap_or(k), show_value(g.atoms, v));
+    let mut keys: Vec<&String> = env.keys().collect();
+    keys.sort();
+    for k in keys {
+        if !tag.is_empty() {
+            tag += ", ";
+        }
+        tag += &format!("{}={}", k.split("__").next().unwrap_or(k), show_value(g.atoms, &env[k]));
     }
     let disp = if tag.is_empty() { name.to_string() } else { format!("{name} [{tag}]") };
     match e {
@@ -1078,33 +1004,20 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
             })?;
             err
         }
-        Un(UOp::Eventually, p) => match p.strip() {
-            Un(UOp::Always, q) if !temporal(q) => Ok(out.push((disp, 2, q.as_ref().clone(), None, cenv))),
-            p if !temporal(p) => Ok(out.push((disp, 0, p.clone(), None, cenv))),
-            _ => Err(format!("property {name}: unsupported form {}", short(e))),
-        },
         Un(UOp::Always, p) => match p.strip() {
-            Un(UOp::Eventually, q) if !temporal(q) => Ok(out.push((disp, 1, q.as_ref().clone(), None, cenv))),
-            Bin(BOp::LeadsTo, a, b) if !temporal(a) && !temporal(b) => {
-                Ok(out.push((disp, 3, a.as_ref().clone(), Some(b.as_ref().clone()), cenv)))
-            }
-            p if !temporal(p) && !p.is_action() => Ok(out.push((disp, 4, p.clone(), None, cenv))),
+            p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone()))),
             // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since v
             // need not be a tuple of variables, e.g. under a refinement mapping)
             BoxAction(a, v) if !temporal(a) => {
                 let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
-                Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), cenv)))
+                Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), env.clone())))
             }
-            _ => Err(format!("property {name}: unsupported form {}", short(e))),
+            _ => Ok(out.push((disp, 7, e.clone(), None, env.clone()))),
         },
-        Bin(BOp::LeadsTo, a, b) if !temporal(a) && !temporal(b) => {
-            Ok(out.push((disp, 3, a.as_ref().clone(), Some(b.as_ref().clone()), cenv)))
-        }
         // A state predicate: TLC checks it on the initial states
-        p if !temporal(p) && !p.is_action() && !has_enabled(p) && !p.any(&|y| matches!(y, BoxAction(..) | Fair(..))) => {
-            Ok(out.push((disp, 6, p.clone(), None, cenv)))
-        }
-        _ => Err(format!("property {name}: only <>P, []<>P, <>[]P, P ~> Q, []P and state predicates are supported ({})", short(e))),
+        p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 6, p.clone(), None, env.clone()))),
+        p if temporal(p) => Ok(out.push((disp, 7, p.clone(), None, env.clone()))),
+        _ => Err(format!("property {name}: an action formula must be under [] as [][A]_v ({})", short(e))),
     }
 }
 

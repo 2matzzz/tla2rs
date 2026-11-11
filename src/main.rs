@@ -12,6 +12,8 @@ mod codegen;
 mod compile;
 mod expand;
 mod lexer;
+mod live;
+mod ltl;
 mod metal;
 mod parser;
 mod runtime;

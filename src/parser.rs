@@ -927,6 +927,20 @@ impl Parser {
                 "<<" => {
                     self.pos += 1;
                     let v = self.nested(|p| p.comma_list(">>"))?;
+                    // <<A>>_v: an A step that changes v, written A /\ v' # v. The subscript follows
+                    // `>>` without a space: `_v` lexes as one identifier, `_<<x, y>>` as `_` and a tuple
+                    let close = &self.toks[self.pos - 1];
+                    let (line, end) = (close.line, close.col + 2);
+                    if let Tok::Ident(u) = &self.raw().tok {
+                        if u.starts_with('_') && self.raw().line == line && self.raw().col == end {
+                            let u = u.clone();
+                            self.pos += 1;
+                            let sub = if u == "_" { self.primary()? } else { Expr::Ident(u[1..].to_string()) };
+                            let [a] = <[Expr; 1]>::try_from(v).map_err(|_| "<<...>>_v takes one action".to_string())?;
+                            let same = Expr::Bin(BOp::Eq, Expr::Prime(sub.clone().b()).b(), sub.b());
+                            return Ok(Expr::And(vec![a, Expr::Un(UOp::Not, same.b())]));
+                        }
+                    }
                     Ok(Expr::Tuple(v))
                 }
                 "{" => {
