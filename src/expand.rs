@@ -231,6 +231,16 @@ impl<'a> Expander<'a> {
                     self.call(n, &d, denv, args, env)?
                 } else if let Some(d) = self.defs.get(n.as_str()).copied() {
                     self.call(n, d, Env::default(), args, env)?
+                } else if n == "SelectSeq" && args.len() == 2 {
+                    // The built-in SelectSeq(s, Test(_)): Test becomes a LAMBDA over a fresh name
+                    let q = ex(self, &args[0])?;
+                    let (d, denv) = self.op_arg(n, "Test", 1, &args[1], env)?;
+                    let mut denv = with_self(&d.name, &d, denv);
+                    let x = self.bind(&d.params[0], &mut denv);
+                    self.stack.push(d.name.clone());
+                    let body = self.expand(&d.body, &denv);
+                    self.stack.pop();
+                    Call(n.clone(), vec![q, Lambda(vec![x], body?.b())])
                 } else {
                     Call(n.clone(), args.iter().map(|a| ex(self, a)).collect::<R<_>>()?)
                 }

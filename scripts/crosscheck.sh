@@ -12,7 +12,7 @@ if [[ $# -gt 0 && "$1" == *.cfg ]]; then cfg="$1"; shift; fi
 extra=(); rsonly=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -setcap|-memlimit|-tmpdir) rsonly+=("$1" "$2"); shift 2 ;;
+    -setcap|-seqcap|-memlimit|-tmpdir) rsonly+=("$1" "$2"); shift 2 ;;
     -notrace|-fp128|-metal|-batched) rsonly+=("$1"); shift ;;
     *) extra+=("$1"); shift ;;
   esac
