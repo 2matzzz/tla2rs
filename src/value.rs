@@ -183,16 +183,76 @@ impl ConstEval<'_> {
                 }
                 // The TLC module: d :> e is the function {d} -> e, and f @@ g joins two functions,
                 // taking f where both are defined
-                (":>", [d, e]) => Value::Fun([(self.eval(d, env)?, self.eval(e, env)?)].into()),
+                (":>", [d, e]) => fun_value([(self.eval(d, env)?, self.eval(e, env)?)].into()),
                 ("@@", [f, g]) => match (self.eval(f, env)?, self.eval(g, env)?) {
                     (Value::Fun(mut a), Value::Fun(b)) => {
                         for (k, v) in b {
                             a.entry(k).or_insert(v);
                         }
-                        Value::Fun(a)
+                        fun_value(a)
+                    }
+                    (a, b) if as_fun(&a).is_some() && as_fun(&b).is_some() => {
+                        let mut a = as_fun(&a).unwrap();
+                        for (k, v) in as_fun(&b).unwrap() {
+                            a.entry(k).or_insert(v);
+                        }
+                        fun_value(a)
                     }
                     _ => return Err("@@ of values that are not functions".into()),
                 },
+                // Sequences are tuples here; strings are sequences of characters in TLC, which only
+                // Len reads here (an operator building a new string has no atom for it)
+                ("Len", [q]) => match self.eval(q, env)? {
+                    Value::Tuple(t) => Value::Int(t.len() as i64),
+                    Value::Atom(a) if !self.atoms.list[a as usize].0 => Value::Int(self.atoms.list[a as usize].1.chars().count() as i64),
+                    v => return Err(format!("Len of {v:?}, which is not a sequence")),
+                },
+                ("Append", [q, x]) => {
+                    let mut t = self.seq(q, env, "Append")?;
+                    t.push(self.eval(x, env)?);
+                    Value::Tuple(t)
+                }
+                ("Head", [q]) => {
+                    let t = self.seq(q, env, "Head")?;
+                    t.first().cloned().ok_or("Attempted to apply Head to the empty sequence.")?
+                }
+                ("Tail", [q]) => {
+                    let t = self.seq(q, env, "Tail")?;
+                    if t.is_empty() {
+                        return Err("Attempted to apply Tail to the empty sequence.".into());
+                    }
+                    Value::Tuple(t[1..].to_vec())
+                }
+                ("SubSeq", [q, m, n]) => {
+                    let t = self.seq(q, env, "SubSeq")?;
+                    let (m, n) = (self.eval(m, env)?.as_int()?, self.eval(n, env)?.as_int()?);
+                    if m > n {
+                        Value::Tuple(vec![])
+                    } else if m < 1 || m > t.len() as i64 {
+                        return Err("The second argument of SubSeq must be in the domain of its first argument.".into());
+                    } else if n > t.len() as i64 {
+                        return Err("The third argument of SubSeq must be in the domain of its first argument.".into());
+                    } else {
+                        Value::Tuple(t[(m - 1) as usize..n as usize].to_vec())
+                    }
+                }
+                ("\\o", [a, b]) => {
+                    let mut t = self.seq(a, env, "\\o")?;
+                    t.extend(self.seq(b, env, "\\o")?);
+                    Value::Tuple(t)
+                }
+                ("SelectSeq", [q, Lambda(ps, body)]) if ps.len() == 1 => {
+                    let t = self.seq(q, env, "SelectSeq")?;
+                    let mut out = vec![];
+                    for x in t {
+                        let mut env2 = env.clone();
+                        env2.insert(ps[0].clone(), x.clone());
+                        if self.eval(body, &env2)?.as_bool()? {
+                            out.push(x);
+                        }
+                    }
+                    Value::Tuple(out)
+                }
                 ("PrintT", [x]) => {
                     self.eval(x, env)?;
                     Value::Bool(true)
@@ -230,7 +290,6 @@ impl ConstEval<'_> {
                     }
                     Value::Set(out)
                 }
-                (f, _) if crate::types::SEQ_OPS.contains(&f) => return Err(crate::types::seq_op_error(f)),
                 _ => return Err(format!("operator `{f}` is not supported in constant expressions")),
             },
             Un(op, x) => {
@@ -275,6 +334,18 @@ impl ConstEval<'_> {
                 let Ident(n) = set.strip() else { unreachable!() };
                 let inside = match self.eval(x, env)? {
                     Value::Int(v) => n == "Int" || v >= 0,
+                    _ => false,
+                };
+                Value::Bool(inside == matches!(op, BOp::In))
+            }
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(set.strip(), Call(f, a) if f == "Seq" && a.len() == 1) => {
+                let Call(_, a) = set.strip() else { unreachable!() };
+                let inside = match self.eval(x, env)? {
+                    Value::Tuple(t) => {
+                        let s = self.eval(&a[0], env)?;
+                        let s = s.as_set()?;
+                        t.iter().all(|e| s.contains(e))
+                    }
                     _ => false,
                 };
                 Value::Bool(inside == matches!(op, BOp::In))
@@ -345,7 +416,14 @@ impl ConstEval<'_> {
                 }
                 return Err(EVAL_FAILURES[3].into());
             }
-            SetLit(xs) => Value::Set(xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?),
+            SetLit(xs) => {
+                let vs: Vec<Value> = xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?;
+                // TLC sorts a set's elements, and stops when that compares a string with an integer
+                if vs.iter().any(|a| vs.iter().any(|b| self.str_int(a, b))) {
+                    return Err("Attempted to compare a string with an integer in a set".into());
+                }
+                Value::Set(vs.into_iter().collect())
+            }
             SetFilter(x, s, p) => {
                 let s = self.eval(s, env)?;
                 let mut out = BTreeSet::new();
@@ -374,7 +452,7 @@ impl ConstEval<'_> {
                     env2.insert(x.clone(), v.clone());
                     m.insert(v.clone(), self.eval(body, &env2)?);
                 }
-                Value::Fun(m)
+                fun_value(m)
             }
             FunSet(d, r) => {
                 let d: Vec<Value> = self.eval(d, env)?.as_set()?.iter().cloned().collect();
@@ -389,7 +467,7 @@ impl ConstEval<'_> {
                     return Ok(Value::Set(out));
                 }
                 loop {
-                    out.insert(Value::Fun(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect()));
+                    out.insert(fun_value(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect()));
                     let mut k = 0;
                     while k < idx.len() {
                         idx[k] += 1;
@@ -515,6 +593,32 @@ impl ConstEval<'_> {
         })
     }
 
+    /// Whether a and b are a string and an integer, which TLC does not compare
+    fn str_int(&self, a: &Value, b: &Value) -> bool {
+        let s = |v: &Value| matches!(v, Value::Atom(x) if !self.atoms.list[*x as usize].0);
+        let i = |v: &Value| matches!(v, Value::Int(_));
+        (s(a) && i(b)) || (i(a) && s(b))
+    }
+
+    /// Equality as TLC evaluates it: comparing a string with an integer is an error
+    fn tlc_eq(&self, a: &Value, b: &Value) -> R<bool> {
+        if self.str_int(a, b) {
+            return Err(format!("Attempted to check equality of {a:?} with {b:?} (a string and an integer)"));
+        }
+        Ok(a == b)
+    }
+
+    /// The elements of a sequence value (a tuple)
+    fn seq(&self, q: &Expr, env: &HashMap<String, Value>, op: &str) -> R<Vec<Value>> {
+        match self.eval(q, env)? {
+            Value::Tuple(t) => Ok(t),
+            Value::Atom(a) if !self.atoms.list[a as usize].0 => {
+                Err(format!("`{op}` on strings is not supported (only Len of a string is)"))
+            }
+            v => Err(format!("`{op}` of {v:?}, which is not a sequence")),
+        }
+    }
+
     /// Iterates over bindings one at a time, stopping when f returns false.
     pub fn each_binding(
         &self,
@@ -543,14 +647,19 @@ impl ConstEval<'_> {
             Implies => Value::Bool(!a.as_bool()? || b.as_bool()?),
             Equiv => Value::Bool(a.as_bool()? == b.as_bool()?),
             LeadsTo => return Err("~> is temporal".into()),
-            Eq => Value::Bool(a == b),
-            Neq => Value::Bool(a != b),
+            Eq => Value::Bool(self.tlc_eq(&a, &b)?),
+            Neq => Value::Bool(!self.tlc_eq(&a, &b)?),
             Lt => Value::Bool(a.as_int()? < b.as_int()?),
             Le => Value::Bool(a.as_int()? <= b.as_int()?),
             Gt => Value::Bool(a.as_int()? > b.as_int()?),
             Ge => Value::Bool(a.as_int()? >= b.as_int()?),
-            In => Value::Bool(b.as_set()?.contains(&a)),
-            NotIn => Value::Bool(!b.as_set()?.contains(&a)),
+            In | NotIn => {
+                let set = b.as_set()?;
+                if let Some(e) = set.iter().find(|e| self.str_int(&a, e)) {
+                    return Err(format!("Attempted to check equality of {a:?} with {e:?} (a string and an integer)"));
+                }
+                Value::Bool(set.contains(&a) == (op == In))
+            }
             Subseteq => Value::Bool(a.as_set()?.is_subset(b.as_set()?)),
             Cup => Value::Set(a.as_set()?.union(b.as_set()?).cloned().collect()),
             Cap => Value::Set(a.as_set()?.intersection(b.as_set()?).cloned().collect()),
@@ -580,6 +689,24 @@ impl ConstEval<'_> {
                 Value::Int(a.rem_euclid(b))
             }
         })
+    }
+}
+
+/// A function value. A function over 1..n is the tuple of its values (TLA+ identifies them, and the
+/// empty function is <<>>), so equal values have one form.
+pub fn fun_value(m: BTreeMap<Value, Value>) -> Value {
+    if m.keys().enumerate().all(|(i, k)| *k == Value::Int(i as i64 + 1)) {
+        return Value::Tuple(m.into_values().collect());
+    }
+    Value::Fun(m)
+}
+
+/// The entries of a function value, also of a tuple
+pub fn as_fun(v: &Value) -> Option<BTreeMap<Value, Value>> {
+    match v {
+        Value::Fun(m) => Some(m.clone()),
+        Value::Tuple(t) => Some(t.iter().enumerate().map(|(i, x)| (Value::Int(i as i64 + 1), x.clone())).collect()),
+        _ => None,
     }
 }
 

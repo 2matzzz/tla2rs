@@ -23,6 +23,69 @@ const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv",
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 
+/// The maximum length of a sequence value. `-seqcap N` sets it. Otherwise it comes from bounds
+/// `Len(e) <= N` (or `< N`) among the conjuncts of TypeOK and of the CONSTRAINTs: one more than
+/// the largest, so that a state one element too long can still be built, counted, and reported
+/// by TypeOK or discarded by the constraint as in TLC. Without either it is the length of the
+/// longest tuple written in the spec, unless the spec makes sequences grow (Append, \o, Seq),
+/// in which case it stays unknown (0) and using a sequence is an error that asks for a bound.
+fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize) -> R<usize> {
+    fn longest(e: &Expr) -> usize {
+        let here = if let Expr::Tuple(xs) = e { xs.len() } else { 0 };
+        e.children().into_iter().map(longest).max().unwrap_or(0).max(here)
+    }
+    fn grows(e: &Expr) -> bool {
+        e.any(&|x| matches!(x, Expr::Call(f, _) if f == "Append" || f == "\\o" || f == "Seq"))
+    }
+    let lit = m.defs.iter().map(|d| longest(&d.body)).chain(cfg.constants.iter().map(|(_, e)| longest(e))).max().unwrap_or(0);
+    let cap = if seqcap > 0 {
+        seqcap.max(lit)
+    } else {
+        let mut bound: Option<usize> = None;
+        let mut sources: Vec<Expr> = vec![];
+        for n in TYPE_DECL_NAMES.iter().chain(TYPE_OK_NAMES) {
+            if ex.has_def(n) {
+                sources.push(ex.expand_def(n)?);
+            }
+        }
+        for c in &cfg.constraints {
+            sources.push(ex.expand_def(c)?);
+        }
+        // Conjuncts, also under \A (as in `\A p \in P : Len(q[p]) <= N`)
+        fn conjuncts(e: &Expr, out: &mut Vec<Expr>) {
+            match e.strip() {
+                Expr::And(xs) => xs.iter().for_each(|x| conjuncts(x, out)),
+                Expr::Quant(false, _, b) => conjuncts(b, out),
+                e => out.push(e.clone()),
+            }
+        }
+        for src in &sources {
+            let mut conj = vec![];
+            conjuncts(src, &mut conj);
+            for c in conj {
+                let (k, strict) = match c.strip() {
+                    Expr::Bin(BOp::Le, l, k) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => (k, false),
+                    Expr::Bin(BOp::Lt, l, k) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => (k, true),
+                    _ => continue,
+                };
+                if let Ok(Value::Int(k)) = g.ce.eval(k, &HashMap::new()) {
+                    let n = (k.max(0) as usize).saturating_sub(strict as usize);
+                    bound = Some(bound.unwrap_or(0).max(n + 1));
+                }
+            }
+        }
+        match bound {
+            Some(b) => b.max(lit),
+            None if m.defs.iter().any(|d| grows(&d.body)) => 0,
+            None => lit,
+        }
+    };
+    if cap > 255 {
+        return Err(format!("sequences of up to {cap} elements are not supported (at most 255)"));
+    }
+    Ok(cap)
+}
+
 /// Applies the cfg entries that replace a definition (`Name = value`, `Name <- Def`,
 /// `Name <- [Module] Def` where Name is defined rather than declared) and returns the constants
 /// substituted by a definition, (constant, definition), to be evaluated once the other constants
@@ -124,7 +187,6 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     let mut out = Module { name: m.name.clone(), modules: vec![m.name.clone()], ..Default::default() };
     for e in &m.extends {
         match e.as_str() {
-            // Sequences only for its tuples; its operators are rejected by name (SEQ_OPS)
             "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" => out.extends.push(e.clone()),
             // Apalache type annotations and Gen are not used
             "Apalache" => {}
@@ -155,7 +217,8 @@ fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     Ok(out)
 }
 
-pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, fp128: bool, metal: bool) -> R<Output> {
+#[allow(clippy::too_many_arguments)]
+pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
     let mut warnings = vec![];
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
     let cfg = parse_cfg(cfg_src)?;
@@ -251,6 +314,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
     if setcap > 0 {
         g.scap = setcap;
     }
+    g.qcap = seq_cap(&m, &cfg, &mut ex, &g, seqcap)?;
 
     // Enumerate fairness instances (only relevant when checking properties)
     if !cfg.properties.is_empty() {
@@ -314,7 +378,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
     // Variables whose type TypeOK leaves open are inferred from the assignments in Init and Next
     let undeclared: Vec<String> = m.variables.iter().filter(|v| !decl.contains_key(*v)).cloned().collect();
     if !undeclared.is_empty() {
-        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap)?;
+        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap, g.qcap)?;
         decl.extend(inferred);
     }
     for v in &m.variables {
@@ -493,6 +557,8 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, f
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
+    writeln!(src, "const QCAP: usize = {};", g.qcap).unwrap();
+    src += crate::codegen::SQ_RUNTIME;
     let fp_bits = if fp128 { 128 } else { 64 };
     writeln!(src, "const FP_BITS: usize = {fp_bits};\ntype Fp = u{fp_bits};").unwrap();
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
@@ -610,6 +676,7 @@ fn ty_of_set(g: &Gen, s: &Expr) -> R<Ty> {
             Ty::Rec(fs)
         }
         Expr::Call(f, parts) if f == "\\X" => tuple_ty(parts.iter().map(|x| ty_of_set(g, x)).collect::<R<_>>()?)?,
+        Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Ty::Seq(ty_of_set(g, &a[0])?.into()),
         Expr::Ident(n) if n == "BOOLEAN" => Ty::Bool,
         // Unbounded integers are stored as 64-bit
         Expr::Ident(n) if n == "Nat" => Ty::Int(0, BIG),
@@ -841,6 +908,7 @@ fn infer_types(
     init: &Expr,
     next: &Expr,
     scap: usize,
+    qcap: usize,
 ) -> R<HashMap<String, Ty>> {
     let bottom = Ty::Enum(vec![]);
     let mut cur: HashMap<String, Ty> = undeclared.iter().map(|v| (v.clone(), bottom.clone())).collect();
@@ -851,6 +919,7 @@ fn infer_types(
     for _ in 0..40 {
         let mut g = Gen::new(atoms, constants);
         g.scap = scap;
+        g.qcap = qcap;
         for v in vars {
             g.vars.push((v.clone(), decl.get(v).or(cur.get(v)).unwrap().clone()));
         }

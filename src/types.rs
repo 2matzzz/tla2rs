@@ -24,6 +24,8 @@ pub enum Ty {
     /// Element type. A u128 bitmask if the element type has at most 128 values, otherwise a bounded
     /// sequence (SSet)
     Set(Box<Ty>),
+    /// A sequence (a tuple whose length varies) of elements of this type, up to QCAP long
+    Seq(Box<Ty>),
     /// An optional record field (arises when records whose fields differ by variant are merged into
     /// one type). Represented as (present, value); an absent field holds the default value
     Opt(Box<Ty>),
@@ -50,6 +52,9 @@ fn int_count(lo: i64, hi: i64) -> Option<u64> {
 pub fn narrows(from: &Ty, to: &Ty) -> bool {
     match (from, to) {
         (Ty::IntAtom(..), Ty::Enum(_)) => true,
+        // A sequence converted to a tuple or a function over 1..n fails unless the length matches
+        (Ty::Seq(_), t) if !matches!(t, Ty::Seq(_)) => true,
+        (Ty::Seq(a), Ty::Seq(b)) => narrows(a, b),
         (Ty::Rec(a), Ty::Rec(b)) => a.iter().any(|(n, t)| b.iter().find(|(m, _)| m == n).is_some_and(|(_, u)| narrows(t, u))),
         (Ty::Opt(a), Ty::Opt(b)) => narrows(a, b),
         (Ty::Opt(a), b) => narrows(a, b),
@@ -64,14 +69,6 @@ pub fn narrows(from: &Ty, to: &Ty) -> bool {
 /// are different types, so sequences (tuples whose length changes) are not expressible.
 pub fn tuple_field(i: usize) -> String {
     format!("#{:02}", i + 1)
-}
-
-/// Operators of the Sequences module. Sequences (tuples whose length changes) are not supported, so
-/// these are rejected by name.
-pub const SEQ_OPS: &[&str] = &["Seq", "Len", "Append", "Head", "Tail", "SubSeq", "SelectSeq", "\\o"];
-
-pub fn seq_op_error(f: &str) -> String {
-    format!("sequences are not supported yet (`{f}`); fixed-length tuples are")
 }
 
 pub fn tuple_ty(elems: Vec<Ty>) -> R<Ty> {
@@ -104,7 +101,7 @@ impl Ty {
             Ty::IntAtom(lo, hi, v) => int_count(*lo, *hi)?.checked_add(v.len() as u64),
             Ty::Rec(fs) => fs.iter().try_fold(1u64, |acc, (_, t)| acc.checked_mul(t.size()?)),
             Ty::Opt(t) => t.size()?.checked_add(1),
-            Ty::Fun(..) | Ty::Set(..) => None,
+            Ty::Fun(..) | Ty::Set(..) | Ty::Seq(_) => None,
         }
     }
 
@@ -116,6 +113,7 @@ impl Ty {
             Ty::Rec(fs) => format!("({})", fs.iter().map(|(_, t)| t.repr() + ",").collect::<String>()),
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
             Ty::Set(e) if is_sparse(self) => format!("SSet<{}, SCAP>", e.repr()),
+            Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),
             Ty::Set(_) => "u128".into(),
             Ty::Opt(t) => format!("(bool, {})", t.repr()),
         }
@@ -141,6 +139,7 @@ impl Ty {
             }
             (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) => d1 == d2 && c1.kind_eq(c2),
             (Ty::Set(_), Ty::Set(_)) => is_sparse(self) == is_sparse(o),
+            (Ty::Seq(a), Ty::Seq(b)) => a.kind_eq(b),
             (Ty::Opt(a), Ty::Opt(b)) => a.kind_eq(b),
             _ => false,
         }
@@ -238,6 +237,8 @@ impl Ty {
             (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) => {
                 xs.len() == fs.len() && fs.iter().zip(xs).all(|((_, t), x)| t.conforms(x))
             }
+            (Ty::Fun(d, c), Value::Tuple(xs)) if seq_domain(d) == Some(xs.len()) => xs.iter().all(|x| c.conforms(x)),
+            (Ty::Seq(e), Value::Tuple(xs)) => xs.iter().all(|x| e.conforms(x)),
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
@@ -277,11 +278,8 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
                 return Err(format!("type mismatch: a tuple and a record: {a:?} vs {b:?}"));
             }
             if x.len() != y.len() {
-                return Err(format!(
-                    "tuples of different lengths ({} and {}); sequences are not supported yet",
-                    x.len(),
-                    y.len()
-                ));
+                // Tuples of different lengths are values of one sequence type
+                return Ok(Ty::Seq(seq_elem_join(&[a, b])?.into()));
             }
             Ty::Rec(x.iter().zip(y).map(|((n, s), (_, t))| Ok((n.clone(), join(s, t)?))).collect::<R<_>>()?)
         }
@@ -307,12 +305,54 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
             Ty::Rec(fs)
         }
         (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) if d1 == d2 => Ty::Fun(d1.clone(), join(c1, c2)?.into()),
-        (Ty::Fun(d, _), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, _)) if is_tuple_fields(fs) && matches!(**d, Ty::Int(1, _)) => {
-            return Err(format!("comparing a function over 1..n with a tuple is not supported: {a:?} vs {b:?}"))
+        // A function over 1..n is a tuple of length n (TLA+ identifies them): with a tuple of the
+        // same length it stays such a function, otherwise the two are sequences
+        (Ty::Fun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, c)) if is_tuple_fields(fs) && seq_domain(d).is_some() => {
+            if seq_domain(d) == Some(fs.len()) {
+                let mut e = c.as_ref().clone();
+                for (_, t) in fs {
+                    e = join(&e, t)?;
+                }
+                Ty::Fun(d.clone(), e.into())
+            } else {
+                Ty::Seq(seq_elem_join(&[a, b])?.into())
+            }
         }
+        (Ty::Fun(d1, _), Ty::Fun(d2, _)) if seq_domain(d1).is_some() && seq_domain(d2).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
+        (Ty::Seq(_), t) | (t, Ty::Seq(_)) if seq_elems(t).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(join(x, y)?.into()),
         _ => return Err(format!("type mismatch: {a:?} vs {b:?}")),
     })
+}
+
+/// n when the type `d` of a function domain is 1..n (an empty 1..0 included)
+pub fn seq_domain(d: &Ty) -> Option<usize> {
+    match d {
+        Ty::Int(1, hi) if *hi >= 0 && *hi < 1 << 16 => Some(*hi as usize),
+        _ => None,
+    }
+}
+
+/// The element types of a value that is a sequence in TLA+: a tuple, a function over 1..n, or a
+/// sequence
+pub fn seq_elems(t: &Ty) -> Option<Vec<Ty>> {
+    match t {
+        Ty::Seq(e) => Some(vec![e.as_ref().clone()]),
+        Ty::Fun(d, c) if seq_domain(d).is_some() => Some(vec![c.as_ref().clone()]),
+        Ty::Rec(fs) if is_tuple_fields(fs) => Some(fs.iter().map(|(_, t)| t.clone()).collect()),
+        _ => None,
+    }
+}
+
+/// The element type of a sequence that can hold the elements of all of `ts`
+pub fn seq_elem_join(ts: &[&Ty]) -> R<Ty> {
+    let mut e = Ty::Enum(vec![]);
+    for t in ts {
+        for x in seq_elems(t).ok_or(format!("{t:?} is not a sequence"))? {
+            e = join(&e, &x)?;
+        }
+    }
+    Ok(e)
 }
 
 pub fn ty_of_value(v: &Value) -> R<Ty> {

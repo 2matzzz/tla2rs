@@ -1,7 +1,7 @@
 //! tla2rs: compiles a TLA+ spec into an explicit-state model checker in Rust, specialized to that
 //! spec.
 //!
-//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-fp128] [-metal] [-batched]
+//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched]
 //!
 //! Builds the generated crate with `cargo build --release` and runs it. With --emit-only, it only
 //! writes the Rust code.
@@ -23,7 +23,7 @@ use std::process::{exit, Command};
 use std::time::Instant;
 
 fn usage() -> ! {
-    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-fp128] [-metal] [-batched]");
+    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched]");
     exit(2)
 }
 
@@ -34,6 +34,7 @@ fn main() {
     let mut out: Option<PathBuf> = None;
     let mut emit_only = false;
     let mut setcap: usize = 0;
+    let mut seqcap: usize = 0;
     let mut fp128 = false;
     let mut metal = false;
     let mut pass = vec![];
@@ -61,6 +62,11 @@ fn main() {
             "-setcap" => {
                 i += 1;
                 setcap = args.get(i).and_then(|x| x.parse().ok()).unwrap_or_else(|| usage());
+            }
+            // Maximum length of a sequence value
+            "-seqcap" => {
+                i += 1;
+                seqcap = args.get(i).and_then(|x| x.parse().ok()).unwrap_or_else(|| usage());
             }
             // Candidate budget (MB) the checker holds at once. Smaller values split each level into
             // more chunks
@@ -100,7 +106,7 @@ fn main() {
     let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
     let result = std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, fp128, metal))
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, fp128, metal))
         .expect("start the compiler thread")
         .join()
         .unwrap_or_else(|_| Err("internal error in the compiler".into()));

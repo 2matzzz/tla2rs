@@ -34,6 +34,8 @@ cargo build --release
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` sets the capacity of sets whose size is only known at run time
+- `-seqcap N` sets the maximum length of sequences, when the spec does not bound them with `Len(x) <= N` in `TypeOK`
+  or a `CONSTRAINT`
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
   the CPU
@@ -89,9 +91,9 @@ memory.
 
 | | |
 |---|---|
-| Expressions | logic, arithmetic (`+ - * \div % ^`), comparison, `IF` / `CASE` / `LET`, `\E` / `\A` (also `<<x, y>> \in S`), `CHOOSE` (also over sets in the state, picking what TLC picks), `RECURSIVE` operators and recursive function definitions, operator parameters and `LAMBDA`, infix operators defined by the spec (`a \oplus b == ...`), `Assert` / `Print` / `PrintT` / `:>` / `@@` from TLC, `UNION`, `SUBSET` and `\X` of sets in the state, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
+| Expressions | logic, arithmetic (`+ - * \div % ^`), comparison, sequences (`Seq`, `Len`, `Append`, `Head`, `Tail`, `SubSeq`, `SelectSeq`, `\o`, indexing, a tuple and a function over 1..n being the same value), sets of sets and of functions as values, `IF` / `CASE` / `LET`, `\E` / `\A` (also `<<x, y>> \in S`), `CHOOSE` (also over sets in the state, picking what TLC picks), `RECURSIVE` operators and recursive function definitions, operator parameters and `LAMBDA`, infix operators defined by the spec (`a \oplus b == ...`), `Assert` / `Print` / `PrintT` / `:>` / `@@` from TLC, `UNION`, `SUBSET` and `\X` of sets in the state, sets (literals, `\cup \cap \`, `\subseteq`, `{x \in S : P}`, `{e : x \in S}`, `Cardinality`, `SUBSET`), functions (`[x \in S \|-> e]`, `[x \in S, y \in T \|-> e]`, non-recursive definitions `f[x \in S] == e`, `f[x]`, `[f EXCEPT ![a] = @ + 1]`, `[S -> T]`), records (`[a \|-> 1]`, `r.a`, `[a : S]`, `!.a`), fixed-length tuples (`<<a, b>>`, `t[1]` with a constant index, `![k][1]`, `A \X B`) |
 | Actions | `x' = e`, `x' \in S`, `UNCHANGED`, action-level `\/` `\E` `IF` `CASE`, guards that read an already assigned `x'` |
-| Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. A model value may share a type with integers (`1..4 \cup {None}`). `Name <- Def` substitutes a definition (also from a module that EXTENDS the spec, such as an MC.tla) for a constant, and `<-` / `=` on a defined name replace that definition. `ASSUME` is checked |
+| Specs | `SPECIFICATION` (`Init /\ [][Next]_v /\ fairness`) or `INIT` / `NEXT`. `CONSTANT` values may be model values, numbers, strings, booleans, or sets of them. A model value may share a type with integers (`1..4 \cup {None}`), and arithmetic on such a value is an evaluation error only when it is a model value; a variable may also hold an integer or a string, and comparing the two is an evaluation error, as in TLC. `Name <- Def` substitutes a definition (also from a module that EXTENDS the spec, such as an MC.tla) for a constant, and `<-` / `=` on a defined name replace that definition. `ASSUME` is checked |
 | Properties | `INVARIANT`. `PROPERTY` supports `<>P`, `[]<>P`, `<>[]P`, `P ~> Q`, `[]P`, and `[][A]_v` (optionally quantified with `\A x \in S :`) |
 | Fairness | `WF_v(A)` (optionally quantified with `\A`). `A` must be a named definition called from `Next` |
 | State space | `CONSTRAINT`, `VIEW`, `SYMMETRY` |
@@ -103,10 +105,10 @@ memory.
   stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant). A variable missing from
   `TypeOK` gets a type inferred from Init and Next; an integer range that settles (a `Cardinality`, `x % 3`) stays
   finite, one that keeps growing becomes unbounded
-- Set elements may have at most 128 possible values. Sets of sets and sets of functions cannot be held as values
-  (`SUBSET` and `[S -> T]` in `TypeOK` are fine)
-- Not supported: sequences (tuples whose length changes, and the operators of `Sequences`), a tuple index that is not
-  constant, strings mixed with integers in one value, arithmetic on a value that may be a model value, functions over
+- A set whose element type has at most 128 values is a bitmask; a larger one (including sets of sets) is a sorted array
+  of up to `-setcap` elements. A sequence holds up to `-seqcap` elements (see above); growing past it is an
+  evaluation error
+- Not supported: operators other than `Len` on strings, sets that may hold both strings and integers, functions over
   part of a type (`[S -> T]` with S in the state, `:>` / `@@` other than `(d :> e) @@ f`), recursive operators with
   operator parameters, strong fairness (SF), `ENABLED`, `<<A>>_v`, and `Name <- [Module] Def` for a CONSTANT (TLC
   rejects it too)

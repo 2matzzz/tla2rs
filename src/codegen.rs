@@ -56,6 +56,8 @@ pub struct Gen<'a> {
     fair_param_tys: Vec<Vec<Ty>>,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
+    /// Maximum length of a sequence (QCAP); 0 while no bound is known
+    pub qcap: usize,
     /// During type inference, collects the types of assigned values
     pub infer: Option<HashMap<String, Ty>>,
     /// Rust functions for recursive operators, per (RecDef index, argument types): name and return
@@ -87,6 +89,7 @@ impl<'a> Gen<'a> {
             fair: vec![],
             fair_param_tys: vec![],
             scap: 8,
+            qcap: 0,
             infer: None,
             rec_done: HashMap::new(),
             rec_progress: vec![],
@@ -116,6 +119,15 @@ impl<'a> Gen<'a> {
         }
         match t {
             Ty::Set(e) => {
+                if matches!(e.as_ref(), Ty::IntAtom(..)) && self.has_str(e) {
+                    return Err("a set that may hold both strings and integers is not supported (TLC stops with an error when it builds one with both)".into());
+                }
+                self.ty_id(e)?;
+            }
+            Ty::Seq(e) => {
+                if self.qcap == 0 {
+                    return Err("sequences whose length changes need a maximum length: add `Len(x) <= N` to TypeOK or a CONSTRAINT, or pass -seqcap N".into());
+                }
                 self.ty_id(e)?;
             }
             Ty::Opt(e) => {
@@ -131,7 +143,7 @@ impl<'a> Gen<'a> {
                     self.ty_id(f)?;
                 }
             }
-            Ty::IntAtom(_, _, d) => self.check_model_values(d)?,
+            Ty::IntAtom(..) => {}
             _ => {}
         }
         let i = self.tys.len();
@@ -140,16 +152,41 @@ impl<'a> Gen<'a> {
         Ok(i)
     }
 
-    /// Only model values can share a type with integers: TLC compares a model value with anything,
-    /// but stops with an error when comparing a string with an integer
-    fn check_model_values(&self, atoms: &[u32]) -> R<()> {
-        match atoms.iter().find(|&&a| !self.atoms.list[a as usize].0) {
-            Some(&a) => Err(format!(
-                "the string {} is mixed with integers in one value; only model values can be (TLC reports comparing a string with an integer as an error)",
-                self.atoms.show(a)
-            )),
-            None => Ok(()),
+    /// `x \in set` (a constant set) when x may be a string and the set holds integers or the other
+    /// way around: compared element by element as TLC does, which stops on a string against an
+    /// integer. None when no such comparison can happen.
+    fn member_mixed(&mut self, x: &str, xt: &Ty, set: &BTreeSet<Value>) -> R<Option<String>> {
+        let mut j = xt.clone();
+        let mut mixed = false;
+        for e in set {
+            let Ok(et) = ty_of_value(e) else { return Ok(None) };
+            if !matches!(et, Ty::Int(..) | Ty::Enum(_) | Ty::IntAtom(..)) {
+                return Ok(None);
+            }
+            mixed |= self.str_meets_int(xt, &et);
+            j = join(&j, &et)?;
         }
+        if !mixed {
+            return Ok(None);
+        }
+        let xc = self.coerce(x.to_string(), xt, &j)?;
+        let parts: Vec<String> = set.iter().map(|e| Ok(format!("mixed_eq(__x, {})", self.lit(e, &j)?))).collect::<R<_>>()?;
+        Ok(Some(format!("{{ let __x = {xc}; {} }}", if parts.is_empty() { "false".into() } else { parts.join(" || ") })))
+    }
+
+    /// Whether a value of type `t` may be a string
+    fn has_str(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.iter().any(|&a| !self.atoms.list[a as usize].0),
+            _ => false,
+        }
+    }
+
+    /// Whether comparing values of types `a` and `b` may compare a string with an integer, which TLC
+    /// stops on (a model value compares unequal with anything)
+    fn str_meets_int(&self, a: &Ty, b: &Ty) -> bool {
+        let int = |t: &Ty| matches!(t, Ty::Int(..) | Ty::IntAtom(..));
+        (self.has_str(a) && int(b)) || (int(a) && self.has_str(b))
     }
 
     /// How TLC compares values of types `a` and `b` when a tuple meets something else. A tuple of
@@ -164,6 +201,11 @@ impl<'a> Gen<'a> {
                 Cmp::Normal
             })
         };
+        if let (Ty::Seq(_), t) | (t, Ty::Seq(_)) = (a, b) {
+            if seq_elems(t).is_none() && !matches!(t, Ty::Enum(v) if v.is_empty()) {
+                return self.tuple_vs(t).map(|c| if c == Cmp::Normal { Cmp::Normal } else { c });
+            }
+        }
         Ok(match (tuple_elems(a), tuple_elems(b)) {
             (Some(x), Some(y)) if x.len() != y.len() => Cmp::Unequal,
             (Some(x), Some(y)) => all(x.iter().zip(&y).map(|(s, t)| self.tuple_cmp(s, t)).collect::<R<_>>()?),
@@ -197,13 +239,58 @@ impl<'a> Gen<'a> {
         Ok(match t {
             Ty::Enum(v) if v.is_empty() => Cmp::Normal,
             Ty::Enum(v) if v.iter().all(|&a| self.atoms.list[a as usize].0) => Cmp::Unequal,
-            _ if seq_like_fun(t) => return Err("comparing a function over 1..n with a tuple is not supported".into()),
+            // A sequence, or a function over 1..n, compares with a tuple as TLA+ identifies them; a
+            // function over other integers is unequal to it
+            Ty::Seq(_) => Cmp::Normal,
+            Ty::Fun(d, _) if seq_domain(d).is_some() => Cmp::Normal,
+            Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(..)) => Cmp::Unequal,
             _ => Cmp::Fails(format!("Attempted to compare a tuple with a value of type {t:?}")),
         })
     }
 
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
         self.ty_id(t)
+    }
+
+    /// For a function domain `1..n` or `DOMAIN q` (q a sequence), the code of its length
+    fn seq_domain_len(&mut self, s: &Expr, env: &Env) -> Option<R<String>> {
+        match s.strip() {
+            Expr::Bin(BOp::Range, lo, hi) if matches!(self.try_const(lo, env), Some(Value::Int(1))) => {
+                Some(self.gen_int(hi, env).map(|(c, _)| format!("({c}).max(0)")))
+            }
+            Expr::Un(UOp::Domain, q) => match self.gen(q, env, None) {
+                Ok((c, Ty::Seq(_))) => Some(Ok(format!("(({c}).len as i64)"))),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The value of `q` as a sequence (converting a tuple or a function over 1..n), and its type
+    fn as_seq(&mut self, q: &Expr, env: &Env, op: &str) -> R<(String, Ty)> {
+        let (c, t) = self.gen(q, env, None)?;
+        if let Ty::Seq(_) = t {
+            return Ok((c, t));
+        }
+        let el = seq_elem_join(&[&t]).map_err(|_| self.seq_op_err(op, &t))?;
+        let st = Ty::Seq(el.into());
+        Ok((self.coerce(c, &t, &st)?, st))
+    }
+
+    fn seq_op_err(&self, op: &str, t: &Ty) -> String {
+        match t {
+            Ty::Enum(_) => format!("`{op}` on strings is only supported in constant expressions"),
+            _ => format!("`{op}` of a value of type {t:?}, which is not a sequence"),
+        }
+    }
+
+    /// The length of a tuple or a function over 1..n
+    fn seq_len_of(&self, t: &Ty) -> R<usize> {
+        match t {
+            Ty::Fun(d, _) if seq_domain(d).is_some() => Ok(seq_domain(d).unwrap()),
+            Ty::Rec(fs) if is_tuple_fields(fs) => Ok(fs.len()),
+            t => Err(self.seq_op_err("Len", t)),
+        }
     }
 
     /// Identifiers in the body of a recursive operator bound outside it (by the call site), sorted
@@ -397,6 +484,7 @@ impl<'a> Gen<'a> {
             cur = match (p, &cur) {
                 (Path::Field(k), _) if k.starts_with('@') => continue,
                 (Path::Idx(_), Ty::Fun(_, c)) => c.as_ref().clone(),
+                (Path::Idx(_), Ty::Seq(e)) => e.as_ref().clone(),
                 (Path::Field(k), Ty::Rec(fs)) => match &fs.iter().find(|(n, _)| n == k)?.1 {
                     Ty::Opt(i) => i.as_ref().clone(),
                     t => t.clone(),
@@ -413,6 +501,7 @@ impl<'a> Gen<'a> {
         match (p, t) {
             (Path::Field(k), _) if k.starts_with('@') => Self::set_path_type(t, rest, new),
             (Path::Idx(_), Ty::Fun(d, c)) => Ty::Fun(d.clone(), Self::set_path_type(c, rest, new).into()),
+            (Path::Idx(_), Ty::Seq(e)) => Ty::Seq(Self::set_path_type(e, rest, new).into()),
             (Path::Field(k), Ty::Rec(fs)) => Ty::Rec(
                 fs.iter()
                     .map(|(n, ft)| {
@@ -450,8 +539,46 @@ impl<'a> Gen<'a> {
     }
 
     fn s_iter(&mut self, c: &str, st: &Ty) -> R<String> {
-        let eid = self.ty_id(&Self::elem_of(st))?;
+        let et = Self::elem_of(st);
+        let eid = self.ty_id(&et)?;
+        if is_sparse(st) && needs_tlc_order(&et) {
+            // The array is sorted by the Rust order of the elements, which for a set held as a
+            // bitmask is not TLC's: iterate in TLC's order, which decides CHOOSE and the order
+            // successors are generated in
+            let cmp = self.tlc_cmp(&et, "x", "y")?;
+            return Ok(format!(
+                "{{ let mut __v: Vec<{}> = ({c}).iter().collect(); __v.sort_by(|x, y| {cmp}); __v }}.into_iter()",
+                et.repr()
+            ));
+        }
         Ok(if is_sparse(st) { format!("({c}).iter()") } else { format!("bits({c}).map(dec_{eid})") })
+    }
+
+    /// An expression comparing `a` and `b` (references to values of type `t`) in TLC's order
+    fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
+        Ok(match t {
+            Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            Ty::Rec(fs) if needs_tlc_order(t) => {
+                let mut parts = vec![];
+                for (i, (_, ft)) in fs.iter().enumerate() {
+                    parts.push(self.tlc_cmp(ft, &format!("&{a}.{i}"), &format!("&{b}.{i}"))?);
+                }
+                let mut code = parts.pop().unwrap();
+                while let Some(p) = parts.pop() {
+                    code = format!("{p}.then_with(|| {code})");
+                }
+                code
+            }
+            Ty::Fun(_, c) if needs_tlc_order(t) => {
+                let inner = self.tlc_cmp(c, "__fa", "__fb")?;
+                format!("{a}.iter().zip({b}.iter()).map(|(__fa, __fb)| {inner}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)")
+            }
+            Ty::Seq(e) if needs_tlc_order(t) => {
+                let inner = self.tlc_cmp(e, "__fa", "__fb")?;
+                format!("{a}.len.cmp(&{b}.len).then_with(|| {a}.slice().iter().zip({b}.slice().iter()).map(|(__fa, __fb)| {inner}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal))")
+            }
+            _ => format!("{a}.cmp({b})"),
+        })
     }
 
     fn s_card(&mut self, c: &str, st: &Ty) -> String {
@@ -477,6 +604,14 @@ impl<'a> Gen<'a> {
         }
         if matches!(&et, Ty::Enum(v) if v.is_empty()) {
             return Ok("false".into());
+        }
+        if self.str_meets_int(xt, &et) {
+            // Compare with each element as TLC does, which stops on a string against an integer
+            let j = join(xt, &et)?;
+            let xc = self.coerce(x.to_string(), xt, &j)?;
+            let ec = self.coerce("__e".into(), &et, &j)?;
+            let it = self.s_iter(c, st)?;
+            return Ok(format!("{{ let __x = {xc}; let __any = {it}.any(|__e| mixed_eq(__x, {ec})); __any }}"));
         }
         if narrows(xt, &et) {
             // x may hold a model value stored as an integer-or-model-value: compare in the joined
@@ -542,6 +677,7 @@ impl<'a> Gen<'a> {
             Ty::Fun(d, c) => format!("[{}; {}]", Self::default_code(c), d.size().unwrap_or(0)),
             Ty::Set(_) if is_sparse(t) => format!("{}::new()", t.repr().replace('<', "::<")),
             Ty::Set(_) => "0u128".into(),
+            Ty::Seq(_) => format!("{}::new()", t.repr().replace('<', "::<")),
         }
     }
 
@@ -551,11 +687,20 @@ impl<'a> Gen<'a> {
         Ok(match (v, t) {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
-            (Value::Atom(a), Ty::IntAtom(..)) => {
-                self.check_model_values(&[*a])?;
-                format!("(i64::MIN + {a}i64)")
-            }
+            (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
             (Value::Atom(a), _) => format!("{a}u16"),
+            (Value::Tuple(xs), Ty::Seq(e)) => {
+                if xs.len() > self.qcap {
+                    return Err(format!("a sequence of length {} is longer than the maximum length {}", xs.len(), self.qcap));
+                }
+                let parts: Vec<String> = xs.iter().map(|x| self.lit(x, e)).collect::<R<_>>()?;
+                format!("{}::from_slice(&[{}])", t.repr().replace('<', "::<"), parts.join(", "))
+            }
+            (Value::Tuple(xs), Ty::Fun(d, c)) if seq_domain(d) == Some(xs.len()) => {
+                self.ty_id(t)?;
+                let parts: Vec<String> = xs.iter().map(|x| self.lit(x, c)).collect::<R<_>>()?;
+                format!("[{}]", parts.iter().map(|p| format!("{p},")).collect::<String>())
+            }
             (Value::Tuple(xs), Ty::Rec(fs)) if is_tuple_fields(fs) && xs.len() == fs.len() => {
                 let mut s = String::from("(");
                 for (x, (_, ft)) in xs.iter().zip(fs) {
@@ -717,11 +862,62 @@ impl<'a> Gen<'a> {
                 let empty = self.s_empty(to)?;
                 Ok(format!("{{ let mut {acc} = {empty}; for {x} in {it} {{ {add} }} {acc} }}"))
             }
-            (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..)) if x.is_empty() => Err("empty enum".into()),
-            (Ty::Enum(x), Ty::IntAtom(..)) => {
-                self.check_model_values(x)?;
-                Ok(format!("(i64::MIN + ({code}) as i64)"))
+            (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..) | Ty::Seq(_)) if x.is_empty() => Err("empty enum".into()),
+            // Between tuples, functions over 1..n, and sequences
+            (_, Ty::Seq(e)) if seq_elems(from).is_some() => {
+                let (r, q) = (self.fresh("r"), self.fresh("q"));
+                let mut s = format!("{{ let {r} = {code}; let mut {q} = {}; ", Self::default_code(to));
+                match from {
+                    Ty::Seq(fe) => {
+                        let x = self.fresh("x");
+                        let xc = self.coerce(x.clone(), fe, e)?;
+                        write!(s, "for {x} in {r}.iter() {{ {q}.push({xc}); }} ").unwrap();
+                    }
+                    Ty::Fun(_, fc) => {
+                        let x = self.fresh("x");
+                        let xc = self.coerce(x.clone(), fc, e)?;
+                        write!(s, "for &{x} in {r}.iter() {{ {q}.push({xc}); }} ").unwrap();
+                    }
+                    _ => {
+                        for (k, t) in seq_elems(from).unwrap().iter().enumerate() {
+                            let xc = self.coerce(format!("{r}.{k}"), t, e)?;
+                            write!(s, "{q}.push({xc}); ").unwrap();
+                        }
+                    }
+                }
+                Ok(s + &format!("{q} }}"))
             }
+            (Ty::Seq(fe), _) if seq_elems(to).is_some() => {
+                // A sequence used as a tuple or a function over 1..n: its length must match
+                let r = self.fresh("r");
+                let (n, body) = match to {
+                    Ty::Fun(d, c) => {
+                        let n = seq_domain(d).unwrap();
+                        let parts: Vec<String> = (0..n).map(|k| self.coerce(format!("{r}.items[{k}]"), fe, c)).collect::<R<_>>()?;
+                        (n, format!("[{}]", parts.iter().map(|p| format!("{p},")).collect::<String>()))
+                    }
+                    _ => {
+                        let ts: Vec<Ty> = tuple_elems(to).unwrap().into_iter().cloned().collect();
+                        let parts: Vec<String> =
+                            ts.iter().enumerate().map(|(k, t)| self.coerce(format!("{r}.items[{k}]"), fe, t)).collect::<R<_>>()?;
+                        (ts.len(), format!("({})", parts.iter().map(|p| format!("{p},")).collect::<String>()))
+                    }
+                };
+                Ok(format!(
+                    "{{ let {r} = {code}; if {r}.len as usize != {n} {{ eval_error(format!(\"a sequence of length {{}} is used where one of length {n} is expected\", {r}.len)) }} {body} }}"
+                ))
+            }
+            (Ty::Rec(fs), Ty::Fun(d, c)) if is_tuple_fields(fs) && seq_domain(d) == Some(fs.len()) => {
+                let r = self.fresh("r");
+                let parts: Vec<String> = fs.iter().enumerate().map(|(k, (_, t))| self.coerce(format!("{r}.{k}"), t, c)).collect::<R<_>>()?;
+                Ok(format!("{{ let {r} = {code}; [{}] }}", parts.iter().map(|p| format!("{p},")).collect::<String>()))
+            }
+            (Ty::Fun(d, c), Ty::Rec(fs)) if is_tuple_fields(fs) && seq_domain(d) == Some(fs.len()) => {
+                let r = self.fresh("r");
+                let parts: Vec<String> = fs.iter().enumerate().map(|(k, (_, t))| self.coerce(format!("{r}[{k}]"), c, t)).collect::<R<_>>()?;
+                Ok(format!("{{ let {r} = {code}; ({}) }}", parts.iter().map(|p| format!("{p},")).collect::<String>()))
+            }
+            (Ty::Enum(_), Ty::IntAtom(..)) => Ok(format!("(i64::MIN + ({code}) as i64)")),
             (Ty::IntAtom(..), Ty::Enum(_)) => {
                 let a = self.fresh("a");
                 Ok(format!(
@@ -804,7 +1000,7 @@ impl<'a> Gen<'a> {
                         None => short(m),
                     };
                     let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
-                    (format!("(if {pc} {{ true }} else {{ eval_error({msg:?}.to_string()) }})"), Ty::Bool)
+                    (format!("(if {pc} {{ true }} else {{ assert_error({msg:?}.to_string()) }})"), Ty::Bool)
                 }
                 // Print and PrintT write to stderr (TLC prints to its output); the checker's verdict
                 // does not depend on them
@@ -846,7 +1042,7 @@ impl<'a> Gen<'a> {
                         _ => Ty::Int(-BIG, BIG),
                     };
                     (
-                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ eval_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => eval_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
+                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ arith_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => arith_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
                         t,
                     )
                 }
@@ -870,17 +1066,79 @@ impl<'a> Gen<'a> {
                         short(e)
                     ))
                 }
-                (f, _) if SEQ_OPS.contains(&f) => return Err(seq_op_error(f)),
+                ("Len", [q]) => {
+                    let (c, t) = self.gen(q, env, None)?;
+                    match &t {
+                        Ty::Seq(_) => (format!("(({c}).len as i64)"), Ty::Int(0, self.qcap as i64)),
+                        _ => {
+                            let n = self.seq_len_of(&t)?;
+                            (format!("{{ let _ = {c}; {n}i64 }}"), Ty::Int(n as i64, n as i64))
+                        }
+                    }
+                }
+                ("Append", [q, x]) => {
+                    let (qc, qt) = self.gen(q, env, None)?;
+                    let (xc, xt) = self.gen(x, env, None)?;
+                    let el = join(&seq_elem_join(&[&qt]).map_err(|_| self.seq_op_err("Append", &qt))?, &xt)?;
+                    let st = Ty::Seq(el.clone().into());
+                    let qc = self.coerce(qc, &qt, &st)?;
+                    let xc = self.coerce(xc, &xt, &el)?;
+                    let v = self.fresh("q");
+                    (format!("{{ let mut {v} = {qc}; {v}.push({xc}); {v} }}"), st)
+                }
+                ("Head", [q]) => {
+                    let (qc, st) = self.as_seq(q, env, "Head")?;
+                    let Ty::Seq(e) = &st else { unreachable!() };
+                    (format!("({qc}).head()"), e.as_ref().clone())
+                }
+                ("Tail", [q]) => {
+                    let (qc, st) = self.as_seq(q, env, "Tail")?;
+                    (format!("({qc}).tail()"), st)
+                }
+                ("SubSeq", [q, m, n]) => {
+                    let (qc, st) = self.as_seq(q, env, "SubSeq")?;
+                    let (mc, _) = self.gen_int(m, env)?;
+                    let (nc, _) = self.gen_int(n, env)?;
+                    (format!("({qc}).sub({mc}, {nc})"), st)
+                }
+                ("\\o", [a, b]) => {
+                    let (ac, at) = self.gen(a, env, None)?;
+                    let (bc, bt) = self.gen(b, env, None)?;
+                    let el = seq_elem_join(&[&at, &bt]).map_err(|_| self.seq_op_err("\\o", &at))?;
+                    let st = Ty::Seq(el.into());
+                    let ac = self.coerce(ac, &at, &st)?;
+                    let bc = self.coerce(bc, &bt, &st)?;
+                    (format!("({ac}).concat(&{bc})"), st)
+                }
+                ("SelectSeq", [q, Lambda(ps, body)]) if ps.len() == 1 => {
+                    let (qc, st) = self.as_seq(q, env, "SelectSeq")?;
+                    let Ty::Seq(e) = &st else { unreachable!() };
+                    let mut env2 = env.clone();
+                    let x = rid(&ps[0]);
+                    env2.locals.insert(ps[0].clone(), (x.clone(), e.as_ref().clone()));
+                    let pc = self.gen_as(body, &env2, &Ty::Bool)?;
+                    let r = self.fresh("q");
+                    (format!("{{ let mut {r} = {}; for {x} in ({qc}).iter() {{ if {pc} {{ {r}.push({x}); }} }} {r} }}", Self::default_code(&st)), st)
+                }
+                ("Seq", _) => return Err("Seq(S) is only supported on the right of \\in".into()),
                 _ => return Err(format!("unknown operator `{f}`")),
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),
             Un(UOp::Neg, x) => {
-                let (c, t) = self.gen(x, env, None)?;
-                let Ty::Int(lo, hi) = t else { return Err("negation of a non-integer".into()) };
+                let (c, (lo, hi)) = self.gen_int(x, env).map_err(|_| "negation of a non-integer".to_string())?;
                 (format!("(-{c})"), Ty::Int(-hi, -lo))
             }
             Un(UOp::Domain, f) => {
                 let (_, ft) = self.gen(f, env, None)?;
+                if let Ty::Seq(_) = &ft {
+                    let (fc, _) = self.gen(f, env, None)?;
+                    let st = Ty::Set(Ty::Int(1, self.qcap as i64).into());
+                    if self.qcap > 128 {
+                        return Err("DOMAIN of a sequence longer than 128 is not supported".into());
+                    }
+                    self.ty_id(&st)?;
+                    return Ok((format!("{{ let __n = ({fc}).len as u32; if __n >= 128 {{ u128::MAX }} else {{ (1u128 << __n) - 1 }} }}"), st));
+                }
                 if let Some(el) = tuple_elems(&ft) {
                     // A tuple of n elements is a function over 1..n
                     let n = el.len();
@@ -954,6 +1212,19 @@ impl<'a> Gen<'a> {
                     _ => unreachable!(),
                 }
             }
+            // SUBSET S of a set in the state, as a value: a set of sets, in TLC's order
+            Un(UOp::Subset, x) => {
+                let (c, t) = self.gen(x, env, None)?;
+                if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
+                    return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
+                }
+                self.need_subsets = true;
+                let st = Ty::Set(t.clone().into());
+                let acc = self.fresh("acc");
+                let add = self.s_add(&acc, "__t", &st)?;
+                let empty = self.s_empty(&st)?;
+                (format!("{{ let mut {acc} = {empty}; for __t in subsets_tlc({c}) {{ {add} }} {acc} }}"), st)
+            }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
             And(xs) | Or(xs) => {
@@ -1005,7 +1276,9 @@ impl<'a> Gen<'a> {
                 }
                 let mut env2 = env.clone();
                 let mut heads = vec![];
-                for (x, s) in bs {
+                // The first bound variable varies fastest, as in TLC (which matters for where an
+                // evaluation error stops the search)
+                for (x, s) in bs.iter().rev() {
                     let (it, et, ix) = self.iter_of_indexed(s, &env2)?;
                     let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
                     heads.push((it, lx));
@@ -1077,6 +1350,18 @@ impl<'a> Gen<'a> {
                 let empty = self.s_empty(&st)?;
                 (format!("{{ let mut {acc} = {empty}; {body} {acc} }}"), st)
             }
+            // [k \in 1..n |-> e] (or over DOMAIN of a sequence) with n from the state is a sequence
+            FunCons(x, s, body) if self.try_const(s, env).is_none() && self.seq_domain_len(s, env).is_some() => {
+                let nc = self.seq_domain_len(s, env).unwrap()?;
+                let mut env2 = env.clone();
+                let lx = rid(x);
+                env2.locals.insert(x.clone(), (lx.clone(), Ty::Int(1, self.qcap.max(1) as i64)));
+                let (bc, bt) = self.gen(body, &env2, None)?;
+                let st = Ty::Seq(bt.into());
+                self.ty_id(&st)?;
+                let q = self.fresh("q");
+                (format!("{{ let mut {q} = {}; for {lx} in 1..=({nc}) {{ {q}.push({bc}); }} {q} }}", Self::default_code(&st)), st)
+            }
             FunCons(x, s, body) => {
                 let dv = self.ce.eval(s, &HashMap::new()).map_err(|m| format!("function domain must be constant: {m}"))?;
                 let dt = elem_ty_of_domain(dv.as_set()?)?;
@@ -1138,9 +1423,34 @@ impl<'a> Gen<'a> {
                 let (fc, ft) = self.gen(f, env, None)?;
                 if let Ty::Rec(fs) = &ft {
                     if is_tuple_fields(fs) {
-                        let k = self.tuple_index(x, env, fs.len())?;
-                        return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                        if self.try_const(x, env).is_some() {
+                            let k = self.tuple_index(x, env, fs.len())?;
+                            return Ok((format!("({fc}).{k}"), fs[k].1.clone()));
+                        }
+                        // An index from the state: the elements as one type, chosen at run time
+                        let mut t = Ty::Enum(vec![]);
+                        for (_, ft) in fs {
+                            t = join(&t, ft).map_err(|e| format!("indexing a tuple with an index that is not constant needs elements of one type: {e}"))?;
+                        }
+                        let (ic, _) = self.gen_int(x, env)?;
+                        let (r, i) = (self.fresh("r"), self.fresh("i"));
+                        let mut arms = String::new();
+                        for (k, (_, ft)) in fs.iter().enumerate() {
+                            let c = self.coerce(format!("{r}.{k}"), ft, &t)?;
+                            write!(arms, "{} => {c}, ", k + 1).unwrap();
+                        }
+                        return Ok((
+                            format!(
+                                "{{ let {r} = {fc}; let {i}: i64 = {ic}; match {i} {{ {arms}_ => eval_error(format!(\"Attempted to apply a tuple of length {} to the index {{}}\", {i})) }} }}",
+                                fs.len()
+                            ),
+                            t,
+                        ));
                     }
+                }
+                if let Ty::Seq(e) = &ft {
+                    let (ic, _) = self.gen_int(x, env)?;
+                    return Ok((format!("({fc}).at({ic})"), e.as_ref().clone()));
                 }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
                 // If the argument is a bound variable with a known index, use it without conversion
@@ -1205,6 +1515,15 @@ impl<'a> Gen<'a> {
                         match (p, &cur) {
                             // Name of this EXCEPT's @, attached during expansion
                             (Path::Field(k), _) if k.starts_with('@') => at_name = Some(k.clone()),
+                            // An index outside the sequence leaves it unchanged, as in TLC
+                            (Path::Idx(i), Ty::Seq(e)) => {
+                                let (ic, _) = self.gen_int(i, env)?;
+                                let iv = self.fresh("i");
+                                write!(s, "let {iv}: i64 = {ic}; ").unwrap();
+                                conds.push(format!("{iv} >= 1 && {iv} <= ({place}).len as i64"));
+                                place = format!("{place}.items[({iv} - 1) as usize]");
+                                cur = e.as_ref().clone();
+                            }
                             (Path::Idx(i), Ty::Fun(d, c)) => {
                                 // A bound variable with a known index needs neither conversion nor
                                 // a bounds check
@@ -1357,6 +1676,11 @@ impl<'a> Gen<'a> {
                 let t = join(&at, &bt)?;
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
+                if matches!(t, Ty::IntAtom(..)) && self.has_str(&t) && self.str_meets_int(&at, &bt) {
+                    // A string and an integer: TLC stops with an error when it compares them
+                    let neg = if op == Eq { "" } else { "!" };
+                    return Ok((format!("{neg}mixed_eq({ac}, {bc})"), Ty::Bool));
+                }
                 (format!("({ac} {} {bc})", if op == Eq { "==" } else { "!=" }), Ty::Bool)
             }
             Lt | Le | Gt | Ge => {
@@ -1443,6 +1767,12 @@ impl<'a> Gen<'a> {
         let (c, t) = self.gen(e, env, None)?;
         match t {
             Ty::Int(lo, hi) => Ok((c, (lo, hi))),
+            // An integer or a model value (`x # None => x + 1 > 0`): a model value reaching
+            // arithmetic or a comparison is an evaluation error, as in TLC
+            Ty::IntAtom(lo, hi, _) => Ok((
+                format!("{{ let __n: i64 = {c}; if __n < i64::MIN + 65536 {{ eval_error(format!(\"Attempted to use the model value {{}} as an integer\", ATOMS[(__n - i64::MIN) as usize])) }} __n }}"),
+                (lo, hi),
+            )),
             t => Err(format!("expected an integer, got {t:?} in {e:?}")),
         }
     }
@@ -1616,6 +1946,29 @@ impl<'a> Gen<'a> {
                 }
                 return Ok(format!("({})", conj.join(" && ")));
             }
+            Call(f, a) if f == "Seq" && a.len() == 1 => {
+                let e = self.fresh("e");
+                return Ok(match xt {
+                    Ty::Seq(et) => {
+                        let inner = self.gen_member(&e, et, &a[0], env)?;
+                        // Bound first: an iterator borrowing x must not outlive the block x lives in
+                        format!("{{ let __all = ({x}).iter().all(|{e}| {inner}); __all }}")
+                    }
+                    Ty::Fun(d, c) if seq_domain(d).is_some() => {
+                        let inner = self.gen_member(&e, c, &a[0], env)?;
+                        format!("{{ let __all = ({x}).iter().all(|&{e}| {inner}); __all }}")
+                    }
+                    Ty::Rec(fs) if is_tuple_fields(fs) => {
+                        let mut conj = vec!["true".to_string()];
+                        for (k, (_, t)) in fs.iter().enumerate() {
+                            let inner = self.gen_member(&e, t, &a[0], env)?;
+                            conj.push(format!("{{ let {e} = {x}.{k}; {inner} }}"));
+                        }
+                        format!("({})", conj.join(" && "))
+                    }
+                    _ => "false".into(),
+                });
+            }
             Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
             Ident(n) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
@@ -1652,6 +2005,9 @@ impl<'a> Gen<'a> {
         }
         if let Some(v) = self.try_const(s, env) {
             let set = v.as_set()?;
+            if let Some(code) = self.member_mixed(x, xt, set)? {
+                return Ok(code);
+            }
             let mut fits: Vec<&Value> = vec![];
             let mut clash = None;
             for e in set {
@@ -1693,6 +2049,14 @@ impl<'a> Gen<'a> {
             let mut comparable = false;
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
+                if self.str_meets_int(xt, &t) {
+                    let j = join(xt, &t)?;
+                    let xc = self.coerce(x.to_string(), xt, &j)?;
+                    let c = self.coerce(c, &t, &j)?;
+                    parts.push(format!("mixed_eq({xc}, {c})"));
+                    comparable = true;
+                    continue;
+                }
                 match self.tuple_cmp(xt, &t)? {
                     Cmp::Normal => comparable = true,
                     Cmp::Unequal => {
@@ -1775,7 +2139,10 @@ impl<'a> Gen<'a> {
                 }
                 let mut env2 = env.clone();
                 let mut closes = 0;
-                for (x, s) in bs {
+                // TLC varies the first bound variable fastest: `\E x \in S, y \in T` loops over T
+                // outside and S inside. The sets cannot refer to the other variables (SANY rejects
+                // that), so the order of the loops is free
+                for (x, s) in bs.iter().rev() {
                     let (it, et, ix) = match self.iter_of_indexed(s, &env2) {
                         Ok(x) => x,
                         // During inference, proceed past sets of still-unknown type, treating the
@@ -2061,6 +2428,14 @@ impl<'a> Gen<'a> {
                 match (step, &cur) {
                     // Name of this EXCEPT's @, attached during expansion
                     (Path::Field(k), _) if k.starts_with('@') => at_name = Some(k.clone()),
+                    (Path::Idx(i), Ty::Seq(e)) => {
+                        let (ic, _) = self.gen_int(i, env)?;
+                        let iv = self.fresh("i");
+                        writeln!(out, "let {iv}: i64 = {ic};").unwrap();
+                        conds.push(format!("{iv} >= 1 && {iv} <= ({p}).len as i64"));
+                        p = format!("{p}.items[({iv} - 1) as usize]");
+                        cur = e.as_ref().clone();
+                    }
                     (Path::Idx(i), Ty::Fun(d, c)) => {
                         let known = match i.strip() {
                             Expr::Ident(n) => env.idx.get(n).filter(|(t, _)| *t == **d).map(|(_, v)| v.clone()),
@@ -2245,6 +2620,8 @@ impl<'a> Gen<'a> {
 
     pub fn helpers(&mut self) -> R<String> {
         let mut s = String::new();
+        // TLC's order of sets: by size, then by their elements in order
+        s += "fn tlc_set_cmp(a: u128, b: u128) -> std::cmp::Ordering { a.count_ones().cmp(&b.count_ones()).then_with(|| { let d = a ^ b; if d == 0 { std::cmp::Ordering::Equal } else if a & d & d.wrapping_neg() != 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } }) }\n";
         if self.need_subsets {
             // The subsets of a bitmask set in TLC's order: by size, then by their elements in order
             // (the lowest element where two subsets differ belongs to the earlier one)
@@ -2388,9 +2765,14 @@ impl<'a> Gen<'a> {
                         )
                     }
                 }
+                Ty::Seq(e) => {
+                    let eid = self.ty_id(e)?;
+                    format!("format!(\"<<{{}}>>\", v.iter().map(|x| fmt_{eid}(&x)).collect::<Vec<_>>().join(\", \"))")
+                }
                 Ty::Set(e) if is_sparse(&t) => {
                     let eid = self.ty_id(e)?;
-                    format!("format!(\"{{{{{{}}}}}}\", v.iter().map(|x| fmt_{eid}(&x)).collect::<Vec<_>>().join(\", \"))")
+                    let it = self.s_iter("*v", &t)?;
+                    format!("format!(\"{{{{{{}}}}}}\", {it}.map(|x| fmt_{eid}(&x)).collect::<Vec<_>>().join(\", \"))")
                 }
                 Ty::Set(e) => {
                     let eid = self.ty_id(e)?;
@@ -2473,6 +2855,19 @@ impl<'a> Gen<'a> {
             return Ok(b);
         }
         Ok(match t {
+            Ty::Seq(e) => {
+                // The length, followed by that many elements, as for a sparse set
+                let lb = Self::bits_for(self.qcap as u64 + 1);
+                let (k, n) = (self.fresh("k"), self.fresh("n"));
+                if let Some(o) = at {
+                    write!(out, "let mut p = {o}u32; ").unwrap();
+                }
+                *at = None;
+                write!(out, "let {n} = ({c}).len as usize; put(&mut w, &mut p, {n} as u128, {lb}); for {k} in 0..{n} {{ ").unwrap();
+                let b = self.pack_value(&format!("({c}).items[{k}]"), e, out, &mut None)?;
+                out.push_str("} ");
+                lb + b * self.qcap as u32
+            }
             Ty::Set(e) if is_sparse(t) => {
                 // The count, followed by that many elements (the rest stay 0). The offset is only
                 // known at runtime from here on, so thread it
@@ -2643,6 +3038,19 @@ impl<'a> Gen<'a> {
             });
         }
         Ok(match t {
+            Ty::Seq(e) => {
+                let lb = Self::bits_for(self.qcap as u64 + 1);
+                let pre = match at {
+                    Some(o) => format!("p = {o}u32; "),
+                    None => String::new(),
+                };
+                *at = None;
+                let inner = self.unpack_value(e, &mut None)?;
+                format!(
+                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u8; ss }}",
+                    Self::default_code(t)
+                )
+            }
             Ty::Set(e) if is_sparse(t) => {
                 let lb = Self::bits_for(self.scap as u64 + 1);
                 // Thread the offset from here on, assigning to the outer p (a fresh `let` inside
@@ -2794,6 +3202,11 @@ impl<'a> Gen<'a> {
                 let v = self.perm_code(&format!("{f}[{i}]"), cod)?;
                 format!("{{ let {f} = &({c}); let mut {o} = *{f}; for {i} in 0..{} {{ {o}[idx_{did}({k})] = {v}; }} {o} }}", d.size().unwrap())
             }
+            Ty::Seq(e) => {
+                let (acc, i) = (self.fresh("acc"), self.fresh("i"));
+                let py = self.perm_code(&format!("{acc}.items[{i}]"), e)?;
+                format!("{{ let mut {acc} = {c}; for {i} in 0..{acc}.len as usize {{ {acc}.items[{i}] = {py}; }} {acc} }}")
+            }
             // A permutation is a bijection, so permuting the elements of a sorted array in place
             // leaves them distinct and one sort restores the order.
             Ty::Set(e) if is_sparse(t) => {
@@ -2834,7 +3247,18 @@ impl<'a> Gen<'a> {
 
     pub fn atoms_table(&self) -> String {
         let names: Vec<String> = self.atoms.list.iter().enumerate().map(|(i, _)| format!("{:?}", self.atoms.show(i as u32))).collect();
-        format!("static ATOMS: [&str; {}] = [{}];\n", names.len(), names.join(", "))
+        let strs: Vec<String> = self.atoms.list.iter().map(|(model, _)| (!model).to_string()).collect();
+        format!(
+            "static ATOMS: [&str; {}] = [{}];\nstatic IS_STR: [bool; {}] = [{}];\n\
+             // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\
+             fn mixed_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
+             if ai != bi {{ let at = if ai {{ b }} else {{ a }}; let n = if ai {{ a }} else {{ b }}; if IS_STR[(at - i64::MIN) as usize] {{ \
+             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer {{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
+            names.len(),
+            names.join(", "),
+            strs.len(),
+            strs.join(", ")
+        )
     }
 }
 
@@ -2847,6 +3271,108 @@ enum Cmp {
     Unequal,
     /// TLC stops with this error when it evaluates the comparison
     Fails(String),
+}
+
+/// The sequence type of the generated checker, pasted in with the runtime. Errors of the operators
+/// TLC implements as built-ins (Head, Tail, SubSeq) use `arith_error`, for TLC's exit code. Unused slots hold the
+/// default value, so derived equality and hashing see only the elements; it orders as TLC orders
+/// tuples, by length and then element by element.
+pub const SQ_RUNTIME: &str = r#"
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Sq<T: Copy + Ord + ConstDefault, const N: usize> {
+    len: u8,
+    items: [T; N],
+}
+impl<T: Copy + Ord + ConstDefault, const N: usize> ConstDefault for Sq<T, N> {
+    const DEFAULT: Self = Sq { len: 0, items: [T::DEFAULT; N] };
+}
+impl<T: Copy + Ord + ConstDefault, const N: usize> Ord for Sq<T, N> {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.len.cmp(&o.len).then_with(|| self.slice().cmp(o.slice()))
+    }
+}
+impl<T: Copy + Ord + ConstDefault, const N: usize> PartialOrd for Sq<T, N> {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+#[cold]
+fn seq_too_long(n: usize) -> ! {
+    eval_error(format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
+}
+impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
+    fn new() -> Self {
+        Self::DEFAULT
+    }
+    fn slice(&self) -> &[T] {
+        &self.items[..self.len as usize]
+    }
+    fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.slice().iter().copied()
+    }
+    fn from_slice(xs: &[T]) -> Self {
+        let mut s = Self::new();
+        for &x in xs {
+            s.push(x);
+        }
+        s
+    }
+    fn push(&mut self, x: T) {
+        if self.len as usize == N {
+            seq_too_long(N)
+        }
+        self.items[self.len as usize] = x;
+        self.len += 1;
+    }
+    fn at(&self, i: i64) -> T {
+        if i < 1 || i > self.len as i64 {
+            eval_error(format!("Attempted to apply a sequence of length {} to the index {}", self.len, i))
+        }
+        self.items[(i - 1) as usize]
+    }
+    fn head(&self) -> T {
+        if self.len == 0 {
+            arith_error("Attempted to apply Head to the empty sequence.".into())
+        }
+        self.items[0]
+    }
+    fn tail(&self) -> Self {
+        if self.len == 0 {
+            arith_error("Attempted to apply Tail to the empty sequence.".into())
+        }
+        Self::from_slice(&self.slice()[1..])
+    }
+    fn concat(&self, o: &Self) -> Self {
+        let mut s = *self;
+        for x in o.iter() {
+            s.push(x);
+        }
+        s
+    }
+    fn sub(&self, m: i64, n: i64) -> Self {
+        if m > n {
+            return Self::new();
+        }
+        if m < 1 || m > self.len as i64 {
+            arith_error("The second argument of SubSeq must be in the domain of its first argument.".into())
+        }
+        if n > self.len as i64 {
+            arith_error("The third argument of SubSeq must be in the domain of its first argument.".into())
+        }
+        Self::from_slice(&self.slice()[(m - 1) as usize..n as usize])
+    }
+}
+"#;
+
+/// Whether the Rust order of values of type `t` differs from TLC's: a set held as a bitmask compares
+/// as a number in Rust, but by size and then elements in TLC
+fn needs_tlc_order(t: &Ty) -> bool {
+    match t {
+        Ty::Set(_) => !is_sparse(t),
+        Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
+        Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),
+        _ => false,
+    }
 }
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
