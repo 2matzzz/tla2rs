@@ -281,8 +281,16 @@ impl Parser {
         loop {
             match self.raw().tok.clone() {
                 Tok::Eof => break,
-                Tok::Sym(s) if s == "====" => break,
+                Tok::Sym(s) if s == "====" => {
+                    // Consumed, so that a nested module ends here and the enclosing one goes on
+                    self.pos += 1;
+                    break;
+                }
                 Tok::Sym(s) if s == "----" => self.pos += 1,
+                Tok::Ident(k) if k == "MODULE" => {
+                    let inner = self.module()?;
+                    m.nested.push(inner);
+                }
                 Tok::Ident(k) if k == "EXTENDS" => {
                     self.pos += 1;
                     m.extends = self.ident_list()?;

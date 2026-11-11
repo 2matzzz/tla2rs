@@ -82,6 +82,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
     let mut out = Vec::new();
     let (mut i, mut line, mut col) = (0usize, 1usize, 0usize);
     let mut line_has_tok = false;
+    let mut depth = 0i32;
     if module {
         // Skip to the header, keeping line numbers
         let start = module_start(&cs).unwrap_or(0);
@@ -226,7 +227,14 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
             }
             Tok::Sym(sym.to_string())
         };
-        let end = module && tok == Tok::Sym("====".into());
+        // A module ends at its `====`; a module nested in it (`---- MODULE M ----`) ends at its own
+        if module && tok == Tok::Ident("MODULE".into()) {
+            depth += 1;
+        }
+        if module && tok == Tok::Sym("====".into()) {
+            depth -= 1;
+        }
+        let end = module && tok == Tok::Sym("====".into()) && depth <= 0;
         out.push(Token { tok, line: tl, col: tc, first });
         line_has_tok = true;
         if end {

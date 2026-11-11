@@ -99,9 +99,12 @@ pub struct Def {
     pub body: Expr,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Module {
     pub name: String,
+    /// Modules written inside this one (`---- MODULE M ---- ... ====`), which it can EXTEND or
+    /// INSTANCE
+    pub nested: Vec<Module>,
     pub extends: Vec<String>,
     pub constants: Vec<String>,
     pub variables: Vec<String>,
