@@ -1516,6 +1516,29 @@ impl<'a> Gen<'a> {
                         _ => (format!("{{ let (__a, __b) = ({ac}, {bc}); let __le = __a.iter().zip(__b.iter()).all(|(x, y)| x <= y); __le }}"), Ty::Bool),
                     }
                 }
+                // A function whose values are positive integers (an atom is held below every integer)
+                ("IsABag", [b]) => {
+                    let (c, t) = self.gen(b, env, None)?;
+                    let ints = |t: &Ty| matches!(t, Ty::Int(..) | Ty::IntAtom(..));
+                    let test = match &t {
+                        Ty::Bag(_) => "true".to_string(),
+                        Ty::Bool | Ty::Int(..) | Ty::IntAtom(..) | Ty::Enum(_) | Ty::Set(_) => "false".into(),
+                        Ty::Fun(_, r) if ints(r) => "__b.iter().all(|&x| x > 0)".into(),
+                        Ty::Seq(r) if ints(r) => "__b.iter().all(|x| x > 0)".into(),
+                        Ty::Fun(_, r) if !ints(r) => "__b.len() == 0".into(),
+                        Ty::Seq(r) if !ints(r) => "__b.len == 0".into(),
+                        Ty::Rec(fs) if !fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => {
+                            let parts: Vec<String> = fs
+                                .iter()
+                                .enumerate()
+                                .map(|(k, (_, ft))| if ints(ft) { format!("__b{} > 0", rec_field(fs.len(), k)) } else { "false".into() })
+                                .collect();
+                            if parts.is_empty() { "true".into() } else { parts.join(" && ") }
+                        }
+                        _ => return Err(format!("IsABag of {t:?} is not supported")),
+                    };
+                    (format!("{{ let __b = {c}; let _ = &__b; let __r: bool = {test}; __r }}"), Ty::Bool)
+                }
                 ("BagCardinality", [b]) => {
                     let (bc, _) = self.bag_of(b, env, None)?;
                     (format!("{{ let __b = {bc}; let __n: i64 = __b.iter().sum(); __n }}"), Ty::Int(0, BIG))
@@ -1537,6 +1560,9 @@ impl<'a> Gen<'a> {
                     let rt = Ty::Bag(yt.clone().into());
                     self.ty_id(&rt)?;
                     let yid = self.ty_id(&yt)?;
+                    if let Some(msg) = crate::value::bag_of_all_literal(self.atoms, body) {
+                        return Ok((format!("{{ let _ = {bc}; let __v: {} = eval_error({msg:?}.to_string()); __v }}", rt.repr()), rt));
+                    }
                     (
                         format!("{{ let __b = {bc}; let mut __r = {}; for __i in 0..__b.len() {{ if __b[__i] > 0 {{ let {x} = dec_{eid}(__i as u64); __r[idx_{yid}({yc})] += __b[__i]; }} }} __r }}", Self::default_code(&rt)),
                         rt,
