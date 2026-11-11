@@ -164,6 +164,18 @@ impl ConstEval<'_> {
                     }
                     Value::Bool(true)
                 }
+                // The TLC module: d :> e is the function {d} -> e, and f @@ g joins two functions,
+                // taking f where both are defined
+                (":>", [d, e]) => Value::Fun([(self.eval(d, env)?, self.eval(e, env)?)].into()),
+                ("@@", [f, g]) => match (self.eval(f, env)?, self.eval(g, env)?) {
+                    (Value::Fun(mut a), Value::Fun(b)) => {
+                        for (k, v) in b {
+                            a.entry(k).or_insert(v);
+                        }
+                        Value::Fun(a)
+                    }
+                    _ => return Err("@@ of values that are not functions".into()),
+                },
                 ("PrintT", [x]) => {
                     self.eval(x, env)?;
                     Value::Bool(true)

@@ -808,6 +808,24 @@ impl<'a> Gen<'a> {
                 }
                 // Print and PrintT write to stderr (TLC prints to its output); the checker's verdict
                 // does not depend on them
+                // (d :> e) @@ f, with f over a whole type: f with the entry at d replaced. Any other
+                // use of :> and @@ builds a function over part of a type, which is not represented
+                ("@@", [l, f]) if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2) => {
+                    let Call(_, de) = l.strip() else { unreachable!() };
+                    let (fc, ft) = self.gen(f, env, want)?;
+                    let Ty::Fun(d, c) = &ft else { return Err("@@ of a value that is not a function".into()) };
+                    let did = self.ty_id(d)?;
+                    let kc = self.gen_as(&de[0], env, d)?;
+                    let vc = self.gen_as(&de[1], env, c)?;
+                    let (t, i) = (self.fresh("t"), self.fresh("i"));
+                    (
+                        format!("{{ let mut {t} = {fc}; let {i} = enc_{did}({kc}); if {i} == u64::MAX {{ eval_error(\"(d :> e) @@ f with d outside the domain of f is not supported\".into()) }} {t}[{i} as usize] = {vc}; {t} }}"),
+                        ft,
+                    )
+                }
+                (":>" | "@@", _) => {
+                    return Err(format!("`{f}` over values that depend on the state is only supported as `(d :> e) @@ f` with f a function over a whole type: {}", short(e)))
+                }
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;

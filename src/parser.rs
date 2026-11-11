@@ -38,7 +38,27 @@ pub fn parse_module(src: &str) -> R<Module> {
     p.module()
 }
 
+/// Infix operators without a built-in meaning, which a spec may define (`a ++ b == ...`), with
+/// their precedence (the lower end of the range in the TLA+ table). `:>` and `@@` are defined by
+/// the TLC module.
+const USER_INFIX: &[(&str, u8)] = &[
+    ("@@", 6), (":>", 7), ("<:", 7), ("\\prec", 5), ("\\succ", 5), ("\\preceq", 5), ("\\succeq", 5),
+    ("\\sim", 5), ("\\simeq", 5), ("\\approx", 5), ("\\cong", 5), ("\\asymp", 5), ("\\doteq", 5),
+    ("\\propto", 5), ("\\sqsubseteq", 5), ("\\sqsupseteq", 5), ("\\uplus", 9), ("\\sqcap", 9),
+    ("\\sqcup", 9), ("##", 9), ("$$", 9), ("\\wr", 9), ("\\oplus", 10), ("++", 10), ("%%", 10),
+    ("\\ominus", 11), ("\\otimes", 13), ("\\oslash", 13), ("\\odot", 13), ("**", 13), ("//", 13),
+    ("&&", 13), ("\\star", 13), ("\\bullet", 13), ("||", 13), ("^^", 14),
+];
+
+fn user_infix(t: &Tok) -> Option<(u8, &'static str)> {
+    let Tok::Sym(s) = t else { return None };
+    USER_INFIX.iter().find(|(n, _)| n == s).map(|(n, p)| (*p, *n))
+}
+
 fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
+    if let Some((p, n)) = user_infix(t) {
+        return Some((p, false, n));
+    }
     let Tok::Sym(s) = t else { return None };
     // (precedence, right-associative, normalized name)
     Some(match s.as_str() {
@@ -118,6 +138,7 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "%" => BOp::Mod,
         "\\o" => return Expr::Call("\\o".into(), vec![a, b]),
         "^" => return Expr::Call("^".into(), vec![a, b]),
+        o if USER_INFIX.iter().any(|(n, _)| *n == o) => return Expr::Call(o.into(), vec![a, b]),
         _ => unreachable!(),
     };
     Expr::Bin(o, a.b(), b.b())
@@ -334,6 +355,14 @@ impl Parser {
 
     fn def(&mut self) -> R<Vec<Def>> {
         let name = self.ident()?;
+        // An infix operator definition `a ++ b == e`
+        if let Some((_, op)) = user_infix(self.peek()) {
+            self.pos += 1;
+            let b = self.ident()?;
+            self.expect("==")?;
+            let body = self.expr(0)?;
+            return Ok(vec![Def { name: op.to_string(), params: vec![name, b], arity: vec![0, 0], body }]);
+        }
         let mut params = vec![];
         let mut arity = vec![];
         if self.is("(") {
