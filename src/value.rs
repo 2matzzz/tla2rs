@@ -142,7 +142,7 @@ thread_local! {
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
 const EVAL_FAILURES: [&str; 9] = [
     "The first argument of BagOfAll should be an operator",
-    "Attempted to check if the value:",
+    "Attempted to check if ",
     "The second argument of \\div is 0.",
     "The second argument of % should be a positive number",
     "Attempted to evaluate a CASE with no conditions true.",
@@ -527,6 +527,11 @@ impl ConstEval<'_> {
                 let inside = self.in_builtin_set(n, self.eval(x, env)?)?;
                 Value::Bool(inside == matches!(op, BOp::In))
             }
+            // x \in [D -> R]: decided without enumerating the set of functions
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(set.strip(), FunSet(..)) => {
+                let v = self.eval(x, env)?;
+                Value::Bool(self.member(&v, set, env)? == matches!(op, BOp::In))
+            }
             Bin(BOp::Subseteq, x, set)
                 if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int" || n == "STRING")
                     && !env.contains_key(n) && !self.constants.contains_key(n)) =>
@@ -821,6 +826,48 @@ impl ConstEval<'_> {
     }
 
     /// The entries of a bag
+    /// Whether `v` is in `set`. A set of functions [D -> R] is not enumerated: a function (records
+    /// and tuples included) is in it when its domain is D and its values are in R. TLC answers FALSE
+    /// for a model value and stops with an error for any other value that is not a function.
+    fn member(&self, v: &Value, set: &Expr, env: &HashMap<String, Value>) -> R<bool> {
+        match set.strip() {
+            Expr::FunSet(d, r) => {
+                let m: BTreeMap<Value, Value> = match v {
+                    Value::Rec(m) => m.iter().map(|(k, x)| (Value::Atom(self.atoms.intern(false, k)), x.clone())).collect(),
+                    Value::Atom(a) if self.atoms.is_model(*a) => return Ok(false),
+                    v => as_fun(v).ok_or_else(|| {
+                        format!(
+                            "Attempted to check if \n{}\nwhich is not a TLC function value, is in the set of functions:\n{}",
+                            crate::compile::show_value(self.atoms, v),
+                            crate::codegen::short(set)
+                        )
+                    })?,
+                };
+                let dom = self.eval(d, env)?;
+                if !m.keys().eq(dom.as_set()?.iter()) {
+                    return Ok(false);
+                }
+                for x in m.values() {
+                    if !self.member(x, r, env)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Expr::Ident(n) if ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
+                self.in_builtin_set(n, v.clone())
+            }
+            _ => {
+                let s = self.eval(set, env)?;
+                let s = s.as_set()?;
+                if let Some(e) = s.iter().find(|e| self.str_int(v, e)) {
+                    return Err(format!("Attempted to check equality of {v:?} with {e:?} (a string and an integer)"));
+                }
+                Ok(s.contains(v))
+            }
+        }
+    }
+
     /// Whether `v` is in the set `n`, which is Nat, Int, STRING, or TLC's Any
     fn in_builtin_set(&self, n: &str, v: Value) -> R<bool> {
         Ok(match v {

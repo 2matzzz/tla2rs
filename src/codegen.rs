@@ -382,6 +382,108 @@ impl<'a> Gen<'a> {
         Ok((format!("{{ let __m: i64 = {mc}; let __n: i64 = {nc}; match {qc} {{ {arms}_ => type_error(\"string\", \"\") }} }}"), Ty::Enum(res)))
     }
 
+    /// Whether the value `x` of type `xt` is in [d -> r]: a function (sequences, bags, records
+    /// and partial functions included) whose domain is d and whose values are in r. TLC answers
+    /// FALSE for a model value and stops with an error for any other value that is not a function.
+    fn fun_set_member(&mut self, x: &str, xt: &Ty, d: &Expr, r: &Expr, s: &Expr, env: &Env) -> R<String> {
+        let not_fun = |g: &mut Self| -> R<String> {
+            let tid = g.ty_id(xt)?;
+            let msg = format!("Attempted to check if \n{{}}\nwhich is not a TLC function value, is in the set of functions:\n{}", short(s));
+            Ok(format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{x}))); __b }}"))
+        };
+        let in_r = |g: &mut Self, v: &str, t: &Ty| -> R<String> {
+            let e = g.fresh("e");
+            let inner = g.gen_member(&e, t, r, env)?;
+            Ok(format!("{{ let {e} = {v}; {inner} }}"))
+        };
+        match xt {
+            Ty::Enum(ids) => {
+                let strs: Vec<String> = ids.iter().filter(|&&a| !self.atoms.is_model(a)).map(|a| a.to_string()).collect();
+                if strs.is_empty() {
+                    return Ok("false".into());
+                }
+                let err = not_fun(self)?;
+                return Ok(format!("(if matches!({x}, {}) {{ {err} }} else {{ false }})", strs.join(" | ")));
+            }
+            Ty::Bool | Ty::Int(..) | Ty::IntAtom(..) | Ty::Set(_) => return not_fun(self),
+            // A sequence is a function over 1..Len
+            Ty::Seq(et) => {
+                let Some(dv) = self.try_const(d, env) else {
+                    let mut env2 = env.clone();
+                    env2.locals.insert("#seq".into(), (x.to_string(), xt.clone()));
+                    let (dc, dt) = self.gen(d, env, None)?;
+                    let range = Expr::Bin(BOp::Range, Expr::Num(1).b(), Expr::Call("Len".into(), vec![Expr::Ident("#seq".into())]).b());
+                    let (rc, rt) = self.gen(&range, &env2, Some(&dt))?;
+                    let t = join(&dt, &rt)?;
+                    let same = format!("({} == {})", self.coerce(dc, &dt, &t)?, self.coerce(rc, &rt, &t)?);
+                    let all = in_r(self, "__v", et)?;
+                    return Ok(format!("({same} && {x}.iter().all(|__v| {all}))"));
+                };
+                let dom = dv.as_set()?;
+                let n = dom.len();
+                if !(1..=n as i64).all(|i| dom.contains(&Value::Int(i))) {
+                    return Ok("false".into());
+                }
+                let all = in_r(self, "__v", et)?;
+                return Ok(format!("(({x}).len as usize == {n} && {x}.iter().all(|__v| {all}))"));
+            }
+            _ => {}
+        }
+        let Some(dv) = self.try_const(d, env) else {
+            return Err(format!("membership in [D -> R] with D from the state is not supported for {xt:?}: {}", short(s)));
+        };
+        let dom = dv.as_set()?.clone();
+        Ok(match xt {
+            Ty::Fun(dt, ct) => {
+                if dt.enumerate().into_iter().collect::<BTreeSet<_>>() != dom {
+                    return Ok("false".into());
+                }
+                let all = in_r(self, "__v", ct)?;
+                format!("{x}.iter().all(|&__v| {all})")
+            }
+            // Present keys must be exactly the domain
+            Ty::PFun(dt, _) | Ty::Bag(dt) => {
+                let keys = dt.enumerate();
+                if dom.iter().any(|k| !keys.contains(k)) {
+                    return Ok("false".into());
+                }
+                let mask: Vec<String> = keys.iter().map(|k| dom.contains(k).to_string()).collect();
+                let (present, val, vt) = match xt {
+                    Ty::PFun(_, ct) => ("__p.0", "__p.1", ct.as_ref().clone()),
+                    _ => ("(__p > 0)", "__p", Ty::Int(1, crate::types::BIG)),
+                };
+                let all = in_r(self, val, &vt)?;
+                format!(
+                    "{{ const D: [bool; {}] = [{}]; {x}.iter().enumerate().all(|(__i, &__p)| {present} == D[__i] && (!D[__i] || {all})) }}",
+                    keys.len(),
+                    mask.join(", ")
+                )
+            }
+            // A record is a function over its field names
+            Ty::Rec(fs) => {
+                let names: BTreeSet<Value> = fs.iter().map(|(k, _)| Value::Atom(self.atoms.intern(false, k))).collect();
+                if !dom.is_subset(&names) {
+                    return Ok("false".into());
+                }
+                let mut conj = vec!["true".to_string()];
+                for (i, (k, ft)) in fs.iter().enumerate() {
+                    let fp = format!("{x}{}", rec_field(fs.len(), i));
+                    let want = dom.contains(&Value::Atom(self.atoms.intern(false, k)));
+                    match ft {
+                        Ty::Opt(inner) => {
+                            let m = in_r(self, &format!("{fp}.1"), inner)?;
+                            conj.push(if want { format!("({fp}.0 && {m})") } else { format!("!{fp}.0") });
+                        }
+                        ft if want => conj.push(in_r(self, &fp, ft)?),
+                        _ => return Ok("false".into()),
+                    }
+                }
+                format!("({})", conj.join(" && "))
+            }
+            _ => return Err(format!("membership of {xt:?} in [D -> R] is not supported: {}", short(s))),
+        })
+    }
+
     /// Whether `b` is a bag held in the state (a constant bag is a plain function value)
     fn is_bag(&mut self, b: &Expr, env: &Env) -> bool {
         matches!(b.strip(), Expr::Ident(n) if n == "EmptyBag") || matches!(self.gen(b, env, None), Ok((_, Ty::Bag(_))))
@@ -1850,6 +1952,20 @@ impl<'a> Gen<'a> {
                 let empty = self.s_empty(&st)?;
                 (format!("{{ let mut {acc} = {empty}; for __t in {it} {{ {add} }} {acc} }}"), st)
             }
+            // UNION S of a set of sets from the state
+            Un(UOp::Union, x) => {
+                let (c, t) = self.gen(x, env, None)?;
+                let Ty::Set(inner) = &t else { return Err("UNION of a non-set".into()) };
+                if !matches!(inner.as_ref(), Ty::Set(_)) {
+                    return Err("UNION of a set whose elements are not sets".into());
+                }
+                let rt = inner.as_ref().clone();
+                let it = self.s_iter(&c, &t)?;
+                let acc = self.fresh("acc");
+                let empty = self.s_empty(&rt)?;
+                let cup = self.s_bin(BOp::Cup, &acc, "__u", &rt);
+                (format!("{{ let mut {acc} = {empty}; for __u in {it} {{ {acc} = {cup}; }} {acc} }}"), rt)
+            }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
             And(xs) | Or(xs) => {
@@ -2294,8 +2410,26 @@ impl<'a> Gen<'a> {
                 let add = self.s_add("__s", "__f", &st)?;
                 (format!("{{ let mut __s = {empty}; for __f in {it} {{ {add} }} __s }}"), st)
             }
-            RecSet(..) => {
-                return Err("this set is only supported on the right of \\in (or must be constant)".into())
+            // [a : S, b : T] with sets from the state, as a value: every record, collected
+            RecSet(fs) => {
+                let mut fs = fs.clone();
+                fs.sort_by(|a, b| a.0.cmp(&b.0));
+                let (mut open, mut close, mut names, mut tys) = (String::new(), String::new(), vec![], vec![]);
+                for (k, se) in &fs {
+                    let (c, t) = self.gen(se, env, None)?;
+                    let Ty::Set(et) = &t else { return Err(format!("[{k} : S] with S not a set")) };
+                    let it = self.s_iter(&c, &t)?;
+                    let v = self.fresh("f");
+                    write!(open, "for {v} in {it} {{ ").unwrap();
+                    close.push('}');
+                    names.push(v);
+                    tys.push((k.clone(), et.as_ref().clone()));
+                }
+                let st = Ty::Set(Ty::Rec(tys).into());
+                let acc = self.fresh("acc");
+                let add = self.s_add(&acc, &rec_build(&names), &st)?;
+                let empty = self.s_empty(&st)?;
+                (format!("{{ let mut {acc} = {empty}; {open}{add} {close} {acc} }}"), st)
             }
             Let(..) | Label(..) => unreachable!(),
             Lambda(..) => return Err("LAMBDA is only supported as the argument of an operator parameter".into()),
@@ -2408,7 +2542,10 @@ impl<'a> Gen<'a> {
                 (format!("{neg}{{ let {x} = {xc}; {m} }}"), Ty::Bool)
             }
             // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
-            Subseteq if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int" || n == "STRING") => {
+            Subseteq
+                if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int" || n == "STRING")
+                    || matches!(b.strip(), Expr::Call(f, a) if f == "Seq" && a.len() == 1) =>
+            {
                 let (ac, at) = self.gen(a, env, None)?;
                 let x = self.fresh("x");
                 let m = self.gen_member(&x, &at, &Expr::Un(UOp::Subset, b.clone().into()), env)?;
@@ -2610,15 +2747,20 @@ impl<'a> Gen<'a> {
             // each element is in R
             if let FunSet(d, r) = s {
                 let n = tuple_elems(xt).unwrap().len();
-                let Some(dv) = self.try_const(d, env) else {
-                    return Err(format!("membership of a tuple in [D -> R] with D from the state is not supported: {}", short(s)));
-                };
                 let one_to_n: BTreeSet<Value> = (1..=n as i64).map(Value::Int).collect();
-                if dv.as_set()? != &one_to_n {
-                    return Ok("false".into());
-                }
+                let same_domain = match self.try_const(d, env) {
+                    Some(dv) if dv.as_set()? != &one_to_n => return Ok("false".into()),
+                    Some(_) => "true".to_string(),
+                    // D from the state: compare it with 1..n
+                    None => {
+                        let (dc, dt) = self.gen(d, env, None)?;
+                        let (rc, rt) = self.gen(&Bin(BOp::Range, Num(1).b(), Num(n as i64).b()), env, Some(&dt))?;
+                        let t = join(&dt, &rt)?;
+                        format!("({} == {})", self.coerce(dc, &dt, &t)?, self.coerce(rc, &rt, &t)?)
+                    }
+                };
                 let els: Vec<Ty> = tuple_elems(xt).unwrap().into_iter().cloned().collect();
-                let mut conj = vec!["true".to_string()];
+                let mut conj = vec![same_domain];
                 for (k, et) in els.iter().enumerate() {
                     let e = self.fresh("e");
                     let inner = self.gen_member(&e, et, r, env)?;
@@ -2651,18 +2793,7 @@ impl<'a> Gen<'a> {
                     "{{ let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __p == {in_d} && (!__p || {in_r}) }}); __all }}"
                 ));
             }
-            FunSet(d, r) => {
-                let Ty::Fun(dt, ct) = xt else { return Ok("false".into()) };
-                let dv = self.ce.eval(d, &HashMap::new())?;
-                let mut dom = dt.enumerate();
-                dom.sort();
-                if dom.into_iter().collect::<BTreeSet<_>>() != *dv.as_set()? {
-                    return Ok("false".into());
-                }
-                let e = self.fresh("e");
-                let inner = self.gen_member(&e, ct, r, env)?;
-                return Ok(format!("{x}.iter().all(|&{e}| {inner})"));
-            }
+            FunSet(d, r) => return self.fun_set_member(x, xt, d, r, s, env),
             RecSet(fs) => {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
