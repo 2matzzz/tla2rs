@@ -208,9 +208,24 @@ impl Expr {
         f(self) || self.children().into_iter().any(|c| c.any(f))
     }
 
-    /// Whether this contains a prime or UNCHANGED (i.e. is action-level)
+    /// Whether this contains a prime, UNCHANGED or [A]_v outside ENABLED (i.e. is action-level;
+    /// ENABLED A is a state predicate)
     pub fn is_action(&self) -> bool {
-        self.any(&|e| matches!(e, Expr::Prime(_) | Expr::Un(UOp::Unchanged, _)))
+        match self {
+            Expr::Prime(_) | Expr::Un(UOp::Unchanged, _) | Expr::BoxAction(..) => true,
+            Expr::Un(UOp::Enabled, _) => false,
+            e => e.children().into_iter().any(|c| c.is_action()),
+        }
+    }
+
+    /// Whether this is \EE, \AA or -+-> (temporal operators TLC cannot check)
+    pub fn is_unchecked_temporal(&self) -> bool {
+        matches!(self, Expr::Call(n, _) if n == "\\EE" || n == "\\AA" || n == "-+->")
+    }
+
+    /// Whether this is a label written in the spec (`l :: e`), as opposed to a call site
+    pub fn is_user_label(&self) -> bool {
+        matches!(self, Expr::Label(n, ..) if n.ends_with("::"))
     }
 
     /// Strips Label wrappers

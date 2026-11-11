@@ -503,7 +503,7 @@ fn std_ops(m: &str) -> &'static [(&'static str, usize)] {
         ],
         "Bags" => &[
             ("IsABag", 1), ("BagToSet", 1), ("SetToBag", 1), ("BagIn", 2), ("EmptyBag", 0), ("\\oplus", 2), ("\\ominus", 2),
-            ("BagUnion", 1), ("\\sqsubseteq", 2), ("SubBag", 1), ("BagCardinality", 1), ("CopiesIn", 2),
+            ("BagUnion", 1), ("\\sqsubseteq", 2), ("SubBag", 1), ("BagOfAll", 2), ("BagCardinality", 1), ("CopiesIn", 2),
         ],
         _ => &[],
     }
@@ -536,7 +536,9 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
                 let mut params = inst.params.clone();
                 params.extend(ps);
                 let mut arity = inst.arity.clone();
-                arity.extend(vec![0; k]);
+                // An operator argument (SelectSeq's test, SortSeq's order, BagOfAll's function)
+                let op_param = crate::expand::builtin_op_param(op, k);
+                arity.extend((0..k).map(|i| op_param.filter(|(p, _)| *p == i).map_or(0, |(_, n)| n)));
                 out.defs.push(Def { name: format!("{n}!{op}"), params, arity, body });
             }
         }
@@ -631,6 +633,70 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
+    let mut startup = vec![];
+    let mut out = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup)?;
+    // What TLC prints when it starts comes before its verdict on the spec
+    if let Some((msg, _)) = &mut out.rejected {
+        if !startup.is_empty() {
+            *msg = format!("{}\n{msg}", startup.join("\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// e with Print and PrintT removed (as TLC uses the value it computed when it started)
+fn strip_prints(e: &Expr) -> Expr {
+    match e {
+        Expr::Call(n, a) if n == "PrintT" && a.len() == 1 => Expr::Bool(true),
+        Expr::Call(n, a) if n == "Print" && a.len() == 2 => strip_prints(&a[1]),
+        _ => crate::codegen::map_children(e, &strip_prints),
+    }
+}
+
+/// e with the definitions in `cached` (evaluated when TLC started) not printing again
+fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
+    match e {
+        Expr::Label(n, a, b) if a.is_empty() && cached.contains(n) => Expr::Label(n.clone(), vec![], strip_prints(b).b()),
+        _ => crate::codegen::map_children(e, &|c| uncache_prints(c, cached)),
+    }
+}
+
+/// Whether e is of constant level (no variable, prime or temporal operator)
+fn constant_level(e: &Expr, m: &Module) -> bool {
+    !e.any(&|x| match x {
+        Expr::Ident(v) => m.variables.contains(v),
+        Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => true,
+        Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) => true,
+        x => x.is_unchecked_temporal(),
+    })
+}
+
+fn has_prints(e: &Expr) -> bool {
+    e.any(&|x| matches!(x, Expr::Call(n, _) if n == "PrintT" || n == "Print"))
+}
+
+/// Evaluates e with Print and PrintT recorded, adding the lines printed to `out`
+fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
+    PRINTED.with(|p| *p.borrow_mut() = Some(vec![]));
+    let r = ce.eval(e, &HashMap::new());
+    let lines = PRINTED.with(|p| p.borrow_mut().take()).unwrap_or_default();
+    for l in lines {
+        out.push(l.iter().map(|v| show_value(ce.atoms, v)).collect::<Vec<_>>().join("  "));
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_inner(
+    tla: &str,
+    cfg_src: &str,
+    dir: &std::path::Path,
+    setcap: usize,
+    seqcap: usize,
+    fp128: bool,
+    metal: bool,
+    startup: &mut Vec<String>,
+) -> R<Output> {
     let mut warnings = vec![];
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
     let cfg = parse_cfg(cfg_src)?;
@@ -714,6 +780,35 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         pending = left;
     }
 
+    // SANY checks the level rules of temporal formulas in every definition, used or not (a
+    // definition with arguments is checked as written, without what it refers to)
+    for d in &m.defs {
+        let e = if d.params.is_empty() { ex.expand_def(&d.name).ok() } else { Some(d.body.clone()) };
+        if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
+            let msg = format!("Error: {msg} (in {})\nError: Parsing or semantic analysis failed.", d.name);
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)) });
+        }
+    }
+
+    // When it starts, TLC evaluates the definitions of constant level without arguments, in order,
+    // and keeps their values; then it checks the ASSUMEs. What Print and PrintT print in them is
+    // printed then, once (a definition used again later is not evaluated again)
+    let mut cached = HashSet::new();
+    {
+        let ce = ConstEval { atoms: &atoms, constants: &constants };
+        let names: Vec<String> = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
+        for n in names {
+            let Ok(e) = ex.expand_def(&n) else { continue };
+            if !constant_level(&e, &m) || !has_prints(&e) {
+                continue;
+            }
+            // TLC ignores a definition it fails to evaluate here
+            if eval_printing(&ce, &uncache_prints(&e, &cached), startup).is_ok() {
+                cached.insert(n);
+            }
+        }
+    }
+
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
     // is false. An expression that cannot be evaluated is an error rather than silently passing.
     {
@@ -722,7 +817,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
             let (l1, c1, l2, c2) = a.span;
             let at = format!("line {l1}, col {c1} to line {l2}, col {c2} of module {}", a.module);
             let e = ex.expand_top(&a.expr).map_err(|e| format!("ASSUME at {at}: {e}"))?;
-            match ce.eval(&e, &HashMap::new()) {
+            match eval_printing(&ce, &uncache_prints(&e, &cached), startup) {
                 Ok(Value::Bool(true)) => {}
                 Ok(Value::Bool(false)) => {
                     return Ok(Output {
@@ -741,23 +836,58 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         }
     }
 
-    let (init, next, fairness) = resolve_spec(&m, &cfg, &mut ex)?;
-    if uses_real_time(&init) || uses_real_time(&next) || fairness.iter().any(uses_real_time) {
+    let SpecParts { init, next, temporal } = match resolve_spec(&m, &cfg, &mut ex)? {
+        Ok(p) => p,
+        Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r) }),
+    };
+    // TLC evaluates an invariant or property of constant level once, before exploring, and
+    // refuses one that is not TRUE (one it fails to evaluate is evaluated again on each state)
+    {
+        let ce = ConstEval { atoms: &atoms, constants: &constants };
+        let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
+        for (what, name) in named {
+            let e = ex.expand_def(name)?;
+            if !constant_level(&e, &m) {
+                continue;
+            }
+            match ce.eval(&e, &HashMap::new()) {
+                Ok(Value::Bool(true)) | Err(_) => {}
+                Ok(v) => {
+                    let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)) });
+                }
+            }
+        }
+    }
+    if uses_real_time(&init) || next.as_ref().is_some_and(uses_real_time) {
         return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
     }
+    // Without a next-state action TLC computes the initial states and stops (or refuses the spec
+    // when there is something to check on the steps, below)
+    let no_next = next.is_none();
+    let next = next.unwrap_or(Expr::Bool(false));
 
     let mut g = Gen::new(&atoms, &constants);
+    g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
     if setcap > 0 {
         g.scap = setcap;
     }
     g.qcap = seq_cap(&m, &cfg, &mut ex, &g, seqcap, &init, &next)?;
 
-    // Fairness conditions (only relevant when checking properties)
+    // The temporal conjuncts of the spec other than [][Next]_v (only relevant when checking
+    // temporal properties): WF / SF become conditions on the cycles the search accepts, anything
+    // else is assumed as part of the formula checked (as TLC does: it checks the properties under
+    // all of them, and checks none of them)
     let mut fair_defs = vec![];
+    let mut assumed = vec![];
     if !cfg.properties.is_empty() {
-        for f in &fairness {
-            let f = ex.expand_top(f)?;
-            crate::live::collect_fair(&f, &HashMap::new(), &g, &mut fair_defs)?;
+        for f in &temporal {
+            let mut fs = vec![];
+            if !uses_real_time(f) && crate::live::collect_fair(f, &HashMap::new(), &g, &mut fs).is_ok() {
+                fair_defs.extend(fs);
+            } else {
+                assumed.push(f.clone());
+            }
         }
     }
 
@@ -892,7 +1022,18 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
             unreachable!();
         }
     }
-    let live_code = match crate::live::compile(&mut g, &fair_defs, &live_parts)? {
+    if no_next && (!inv_list.is_empty() || !cfg.invariants.is_empty() || !action_props.is_empty() || !live_parts.is_empty()) {
+        let msg = "Error: The configuration file did not specify the next state predicate.";
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)) });
+    }
+    if !live_parts.is_empty() {
+        if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
+            let msg = format!("Error: TLC cannot handle the temporal formula {} (RTBound / RTnow of RealTime)", short(f));
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
+        }
+    }
+    let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
+    let live_code = match crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts)? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
             return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)) })
@@ -1029,6 +1170,8 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     show += "o }\n";
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
+    writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();
+    writeln!(src, "static STARTUP_PRINTS: &[&str] = &{startup:?};").unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
     writeln!(src, "const QCAP: usize = {};", g.qcap).unwrap();
     src += crate::codegen::SQ_RUNTIME;
@@ -1170,13 +1313,17 @@ fn ty_of_set(g: &Gen, s: &Expr) -> R<Ty> {
 }
 
 fn is_temporal(e: &Expr, m: &Module, seen: &mut HashSet<String>) -> bool {
-    e.any(&|x| matches!(x, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::BoxAction(..) | Expr::Fair(..)))
+    e.any(&|x| matches!(x, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..)) || x.is_unchecked_temporal())
         || {
             let mut names = vec![];
             collect_refs(e, &mut names);
             names.into_iter().any(|n| {
                 if !seen.insert(n.clone()) {
                     return false;
+                }
+                // RTnow and RTBound of RealTime (their bodies here are placeholders)
+                if n == "RTnow" || n == "RTBound" {
+                    return true;
                 }
                 m.defs.iter().find(|d| d.name == n).is_some_and(|d| is_temporal(&d.body, m, seen))
             })
@@ -1193,50 +1340,115 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
-fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<(Expr, Expr, Vec<Expr>)> {
-    if let (Some(i), Some(n)) = (&cfg.init, &cfg.next) {
-        return Ok((ex.expand_def(i)?, ex.expand_def(n)?, vec![]));
-    }
-    let spec = cfg.specification.as_ref().ok_or("cfg needs SPECIFICATION or INIT/NEXT")?;
-    let mut init = vec![];
-    let mut next = None;
-    let mut fair = vec![];
-    let body = ex.def(spec).ok_or(format!("no definition `{spec}`"))?.body.clone();
-    walk_spec(&body, m, ex, &mut init, &mut next, &mut fair)?;
-    let next = next.ok_or(format!("{spec}: no [][Next]_vars conjunct"))?;
-    if init.is_empty() {
-        return Err(format!("{spec}: no initial predicate"));
-    }
-    let init = if init.len() == 1 { init.pop().unwrap() } else { Expr::And(init) };
-    Ok((ex.expand_top(&init)?, ex.expand_top(&next)?, fair))
+/// The parts of the spec, as TLC splits it: the conjuncts of level at most 1 (the initial
+/// predicate), the action of the one `[][A]_v` conjunct, and the other temporal conjuncts. TLC
+/// splits through conjunctions and definitions without arguments (also those of an instance), not
+/// through LET or operators with arguments.
+pub struct SpecParts {
+    pub init: Expr,
+    pub next: Option<Expr>,
+    pub temporal: Vec<Expr>,
 }
 
-fn walk_spec(
-    e: &Expr,
-    m: &Module,
-    ex: &mut Expander,
-    init: &mut Vec<Expr>,
-    next: &mut Option<Expr>,
-    fair: &mut Vec<Expr>,
-) -> R<()> {
-    match e {
-        Expr::And(xs) => {
-            for x in xs {
-                walk_spec(x, m, ex, init, next, fair)?;
-            }
-        }
-        Expr::Un(UOp::Always, x) => match x.as_ref() {
-            Expr::BoxAction(a, _) => *next = Some(a.as_ref().clone()),
-            _ => return Err(format!("unsupported temporal conjunct in the spec: {}", short(e))),
-        },
-        Expr::Ident(n) if ex.def(n).is_some_and(|d| d.params.is_empty()) && is_temporal(e, m, &mut HashSet::new()) => {
-            let b = ex.def(n).unwrap().body.clone();
-            walk_spec(&b, m, ex, init, next, fair)?;
-        }
-        e if is_temporal(e, m, &mut HashSet::new()) => fair.push(e.clone()),
-        e => init.push(e.clone()),
+const NO_INIT: &str = "Error: The configuration file did not specify the initial state predicate.\nCan also be caused by trying to run TLC on a specification from\na module imported with a parameterized INSTANCE statement.";
+
+/// The spec's parts, or why TLC refuses it (message and exit code)
+fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts, (String, i32)>> {
+    if cfg.specification.is_none() && (cfg.init.is_some() || cfg.next.is_some()) {
+        let Some(i) = &cfg.init else { return Ok(Err((NO_INIT.into(), 151))) };
+        let next = match &cfg.next {
+            Some(n) => Some(ex.expand_def(n)?),
+            None => None,
+        };
+        return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![] }));
     }
-    Ok(())
+    let spec = cfg.specification.as_ref().ok_or("cfg needs SPECIFICATION or INIT/NEXT")?;
+    let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false };
+    if !ex.has_def(spec) {
+        return Err(format!("no definition `{spec}`"));
+    }
+    w.walk(&Expr::Ident(spec.clone()), m, ex)?;
+    if w.init.is_empty() {
+        return Ok(Err((NO_INIT.into(), 151)));
+    }
+    if w.twice {
+        let msg = "Error: The specification contains more than one conjunct of the form [][Next]_v,\nbut TLC can handle only specifications with one next-state relation.";
+        return Ok(Err((msg.into(), 151)));
+    }
+    let init = if w.init.len() == 1 { w.init.pop().unwrap() } else { Expr::And(w.init) };
+    Ok(Ok(SpecParts { init, next: w.next, temporal: w.temporal }))
+}
+
+struct SpecWalk {
+    init: Vec<Expr>,
+    next: Option<Expr>,
+    temporal: Vec<Expr>,
+    twice: bool,
+}
+
+impl SpecWalk {
+    fn set_next(&mut self, a: Expr) {
+        if self.next.is_some() {
+            self.twice = true;
+        }
+        self.next = Some(a);
+    }
+
+    /// Walks a conjunct as written
+    fn walk(&mut self, e: &Expr, m: &Module, ex: &mut Expander) -> R<()> {
+        match e {
+            Expr::And(xs) => {
+                for x in xs {
+                    self.walk(x, m, ex)?;
+                }
+            }
+            Expr::Un(UOp::Always, x) => match x.as_ref() {
+                Expr::BoxAction(a, _) => {
+                    let a = ex.expand_top(a)?;
+                    self.set_next(a);
+                }
+                _ => self.temporal.push(ex.expand_top(e)?),
+            },
+            Expr::Ident(n) if ex.def(n).is_some_and(|d| d.params.is_empty()) => {
+                let b = ex.def(n).unwrap().body.clone();
+                // A definition of an instance: its body calls the instantiated module's definition,
+                // which is split after substitution
+                let inst = matches!(&b, Expr::Ident(r) | Expr::Call(r, _) if r.contains("#i"));
+                if inst {
+                    let x = ex.expand_top(e)?;
+                    self.walk_expanded(&x);
+                } else if is_temporal(e, m, &mut HashSet::new()) {
+                    self.walk(&b, m, ex)?;
+                } else {
+                    self.init.push(ex.expand_top(e)?);
+                }
+            }
+            // RTnow(v) and RTBound(..) of RealTime are temporal formulas
+            Expr::Call(n, _) if n == "RTnow" || n == "RTBound" => self.temporal.push(ex.expand_top(e)?),
+            e if is_temporal(e, m, &mut HashSet::new()) => self.temporal.push(ex.expand_top(e)?),
+            e => self.init.push(ex.expand_top(e)?),
+        }
+        Ok(())
+    }
+
+    /// Walks an expanded conjunct, where a call of a definition is a Label
+    fn walk_expanded(&mut self, e: &Expr) {
+        let temporal = |x: &Expr| {
+            x.any(&|y| matches!(y, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..)) || y.is_unchecked_temporal())
+        };
+        match e {
+            Expr::And(xs) => xs.iter().for_each(|x| self.walk_expanded(x)),
+            Expr::Label(n, args, b) if (args.is_empty() || n.contains("#i")) && n != "<<>>_" && !e.is_user_label() => {
+                self.walk_expanded(b)
+            }
+            Expr::Un(UOp::Always, x) => match x.as_ref() {
+                Expr::BoxAction(a, _) => self.set_next(a.as_ref().clone()),
+                _ => self.temporal.push(e.clone()),
+            },
+            e if uses_real_time(e) || temporal(e) => self.temporal.push(e.clone()),
+            e => self.init.push(e.clone()),
+        }
+    }
 }
 
 pub fn show_value(atoms: &Atoms, v: &Value) -> String {
@@ -1283,7 +1495,7 @@ fn action_level(e: &Expr) -> bool {
 fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, out: &mut Vec<PropPart>) -> R<()> {
     use Expr::*;
     let temporal = |x: &Expr| {
-        x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..) | BoxAction(..) | Fair(..)))
+        x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..) | BoxAction(..) | Fair(..)) || y.is_unchecked_temporal())
     };
     let mut tag = String::new();
     let mut keys: Vec<&String> = env.keys().collect();
@@ -1296,7 +1508,7 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
     }
     let disp = if tag.is_empty() { name.to_string() } else { format!("{name} [{tag}]") };
     match e {
-        Label(_, _, b) => split_property(g, b, env, name, out),
+        Label(_, _, b) if !e.is_user_label() => split_property(g, b, env, name, out),
         And(xs) => xs.iter().try_for_each(|x| split_property(g, x, env, name, out)),
         Quant(false, bs, body) if temporal(body) => {
             let mut err = Ok(());

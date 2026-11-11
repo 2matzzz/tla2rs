@@ -23,7 +23,7 @@ pub struct Token {
 }
 
 const SYMS: &[&str] = &[
-    "<=>", "|->", "~>", "==", "=>", "=<", "<=", ">=", "/=", "/\\", "\\/", "->", "<-", "<<", ">>", "<>",
+    "!!", "??", "<=>", "|->", "~>", "==", "=>", "=<", "<=", ">=", "/=", "/\\", "\\/", "->", "<-", "<<", ">>", "<>",
     "[]", "..", "::", "^+", "^*", "^#", "--", "|-", "@@", ":>", "<:", "++", "**", "//", "^^", "%%", "##", "&&", "||", "$$", "(", ")", "[", "]", "{", "}", ",", ":", "'", ".", "=", "#", "<", ">", "+",
     "-", "*", "%", "!", "@", "~", "^", "|", "&", "$",
 ];
@@ -202,12 +202,33 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                     w.push(cs[i]);
                     adv!();
                 }
-                Tok::Sym(normalize_backslash(&w))
+                // \b101, \o17, \hFF: numbers in base 2, 8 and 16
+                let radix = match w.chars().next() {
+                    Some('b' | 'B') => 2,
+                    Some('o' | 'O') => 8,
+                    Some('h' | 'H') => 16,
+                    _ => 0,
+                };
+                let digits = &w[1..];
+                if radix > 0 && !digits.is_empty() && digits.chars().all(|d| d.is_digit(radix)) {
+                    Tok::Num(i64::from_str_radix(digits, radix).map_err(|e| format!("line {tl}: {e}"))?)
+                } else {
+                    Tok::Sym(normalize_backslash(&w))
+                }
             } else {
                 adv!();
                 Tok::Sym("\\".into())
             }
         } else {
+            // -+-> (TLA+'s "while" operator), the only symbol of four characters
+            if cs[i..].starts_with(&['-', '+', '-', '>']) {
+                for _ in 0..4 {
+                    adv!();
+                }
+                out.push(Token { tok: Tok::Sym("-+->".into()), line: tl, col: tc, first });
+                line_has_tok = true;
+                continue;
+            }
             let rest: String = cs[i..(i + 3).min(cs.len())].iter().collect();
             // (+) and (-) spell \oplus and \ominus (the bag union and difference of Bags)
             if rest == "(+)" || rest == "(-)" {

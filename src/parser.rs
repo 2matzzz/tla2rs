@@ -57,6 +57,7 @@ const USER_INFIX: &[(&str, u8)] = &[
     ("\\sqcup", 9), ("##", 9), ("$$", 9), ("\\wr", 9), ("\\oplus", 10), ("++", 10), ("%%", 10),
     ("\\ominus", 11), ("\\otimes", 13), ("\\oslash", 13), ("\\odot", 13), ("**", 13), ("//", 13),
     ("&&", 13), ("\\star", 13), ("\\bullet", 13), ("||", 13), ("^^", 14), ("--", 11), ("|-", 5),
+    ("!!", 9), ("??", 9), ("\\bigcirc", 13),
 ];
 
 fn user_infix(t: &Tok) -> Option<(u8, &'static str)> {
@@ -74,6 +75,7 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
         "=>" => (1, true, "=>"),
         "<=>" => (2, false, "<=>"),
         "~>" => (2, false, "~>"),
+        "-+->" => (2, false, "-+->"),
         "\\/" => (3, false, "\\/"),
         "/\\" => (3, false, "/\\"),
         "=" => (5, false, "="),
@@ -156,6 +158,8 @@ pub(crate) fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "\\div" => BOp::Div,
         "%" => BOp::Mod,
         "\\o" => return Expr::Call("\\o".into(), vec![a, b]),
+        // TLC cannot check -+->, \EE or \AA: kept only to be refused where TLC refuses them
+        "-+->" => return Expr::Call("-+->".into(), vec![a, b]),
         "^" => return Expr::Call("^".into(), vec![a, b]),
         o if USER_INFIX.iter().any(|(n, _)| *n == o) => return Expr::Call(o.into(), vec![a, b]),
         _ => unreachable!(),
@@ -373,13 +377,40 @@ impl Parser {
                 // TLC checks ASSUME and ASSUMPTION, and skips THEOREM and AXIOM
                 Tok::Ident(k) if k == "ASSUME" || k == "ASSUMPTION" => {
                     self.pos += 1;
+                    // ASSUME Name == e also defines Name
+                    let named = match (self.peek().clone(), self.peek2().clone()) {
+                        (Tok::Ident(n), Tok::Sym(eq)) if eq == "==" => {
+                            self.pos += 2;
+                            Some(n)
+                        }
+                        _ => None,
+                    };
                     let start = self.pos;
                     let expr = self.expr(0)?;
                     let (a, b) = (&self.toks[start], &self.toks[self.pos - 1]);
                     let span = (a.line, a.col + 1, b.line, b.col + tok_width(&b.tok));
+                    if let Some(name) = named {
+                        m.defs.push(Def { name, params: vec![], arity: vec![], body: expr.clone() });
+                    }
                     m.assumes.push(Assume { module: m.name.clone(), expr, span });
                 }
-                Tok::Ident(k) if PROOF_UNITS.contains(&k.as_str()) => self.skip_proof_unit(),
+                Tok::Ident(k) if PROOF_UNITS.contains(&k.as_str()) => {
+                    // THEOREM Name == e defines Name (TLC checks nothing of it)
+                    if !matches!(k.as_str(), "USE" | "HIDE") {
+                        let at = |p: &Self, k: usize| p.toks[(p.pos + k).min(p.toks.len() - 1)].tok.clone();
+                        if let (Tok::Ident(n), Tok::Sym(eq)) = (at(self, 1), at(self, 2)) {
+                            if eq == "==" {
+                                let save = self.pos;
+                                self.pos += 3;
+                                if let Ok(e) = self.expr(0) {
+                                    m.defs.push(Def { name: n, params: vec![], arity: vec![], body: e });
+                                }
+                                self.pos = save;
+                            }
+                        }
+                    }
+                    self.skip_proof_unit()
+                }
                 Tok::Ident(k) if k == "INSTANCE" => {
                     self.pos += 1;
                     let inst = self.instance(None, vec![], vec![])?;
@@ -615,10 +646,11 @@ impl Parser {
             // f[x \in S] == e is f == [x \in S |-> e]
             let at = self.pos;
             self.pos += 1;
-            let bs = self.nested(|p| p.binders())?;
+            let (bs, lets) = self.nested(|p| p.binders_pat())?;
             self.expect("]")?;
             self.expect("==")?;
             let body = self.expr(0)?;
+            let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
             let _ = at;
             if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
                 return Ok(Ok(self.rec_fun(name, bs, body)));
@@ -706,14 +738,6 @@ impl Parser {
         } else {
             Expr::Or(items)
         })
-    }
-
-    fn binders(&mut self) -> R<Vec<(String, Expr)>> {
-        let (bs, lets) = self.binders_pat()?;
-        if !lets.is_empty() {
-            return self.err("a tuple of bound variables `<<x, y>> \\in S` is only supported after \\E, \\A, and in {e : ...}");
-        }
-        Ok(bs)
     }
 
     /// At `<<x, y>> \in`, the names (consuming the pattern up to `\in` inclusive); otherwise None
@@ -813,6 +837,20 @@ impl Parser {
             Tok::Sym(s) if s == "<>" => {
                 self.pos += 1;
                 Ok(Expr::Un(UOp::Eventually, self.expr(4)?.b()))
+            }
+            // \EE x : e and \AA x : e (temporal quantifiers)
+            Tok::Sym(s) if s == "\\EE" || s == "\\AA" => {
+                self.pos += 1;
+                loop {
+                    self.ident()?;
+                    if !self.is(",") {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                self.expect(":")?;
+                let body = self.expr(0)?;
+                Ok(Expr::Call(s.clone(), vec![body]))
             }
             Tok::Sym(s) if s == "\\E" || s == "\\A" => {
                 let ex = s == "\\E";
@@ -1030,6 +1068,27 @@ impl Parser {
                     self.expect(")")?;
                     return Ok(Expr::Fair(s.starts_with("WF_"), Expr::Ident(s[3..].into()).b(), a.b()));
                 }
+                // A label `l :: e` or `l(a, b) :: e`: kept as a Label named `l::`, which nothing
+                // but liveness looks at (TLC cannot check a labeled temporal formula)
+                if self.is("::") {
+                    self.pos += 1;
+                    let body = self.expr(0)?;
+                    return Ok(Expr::Label(format!("{s}::"), vec![], body.b()));
+                }
+                if self.is("(") {
+                    let mut j = self.pos + 1;
+                    while matches!(&self.toks[j].tok, Tok::Ident(_)) && matches!(&self.toks[j + 1].tok, Tok::Sym(c) if c == "," || c == ")") {
+                        j += 2;
+                        if matches!(&self.toks[j - 1].tok, Tok::Sym(c) if c == ")") {
+                            break;
+                        }
+                    }
+                    if j > self.pos + 1 && matches!(&self.toks[j - 1].tok, Tok::Sym(c) if c == ")") && matches!(&self.toks[j].tok, Tok::Sym(c) if c == "::") {
+                        self.pos = j + 1;
+                        let body = self.expr(0)?;
+                        return Ok(Expr::Label(format!("{s}::"), vec![], body.b()));
+                    }
+                }
                 let mut name = s;
                 let mut args = vec![];
                 let mut call = false;
@@ -1179,10 +1238,13 @@ impl Parser {
         if self.is(",") && matches!(&e, Expr::Ident(_) | Expr::Bin(BOp::In, ..)) {
             // [x \in S, y \in T |-> e] or [x, y \in S |-> e]
             self.pos = start;
-            let bs = self.binders()?;
+            // A tuple of bound variables `<<a, b>> \in S` among them names the components of
+            // that argument
+            let (bs, lets) = self.binders_pat()?;
             self.expect("|->")?;
             let body = self.expr(0)?;
             self.expect("]")?;
+            let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
             return Ok(fun_cons(bs, body));
         }
         if self.is_kw("EXCEPT") {

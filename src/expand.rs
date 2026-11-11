@@ -356,7 +356,7 @@ impl<'a> Expander<'a> {
 }
 
 /// For a built-in operator taking an operator argument: its position and number of arguments
-fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)> {
+pub(crate) fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)> {
     match (name, args) {
         ("SelectSeq", 2) => Some((1, 1)),
         ("SortSeq", 2) => Some((1, 2)),

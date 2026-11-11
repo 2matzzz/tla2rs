@@ -991,7 +991,18 @@ fn main() {
     // Evaluation errors are caught and reported where they occur. Anything that reaches this point
     // is unexpected, so print a message instead of exiting silently (the default panic output is
     // suppressed above).
+    // What TLC prints when it starts: Print and PrintT in the constant definitions and ASSUMEs
+    for l in STARTUP_PRINTS {
+        println!("{l}");
+    }
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // A spec without [][Next]_v: TLC computes and checks the initial states, then stops
+        if NO_NEXT {
+            let (inits, _) = initial_states();
+            println!("Finished computing initial states: {} distinct states generated.", inits.len());
+            println!("Error: No next state actions defined to generate successor states from.");
+            std::process::exit(75);
+        }
         if LIVENESS {
             run_liveness(&opt);
         } else if opt.batched {

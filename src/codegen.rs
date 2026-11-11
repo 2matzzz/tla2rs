@@ -9,7 +9,7 @@ use crate::ast::*;
 use crate::lexer::R;
 use crate::types::*;
 use crate::value::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 #[derive(Clone, Default)]
@@ -31,9 +31,15 @@ pub struct Env {
     work: Option<String>,
     /// Inside ENABLED: a successor need not determine every variable (as in TLC)
     partial: bool,
+    /// Bound variables whose value is known at compile time (an unrolled \\A or recursive call)
+    vals: HashMap<String, Value>,
 }
 
 pub struct Gen<'a> {
+    /// The module's definitions without arguments (TLC keeps the value of those of constant level)
+    pub zero_defs: HashSet<String>,
+    /// How deep recursive operators are being unrolled in an action
+    unroll: u32,
     pub atoms: &'a Atoms,
     pub ce: ConstEval<'a>,
     pub vars: Vec<(String, Ty)>,
@@ -67,6 +73,8 @@ fn rid(n: &str) -> String {
 impl<'a> Gen<'a> {
     pub fn new(atoms: &'a Atoms, constants: &'a HashMap<String, Value>) -> Self {
         Gen {
+            zero_defs: HashSet::new(),
+            unroll: 0,
             atoms,
             ce: ConstEval { atoms, constants },
             vars: vec![],
@@ -688,7 +696,7 @@ impl<'a> Gen<'a> {
     /// (its parameters, then the free variables of `rec_free`): its name and return type. The
     /// return type is found by generating the body until the type settles, starting from a few
     /// guesses; integer ranges that keep growing are widened to unbounded.
-    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, reads: &[String], primes: &[String]) -> R<(String, Ty)> {
+    fn rec_fn(&mut self, i: usize, rd: &crate::expand::RecDef, tys: Vec<Ty>, reads: &[String], primes: &[String], enabled: bool) -> R<(String, Ty)> {
         let key = (i, tys.clone());
         if let Some(r) = self.rec_done.get(&key) {
             return Ok(r.clone());
@@ -705,6 +713,10 @@ impl<'a> Gen<'a> {
         let names: Vec<String> = rd.params.iter().chain(&free).chain(reads).cloned().collect();
         let mut env = Env::default();
         let mut sig = String::new();
+        // ENABLED in the body is evaluated on the current state, passed as `s`
+        if enabled {
+            sig += "s: &State, ";
+        }
         for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
             env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
             write!(sig, "a{k}: {}, ", t.repr()).unwrap();
@@ -757,21 +769,21 @@ impl<'a> Gen<'a> {
 
     /// The variables that the recursive operator `i` reads, and those it reads primed, including
     /// through the recursive operators it calls
-    fn rec_reads(&self, i: usize) -> R<(Vec<String>, Vec<String>)> {
+    /// (and whether it, or one it calls, has ENABLED)
+    fn rec_reads(&self, i: usize) -> R<(Vec<String>, Vec<String>, bool)> {
         let mut todo = vec![i];
         let mut seen = BTreeSet::new();
         let (mut reads, mut primes) = (BTreeSet::new(), BTreeSet::new());
+        let mut enabled = false;
         while let Some(j) = todo.pop() {
             if !seen.insert(j) {
                 continue;
             }
             let rd = crate::expand::rec_def(j);
-            if rd.body.any(&|e| matches!(e, Expr::Un(UOp::Enabled, _))) {
-                return Err(format!("recursive operator `{}`: ENABLED inside a recursive operator is not supported", rd.name));
-            }
+            enabled |= rd.body.any(&|e| matches!(e, Expr::Un(UOp::Enabled, _)));
             self.collect_reads(&rd.body, false, &mut reads, &mut primes, &mut todo);
         }
-        Ok((reads.into_iter().collect(), primes.into_iter().collect()))
+        Ok((reads.into_iter().collect(), primes.into_iter().collect(), enabled))
     }
 
     fn collect_reads(&self, e: &Expr, primed: bool, reads: &mut BTreeSet<String>, primes: &mut BTreeSet<String>, todo: &mut Vec<usize>) {
@@ -784,6 +796,8 @@ impl<'a> Gen<'a> {
                 }
             }
             Expr::Prime(x) => self.collect_reads(x, true, reads, primes, todo),
+            // ENABLED reads the current state, which is passed whole (see rec_fn)
+            Expr::Un(UOp::Enabled, _) => {}
             Expr::Un(UOp::Unchanged, x) => {
                 self.collect_reads(x, false, reads, primes, todo);
                 self.collect_reads(x, true, reads, primes, todo);
@@ -840,16 +854,30 @@ impl<'a> Gen<'a> {
     }
 
     fn is_const(&self, e: &Expr, env: &Env) -> bool {
+        match e {
+            // Print and PrintT print each time they are evaluated, except in a definition of
+            // constant level without arguments: TLC computes its value once, when it starts (and
+            // prints then, see compile.rs)
+            Expr::Call(n, _) if n == "PrintT" || n == "Print" => false,
+            Expr::Label(n, a, b) if a.is_empty() && self.zero_defs.contains(n) => self.is_const_quiet(b, env),
+            Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
+            Expr::Ident(n) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
+            _ => e.children().into_iter().all(|c| self.is_const(c, env)),
+        }
+    }
+
+    /// Whether e is constant, printing or not
+    fn is_const_quiet(&self, e: &Expr, env: &Env) -> bool {
         !e.any(&|x| match x {
             Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => true,
-            Expr::Ident(n) => self.is_var(n) || env.locals.contains_key(n),
+            Expr::Ident(n) => self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n),
             _ => false,
         })
     }
 
     fn try_const(&self, e: &Expr, env: &Env) -> Option<Value> {
         if self.is_const(e, env) {
-            self.ce.eval(e, &HashMap::new()).ok()
+            self.ce.eval(e, &env.vals).ok()
         } else {
             None
         }
@@ -913,6 +941,11 @@ impl<'a> Gen<'a> {
         for p in path {
             let step = match (p, &cur) {
                 (Path::Idx(i), Some(Ty::Rec(fs))) if is_tuple_fields(fs) => Path::Field(tuple_field(self.tuple_index(i, env, fs.len())?)),
+                // A record is a function from its field names: !["a"] is !.a
+                (Path::Idx(i), Some(Ty::Rec(fs))) => match self.try_const(i, env) {
+                    Some(Value::Atom(a)) if fs.iter().any(|(n, _)| *n == self.atoms.name(a)) => Path::Field(self.atoms.name(a)),
+                    _ => p.clone(),
+                },
                 _ => p.clone(),
             };
             cur = match &cur {
@@ -1494,8 +1527,18 @@ impl<'a> Gen<'a> {
 
     fn gen_inner(&mut self, e: &Expr, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
         use Expr::*;
+        // A definition of constant level: its value (see is_const)
+        if matches!(e, Label(..)) {
+            if let Some(v) = self.try_const(e, env) {
+                return self.lit_auto(&v, want);
+            }
+        }
         let e = e.strip();
-        if let Some(v) = self.try_const(e, env) {
+        // A constant bag is built by SetToBag below, which gives it the type of a bag (its value
+        // alone is a function, over part of a type when its elements are records with different
+        // fields)
+        let bag = matches!(e, Call(f, _) if f == "SetToBag");
+        if let Some(v) = self.try_const(e, env).filter(|_| !bag) {
             return self.lit_auto(&v, want);
         }
         // A constant comparison that TLC fails to evaluate fails when the checker evaluates it
@@ -1692,11 +1735,13 @@ impl<'a> Gen<'a> {
                     let id = self.ty_id(&t)?;
                     (format!("{{ println!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
                 }
+                // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;
                     let (vc, vt) = self.gen(v, env, want)?;
-                    (format!("{{ println!(\"{{}}\", fmt_{id}(&{c})); {vc} }}"), vt)
+                    let vid = self.ty_id(&vt)?;
+                    (format!("{{ let __x = {c}; let __v = {vc}; println!(\"{{}}  {{}}\", fmt_{id}(&__x), fmt_{vid}(&__v)); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int(a, env)?;
@@ -1958,6 +2003,25 @@ impl<'a> Gen<'a> {
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),
             // ENABLED A: whether A has a successor from the current state
+            Un(UOp::Enabled, x) if env.init => {
+                // In Init, ENABLED is evaluated on the state assigned so far (TLC fails on a
+                // variable not assigned yet)
+                match self.vars.iter().find(|(v, _)| !env.primed.contains_key(v)) {
+                    Some((v, _)) => {
+                        (eval_error_bool(&format!("In evaluation, the identifier {v} is either undefined or not an operator.")), Ty::Bool)
+                    }
+                    None => {
+                        let fields: Vec<String> =
+                            self.vars.iter().map(|(v, _)| format!("v_{v}: {}", env.primed[v].0)).collect();
+                        let mut inner = env.clone();
+                        inner.init = false;
+                        inner.primed.clear();
+                        inner.work = None;
+                        let (c, _) = self.gen(&Un(UOp::Enabled, x.clone()), &inner, None)?;
+                        (format!("{{ let __st = State {{ {} }}; let s = &__st; {c} }}", fields.join(", ")), Ty::Bool)
+                    }
+                }
+            }
             Un(UOp::Enabled, x) => {
                 let mut inner = env.clone();
                 inner.primed.clear();
@@ -2011,6 +2075,10 @@ impl<'a> Gen<'a> {
                 let n = d.size().unwrap();
                 let mask: u128 = if n >= 128 { u128::MAX } else { (1u128 << n) - 1 };
                 (format!("{mask}u128"), st)
+            }
+            // UNCHANGED e for an expression that is not a tuple of variables is e' = e
+            Un(UOp::Unchanged, x) if Self::unchanged_vars(x, &mut vec![]).is_err() => {
+                return self.gen(&Bin(BOp::Eq, self.prime_vars(x).b(), x.clone()), env, want);
             }
             Un(UOp::Unchanged, x) => {
                 let mut names = vec![];
@@ -2363,6 +2431,15 @@ impl<'a> Gen<'a> {
                         Ty::Int(1, BIG),
                     ));
                 }
+                // A record is a function from its field names: r["a"] is r.a
+                if let Ty::Rec(fs) = &ft {
+                    if let Some(Value::Atom(a)) = self.try_const(x, env) {
+                        let k = self.atoms.name(a);
+                        if fs.iter().any(|(n, _)| *n == k) {
+                            return self.gen(&Expr::Field(f.clone(), k), env, want);
+                        }
+                    }
+                }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
                 // If the argument is a bound variable with a known index, use it without conversion
                 if let Ident(n) = x.strip() {
@@ -2566,9 +2643,22 @@ impl<'a> Gen<'a> {
                 // Constant arguments were folded above when the whole call evaluates; otherwise
                 // call a Rust function generated for the operator
                 let rd = crate::expand::rec_def(*i);
-                let (reads, primes) = self.rec_reads(*i)?;
+                let (reads, primes, enabled) = self.rec_reads(*i)?;
                 let mut codes = vec![];
                 let mut tys = vec![];
+                let mut state_arg = String::new();
+                if enabled {
+                    state_arg = if env.init {
+                        // In Init: the state assigned so far, once it is complete
+                        if let Some((v, _)) = self.vars.iter().find(|(v, _)| !env.primed.contains_key(v)) {
+                            return Err(format!("recursive operator `{}` evaluates ENABLED in Init before {v} is assigned", rd.name));
+                        }
+                        let fields: Vec<String> = self.vars.iter().map(|(v, _)| format!("v_{v}: {}", env.primed[v].0)).collect();
+                        format!("&State {{ {} }}, ", fields.join(", "))
+                    } else {
+                        "s, ".into()
+                    };
+                }
                 for a in args {
                     // Integer arguments are passed unbounded: their ranges change from call to call
                     // (n, n - 1, ...), and one function serves them all
@@ -2602,16 +2692,24 @@ impl<'a> Gen<'a> {
                     codes.push(self.coerce(c, &t, &vt)?);
                     tys.push(vt);
                 }
-                let (name, ret) = self.rec_fn(*i, &rd, tys, &reads, &primes)?;
-                (format!("{name}({})", codes.join(", ")), ret)
+                let (name, ret) = self.rec_fn(*i, &rd, tys, &reads, &primes, enabled)?;
+                (format!("{name}({state_arg}{})", codes.join(", ")), ret)
             }
-            BoxAction(..) | Fair(..) => return Err("temporal formula in a state expression".into()),
+            // [A]_v is A \/ UNCHANGED v
+            BoxAction(a, v) => return self.gen(&Or(vec![a.as_ref().clone(), Un(UOp::Unchanged, v.clone())]), env, want),
+            Fair(..) => return Err("temporal formula in a state expression".into()),
             Num(_) | Str(_) | Bool(_) => unreachable!("constants are folded"),
         })
     }
 
     fn gen_bin(&mut self, op: BOp, a: &Expr, b: &Expr, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
         use BOp::*;
+        // S \subseteq "Reals" (Real): each element of S is checked against the string, which fails
+        if op == Subseteq && matches!(self.try_const(b, env), Some(Value::Atom(x)) if !self.atoms.is_model(x)) {
+            let y = self.fresh("sub");
+            let e = Expr::Quant(false, vec![(y.clone(), a.clone())], Expr::Bin(In, Expr::Ident(y).b(), b.clone().b()).b());
+            return self.gen(&e, env, want);
+        }
         Ok(match op {
             Implies | Equiv => {
                 let ac = self.gen_as(a, env, &Ty::Bool)?;
@@ -3067,6 +3165,15 @@ impl<'a> Gen<'a> {
             _ => {}
         }
         if let Some(v) = self.try_const(s, env) {
+            // A string (Real of the Reals module is the string "Reals"): TLC fails when it
+            // evaluates the membership
+            if let Value::Atom(a) = v {
+                if !self.atoms.is_model(a) {
+                    let tid = self.ty_id(xt)?;
+                    let msg = format!("Attempted to check if the value:\n{{}}\nis an element of the string {}", self.atoms.show(a));
+                    return Ok(format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{x}))); __b }}"));
+                }
+            }
             let set = v.as_set()?;
             if let Some(code) = self.member_mixed(x, xt, set)? {
                 return Ok(code);
@@ -3167,6 +3274,28 @@ impl<'a> Gen<'a> {
             return self.emit_state(env, out);
         };
         let with = |x: Vec<Expr>| -> Vec<Expr> { x.into_iter().chain(rest.iter().cloned()).collect() };
+        match h.strip() {
+            // [A]_v is A \/ UNCHANGED v (TLC follows both)
+            BoxAction(a, v) => {
+                let e = Or(vec![a.as_ref().clone(), Un(UOp::Unchanged, v.clone())]);
+                return self.gen_action(&with(vec![e]), env, out);
+            }
+            // UNCHANGED <<x, e>>: as TLC does, a variable is assigned (or compared) and any other
+            // expression is compared as e' = e, in order
+            Un(UOp::Unchanged, x) if Self::unchanged_vars(x, &mut vec![]).is_err() => {
+                let mut leaves = vec![];
+                Self::unchanged_leaves(x, &mut leaves);
+                let parts = leaves
+                    .into_iter()
+                    .map(|l| match l.strip() {
+                        Ident(n) if self.is_var(n) => Un(UOp::Unchanged, l.clone().b()),
+                        _ => Bin(BOp::Eq, Prime(l.clone().b()).b(), l.b()),
+                    })
+                    .collect();
+                return self.gen_action(&with(parts), env, out);
+            }
+            _ => {}
+        }
         // As in TLC, \/ and \E branch while some variables are still unassigned (so the number of
         // generated successors matches TLC). Once all are assigned, the rest is evaluated as a
         // boolean expression.
@@ -3178,7 +3307,7 @@ impl<'a> Gen<'a> {
         match h {
             Label(name, _, body) => {
                 let mut env2 = env.clone();
-                if !env.label_final && action && !env.init {
+                if !env.label_final && action && !env.init && !h.is_user_label() {
                     env2.label = Some(self.label_id(name));
                     env2.label_final = !matches!(body.strip(), Or(_) | Quant(..));
                 }
@@ -3223,7 +3352,78 @@ impl<'a> Gen<'a> {
                 out.push_str(&"}\n".repeat(closes));
                 return Ok(());
             }
+            // \A over a constant set is the conjunction over its elements, in TLC's order (the
+            // first bound variable varies fastest), so it can assign variables
+            Quant(false, bs, body)
+                if action && !self.only_reads_assigned(h, env)
+                    || env.init && body.any(&|e| matches!(e, Ident(n) if self.is_var(n) && !env.primed.contains_key(n))) =>
+            {
+                let sets: Option<Vec<(String, Vec<Value>)>> = bs
+                    .iter()
+                    .map(|(x, s)| {
+                        let v = self.try_const(s, env)?;
+                        Some((x.clone(), v.as_set().ok()?.iter().cloned().collect()))
+                    })
+                    .collect();
+                match sets {
+                    Some(sets) => {
+                    let total: usize = sets.iter().map(|(_, v)| v.len()).product();
+                    let mut env2 = env.clone();
+                    let mut items = vec![];
+                    for k in 0..total {
+                        let mut b = body.as_ref().clone();
+                        let mut r = k;
+                        for (x, vals) in &sets {
+                            let v = &vals[r % vals.len()];
+                            r /= vals.len();
+                            let t = ty_of_value(v)?;
+                            let code = self.lit(v, &t)?;
+                            let y = self.fresh(&format!("{x}_e"));
+                            env2.bind(&y, code, t);
+                            env2.vals.insert(y.clone(), v.clone());
+                            b = rename_ident(&b, x, &y);
+                        }
+                        items.push(b);
+                    }
+                    return self.gen_action(&with(items), &env2, out);
+                    }
+                    // In Init, a condition on what is assigned so far: evaluated as a boolean below
+                    None if env.init => {}
+                    None => return Err(format!("unsupported action form (\\A over a set that is not constant): {}", short(h))),
+                }
+            }
+            // A recursive operator called with constant arguments in an action: its body, with
+            // the arguments bound (as TLC evaluates it), so that it can assign variables
+            RecCall(i, args) if open && self.rec_assigns(*i, env) => {
+                let vals: Option<Vec<Value>> = args.iter().map(|a| self.try_const(a, env)).collect();
+                let Some(vals) = vals else {
+                    return Err(format!("unsupported action form (a recursive operator whose arguments are not constant): {}", short(h)));
+                };
+                if self.unroll >= 2000 {
+                    return Err(format!("recursive operator `{}` in an action recurses more than 2000 levels", crate::expand::rec_def(*i).name));
+                }
+                let rd = crate::expand::rec_def(*i);
+                let mut b = rd.body.clone();
+                let mut env2 = env.clone();
+                for (p, v) in rd.params.iter().zip(&vals) {
+                    let t = ty_of_value(v)?;
+                    let code = self.lit(v, &t)?;
+                    let y = self.fresh(&format!("{p}_r"));
+                    env2.bind(&y, code, t);
+                    env2.vals.insert(y.clone(), v.clone());
+                    b = rename_ident(&b, p, &y);
+                }
+                self.unroll += 1;
+                let r = self.gen_action(&with(vec![Label(rd.name.clone(), args.clone(), b.b())]), &env2, out);
+                self.unroll -= 1;
+                return r;
+            }
             If(c, a, b) if action => {
+                // A condition known here (as in an unrolled recursive operator): only its branch
+                if let Some(Value::Bool(cv)) = self.try_const(c, env) {
+                    let e = if cv { a } else { b };
+                    return self.gen_action(&with(vec![e.as_ref().clone()]), env, out);
+                }
                 let cc = match self.gen_as(c, env, &Ty::Bool) {
                     Err(_) if self.infer.is_some() => "true".into(),
                     r => r?,
@@ -3305,6 +3505,14 @@ impl<'a> Gen<'a> {
                         env2.primed.insert(v, ("__inferred".into(), t));
                         return self.gen_action(rest, &env2, out);
                     }
+                    // x \in "Reals" (Real): TLC cannot enumerate a string
+                    if let Some(Value::Atom(a)) = self.try_const(s, env) {
+                        if !self.atoms.is_model(a) {
+                            let when = if env.init { "initial" } else { "next" };
+                            writeln!(out, "eval_error(\"In computing {when} states, the right side of \\\\IN is not enumerable.\".into());").unwrap();
+                            return Ok(());
+                        }
+                    }
                     let (it, et, ix) = self.iter_of_indexed(s, env)?;
                     let x = self.fresh("x");
                     let p = self.fresh(&format!("p_{v}_"));
@@ -3356,9 +3564,8 @@ impl<'a> Gen<'a> {
             }
             _ => {}
         }
-        if h.is_action() && !matches!(h, Bin(..) | Un(UOp::Not, _)) && !self.only_reads_assigned(h, env) {
-            return Err(format!("unsupported action form: {}", short(h)));
-        }
+        // Anything else is evaluated as a condition: as in TLC, reading a primed variable the action
+        // has not determined yet is an error when evaluated
         if let Some(Value::Bool(b)) = self.try_const(h, env) {
             return if b { self.gen_action(rest, env, out) } else { Ok(()) };
         }
@@ -3392,15 +3599,39 @@ impl<'a> Gen<'a> {
         (self.is_var(&n) && !env.primed.contains_key(&n)).then_some(n)
     }
 
-    fn only_reads_assigned(&self, e: &Expr, env: &Env) -> bool {
-        !e.any(&|x| match x {
-            Expr::Prime(p) => matches!(p.strip(), Expr::Ident(n) if !env.primed.contains_key(n)),
-            Expr::Un(UOp::Unchanged, v) => {
-                let mut names = vec![];
-                Self::unchanged_vars(v, &mut names).is_err() || names.iter().any(|n| !env.primed.contains_key(n))
+    /// Whether the recursive operator `i` may assign a variable here: it reads a variable the
+    /// action has not determined (primed, or in Init unprimed)
+    fn rec_assigns(&self, i: usize, env: &Env) -> bool {
+        match self.rec_reads(i) {
+            Ok((reads, primes, _)) => {
+                let open = |v: &String| !env.primed.contains_key(v);
+                if env.init { reads.iter().any(open) } else { primes.iter().any(open) }
             }
-            _ => false,
-        })
+            Err(_) => false,
+        }
+    }
+
+    fn only_reads_assigned(&self, e: &Expr, env: &Env) -> bool {
+        match e {
+            // A primed constant is the constant
+            Expr::Prime(p) => match p.strip() {
+                Expr::Ident(n) if self.is_var(n) => env.primed.contains_key(n),
+                p => self.only_reads_assigned(p, env),
+            },
+            // UNCHANGED e reads e' (every variable in e primed)
+            Expr::Un(UOp::Unchanged, v) => !v.any(&|x| matches!(x, Expr::Ident(n) if self.is_var(n) && !env.primed.contains_key(n))),
+            // ENABLED A reads no primed variable of the step around it
+            Expr::Un(UOp::Enabled, _) => true,
+            e => e.children().into_iter().all(|c| self.only_reads_assigned(c, env)),
+        }
+    }
+
+    /// The components of UNCHANGED e: the elements of (nested) tuples
+    fn unchanged_leaves(e: &Expr, out: &mut Vec<Expr>) {
+        match e.strip() {
+            Expr::Tuple(xs) => xs.iter().for_each(|x| Self::unchanged_leaves(x, out)),
+            _ => out.push(e.clone()),
+        }
     }
 
     fn unchanged_vars(e: &Expr, out: &mut Vec<String>) -> R<()> {
@@ -4522,6 +4753,14 @@ fn unbounded_ints(t: &Ty) -> Ty {
 impl Env {
     pub fn bind(&mut self, name: &str, code: String, t: Ty) {
         self.locals.insert(name.to_string(), (code, t));
+    }
+}
+
+/// e with the identifier `from` (a bound variable, named uniquely by expansion) renamed to `to`
+fn rename_ident(e: &Expr, from: &str, to: &str) -> Expr {
+    match e {
+        Expr::Ident(n) if n == from => Expr::Ident(to.to_string()),
+        _ => map_children(e, &|c| rename_ident(c, from, to)),
     }
 }
 
