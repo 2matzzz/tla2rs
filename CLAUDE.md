@@ -11,8 +11,9 @@ It has no crate dependencies.
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, and `-deadlock` are passed on to the
     generated checker, which also accepts them directly
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 118 currently
-  pass). Run it after every change, and also with `-batched` and `-metal` when you touch either search path
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 139 currently
+  pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
+  either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
   one worker, and it compares the verdict, generated and distinct state counts, counterexample length, and exit code.
   If TLC produces no verdict, the check fails
@@ -141,3 +142,10 @@ The goal was 3x on both, so neither was reached. Energy uses CPU time as a proxy
 - With `-batched` / `-metal`, whether to grow the table was decided from the count at the start of a level. When a
   level split into many batches, later batches were inserted without counting earlier ones, and a shard filled up.
   Counts are now updated per batch (`tests/tlc/WideLevel.cfg`)
+- With `-batched` / `-metal`, an error found in a later batch of a level stopped the level before that batch went
+  through phases 2 and 3, so the trace could not be rebuilt and the distinct count came out low
+  (`tests/tlc/BatchViol.cfg`)
+- With `-batched` / `-metal` and a VIEW, phase 1 packed and checked every successor, so a state whose view had already
+  been visited could be reported as out of type or as violating an invariant. TLC checks only new states. A candidate
+  that would stop the search is now first looked up among the states visited or collected so far
+  (`tests/tlc/ViewOutOfType.cfg`, `tests/tlc/ViewInv.cfg`)
