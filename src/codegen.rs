@@ -985,7 +985,7 @@ impl<'a> Gen<'a> {
         for p in path {
             cur = match (p, &cur) {
                 (Path::Field(k), _) if k.starts_with('@') => continue,
-                (Path::Idx(_), Ty::Fun(_, c)) => c.as_ref().clone(),
+                (Path::Idx(_), Ty::Fun(_, c) | Ty::PFun(_, c)) => c.as_ref().clone(),
                 (Path::Idx(_), Ty::Seq(e)) => e.as_ref().clone(),
                 (Path::Field(k), Ty::Rec(fs)) => match &fs.iter().find(|(n, _)| n == k)?.1 {
                     Ty::Opt(i) => i.as_ref().clone(),
@@ -1003,6 +1003,7 @@ impl<'a> Gen<'a> {
         match (p, t) {
             (Path::Field(k), _) if k.starts_with('@') => Self::set_path_type(t, rest, new),
             (Path::Idx(_), Ty::Fun(d, c)) => Ty::Fun(d.clone(), Self::set_path_type(c, rest, new).into()),
+            (Path::Idx(_), Ty::PFun(d, c)) => Ty::PFun(d.clone(), Self::set_path_type(c, rest, new).into()),
             (Path::Idx(_), Ty::Seq(e)) => Ty::Seq(Self::set_path_type(e, rest, new).into()),
             (Path::Field(k), Ty::Rec(fs)) => Ty::Rec(
                 fs.iter()
@@ -2725,6 +2726,24 @@ impl<'a> Gen<'a> {
                                         conds.push(format!("{iv} != u64::MAX"));
                                         place = format!("{place}[{iv} as usize]");
                                     }
+                                }
+                                cur = c.as_ref().clone();
+                            }
+                            // A function over part of a type: a key outside its domain leaves it
+                            // unchanged, as in TLC
+                            (Path::Idx(i), Ty::PFun(d, c)) => {
+                                let ic = self.gen_as(i, env, d)?;
+                                let iv = self.fresh("i");
+                                if is_sparse_fun(&cur) {
+                                    // Looked up only once the steps before it are known to apply
+                                    write!(s, "let {iv} = {ic}; ").unwrap();
+                                    conds.push(format!("({place}).find(&{iv}).is_ok()"));
+                                    place = format!("{place}.items[({place}).find(&{iv}).unwrap()].1");
+                                } else {
+                                    let did = self.ty_id(d)?;
+                                    write!(s, "let {iv} = enc_{did}({ic}); ").unwrap();
+                                    conds.push(format!("{iv} != u64::MAX && {place}[{iv} as usize].0"));
+                                    place = format!("{place}[{iv} as usize].1");
                                 }
                                 cur = c.as_ref().clone();
                             }
