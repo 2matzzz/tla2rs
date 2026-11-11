@@ -118,6 +118,23 @@ thread_local! {
     static REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// The starts of the error messages for failures that TLC raises too when it evaluates the same
+/// expression (as opposed to expressions tla2rs cannot evaluate here).
+const EVAL_FAILURES: [&str; 7] = [
+    "The second argument of \\div is 0.",
+    "The second argument of % should be a positive number",
+    "Attempted to evaluate a CASE with no conditions true.",
+    "CHOOSE: no element satisfies the predicate",
+    "function applied outside its domain",
+    "tuple index out of range",
+    "no field ",
+];
+
+/// Whether an error from `ConstEval::eval` is an evaluation failure of the spec itself.
+pub fn is_eval_failure(e: &str) -> bool {
+    EVAL_FAILURES.iter().any(|p| e.starts_with(p))
+}
+
 #[derive(Clone)]
 pub struct ConstEval<'a> {
     pub atoms: &'a Atoms,
@@ -298,7 +315,7 @@ impl ConstEval<'_> {
                 }
                 match other {
                     Some(o) => self.eval(o, env)?,
-                    None => return Err("CASE: no arm matched".into()),
+                    None => return Err(EVAL_FAILURES[2].into()),
                 }
             }
             Quant(ex, bs, body) => {
@@ -326,7 +343,7 @@ impl ConstEval<'_> {
                         return Ok(v.clone());
                     }
                 }
-                return Err("CHOOSE: no element satisfies the predicate".into());
+                return Err(EVAL_FAILURES[3].into());
             }
             SetLit(xs) => Value::Set(xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?),
             SetFilter(x, s, p) => {
@@ -551,14 +568,14 @@ impl ConstEval<'_> {
             Div => {
                 let (a, b) = (a.as_int()?, b.as_int()?);
                 if b == 0 {
-                    return Err("division by zero".into());
+                    return Err(EVAL_FAILURES[0].into());
                 }
                 Value::Int(floor_div(a, b))
             }
             Mod => {
                 let (a, b) = (a.as_int()?, b.as_int()?);
                 if b <= 0 {
-                    return Err("the second argument of % should be a positive number".into());
+                    return Err(format!("{}, but instead it is: {b}", EVAL_FAILURES[1]));
                 }
                 Value::Int(a.rem_euclid(b))
             }

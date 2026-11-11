@@ -37,8 +37,10 @@ cargo build --release
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
   the CPU
-- Output (state counts, counterexample format) follows TLC, and so do exit codes: 10 = assumption, 11 = deadlock,
-  12 = invariant, 13 = temporal property, 255 = evaluation error
+- Output (state counts, counterexample format) follows TLC, and so do exit codes: 10 = assumption (false or failing to
+  evaluate), 11 = deadlock, 12 = invariant, 13 = temporal or action property. An evaluation error exits with 76 in an
+  invariant, 75 in the initial states, and otherwise 255 for a failed arithmetic operation (such as `\div` by zero) and
+  75 for the rest
 
 ## Speed
 
@@ -125,7 +127,8 @@ memory.
 
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
 generated and distinct state counts, counterexample length, and exit code. `scripts/all.sh` does this for every
-configuration in `examples/` and `tests/tlc/`. Point `TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`).
+configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
+`TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`).
 
 ```
 $ scripts/all.sh

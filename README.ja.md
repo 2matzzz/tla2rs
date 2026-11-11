@@ -35,7 +35,7 @@ cargo build --release
 - `-setcap N` は実行時に大きさが決まる集合の容量
 - `-fp128` は指紋を 64 bit から 128 bit にする
 - `-metal` は「もう見たか」の問い合わせを GPU（Apple Metal）で行う。`-batched` は同じ 3 段の流れを CPU で行う
-- 出力（状態数・反例の書式）は TLC に寄せてある。終了コードも TLC と同じく 10 = ASSUME、11 = デッドロック、12 = 不変条件、13 = 時相の性質、255 = 評価の誤り
+- 出力（状態数・反例の書式）は TLC に寄せてある。終了コードも TLC と同じく 10 = ASSUME（偽、または評価に失敗）、11 = デッドロック、12 = 不変条件、13 = 性質（時相の性質と `[][A]_v`）。評価に失敗したときは、不変条件の中なら 76、初期状態なら 75、それ以外は算術の失敗（0 での `\div` など）なら 255、そのほかは 75 で終わる
 
 ## 速さ
 
@@ -102,7 +102,7 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 ## 確かめ方
 
 `scripts/crosscheck.sh` は TLC（`-workers 1`）と tla2rs で同じ構成を回し、結果・生成状態数・distinct 状態数・反例の長さ・終了コードを比べる。
-`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。
+`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。
 
 ```
 $ scripts/all.sh

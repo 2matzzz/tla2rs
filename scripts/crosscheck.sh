@@ -33,13 +33,15 @@ cd "$work"
 t=$(basename "$tla"); c=$(basename "$cfg")
 
 summarize() {
-  # Line 1: verdict (ok / violated invariant / deadlock), line 2: state counts, line 3: trace length
+  # Line 1: verdict (ok / violated invariant / deadlock / failed invariant or assumption), line 2:
+  # state counts, line 3: trace length
   local f="$1"
   local res
-  res=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+ is false|No error has been found' "$f" | head -1 || true)
+  local span='line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+'
+  res=$(grep -oE "Invariant [A-Za-z0-9_]+ is violated|Evaluating invariant [A-Za-z0-9_]+ failed|Action property [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption $span is false|Evaluating assumption $span failed|No error has been found" "$f" | head -1 || true)
   # If none of the above matched but there is an Error: line, treat it as an evaluation error.
   # The message may differ from TLC's (TLC can also stop on an internal exception), so compare
-  # only the kind
+  # only the kind (and the exit code below)
   if [[ -z "$res" ]] && grep -qE '^Error:' "$f"; then
     res="Evaluation error"
   fi
@@ -85,9 +87,11 @@ if [[ -z "$(echo "$a" | head -1)" ]]; then
   exit 1
 fi
 # Compare exit codes too: identical verdict strings with different exit paths are not a match.
-# 0 / 10 (assumption) / 11 (deadlock) / 12 (safety) / 13 (liveness) are kept as is; anything else
-# is folded into "error" (TLC returns 255 for evaluation errors but 75 for internal exceptions)
-norm() { case "$1" in 0|10|11|12|13) echo "$1" ;; *) echo error ;; esac; }
+# 0 / 10 (assumption) / 11 (deadlock) / 12 (safety) / 13 (liveness) / 75 / 76 / 255 are kept as is;
+# anything else (parse errors, tla2rs rejecting the spec) is folded into "error". For an evaluation
+# error TLC exits with 76 if it is in an invariant, 75 in the initial states, and otherwise 255 for
+# a failed arithmetic operation and 75 for the rest
+norm() { case "$1" in 0|10|11|12|13|75|76|255) echo "$1" ;; *) echo error ;; esac; }
 a="$a
 exit=$(norm $rc_tlc)"; b="$b
 exit=$(norm $rc_rs)"
