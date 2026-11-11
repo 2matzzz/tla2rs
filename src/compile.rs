@@ -74,9 +74,29 @@ fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize) -> 
                 }
             }
         }
+        // Otherwise a test of a length anywhere in the spec (a guard such as `Len(q) < 3` before
+        // an Append) suggests the bound. It need not be proven: a sequence growing past the bound
+        // is an evaluation error, never cut short
+        let guard = || -> Option<usize> {
+            let best = std::cell::Cell::new(None::<usize>);
+            for d in &m.defs {
+                d.body.any(&|e| {
+                    let k = match e {
+                        Expr::Bin(BOp::Le | BOp::Lt, l, k) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => k,
+                        Expr::Bin(BOp::Ge | BOp::Gt, k, l) if matches!(l.strip(), Expr::Call(f, _) if f == "Len") => k,
+                        _ => return false,
+                    };
+                    if let Ok(Value::Int(k)) = g.ce.eval(k, &HashMap::new()) {
+                        best.set(Some(best.get().unwrap_or(0).max(k.max(0) as usize + 2)));
+                    }
+                    false
+                });
+            }
+            best.get()
+        };
         match bound {
             Some(b) => b.max(lit),
-            None if m.defs.iter().any(|d| grows(&d.body)) => 0,
+            None if m.defs.iter().any(|d| grows(&d.body)) => guard().map_or(0, |b| b.max(lit)),
             None => lit,
         }
     };

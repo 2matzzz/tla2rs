@@ -265,6 +265,24 @@ impl ConstEval<'_> {
                     Value::Atom(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v)))
                 }
                 ("TLCEval", [x]) => self.eval(x, env)?,
+                // A stable insertion sort with Op as "comes before"
+                ("SortSeq", [q, Lambda(ps, body)]) if ps.len() == 2 => {
+                    let mut t = self.seq(q, env, "SortSeq")?;
+                    for i in 1..t.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let mut env2 = env.clone();
+                            env2.insert(ps[0].clone(), t[j].clone());
+                            env2.insert(ps[1].clone(), t[j - 1].clone());
+                            if !self.eval(body, &env2)?.as_bool()? {
+                                break;
+                            }
+                            t.swap(j, j - 1);
+                            j -= 1;
+                        }
+                    }
+                    Value::Tuple(t)
+                }
                 ("Append", [q, x]) => {
                     let mut t = self.seq(q, env, "Append")?;
                     t.push(self.eval(x, env)?);

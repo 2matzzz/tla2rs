@@ -102,6 +102,16 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
     })
 }
 
+/// Whether `name` is an infix operator the parser knows (by its normalized name)
+pub fn is_infix_name(name: &str) -> bool {
+    infix(&Tok::Sym(name.to_string())).is_some_and(|(_, _, n)| n == name)
+}
+
+/// `a op b` for an infix operator by its normalized name, as the parser builds it
+pub fn bin_expr(op: &str, a: Expr, b: Expr) -> Expr {
+    bin(op, a, b)
+}
+
 fn bin(op: &str, a: Expr, b: Expr) -> Expr {
     let o = match op {
         "=>" => BOp::Implies,
@@ -772,6 +782,19 @@ impl Parser {
             return Ok(v);
         }
         loop {
+            // An infix operator passed as an operator argument, as in SortSeq(s, <)
+            if let Some((_, _, name)) = infix(self.peek()) {
+                if matches!(self.peek2(), Tok::Sym(s) if s == "," || s == close) {
+                    self.pos += 1;
+                    v.push(Expr::Ident(name.to_string()));
+                    if self.is(",") {
+                        self.pos += 1;
+                        continue;
+                    }
+                    self.expect(close)?;
+                    return Ok(v);
+                }
+            }
             v.push(self.expr(0)?);
             if self.is(",") {
                 self.pos += 1;

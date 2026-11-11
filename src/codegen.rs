@@ -1209,6 +1209,23 @@ impl<'a> Gen<'a> {
                     let r = self.fresh("q");
                     (format!("{{ let mut {r} = {}; for {x} in ({qc}).iter() {{ if {pc} {{ {r}.push({x}); }} }} {r} }}", Self::default_code(&st)), st)
                 }
+                ("SortSeq", [q, Lambda(ps, body)]) if ps.len() == 2 => {
+                    let (qc, st) = self.as_seq(q, env, "SortSeq")?;
+                    let Ty::Seq(e) = &st else { unreachable!() };
+                    let mut env2 = env.clone();
+                    let (a, b) = (rid(&ps[0]), rid(&ps[1]));
+                    env2.locals.insert(ps[0].clone(), (a.clone(), e.as_ref().clone()));
+                    env2.locals.insert(ps[1].clone(), (b.clone(), e.as_ref().clone()));
+                    let pc = self.gen_as(body, &env2, &Ty::Bool)?;
+                    let r = self.fresh("q");
+                    (
+                        format!(
+                            "{{ let mut {r} = {qc}; for __i in 1..{r}.len as usize {{ let mut __j = __i; while __j > 0 {{ \
+                             let ({a}, {b}) = ({r}.items[__j], {r}.items[__j - 1]); if !({pc}) {{ break; }} {r}.items.swap(__j, __j - 1); __j -= 1; }} }} {r} }}"
+                        ),
+                        st,
+                    )
+                }
                 ("Seq", _) => return Err("Seq(S) is only supported on the right of \\in".into()),
                 _ => return Err(format!("unknown operator `{f}`")),
             },
