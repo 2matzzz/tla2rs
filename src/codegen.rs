@@ -31,15 +31,6 @@ pub struct Env {
     work: Option<String>,
 }
 
-/// A single WF_v(A(args)) instance
-pub struct FairInst {
-    pub name: String,
-    pub args: Vec<Value>,
-    pub display: String,
-    /// Variables occurring in the subscript v
-    pub sub: Vec<String>,
-}
-
 pub struct Gen<'a> {
     pub atoms: &'a Atoms,
     pub ce: ConstEval<'a>,
@@ -51,9 +42,6 @@ pub struct Gen<'a> {
     need_subsets: bool,
     pub labels: Vec<String>,
     tmp: usize,
-    /// Fairness instances
-    pub fair: Vec<FairInst>,
-    fair_param_tys: Vec<Vec<Ty>>,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
     /// Maximum length of a sequence (QCAP); 0 while no bound is known
@@ -86,8 +74,6 @@ impl<'a> Gen<'a> {
             need_subsets: false,
             labels: vec!["Init".into(), "Next".into()],
             tmp: 0,
-            fair: vec![],
-            fair_param_tys: vec![],
             scap: 8,
             qcap: 0,
             infer: None,
@@ -842,7 +828,7 @@ impl<'a> Gen<'a> {
 
     // ---------------------------------------------------------------- Value literals
 
-    fn lit(&mut self, v: &Value, t: &Ty) -> R<String> {
+    pub fn lit(&mut self, v: &Value, t: &Ty) -> R<String> {
         Ok(match (v, t) {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
@@ -1433,6 +1419,16 @@ impl<'a> Gen<'a> {
                 _ => return Err(format!("unknown operator `{f}`")),
             },
             Un(UOp::Not, x) => (format!("(!{})", self.gen_as(x, env, &Ty::Bool)?), Ty::Bool),
+            // ENABLED A: whether A has a successor from the current state
+            Un(UOp::Enabled, x) => {
+                let mut inner = env.clone();
+                inner.primed.clear();
+                inner.work = None;
+                inner.init = false;
+                let mut code = String::new();
+                self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
+                (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
+            }
             Un(UOp::Neg, x) => {
                 let (c, (lo, hi)) = self.gen_int(x, env).map_err(|_| "negation of a non-integer".to_string())?;
                 (format!("(-{c})"), Ty::Int(-hi, -lo))
@@ -2921,53 +2917,6 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Compiles the fair operator `name` into a standalone successor function
-    pub fn gen_fair_fn(&mut self, k: usize, name: &str, params: &[String], body: &Expr) -> R<String> {
-        let mut tys: Vec<Ty> = vec![Ty::Enum(vec![]); params.len()];
-        for f in self.fair.iter().filter(|f| f.name == name) {
-            for (i, v) in f.args.iter().enumerate() {
-                tys[i] = join(&tys[i], &ty_of_value(v)?)?;
-            }
-        }
-        let mut env = Env::default();
-        let mut sig = String::from("s: &State, ");
-        for (i, (p, t)) in params.iter().zip(&tys).enumerate() {
-            if !t.is_scalar() {
-                return Err("fairness arguments must be scalar values".into());
-            }
-            env.locals.insert(p.clone(), (format!("a{i}"), t.clone()));
-            write!(sig, "a{i}: {}, ", t.repr()).unwrap();
-        }
-        let mut code = String::new();
-        self.gen_action(&[body.clone()], &env, &mut code)?;
-        self.fair_param_tys.push(tys);
-        Ok(format!("fn fa_{k}({sig}out: &mut Vec<(State, u32)>) {{\n{code}}}\n"))
-    }
-
-    /// fair_succ (successors of instance i) and fair_sub_changed (whether the subscript changed)
-    pub fn gen_fair_dispatch(&mut self, ops: &[String]) -> R<String> {
-        let mut succ = String::from("fn fair_succ(s: &State, i: usize, out: &mut Vec<(State, u32)>) {\n    match i {\n");
-        let mut sub = String::from("fn fair_sub_changed(i: usize, s: &State, t: &State) -> bool {\n    match i {\n");
-        let fair: Vec<(String, Vec<Value>, Vec<String>)> =
-            self.fair.iter().map(|f| (f.name.clone(), f.args.clone(), f.sub.clone())).collect();
-        for (i, (name, args, sv)) in fair.iter().enumerate() {
-            let k = ops.iter().position(|o| o == name).unwrap();
-            let tys = self.fair_param_tys[k].clone();
-            let mut lits = vec![];
-            for (v, t) in args.iter().zip(&tys) {
-                lits.push(self.lit(v, t)?);
-            }
-            lits.push("out".into());
-            writeln!(succ, "        {i} => fa_{k}(s, {}),", lits.join(", ")).unwrap();
-            let cmp: Vec<String> = sv.iter().map(|v| format!("s.v_{v} != t.v_{v}")).collect();
-            let cmp = if cmp.is_empty() { "false".to_string() } else { cmp.join(" || ") };
-            writeln!(sub, "        {i} => {cmp},").unwrap();
-        }
-        succ += "        _ => {}\n    }\n}\n";
-        sub += "        _ => false,\n    }\n}\n";
-        Ok(succ + &sub)
-    }
-
     /// Environment for expressions over a transition (s, t): x' is t.v_x
     pub fn env_step(&self, mut env: Env) -> Env {
         for (v, t) in &self.vars {
@@ -3796,22 +3745,6 @@ fn unbounded_ints(t: &Ty) -> Ty {
 /// the two is rejected rather than compared as unequal.
 fn seq_like_fun(t: &Ty) -> bool {
     matches!(t, Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(1, _)))
-}
-
-/// Turns a constant value into a literal (for \\A bindings in properties)
-pub fn lit_for(g: &Gen, v: &Value) -> R<(String, Ty)> {
-    let t = ty_of_value(v)?;
-    if !t.is_scalar() {
-        return Err("quantifying a property over non-scalar values is not supported yet".into());
-    }
-    let code = match v {
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => format!("{i}i64"),
-        Value::Atom(a) => format!("{a}u16"),
-        _ => return Err("quantifying a property over records is not supported yet".into()),
-    };
-    let _ = g;
-    Ok((code, t))
 }
 
 impl Env {
