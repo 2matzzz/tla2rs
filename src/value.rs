@@ -49,9 +49,11 @@ pub enum Value {
 impl Value {
     fn rank(&self) -> u8 {
         match self {
-            Value::Bool(_) => 0,
-            Value::Int(_) => 1,
-            Value::Atom(_) => 2,
+            // TLC orders a model value before any other value. Atoms mix only with integers in one
+            // type (strings never do), so this matters for `1..3 \cup {None}`
+            Value::Atom(_) => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) => 2,
             Value::Set(_) => 3,
             Value::Fun(_) => 4,
             Value::Rec(_) => 5,

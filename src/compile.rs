@@ -752,6 +752,9 @@ fn widen(old: &Ty, new: &Ty) -> Ty {
     match (old, new) {
         (Ty::Enum(o), _) if o.is_empty() => new.clone(),
         (Ty::Int(a, b), Ty::Int(c, d)) if (a, b) != (c, d) => Ty::Int(if c < a { -BIG } else { *a }, if d > b { BIG } else { *b }),
+        (Ty::Int(a, b) | Ty::IntAtom(a, b, _), Ty::IntAtom(c, d, x)) if (a, b) != (c, d) => {
+            Ty::IntAtom(if c < a { -BIG } else { *a }, if d > b { BIG } else { *b }, x.clone())
+        }
         (Ty::Rec(a), Ty::Rec(b)) => Ty::Rec(
             b.iter()
                 .map(|(n, t)| match a.iter().find(|(m, _)| m == n) {

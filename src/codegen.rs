@@ -116,12 +116,25 @@ impl<'a> Gen<'a> {
                     self.ty_id(f)?;
                 }
             }
+            Ty::IntAtom(_, _, d) => self.check_model_values(d)?,
             _ => {}
         }
         let i = self.tys.len();
         self.tys.push(t.clone());
         self.ty_ids.insert(t.clone(), i);
         Ok(i)
+    }
+
+    /// Only model values can share a type with integers: TLC compares a model value with anything,
+    /// but stops with an error when comparing a string with an integer
+    fn check_model_values(&self, atoms: &[u32]) -> R<()> {
+        match atoms.iter().find(|&&a| !self.atoms.list[a as usize].0) {
+            Some(&a) => Err(format!(
+                "the string {} is mixed with integers in one value; only model values can be (TLC reports comparing a string with an integer as an error)",
+                self.atoms.show(a)
+            )),
+            None => Ok(()),
+        }
     }
 
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
@@ -273,11 +286,21 @@ impl<'a> Gen<'a> {
         if matches!(&et, Ty::Enum(v) if v.is_empty()) {
             return Ok("false".into());
         }
+        if narrows(xt, &et) {
+            // x may hold a model value stored as an integer-or-model-value: compare in the joined
+            // type rather than convert x (which fails at run time on an integer)
+            let jst = Ty::Set(join(xt, &et)?.into());
+            let cc = self.coerce(c.to_string(), st, &jst)?;
+            let v = self.fresh("s");
+            let inner = self.s_has(&v, &jst, x, xt)?;
+            return Ok(format!("{{ let {v} = {cc}; {inner} }}"));
+        }
         if is_sparse(st) {
             let Ok(xc) = self.coerce_soft(x.to_string(), xt, &et) else { return Ok("false".into()) };
             return Ok(format!("({c}).contains(&{xc})"));
         }
-        if !xt.is_scalar() || !(xt.kind_eq(&et) || matches!((xt, &et), (Ty::Rec(_), Ty::Rec(_)))) {
+        let widens = join(xt, &et).ok().as_ref() == Some(&et);
+        if !xt.is_scalar() || !(xt.kind_eq(&et) || widens || matches!((xt, &et), (Ty::Rec(_), Ty::Rec(_)))) {
             return Ok("false".into());
         }
         let eid = self.ty_id(&et)?;
@@ -293,6 +316,9 @@ impl<'a> Gen<'a> {
             if a.iter().any(|(n, _)| !b.iter().any(|(m, _)| m == n)) {
                 return Err("record fields do not fit".into());
             }
+        }
+        if narrows(from, to) {
+            return Err("an integer does not fit a model value".into());
         }
         self.coerce(code, from, to)
     }
@@ -317,7 +343,7 @@ impl<'a> Gen<'a> {
     fn default_code(t: &Ty) -> String {
         match t {
             Ty::Bool => "false".into(),
-            Ty::Int(..) => "0i64".into(),
+            Ty::Int(..) | Ty::IntAtom(..) => "0i64".into(),
             Ty::Enum(_) => "0u16".into(),
             Ty::Rec(fs) => format!("({})", fs.iter().map(|(_, t)| Self::default_code(t) + ",").collect::<String>()),
             Ty::Opt(t) => format!("(false, {})", Self::default_code(t)),
@@ -333,6 +359,10 @@ impl<'a> Gen<'a> {
         Ok(match (v, t) {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
+            (Value::Atom(a), Ty::IntAtom(..)) => {
+                self.check_model_values(&[*a])?;
+                format!("(i64::MIN + {a}i64)")
+            }
             (Value::Atom(a), _) => format!("{a}u16"),
             (Value::Tuple(xs), Ty::Rec(fs)) if is_tuple_fields(fs) && xs.len() == fs.len() => {
                 let mut s = String::from("(");
@@ -433,7 +463,7 @@ impl<'a> Gen<'a> {
             return Ok(format!("{{ let __u: {} = unreachable!(); __u }}", to.repr()));
         }
         match (from, to) {
-            (Ty::Set(_), Ty::Set(_)) if !is_sparse(from) && !is_sparse(to) => {
+            (Ty::Set(a), Ty::Set(b)) if !is_sparse(from) && !is_sparse(to) && a.kind_eq(b) && Self::trivial(a, b) => {
                 let (a, b) = (self.ty_id(from)?, self.ty_id(to)?);
                 self.convs.insert((a, b));
                 Ok(format!("conv_{a}_{b}({code})"))
@@ -481,7 +511,7 @@ impl<'a> Gen<'a> {
                 }
                 Ok(s + ") }")
             }
-            (Ty::Set(_), Ty::Set(_)) if is_sparse(from) || is_sparse(to) => {
+            (Ty::Set(_), Ty::Set(_)) => {
                 // Coerce element by element and rebuild the set
                 let et = Self::elem_of(from);
                 let tt = Self::elem_of(to);
@@ -494,6 +524,16 @@ impl<'a> Gen<'a> {
                 Ok(format!("{{ let mut {acc} = {empty}; for {x} in {it} {{ {add} }} {acc} }}"))
             }
             (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..)) if x.is_empty() => Err("empty enum".into()),
+            (Ty::Enum(x), Ty::IntAtom(..)) => {
+                self.check_model_values(x)?;
+                Ok(format!("(i64::MIN + ({code}) as i64)"))
+            }
+            (Ty::IntAtom(..), Ty::Enum(_)) => {
+                let a = self.fresh("a");
+                Ok(format!(
+                    "{{ let {a} = {code}; if {a} >= i64::MIN + 65536 {{ eval_error(format!(\"the integer {{}} is used where a model value is expected\", {a})) }} ({a} - i64::MIN) as u16 }}"
+                ))
+            }
             _ if from.kind_eq(to) => Ok(code),
             _ => Err(format!("type mismatch: cannot use {from:?} as {to:?}")),
         }
@@ -1157,9 +1197,15 @@ impl<'a> Gen<'a> {
             }
             Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
             Ident(n) if n == "Nat" => {
-                return Ok(if matches!(xt, Ty::Int(..)) { format!("({x} >= 0)") } else { "false".into() })
+                return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
             }
-            Ident(n) if n == "Int" => return Ok(matches!(xt, Ty::Int(..)).to_string()),
+            Ident(n) if n == "Int" => {
+                return Ok(match xt {
+                    Ty::Int(..) => "true".into(),
+                    Ty::IntAtom(..) => format!("({x} >= i64::MIN + 65536)"),
+                    _ => "false".into(),
+                })
+            }
             Bin(BOp::Range, a, b) => {
                 let (ac, _) = self.gen_int(a, env)?;
                 let (bc, _) = self.gen_int(b, env)?;
@@ -1199,7 +1245,10 @@ impl<'a> Gen<'a> {
                     fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
                 return Ok(format!("({})", parts.join(" || ")));
             }
-            let Ty::Set(et) = ty_of_value(&v)? else { unreachable!() };
+            let Ty::Set(mut et) = ty_of_value(&v)? else { unreachable!() };
+            if narrows(xt, &et) {
+                et = join(xt, &et)?.into();
+            }
             let st = Ty::Set(et.clone());
             let mask = self.lit(&v, &st)?;
             let eid = self.ty_id(&et)?;
@@ -1210,7 +1259,13 @@ impl<'a> Gen<'a> {
             let mut parts = vec![];
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
-                if let Ok(c) = self.coerce_soft(c, &t, xt) {
+                if narrows(&t, xt) {
+                    // Compare in the joined type (converting the element could fail at run time)
+                    let j = join(xt, &t)?;
+                    let xc = self.coerce(x.to_string(), xt, &j)?;
+                    let c = self.coerce(c, &t, &j)?;
+                    parts.push(format!("{xc} == {c}"));
+                } else if let Ok(c) = self.coerce_soft(c, &t, xt) {
                     parts.push(format!("{x} == {c}"));
                 }
             }
@@ -1755,6 +1810,14 @@ impl<'a> Gen<'a> {
                         let arms: String = d.iter().enumerate().map(|(p, a)| format!("{a} => {p}, ")).collect();
                         format!("match v {{ {arms}_ => u64::MAX }}")
                     }
+                    Ty::IntAtom(lo, hi, d) => {
+                        // Model values first, then the integers
+                        let k = d.len();
+                        let arms: String = d.iter().enumerate().map(|(p, a)| format!("{a} => {p}, ")).collect();
+                        format!(
+                            "if v >= {lo} && v <= {hi} {{ (v as i128 - {lo} as i128) as u64 + {k} }} else {{ match (v as i128 - i64::MIN as i128) as u64 {{ {arms}_ => u64::MAX }} }}"
+                        )
+                    }
                     Ty::Rec(fs) => {
                         let mut b = String::from("let mut acc: u64 = 0; ");
                         for (k, (_, ft)) in fs.iter().enumerate() {
@@ -1780,6 +1843,14 @@ impl<'a> Gen<'a> {
                     Ty::Enum(d) => {
                         let list: Vec<String> = d.iter().map(|a| format!("{a}u16")).collect();
                         format!("const T: [u16; {}] = [{}]; T[i as usize]", d.len(), list.join(", "))
+                    }
+                    Ty::IntAtom(lo, _, d) => {
+                        let k = d.len();
+                        let list: Vec<String> = d.iter().map(|a| format!("{a}u16")).collect();
+                        format!(
+                            "if i >= {k} {{ ({lo} as i128 + (i - {k}) as i128) as i64 }} else {{ const T: [u16; {k}] = [{}]; i64::MIN + T[i as usize] as i64 }}",
+                            list.join(", ")
+                        )
                     }
                     Ty::Rec(fs) => {
                         let mut b = String::from("let mut i = i; ");
@@ -1818,6 +1889,7 @@ impl<'a> Gen<'a> {
                 Ty::Bool => "if *v { \"TRUE\".into() } else { \"FALSE\".into() }".to_string(),
                 Ty::Int(..) => "v.to_string()".into(),
                 Ty::Enum(_) => "ATOMS[*v as usize].to_string()".into(),
+                Ty::IntAtom(..) => "if *v < i64::MIN + 65536 { ATOMS[(*v - i64::MIN) as usize].to_string() } else { v.to_string() }".into(),
                 Ty::Rec(fs) if fs.iter().all(|(n, _)| n.starts_with('#')) => {
                     // Tuple
                     let mut parts = vec![];
@@ -2239,6 +2311,10 @@ impl<'a> Gen<'a> {
         Ok(match t {
             Ty::Bool | Ty::Int(..) => c.to_string(),
             Ty::Enum(_) => format!("pm[({c}) as usize]"),
+            Ty::IntAtom(..) => {
+                let x = self.fresh("x");
+                format!("{{ let {x} = {c}; if {x} < i64::MIN + 65536 {{ i64::MIN + pm[({x} - i64::MIN) as usize] as i64 }} else {{ {x} }} }}")
+            }
             Ty::Rec(fs) => {
                 let r = self.fresh("r");
                 let mut s = format!("{{ let {r} = &({c}); (");
