@@ -14,9 +14,10 @@ use std::fmt::Write;
 pub struct Output {
     pub rust: String,
     pub warnings: Vec<String>,
-    /// The ASSUME that evaluated to false or failed to evaluate (worded as TLC reports it). When
-    /// set, no checker is generated.
-    pub assume_failed: Option<String>,
+    /// Why TLC refuses the spec before checking anything, worded as TLC reports it, and its exit
+    /// code: an ASSUME that is false or fails to evaluate (10), a temporal formula TLC cannot check
+    /// (150 or 255). When set, no checker is generated.
+    pub rejected: Option<(String, i32)>,
 }
 
 const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv", "TypeCorrect"];
@@ -473,13 +474,13 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
                     return Ok(Output {
                         rust: String::new(),
                         warnings,
-                        assume_failed: Some(format!("Error: Assumption {at} is false.")),
+                        rejected: Some((format!("Error: Assumption {at} is false."), 10)),
                     })
                 }
                 Ok(v) => return Err(format!("ASSUME at {at} is not a boolean: {v:?}")),
                 Err(e) if crate::value::is_eval_failure(&e) => {
                     let msg = format!("Error: Evaluating assumption {at} failed.\n{e}");
-                    return Ok(Output { rust: String::new(), warnings, assume_failed: Some(msg) });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)) });
                 }
                 Err(e) => return Err(format!("cannot evaluate the ASSUME at {at}: {e}")),
             }
@@ -627,7 +628,12 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
             unreachable!();
         }
     }
-    let live_code = crate::live::compile(&mut g, &fair_defs, &live_parts)?;
+    let live_code = match crate::live::compile(&mut g, &fair_defs, &live_parts)? {
+        Ok(c) => c,
+        Err(crate::live::Rejected(m, code)) => {
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)) })
+        }
+    };
     let mut prop_code = String::new();
     let mut aprop_list = vec![];
     for (i, (disp, pc, qc)) in action_props.iter().enumerate() {
@@ -763,7 +769,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
     src += crate::runtime::RUNTIME;
     src += crate::runtime::LIVENESS_RT;
-    Ok(Output { rust: src, warnings, assume_failed: None })
+    Ok(Output { rust: src, warnings, rejected: None })
 }
 
 /// Whether VIEW(perm(s)) = perm(VIEW(s)) for every permutation, so the view can be computed once
@@ -1012,16 +1018,21 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
     match e {
         Label(_, _, b) => split_property(g, b, env, name, out),
         And(xs) => xs.iter().try_for_each(|x| split_property(g, x, env, name, out)),
-        Quant(false, bs, body) => {
+        Quant(false, bs, body) if temporal(body) => {
             let mut err = Ok(());
-            g.ce.each_binding(bs, env, &mut |env2| {
+            let r = g.ce.each_binding(bs, env, &mut |env2| {
                 if let Err(m) = split_property(g, body, env2, name, out) {
                     err = Err(m);
                     return Ok(false);
                 }
                 Ok(true)
-            })?;
-            err
+            });
+            match r {
+                // A bound that depends on the state: left whole, for the liveness checks to refuse
+                // as TLC does
+                Err(m) if m.contains("is not a constant") => Ok(out.push((disp, 7, e.clone(), None, env.clone()))),
+                r => r.and(err),
+            }
         }
         Un(UOp::Always, p) => match p.strip() {
             p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone()))),

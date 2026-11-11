@@ -29,6 +29,8 @@ pub struct Env {
     /// Variable holding the successor state under construction; created from `*s` on the first
     /// assignment
     work: Option<String>,
+    /// Inside ENABLED: a successor need not determine every variable (as in TLC)
+    partial: bool,
 }
 
 pub struct Gen<'a> {
@@ -1562,6 +1564,7 @@ impl<'a> Gen<'a> {
                 inner.primed.clear();
                 inner.work = None;
                 inner.init = false;
+                inner.partial = true;
                 let mut code = String::new();
                 self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
                 (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
@@ -3100,7 +3103,7 @@ impl<'a> Gen<'a> {
 
     fn emit_state(&mut self, env: &Env, out: &mut String) -> R<()> {
         for (v, _) in &self.vars {
-            if env.primed.contains_key(v) {
+            if env.primed.contains_key(v) || env.partial {
                 continue;
             }
             // Fail only if this branch is reached (TLC: Successor state is not completely specified)
@@ -3112,8 +3115,11 @@ impl<'a> Gen<'a> {
         let st = match &env.work {
             Some(w) => w.clone(),
             None => {
-                let fields: Vec<String> =
-                    self.vars.iter().map(|(v, _)| format!("v_{v}: {}", env.primed[v].0)).collect();
+                let fields: Vec<String> = self
+                    .vars
+                    .iter()
+                    .map(|(v, _)| format!("v_{v}: {}", env.primed.get(v).map_or(format!("s.v_{v}"), |p| p.0.clone())))
+                    .collect();
                 format!("State {{ {} }}", fields.join(", "))
             }
         };

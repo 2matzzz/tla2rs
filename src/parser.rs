@@ -959,7 +959,9 @@ impl Parser {
                             let sub = if u == "_" { self.primary()? } else { Expr::Ident(u[1..].to_string()) };
                             let [a] = <[Expr; 1]>::try_from(v).map_err(|_| "<<...>>_v takes one action".to_string())?;
                             let same = Expr::Bin(BOp::Eq, Expr::Prime(sub.clone().b()).b(), sub.b());
-                            return Ok(Expr::And(vec![a, Expr::Un(UOp::Not, same.b())]));
+                            // Marked, so that <>(<<A>>_v) can be told from <> of another action
+                            let step = Expr::And(vec![a, Expr::Un(UOp::Not, same.b())]);
+                            return Ok(Expr::Label("<<>>_".into(), vec![], step.b()));
                         }
                     }
                     Ok(Expr::Tuple(v))

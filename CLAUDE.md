@@ -11,7 +11,7 @@ It has no crate dependencies.
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, and `-deadlock` are passed on to the
     generated checker, which also accepts them directly
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 247 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 259 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -64,6 +64,20 @@ A line `\* crosscheck: distinct-only` in a cfg makes `scripts/crosscheck.sh` ski
 (`tests/tlc/OrDup.cfg` is an example). A line like `\* crosscheck: rsargs -memlimit 0` passes extra arguments to
 tla2rs only. The default stays strict: generated-count mismatches have caught real bugs before (a difference in when
 `\/` and `\E` branch), so mark only configurations whose gap is understood.
+
+### Liveness counterexamples are not compared
+
+For a violated temporal property, `scripts/crosscheck.sh` compares the verdict, the counts and the exit code, but not
+the lasso. TLC's lasso is not reproducible from the spec alone: the successors of a state in its liveness graph come
+out of a hash set keyed by fingerprint (`tlc2.util.SetOfStates`), and TLC picks the fingerprint polynomial at random on
+each run (`with fp N` in its banner). The same configuration then gives different lassos. For
+`tests/tlc/LiveForms-NoneImplies.cfg`, ten runs gave 5 states eight times and 4 states twice; with `-fp 1` it is 4
+states every time, with `-fp 50` 5 states every time. Matching TLC would take its FP64 fingerprint of every value for a
+fixed polynomial, its hash-set order, and a port of its tableau, normal form, SCC search and trace construction
+(`tlc2.tool.liveness.LiveWorker`), and would still hold only for that `-fp`.
+
+What is checked instead: the verdict and exit code of every liveness configuration, including the formulas TLC refuses
+(`tests/tlc/RejTemp*.cfg`), and the counts at which liveness checks stop on an evaluation error.
 
 ### VIEW and SYMMETRY together
 

@@ -96,19 +96,6 @@ impl Atoms {
         Ok(self.state.len() - 1)
     }
 
-    /// ENABLED x: whether x has a successor from the state
-    fn enabled(&mut self, g: &mut Gen, x: &Expr, env: &HashMap<String, Value>) -> R<usize> {
-        let k = format!("ENABLED {}", key(x, env));
-        if let Some(i) = self.state.iter().position(|(y, _)| *y == k) {
-            return Ok(i);
-        }
-        let genv = bind_env(g, env)?;
-        let mut code = String::new();
-        g.gen_action(&[x.clone()], &genv, &mut code).map_err(|m| format!("ENABLED: {m}\n  in: {}", short(x)))?;
-        self.state.push((k, format!("{{ let mut buf: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf; {code} }} !buf.is_empty() }}")));
-        Ok(self.state.len() - 1)
-    }
-
     fn action(&mut self, g: &mut Gen, e: &Expr, env: &HashMap<String, Value>) -> R<usize> {
         let k = key(e, env);
         if let Some(i) = self.action.iter().position(|(x, _)| *x == k) {
@@ -124,85 +111,550 @@ impl Atoms {
 
 /// Whether e has temporal structure (as opposed to being one state or action predicate)
 fn temporal(e: &Expr) -> bool {
-    e.any(&|x| {
-        matches!(
-            x,
-            Expr::Un(UOp::Always | UOp::Eventually | UOp::Enabled, _) | Expr::Bin(BOp::LeadsTo, ..) | Expr::BoxAction(..) | Expr::Fair(..)
-        )
+    e.any(&|x| matches!(x, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::Bin(BOp::LeadsTo, ..) | Expr::Fair(..)))
+}
+
+/// Whether e is an action (primes, UNCHANGED or [A]_v outside ENABLED)
+fn action_level(e: &Expr) -> bool {
+    match e {
+        Expr::Prime(_) | Expr::Un(UOp::Unchanged, _) | Expr::BoxAction(..) => true,
+        Expr::Un(UOp::Enabled, _) => false,
+        _ => e.children().into_iter().any(action_level),
+    }
+}
+
+/// The marker the parser puts around <<A>>_v
+const ANGLE: &str = "<<>>_";
+
+fn is_angle(e: &Expr) -> bool {
+    match e {
+        Expr::Label(n, _, b) => n == ANGLE || is_angle(b),
+        _ => false,
+    }
+}
+
+fn is_box(e: &Expr) -> bool {
+    match e {
+        Expr::Label(n, _, b) if n != ANGLE => is_box(b),
+        Expr::BoxAction(..) => true,
+        _ => false,
+    }
+}
+
+/// The level of e (0 constant or state, 2 action, 3 temporal), checking the rules of TLA+ that SANY
+/// enforces on temporal formulas
+fn sany_level(e: &Expr) -> Result<u8, String> {
+    use Expr::*;
+    Ok(match e {
+        Label(n, _, b) if n == ANGLE => {
+            sany_level(b)?;
+            2
+        }
+        Label(_, _, b) => sany_level(b)?,
+        Un(UOp::Enabled, x) => {
+            sany_level(x)?;
+            1
+        }
+        Prime(_) | Un(UOp::Unchanged, _) | BoxAction(..) => {
+            for c in e.children() {
+                sany_level(c)?;
+            }
+            2
+        }
+        Fair(..) => 3,
+        Un(UOp::Always, x) => {
+            if sany_level(x)? == 2 && !is_box(x) {
+                return Err("[] followed by action not of form [A]_v.".into());
+            }
+            3
+        }
+        Un(UOp::Eventually, x) => {
+            if sany_level(x)? == 2 && !is_angle(x) {
+                return Err("<> followed by action not of form <<A>>_v.".into());
+            }
+            3
+        }
+        Bin(BOp::LeadsTo, a, b) => {
+            if sany_level(a)? == 2 || sany_level(b)? == 2 {
+                return Err("Action used where only temporal formula or state predicate allowed.".into());
+            }
+            3
+        }
+        And(_) | Or(_) | Bin(BOp::Implies | BOp::Equiv, ..) => {
+            let ls: Vec<u8> = e.children().into_iter().map(sany_level).collect::<Result<_, _>>()?;
+            if ls.contains(&3) && ls.contains(&2) {
+                let op = match e {
+                    And(_) => "\\land",
+                    Or(_) => "\\lor",
+                    Bin(BOp::Implies, ..) => "=>",
+                    _ => "\\equiv",
+                };
+                return Err(format!("{op} has both temporal formula and action as arguments."));
+            }
+            ls.into_iter().max().unwrap_or(0)
+        }
+        _ => e.children().into_iter().map(sany_level).collect::<Result<Vec<u8>, _>>()?.into_iter().max().unwrap_or(0),
     })
 }
 
-fn to_ltl(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Atoms) -> R<Ltl> {
+/// e with each [A]_v written as A \/ v' = v
+fn box_to_or(e: &Expr) -> Expr {
+    match e {
+        Expr::BoxAction(a, v) => {
+            let same = Expr::Bin(BOp::Eq, Expr::Prime(v.clone()).b(), v.clone());
+            Expr::Or(vec![box_to_or(a), same])
+        }
+        _ => crate::codegen::map_children(e, &box_to_or),
+    }
+}
+
+/// A formula TLC refuses: its message and exit code
+pub struct Rejected(pub String, pub i32);
+
+/// TLC's form of a temporal formula (tlc2.tool.liveness.LiveExprNode), used to decide what TLC
+/// accepts and when it evaluates each predicate. Atoms are indices into `Atoms` (state from 0,
+/// action from ACTION_BASE); FAIR is a fairness atom, which is only classified.
+#[derive(Clone, Debug)]
+enum TExpr {
+    Bool(bool),
+    State(usize),
+    Action(usize),
+    Neg(Box<TExpr>),
+    Conj(Vec<TExpr>),
+    Disj(Vec<TExpr>),
+    All(Box<TExpr>),
+    Even(Box<TExpr>),
+}
+
+const FAIR: usize = usize::MAX;
+
+impl TExpr {
+    fn level(&self) -> u8 {
+        match self {
+            TExpr::Bool(_) => 0,
+            TExpr::State(_) => 1,
+            TExpr::Action(_) => 2,
+            TExpr::Neg(b) => b.level(),
+            TExpr::Conj(xs) | TExpr::Disj(xs) => xs.iter().map(|x| x.level()).max().unwrap_or(0),
+            TExpr::All(_) | TExpr::Even(_) => 3,
+        }
+    }
+
+    fn has_action(&self) -> bool {
+        match self {
+            TExpr::Action(_) => true,
+            TExpr::Bool(_) | TExpr::State(_) => false,
+            TExpr::Neg(b) | TExpr::All(b) | TExpr::Even(b) => b.has_action(),
+            TExpr::Conj(xs) | TExpr::Disj(xs) => xs.iter().any(|x| x.has_action()),
+        }
+    }
+
+    /// LNConj.addConj / LNDisj.addDisj: a nested junction of the same kind is spliced in
+    fn add(v: &mut Vec<TExpr>, e: TExpr, conj: bool) {
+        match e {
+            TExpr::Conj(xs) if conj => xs.into_iter().for_each(|x| TExpr::add(v, x, conj)),
+            TExpr::Disj(xs) if !conj => xs.into_iter().for_each(|x| TExpr::add(v, x, conj)),
+            e => v.push(e),
+        }
+    }
+
+    fn junction(xs: impl IntoIterator<Item = TExpr>, conj: bool) -> TExpr {
+        let mut v = vec![];
+        for x in xs {
+            TExpr::add(&mut v, x, conj);
+        }
+        if conj { TExpr::Conj(v) } else { TExpr::Disj(v) }
+    }
+
+    /// pushNeg(hasNeg)
+    fn push_neg(self, neg: bool) -> TExpr {
+        match self {
+            TExpr::Bool(b) => TExpr::Bool(b != neg),
+            a @ (TExpr::State(_) | TExpr::Action(_)) => {
+                if neg { TExpr::Neg(a.into()) } else { a }
+            }
+            TExpr::Neg(b) => b.push_neg(!neg),
+            TExpr::Conj(xs) => TExpr::junction(xs.into_iter().map(|x| x.push_neg(neg)), !neg),
+            TExpr::Disj(xs) => TExpr::junction(xs.into_iter().map(|x| x.push_neg(neg)), neg),
+            TExpr::All(b) => {
+                if neg { TExpr::Even(b.push_neg(true).into()) } else { TExpr::All(b.push_neg(false).into()) }
+            }
+            TExpr::Even(b) => {
+                if neg { TExpr::All(b.push_neg(true).into()) } else { TExpr::Even(b.push_neg(false).into()) }
+            }
+        }
+    }
+
+    /// pushNeg() without an argument
+    fn negate(self) -> TExpr {
+        match self {
+            TExpr::Bool(b) => TExpr::Bool(!b),
+            a @ (TExpr::State(_) | TExpr::Action(_)) => TExpr::Neg(a.into()),
+            TExpr::Neg(b) => *b,
+            TExpr::Conj(xs) => TExpr::junction(xs.into_iter().map(|x| x.negate()), false),
+            TExpr::Disj(xs) => TExpr::junction(xs.into_iter().map(|x| x.negate()), true),
+            TExpr::All(b) => TExpr::Even(b.negate().into()),
+            TExpr::Even(b) => TExpr::All(b.negate().into()),
+        }
+    }
+
+    fn simplify(self) -> TExpr {
+        match self {
+            TExpr::Conj(xs) | TExpr::Disj(xs) if false => TExpr::Conj(xs),
+            TExpr::Conj(xs) => {
+                let mut v = vec![];
+                for x in xs {
+                    match x.simplify() {
+                        TExpr::Bool(false) => return TExpr::Bool(false),
+                        TExpr::Bool(true) => {}
+                        e => TExpr::add(&mut v, e, true),
+                    }
+                }
+                match v.len() {
+                    0 => TExpr::Bool(true),
+                    1 => v.pop().unwrap(),
+                    _ => TExpr::Conj(v),
+                }
+            }
+            TExpr::Disj(xs) => {
+                let mut v = vec![];
+                for x in xs {
+                    match x.simplify() {
+                        TExpr::Bool(true) => return TExpr::Bool(true),
+                        TExpr::Bool(false) => {}
+                        e => TExpr::add(&mut v, e, false),
+                    }
+                }
+                match v.len() {
+                    0 => TExpr::Bool(false),
+                    1 => v.pop().unwrap(),
+                    _ => TExpr::Disj(v),
+                }
+            }
+            TExpr::Neg(b) => match b.simplify() {
+                TExpr::Bool(x) => TExpr::Bool(!x),
+                b => TExpr::Neg(b.into()),
+            },
+            TExpr::All(b) => match b.simplify() {
+                TExpr::All(c) => TExpr::All(c),
+                b => TExpr::All(b.into()),
+            },
+            TExpr::Even(b) => match b.simplify() {
+                TExpr::Even(c) => TExpr::Even(c),
+                b => TExpr::Even(b.into()),
+            },
+            e => e,
+        }
+    }
+
+    fn ae_body(&self) -> Option<&TExpr> {
+        match self {
+            TExpr::All(b) => match b.as_ref() {
+                TExpr::Even(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn to_dnf(self) -> TExpr {
+        match self {
+            TExpr::Conj(xs) => {
+                let mut nes = vec![];
+                let mut total = 1usize;
+                for x in xs {
+                    match x.to_dnf() {
+                        TExpr::Disj(d) => {
+                            total = total.saturating_mul(d.len());
+                            nes.push(TExpr::Disj(d));
+                        }
+                        TExpr::Conj(c) => nes.extend(c),
+                        e => nes.push(e),
+                    }
+                }
+                if total == 1 {
+                    return TExpr::Conj(nes);
+                }
+                let mut res: Vec<Vec<TExpr>> = vec![vec![]; total];
+                let mut num = 1;
+                let mut rcount = total;
+                for ln in nes {
+                    match ln {
+                        TExpr::Disj(d) => {
+                            rcount /= d.len();
+                            let mut idx = 0;
+                            for _ in 0..num {
+                                for e in &d {
+                                    for _ in 0..rcount {
+                                        TExpr::add(&mut res[idx], e.clone(), true);
+                                        idx += 1;
+                                    }
+                                }
+                            }
+                            num *= d.len();
+                        }
+                        e => {
+                            for r in res.iter_mut() {
+                                TExpr::add(r, e.clone(), true);
+                            }
+                        }
+                    }
+                }
+                TExpr::Disj(res.into_iter().map(TExpr::Conj).collect())
+            }
+            TExpr::Disj(xs) => {
+                let mut ae = vec![];
+                let mut res = vec![];
+                for x in xs {
+                    let items = match x.to_dnf() {
+                        TExpr::Disj(d) => d,
+                        e => vec![e],
+                    };
+                    for e in items {
+                        match e.ae_body() {
+                            Some(b) => TExpr::add(&mut ae, b.clone(), false),
+                            None => TExpr::add(&mut res, e, false),
+                        }
+                    }
+                }
+                if ae.len() == 1 {
+                    let b = ae.pop().unwrap();
+                    TExpr::add(&mut res, TExpr::All(TExpr::Even(b.into()).into()), false);
+                } else if ae.len() > 1 {
+                    TExpr::add(&mut res, TExpr::All(TExpr::Even(TExpr::Disj(ae).into()).into()), false);
+                }
+                TExpr::Disj(res)
+            }
+            TExpr::Neg(b) => match *b {
+                a @ (TExpr::State(_) | TExpr::Action(_)) => TExpr::Neg(a.into()),
+                b => b.negate().to_dnf(),
+            },
+            e => e,
+        }
+    }
+
+    fn flatten(self) -> TExpr {
+        match self {
+            TExpr::Conj(mut xs) if xs.len() == 1 => xs.pop().unwrap().flatten(),
+            TExpr::Disj(mut xs) if xs.len() == 1 => xs.pop().unwrap().flatten(),
+            TExpr::Conj(xs) => TExpr::junction(xs.into_iter().map(|x| x.flatten()), true),
+            TExpr::Disj(xs) => TExpr::junction(xs.into_iter().map(|x| x.flatten()), false),
+            TExpr::Neg(b) => match *b {
+                TExpr::Neg(c) => c.flatten(),
+                b => TExpr::Neg(b.flatten().into()),
+            },
+            TExpr::All(b) => TExpr::All(b.flatten().into()),
+            TExpr::Even(b) => TExpr::Even(b.flatten().into()),
+            e => e,
+        }
+    }
+
+    fn to_ltl(&self) -> Ltl {
+        match self {
+            TExpr::Bool(b) => Ltl::Bool(*b),
+            TExpr::State(i) | TExpr::Action(i) => Ltl::Atom(*i, true),
+            TExpr::Neg(b) => b.to_ltl().not(),
+            TExpr::Conj(xs) => Ltl::And(xs.iter().map(|x| x.to_ltl()).collect()),
+            TExpr::Disj(xs) => Ltl::Or(xs.iter().map(|x| x.to_ltl()).collect()),
+            TExpr::All(b) => Ltl::Always(b.to_ltl().into()),
+            TExpr::Even(b) => Ltl::Eventually(b.to_ltl().into()),
+        }
+    }
+
+    fn state_atoms(&self, out: &mut u64) {
+        match self {
+            TExpr::State(i) if *i != FAIR => *out |= 1 << i,
+            TExpr::Neg(b) | TExpr::All(b) | TExpr::Even(b) => b.state_atoms(out),
+            TExpr::Conj(xs) | TExpr::Disj(xs) => xs.iter().for_each(|x| x.state_atoms(out)),
+            _ => {}
+        }
+    }
+}
+
+/// Turns a property into TLC's form, as tlc2.tool.liveness.Liveness.astToLive does
+fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Atoms) -> R<Result<TExpr, Rejected>> {
     use Expr::*;
     let e = e.strip();
     if !temporal(e) {
         if let Bool(b) = e {
-            return Ok(Ltl::Bool(*b));
+            return Ok(Ok(TExpr::Bool(*b)));
         }
-        let i = if e.is_action() { atoms.action(g, e, env)? } else { atoms.state(g, e, env)? };
-        return Ok(Ltl::Atom(i, true));
+        return Ok(Ok(if action_level(e) {
+            TExpr::Action(atoms.action(g, &box_to_or(e), env)?)
+        } else {
+            TExpr::State(atoms.state(g, e, env)?)
+        }));
     }
-    let mut sub = |x: &Expr| to_ltl(g, x, env, atoms);
-    Ok(match e {
-        And(xs) => Ltl::And(xs.iter().map(&mut sub).collect::<R<_>>()?),
-        Or(xs) => Ltl::Or(xs.iter().map(&mut sub).collect::<R<_>>()?),
-        Un(UOp::Not, x) => sub(x)?.not(),
-        Bin(BOp::Implies, a, b) => Ltl::Or(vec![sub(a)?.not(), sub(b)?]),
-        Bin(BOp::Equiv, a, b) => {
-            let (a, b) = (sub(a)?, sub(b)?);
-            Ltl::Or(vec![Ltl::And(vec![a.clone(), b.clone()]), Ltl::And(vec![a.not(), b.not()])])
+    macro_rules! sub {
+        ($x:expr) => {
+            match to_texpr(g, $x, env, atoms)? {
+                Ok(t) => t,
+                Err(r) => return Ok(Err(r)),
+            }
+        };
+    }
+    Ok(Ok(match e {
+        And(xs) => {
+            let mut v = vec![];
+            for x in xs {
+                let t = sub!(x);
+                TExpr::add(&mut v, t, true);
+            }
+            TExpr::Conj(v)
         }
-        Un(UOp::Always, x) => Ltl::Always(sub(x)?.into()),
-        Un(UOp::Eventually, x) => Ltl::Eventually(sub(x)?.into()),
-        // P ~> Q is [](P => <>Q)
-        Bin(BOp::LeadsTo, a, b) => Ltl::Always(Ltl::Or(vec![sub(a)?.not(), Ltl::Eventually(sub(b)?.into())]).into()),
-        // [A]_v is A \/ v' = v
-        BoxAction(a, v) => {
-            let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
-            Ltl::Atom(atoms.action(g, &Or(vec![a.as_ref().clone(), same]), env)?, true)
+        Or(xs) => {
+            let mut v = vec![];
+            for x in xs {
+                let t = sub!(x);
+                TExpr::add(&mut v, t, false);
+            }
+            TExpr::Disj(v)
         }
-        Un(UOp::Enabled, x) => Ltl::Atom(atoms.enabled(g, x, env)?, true),
-        // WF_v(A) is []<>~ENABLED <<A>>_v \/ []<><<A>>_v; SF_v(A) is <>[]~ENABLED <<A>>_v \/ []<><<A>>_v
+        Un(UOp::Not, x) => TExpr::Neg(sub!(x).into()),
+        Bin(BOp::Implies, a, b) => TExpr::Disj(vec![TExpr::Neg(sub!(a).into()), sub!(b)]),
+        Un(UOp::Always, x) => TExpr::All(sub!(x).into()),
+        Un(UOp::Eventually, x) => TExpr::Even(sub!(x).into()),
+        // P ~> Q is [](~P \/ <>Q)
+        Bin(BOp::LeadsTo, a, b) => TExpr::All(TExpr::Disj(vec![TExpr::Neg(sub!(a).into()), TExpr::Even(sub!(b).into())]).into()),
+        // WF_v(A) is []<>(~ENABLED <<A>>_v \/ <<A>>_v); SF_v(A) is <>[]~ENABLED <<A>>_v \/ []<><<A>>_v
         Fair(weak, v, a) => {
             let step = And(vec![a.as_ref().clone(), changed(v)]);
-            let en = Ltl::Atom(atoms.enabled(g, &step, env)?, false);
-            let taken = Ltl::Always(Ltl::Eventually(Ltl::Atom(atoms.action(g, &step, env)?, true).into()).into());
-            let off = if *weak { Ltl::Always(Ltl::Eventually(en.into()).into()) } else { Ltl::Eventually(Ltl::Always(en.into()).into()) };
-            Ltl::Or(vec![off, taken])
+            let en = TExpr::Neg(TExpr::State(atoms.state(g, &Un(UOp::Enabled, step.clone().b()), env)?).into());
+            let act = TExpr::Action(atoms.action(g, &step, env)?);
+            if *weak {
+                TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
+            } else {
+                TExpr::Disj(vec![TExpr::Even(TExpr::All(en.into()).into()), TExpr::All(TExpr::Even(act.into()).into())])
+            }
         }
         Quant(exists, bs, body) => {
             let mut parts = vec![];
-            let mut err = Ok(());
+            let mut err: R<Option<Rejected>> = Ok(None);
             let ce = g.ce.clone();
-            ce.each_binding(bs, env, &mut |env2| {
-                match to_ltl(g, body, env2, atoms) {
-                    Ok(l) => parts.push(l),
+            let r = ce.each_binding(bs, env, &mut |env2| {
+                match to_texpr(g, body, env2, atoms) {
+                    Ok(Ok(t)) => parts.push(t),
+                    Ok(Err(r)) => {
+                        err = Ok(Some(r));
+                        return Ok(false);
+                    }
                     Err(m) => {
                         err = Err(m);
                         return Ok(false);
                     }
                 }
                 Ok(true)
-            })?;
-            err?;
-            if *exists { Ltl::Or(parts) } else { Ltl::And(parts) }
+            });
+            if let Err(m) = r {
+                // The bound is not a constant (it depends on the state, or is infinite)
+                if m.contains("is not a constant") {
+                    return Ok(Err(Rejected(format!("TLC cannot handle the temporal formula {}", short(e)), 255)));
+                }
+                return Err(m);
+            }
+            if let Some(r) = err? {
+                return Ok(Err(r));
+            }
+            if parts.is_empty() {
+                TExpr::Bool(!*exists)
+            } else {
+                TExpr::junction(parts, !*exists)
+            }
         }
         If(c, a, b) if !temporal(c) => {
-            let c = sub(c)?;
-            Ltl::Or(vec![Ltl::And(vec![c.clone(), sub(a)?]), Ltl::And(vec![c.not(), sub(b)?])])
+            let c = sub!(c);
+            TExpr::Disj(vec![TExpr::Conj(vec![c.clone(), sub!(a)]), TExpr::Conj(vec![TExpr::Neg(c.into()), sub!(b)])])
         }
-        _ => return Err(format!("unsupported temporal formula {}", short(e))),
-    })
+        _ => return Ok(Err(Rejected(format!("TLC cannot handle the temporal formula {}", short(e)), 255))),
+    }))
+}
+
+/// TLC's fairness conditions in its form; their atoms are only classified
+fn fair_texpr(f: &FairDef) -> TExpr {
+    let en = TExpr::Neg(TExpr::State(FAIR).into());
+    let act = TExpr::Action(FAIR);
+    if f.weak {
+        TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
+    } else {
+        TExpr::Disj(vec![TExpr::Even(TExpr::All(en.into()).into()), TExpr::All(TExpr::Even(act.into()).into())])
+    }
+}
+
+/// What TLC does with fairness /\ ~(the properties), as tlc2.tool.liveness.Liveness.processLiveness:
+/// an error if a part of a disjunct of its normal form has an action but is not <>[]A or []<>A;
+/// otherwise the state atoms that end up in the tableau (TLC evaluates those on a state when it is
+/// generated, and the others when the state is expanded)
+fn tlc_plan(fair: &[FairDef], props: &[TExpr]) -> Result<u64, Rejected> {
+    if props.is_empty() {
+        return Ok(0);
+    }
+    let mut conj = vec![];
+    for f in fair {
+        TExpr::add(&mut conj, fair_texpr(f), true);
+    }
+    let neg = if props.len() == 1 {
+        TExpr::Neg(props[0].clone().into())
+    } else {
+        TExpr::junction(props.iter().map(|p| TExpr::Neg(p.clone().into())), false)
+    };
+    let e = if conj.is_empty() {
+        neg
+    } else {
+        TExpr::add(&mut conj, neg, true);
+        TExpr::Conj(conj)
+    };
+    let dnf = match e.push_neg(false).simplify().to_dnf() {
+        TExpr::Bool(false) => return Ok(0),
+        TExpr::Disj(d) => d,
+        e => vec![e],
+    };
+    let mut tableau = 0u64;
+    for d in dnf {
+        let items = match d.flatten() {
+            TExpr::Conj(xs) => xs,
+            e => vec![e],
+        };
+        for ln in items {
+            let ea = matches!(&ln, TExpr::Even(b) if matches!(b.as_ref(), TExpr::All(c) if c.level() < 3));
+            let ae = matches!(&ln, TExpr::All(b) if matches!(b.as_ref(), TExpr::Even(c) if c.level() <= 2));
+            if ea || ae {
+                continue;
+            }
+            if ln.has_action() {
+                return Err(Rejected("Temporal formulas containing actions must be of forms <>[]A or []<>A.".into(), 255));
+            }
+            ln.state_atoms(&mut tableau);
+        }
+    }
+    Ok(tableau)
 }
 
 /// Generated code for the liveness checks: the atoms, the fairness conditions, and an automaton per
 /// property part. `parts` are (name, formula, constant bindings).
-pub fn compile(g: &mut Gen, fair: &[FairDef], parts: &[(String, Expr, HashMap<String, Value>)]) -> R<String> {
+/// A formula TLC rejects comes back as Ok(Err(..)).
+pub fn compile(g: &mut Gen, fair: &[FairDef], parts: &[(String, Expr, HashMap<String, Value>)]) -> R<Result<String, Rejected>> {
     let mut atoms = Atoms::default();
     let mut src = String::new();
     let mut props = vec![];
+    // SANY's rules on temporal formulas (TLC stops with exit code 150 before checking anything)
+    for (_, e, _) in parts {
+        if let Err(m) = sany_level(e) {
+            return Ok(Err(Rejected(m, 150)));
+        }
+    }
+    let mut texprs = vec![];
     for (name, e, env) in parts {
-        let f = to_ltl(g, e, env, &mut atoms).map_err(|m| format!("property {name}: {m}"))?;
+        match to_texpr(g, e, env, &mut atoms).map_err(|m| format!("property {name}: {m}"))? {
+            Ok(t) => texprs.push(t),
+            Err(r) => return Ok(Err(r)),
+        }
+    }
+    let tableau = match tlc_plan(fair, &texprs) {
+        Ok(t) => t,
+        Err(r) => return Ok(Err(r)),
+    };
+    for ((name, _, _), t) in parts.iter().zip(&texprs) {
+        let f = t.to_ltl();
         let (nodes, nacc) = automaton(&f.not(), 4096).map_err(|m| format!("property {name}: {m}"))?;
         let mut ns = vec![];
         for n in &nodes {
@@ -264,5 +716,8 @@ pub fn compile(g: &mut Gen, fair: &[FairDef], parts: &[(String, Expr, HashMap<St
     writeln!(src, "static FAIRS: &[(bool, fn(&State) -> bool, fn(&State, &State) -> bool)] = &[{}];", fairs.join(", ")).unwrap();
     writeln!(src, "static LPROPS: &[LProp] = &[{}];", props.join(", ")).unwrap();
     writeln!(src, "const LIVENESS: bool = {};", !parts.is_empty()).unwrap();
-    Ok(src)
+    // The state atoms TLC evaluates when a state is generated (those of the tableau); it evaluates
+    // the others when the state is expanded
+    writeln!(src, "const SATOMS_TABLEAU: u64 = {tableau};").unwrap();
+    Ok(Ok(src))
 }
