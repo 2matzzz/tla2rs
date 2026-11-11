@@ -109,7 +109,7 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 ## 確かめ方
 
 `scripts/crosscheck.sh` は TLC（`-workers 1`）と tla2rs で同じ構成を回し、結果・生成状態数・distinct 状態数・反例の長さ・終了コードを比べる。
-`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。
+`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は jar・cfg・引数・仕様が読むモジュールのハッシュで `target/crosscheck/tlc` に、ビルドした検査器は生成コードのハッシュで `target/crosscheck/build` に残すので、再実行では変わったものだけが走る。キャッシュから読んだ TLC の結果が一致しないときは、TLC を回し直して確かめる。`CROSSCHECK_NO_CACHE=1` で両方のキャッシュを使わない。
 
 ```
 $ scripts/all.sh

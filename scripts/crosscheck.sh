@@ -5,6 +5,7 @@
 # Pass tla2tools.jar via TLA_TOOLS (default ~/.tla/tla2tools.jar).
 # State counts at a violation depend on search order, so TLC runs with one worker for a fixed order.
 set -euo pipefail
+orig=("$@"); origdir="$PWD"
 tla="$1"; shift
 cfg="${tla%.tla}.cfg"
 if [[ $# -gt 0 && "$1" == *.cfg ]]; then cfg="$1"; shift; fi
@@ -58,9 +59,48 @@ summarize() {
   printf '%s\n%s\ntrace=%s\n' "$res" "$counts" "$trace"
 }
 
+# TLC's result depends only on the jar, the cfg, the arguments and the modules the spec reads, so it
+# is kept in target/crosscheck/tlc under a hash of those and reused. CROSSCHECK_NO_CACHE=1 turns
+# both caches off. Modules are followed through EXTENDS and INSTANCE within the spec's directory
+# (standard modules come from the jar).
+cache_root="$root/target/crosscheck"
+tlc_key() {
+  local seen=() queue=("${t%.tla}") m f
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    m="${queue[0]}"; queue=("${queue[@]:1}")
+    [[ -f "$m.tla" ]] || continue
+    [[ " ${seen[*]-} " == *" $m "* ]] && continue
+    seen+=("$m")
+    for f in $(grep -oE '(EXTENDS|INSTANCE)[[:space:]]+[A-Za-z0-9_, ]+' "$m.tla" | sed -E 's/^(EXTENDS|INSTANCE)//; s/,/ /g'); do
+      queue+=("$f")
+    done
+  done
+  { echo "v1 -workers 1 ${extra[*]-}"; shasum -a 256 "$jar" | cut -d' ' -f1; cat "$c"
+    for m in $(printf '%s\n' "${seen[@]}" | sort); do echo "== $m"; cat "$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
+}
+run_tlc() {
+  rc_tlc=0
+  # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
+  mkdir -p "$work/jtmp"
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  if [[ -n "$tlc_cache" ]]; then
+    rm -rf "$tlc_cache"; mkdir -p "$tlc_cache.tmp$$" && cp tlc.out "$tlc_cache.tmp$$/" && echo "$rc_tlc" > "$tlc_cache.tmp$$/rc" &&
+      mv "$tlc_cache.tmp$$" "$tlc_cache" 2>/dev/null || rm -rf "$tlc_cache.tmp$$"
+  fi
+}
+tlc_cache=""; tlc_cached=0
+if [[ -z "${CROSSCHECK_NO_CACHE:-}" ]]; then
+  tlc_cache="$cache_root/tlc/$(tlc_key)"
+  export TLA2RS_BUILD_CACHE="$cache_root/build"
+fi
+
 s0=$(date +%s.%N)
 rc_tlc=0; rc_rs=0
-java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+if [[ -n "$tlc_cache" && -f "$tlc_cache/rc" ]]; then
+  cp "$tlc_cache/tlc.out" tlc.out; rc_tlc=$(cat "$tlc_cache/rc"); tlc_cached=1
+else
+  run_tlc
+fi
 s1=$(date +%s.%N)
 "$bin" "$t" -config "$c" -o "$work/gen" -workers 1 ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 s2=$(date +%s.%N)
@@ -82,7 +122,14 @@ fi
 
 a=$(summarize tlc.out); b=$(summarize rs.out)
 # If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
+# A result read from the cache that does not match is checked again with a fresh TLC run, so a
+# stale or bad entry never decides a test
+retry_fresh() {
+  [[ $tlc_cached == 1 ]] || return 0
+  rm -rf "$tlc_cache"; cd "$origdir"; rm -rf "$work"; exec "$root/scripts/crosscheck.sh" "${orig[@]}"
+}
 if [[ -z "$(echo "$a" | head -1)" ]]; then
+  retry_fresh
   echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
   exit 1
 fi
@@ -105,7 +152,9 @@ if [[ $verdict_only == 1 ]]; then
 elif [[ $distinct_only == 1 ]]; then
   a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
 fi
-printf '%-14s TLC %6.2fs | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$(echo "$s2 - $s1" | bc)"
+[[ "$a" == "$b" ]] || retry_fresh
+note=""; [[ $tlc_cached == 1 ]] && note=" cached"
+printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)"
 if [[ "$a" == "$b" ]]; then
   if [[ $verdict_only == 1 ]]; then
     echo "  MATCH(verdict only; VIEW+SYMMETRY): $(echo "$a" | tr '\n' ' ')"
