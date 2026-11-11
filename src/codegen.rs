@@ -1179,8 +1179,7 @@ impl<'a> Gen<'a> {
                     let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
                     (format!("(if {pc} {{ true }} else {{ assert_error({msg:?}.to_string()) }})"), Ty::Bool)
                 }
-                // Print and PrintT write to stderr (TLC prints to its output); the checker's verdict
-                // does not depend on them
+                // Print and PrintT write to stdout as TLC does, when the checker evaluates them
                 // (d :> e) @@ f, with f over a whole type: f with the entry at d replaced. Any other
                 // use of :> and @@ builds a function over part of a type, which is not represented
                 ("@@", [l, f]) if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2) => {
@@ -1202,13 +1201,13 @@ impl<'a> Gen<'a> {
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;
-                    (format!("{{ eprintln!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
+                    (format!("{{ println!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
                 }
                 ("Print", [x, v]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;
                     let (vc, vt) = self.gen(v, env, want)?;
-                    (format!("{{ eprintln!(\"{{}}\", fmt_{id}(&{c})); {vc} }}"), vt)
+                    (format!("{{ println!(\"{{}}\", fmt_{id}(&{c})); {vc} }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int(a, env)?;
