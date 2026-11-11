@@ -110,8 +110,20 @@ impl<'a> Gen<'a> {
                 }
                 self.ty_id(e)?;
             }
+            Ty::PFun(d, c) => {
+                let n = d.size().ok_or("a function over part of a type that is not enumerable is not supported")?;
+                if n > 1 << 16 {
+                    return Err(format!("a function over part of a type of {n} values is not supported (give the domain a smaller type in TypeOK)"));
+                }
+                self.ty_id(d)?;
+                self.ty_id(c)?;
+                self.ty_id(&pfun_repr(d, c))?;
+            }
             Ty::Bag(e) => {
-                e.size().ok_or("a bag of elements of a type that is not enumerable is not supported")?;
+                let n = e.size().ok_or("a bag of elements of a type that is not enumerable is not supported")?;
+                if n > 1 << 16 {
+                    return Err(format!("a bag over a type of {n} values is not supported (give the elements a smaller type in TypeOK)"));
+                }
                 self.ty_id(e)?;
                 self.ty_id(&bag_fun(e))?;
             }
@@ -713,6 +725,16 @@ impl<'a> Gen<'a> {
     fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
         Ok(match t {
             Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            // A function over part of a type: by the size of its domain, then the domain, then the
+            // values
+            Ty::PFun(_, c) => {
+                let vc = self.tlc_cmp(c, "(&__x[__i].1)", "(&__y[__j].1)")?;
+                format!(
+                    "{{ let (__x, __y) = ({a}, {b}); let __dx: Vec<usize> = (0..__x.len()).filter(|&i| __x[i].0).collect(); \
+                     let __dy: Vec<usize> = (0..__y.len()).filter(|&i| __y[i].0).collect(); \
+                     __dx.len().cmp(&__dy.len()).then_with(|| __dx.cmp(&__dy)).then_with(|| __dx.iter().zip(__dy.iter()).map(|(&__i, &__j)| {vc}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
+                )
+            }
             // A bag compares as the function it is: by the size of its domain, then the domain,
             // then the counts
             Ty::Bag(_) => format!(
@@ -832,6 +854,7 @@ impl<'a> Gen<'a> {
     fn default_code(t: &Ty) -> String {
         match t {
             Ty::Bag(e) => format!("[0i64; {}]", e.size().unwrap_or(0)),
+            Ty::PFun(d, c) => Self::default_code(&pfun_repr(d, c)),
             Ty::Bool => "false".into(),
             Ty::Int(..) | Ty::IntAtom(..) => "0i64".into(),
             Ty::Enum(_) => "0u16".into(),
@@ -852,6 +875,18 @@ impl<'a> Gen<'a> {
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
             (Value::Atom(a), _) => format!("{a}u16"),
+            (v, Ty::PFun(d, c)) if crate::value::as_fun(v).is_some() => {
+                self.ty_id(t)?;
+                let m = crate::value::as_fun(v).unwrap();
+                let mut parts = vec![];
+                for k in d.enumerate() {
+                    parts.push(match m.get(&k) {
+                        Some(x) => format!("(true, {})", self.lit(x, c)?),
+                        None => format!("(false, {})", Self::default_code(c)),
+                    });
+                }
+                format!("[{}]", parts.iter().map(|p| format!("{p},")).collect::<String>())
+            }
             (v, Ty::Bag(e)) if crate::value::as_fun(v).is_some() => {
                 self.ty_id(t)?;
                 let m = crate::value::as_fun(v).unwrap();
@@ -1035,7 +1070,25 @@ impl<'a> Gen<'a> {
                 Ok(format!("{{ let mut {acc} = {empty}; for {x} in {it} {{ {add} }} {acc} }}"))
             }
             (Ty::Enum(x), Ty::Set(_) | Ty::Fun(..) | Ty::Seq(_)) if x.is_empty() => Err("empty enum".into()),
-            (Ty::Rec(fs), Ty::Bag(_)) if fs.is_empty() => Ok(Self::default_code(to)),
+            (Ty::Rec(fs), Ty::Bag(_) | Ty::PFun(..)) if fs.is_empty() => Ok(Self::default_code(to)),
+            // A function over all of a type as one over part of it, and between partial functions
+            (Ty::Fun(d1, c1), Ty::PFun(d2, c2)) if d1 != d2 => {
+                let mid = Ty::PFun(d1.clone(), c2.clone());
+                let c = self.coerce(code, from, &mid)?;
+                self.coerce(c, &mid, to)
+            }
+            (Ty::Fun(d1, c1), Ty::PFun(d2, c2)) if d1 == d2 => {
+                let inner = self.coerce("__x".into(), c1, c2)?;
+                Ok(format!("{{ let __f = {code}; let __o: {} = std::array::from_fn(|__i| {{ let __x = __f[__i]; (true, {inner}) }}); __o }}", to.repr()))
+            }
+            (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => {
+                let (aid, bid) = (self.ty_id(d1)?, self.ty_id(d2)?);
+                let inner = self.coerce("__x".into(), c1, c2)?;
+                Ok(format!(
+                    "{{ let __f = {code}; let mut __o = {}; for (__i, &(__p, __x)) in __f.iter().enumerate() {{ if __p {{ __o[idx_{bid}(dec_{aid}(__i as u64))] = (true, {inner}); }} }} __o }}",
+                    Self::default_code(to)
+                ))
+            }
             // A tuple of counts as a bag over 1..n
             (Ty::Rec(fs), Ty::Bag(e)) if is_tuple_fields(fs) => {
                 let eid = self.ty_id(e)?;
@@ -1210,7 +1263,9 @@ impl<'a> Gen<'a> {
                 // Print and PrintT write to stdout as TLC does, when the checker evaluates them
                 // (d :> e) @@ f, with f over a whole type: f with the entry at d replaced. Any other
                 // use of :> and @@ builds a function over part of a type, which is not represented
-                ("@@", [l, f]) if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2) => {
+                ("@@", [l, f])
+                    if matches!(l.strip(), Call(op, a) if op == ":>" && a.len() == 2) && matches!(self.gen(f, env, want), Ok((_, Ty::Fun(..)))) =>
+                {
                     let Call(_, de) = l.strip() else { unreachable!() };
                     let (fc, ft) = self.gen(f, env, want)?;
                     let Ty::Fun(d, c) = &ft else { return Err("@@ of a value that is not a function".into()) };
@@ -1223,8 +1278,47 @@ impl<'a> Gen<'a> {
                         ft,
                     )
                 }
-                (":>" | "@@", _) => {
-                    return Err(format!("`{f}` over values that depend on the state is only supported as `(d :> e) @@ f` with f a function over a whole type: {}", short(e)))
+                // d :> e over values from the state: a function over part of d's type
+                (":>", [d, v]) => {
+                    let (dc, dt) = self.gen(d, env, None)?;
+                    let (vc, vt) = self.gen(v, env, None)?;
+                    let ft = Ty::PFun(dt.clone().into(), vt.into());
+                    self.ty_id(&ft)?;
+                    let did = self.ty_id(&dt)?;
+                    (format!("{{ let mut __o = {}; __o[idx_{did}({dc})] = (true, {vc}); __o }}", Self::default_code(&ft)), ft)
+                }
+                // f @@ g: f where it is defined, g elsewhere
+                ("@@", [a, b]) => {
+                    let (ac, at) = self.gen(a, env, None)?;
+                    let (bc, bt) = self.gen(b, env, None)?;
+                    let (ad, acod) = pfun_parts(&at).ok_or(format!("@@ of {at:?}, which is not a function"))?;
+                    let (bd, bcod) = pfun_parts(&bt).ok_or(format!("@@ of {bt:?}, which is not a function"))?;
+                    let ft = Ty::PFun(join(&ad, &bd)?.into(), join(&acod, &bcod)?.into());
+                    let ac = self.coerce(ac, &at, &ft)?;
+                    let bc = self.coerce(bc, &bt, &ft)?;
+                    (format!("{{ let (mut __a, __b) = ({ac}, {bc}); for __i in 0..__a.len() {{ if !__a[__i].0 {{ __a[__i] = __b[__i]; }} }} __a }}"), ft)
+                }
+                // Permutations of a set from the state: every bijection of it onto itself
+                ("Permutations", [x]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    let Ty::Set(et) = &t else { return Err("Permutations of a non-set".into()) };
+                    let ft = Ty::PFun(et.clone(), et.clone());
+                    let st = Ty::Set(ft.clone().into());
+                    let eid = self.ty_id(et)?;
+                    let it = self.s_iter(&c, &t)?;
+                    let empty = self.s_empty(&st)?;
+                    let add = self.s_add("__s", "__f", &st)?;
+                    (
+                        format!(
+                            "{{ let __e: Vec<{}> = {it}.collect(); let mut __s = {empty}; let mut __p: Vec<usize> = (0..__e.len()).collect(); \
+                             loop {{ let mut __f = {}; for __k in 0..__e.len() {{ __f[idx_{eid}(__e[__k])] = (true, __e[__p[__k]]); }} {add} \
+                             let mut __k = __p.len(); while __k > 1 && __p[__k - 2] >= __p[__k - 1] {{ __k -= 1; }} if __k <= 1 {{ break; }} \
+                             let mut __l = __p.len() - 1; while __p[__l] <= __p[__k - 2] {{ __l -= 1; }} __p.swap(__k - 2, __l); __p[__k - 1..].reverse(); }} __s }}",
+                            et.repr(),
+                            Self::default_code(&ft)
+                        ),
+                        st,
+                    )
                 }
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
@@ -1481,6 +1575,14 @@ impl<'a> Gen<'a> {
                 if let Ty::Bag(_) = &ft {
                     return self.bag_domain(f, env);
                 }
+                if let Ty::PFun(d, _) = &ft {
+                    let (fc, _) = self.gen(f, env, None)?;
+                    let st = Ty::Set(d.clone());
+                    let did = self.ty_id(d)?;
+                    let empty = self.s_empty(&st)?;
+                    let add = self.s_add("__s", &format!("dec_{did}(__i as u64)"), &st)?;
+                    return Ok((format!("{{ let __f = {fc}; let mut __s = {empty}; for __i in 0..__f.len() {{ if __f[__i].0 {{ {add} }} }} __s }}"), st));
+                }
                 if let Ty::Seq(_) = &ft {
                     let (fc, _) = self.gen(f, env, None)?;
                     let st = Ty::Set(Ty::Int(1, self.qcap as i64).into());
@@ -1726,6 +1828,18 @@ impl<'a> Gen<'a> {
                 let q = self.fresh("q");
                 (format!("{{ let mut {q} = {}; for {lx} in 1..=({nc}) {{ {q}.push({bc}); }} {q} }}", Self::default_code(&st)), st)
             }
+            // [x \in S |-> e] with S from the state: a function over part of S's element type
+            FunCons(x, s, body) if self.try_const(s, env).is_none() => {
+                let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                let mut env2 = env.clone();
+                let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                let (bc, bt) = self.gen(body, &env2, None)?;
+                let ft = Ty::PFun(et.clone().into(), bt.into());
+                self.ty_id(&ft)?;
+                let eid = self.ty_id(&et)?;
+                let key = env2.locals[x].0.clone();
+                (format!("{{ let mut __o = {}; for {lx} in {it} {{ __o[idx_{eid}({key})] = (true, {bc}); }} __o }}", Self::default_code(&ft)), ft)
+            }
             FunCons(x, s, body) => {
                 let dv = self.ce.eval(s, &HashMap::new()).map_err(|m| format!("function domain must be constant: {m}"))?;
                 let dt = elem_ty_of_domain(dv.as_set()?)?;
@@ -1815,6 +1929,14 @@ impl<'a> Gen<'a> {
                 if let Ty::Seq(e) = &ft {
                     let (ic, _) = self.gen_int(x, env)?;
                     return Ok((format!("({fc}).at({ic})"), e.as_ref().clone()));
+                }
+                if let Ty::PFun(d, c) = &ft {
+                    let did = self.ty_id(d)?;
+                    let xc = self.gen_as(x, env, d)?;
+                    return Ok((
+                        format!("{{ let __f = {fc}; let __i = enc_{did}({xc}); if __i == u64::MAX || !__f[__i as usize].0 {{ eval_error(\"Attempted to apply a function to an argument not in its domain\".into()) }} __f[__i as usize].1 }}"),
+                        c.as_ref().clone(),
+                    ));
                 }
                 // A bag applied to an element: its count, an error for an element not in it
                 if let Ty::Bag(e) = &ft {
@@ -1992,7 +2114,15 @@ impl<'a> Gen<'a> {
                     et,
                 )
             }
-            FunSet(..) | RecSet(..) => {
+            // [S -> T] with S from the state, as a value: the set of those functions
+            FunSet(..) => {
+                let (it, et, _) = self.iter_of_indexed(e, env)?;
+                let st = Ty::Set(et.into());
+                let empty = self.s_empty(&st)?;
+                let add = self.s_add("__s", "__f", &st)?;
+                (format!("{{ let mut __s = {empty}; for __f in {it} {{ {add} }} __s }}"), st)
+            }
+            RecSet(..) => {
                 return Err("this set is only supported on the right of \\in (or must be constant)".into())
             }
             Let(..) | Label(..) => unreachable!(),
@@ -2229,6 +2359,31 @@ impl<'a> Gen<'a> {
             }
         }
         // SUBSET of a set that depends on the state, in TLC's order (smaller subsets first)
+        // [S -> T] with S from the state: every function over S's elements into T, the values
+        // varying fastest at the last element of S (TLC's order of these functions)
+        if let Expr::FunSet(d, r) = s {
+            let (dc, dty) = self.gen(d, env, None)?;
+            let Ty::Set(det) = &dty else { return Err("[S -> T] where S is not a set".into()) };
+            let (rit, rt, rix) = self.iter_of_indexed(r, env)?;
+            let rid_ = self.ty_id(&rt)?;
+            let rval = if rix.is_some() { format!("dec_{rid_}(__r)") } else { "__r".to_string() };
+            let ft = Ty::PFun(det.clone(), rt.clone().into());
+            self.ty_id(&ft)?;
+            let did = self.ty_id(det)?;
+            let dit = self.s_iter(&dc, &dty)?;
+            let code = format!(
+                "{{ let __d: Vec<{}> = {dit}.collect(); let __r: Vec<{}> = {rit}.map(|__r| {rval}).collect(); let mut __v: Vec<{}> = Vec::new(); \
+                 if !__r.is_empty() || __d.is_empty() {{ let mut __c = vec![0usize; __d.len()]; loop {{ let mut __f = {}; \
+                 for __k in 0..__d.len() {{ __f[idx_{did}(__d[__k])] = (true, __r[__c[__k]]); }} __v.push(__f); \
+                 let mut __k = __d.len(); loop {{ if __k == 0 {{ break; }} __k -= 1; __c[__k] += 1; if __c[__k] < __r.len() {{ break; }} __c[__k] = 0; if __k == 0 {{ __k = usize::MAX; break; }} }} \
+                 if __k == usize::MAX || __d.is_empty() {{ break; }} }} }} __v }}.into_iter()",
+                det.repr(),
+                rt.repr(),
+                ft.repr(),
+                Self::default_code(&ft)
+            );
+            return Ok((code, ft, None));
+        }
         if let Expr::Un(UOp::Subset, x) = s {
             let (c, t) = self.gen(x, env, None)?;
             if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
@@ -2287,6 +2442,16 @@ impl<'a> Gen<'a> {
                 let it = self.s_iter(x, xt)?;
                 // Bound first: an iterator borrowing x must not outlive the block x lives in
                 return Ok(format!("{{ let __all = {it}.all(|{e}| {inner}); __all }}"));
+            }
+            FunSet(d, r) if matches!(xt, Ty::PFun(..)) => {
+                let Ty::PFun(dt, ct) = xt else { unreachable!() };
+                let did = self.ty_id(dt)?;
+                let (e, k) = (self.fresh("e"), self.fresh("k"));
+                let in_d = self.gen_member(&k, dt, d, env)?;
+                let in_r = self.gen_member(&e, ct, r, env)?;
+                return Ok(format!(
+                    "{{ let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __p == {in_d} && (!__p || {in_r}) }}); __all }}"
+                ));
             }
             FunSet(d, r) => {
                 let Ty::Fun(dt, ct) = xt else { return Ok("false".into()) };
@@ -3084,6 +3249,17 @@ impl<'a> Gen<'a> {
             let fmt_body = match &t {
                 // A bag prints as the function it is: << >> when empty (TLC's spelling for an empty
                 // function), a tuple over 1..n
+                Ty::PFun(d, c) => {
+                    let (did, cid) = (self.ty_id(d)?, self.ty_id(c)?);
+                    let ints = matches!(d.as_ref(), Ty::Int(..));
+                    format!(
+                        "let ks: Vec<(u64, String)> = v.iter().enumerate().filter(|(_, x)| x.0).map(|(i, x)| (i as u64, fmt_{cid}(&x.1))).collect(); \
+                         if ks.is_empty() {{ return \"<< >>\".into(); }} \
+                         if {ints} && ks.iter().enumerate().all(|(j, (i, _))| fmt_{did}(&dec_{did}(*i)) == (j + 1).to_string()) {{ \
+                         return format!(\"<<{{}}>>\", ks.iter().map(|(_, c)| c.clone()).collect::<Vec<_>>().join(\", \")); }} \
+                         format!(\"({{}})\", ks.iter().map(|(i, c)| format!(\"{{}} :> {{}}\", fmt_{did}(&dec_{did}(*i)), c)).collect::<Vec<_>>().join(\" @@ \"))"
+                    )
+                }
                 Ty::Bag(e) => {
                     let eid = self.ty_id(e)?;
                     let ints = matches!(e.as_ref(), Ty::Int(..));
@@ -3214,6 +3390,9 @@ impl<'a> Gen<'a> {
         if let Ty::Bag(e) = t {
             return self.pack_value(c, &bag_fun(e), out, at);
         }
+        if let Ty::PFun(d, cd) = t {
+            return self.pack_value(c, &pfun_repr(d, cd), out, at);
+        }
         if let Some(n) = t.size() {
             let id = self.ty_id(t)?;
             let b = Self::bits_for(n);
@@ -3314,6 +3493,9 @@ impl<'a> Gen<'a> {
         if let Ty::Bag(e) = t {
             return self.pack_perm(c, &bag_fun(e), out, at);
         }
+        if let Ty::PFun(d, cd) = t {
+            return self.pack_perm(c, &pfun_repr(d, cd), out, at);
+        }
         let inv_key = |d: &Ty, k: &str| match d {
             Ty::Enum(_) => Some(format!("pi[({k}) as usize]")),
             Ty::Bool | Ty::Int(..) => Some(k.to_string()),
@@ -3403,6 +3585,9 @@ impl<'a> Gen<'a> {
     fn unpack_value(&mut self, t: &Ty, at: &mut Option<u32>) -> R<String> {
         if let Ty::Bag(e) = t {
             return self.unpack_value(&bag_fun(e), at);
+        }
+        if let Ty::PFun(d, cd) = t {
+            return self.unpack_value(&pfun_repr(d, cd), at);
         }
         if let Some(n) = t.size() {
             let id = self.ty_id(t)?;
@@ -3560,8 +3745,11 @@ impl<'a> Gen<'a> {
         if let Ty::Bag(e) = t {
             return self.perm_code(c, &bag_fun(e));
         }
+        if let Ty::PFun(d, cd) = t {
+            return self.perm_code(c, &pfun_repr(d, cd));
+        }
         Ok(match t {
-            Ty::Bag(_) => unreachable!(),
+            Ty::Bag(_) | Ty::PFun(..) => unreachable!(),
             Ty::Bool | Ty::Int(..) => c.to_string(),
             Ty::Enum(_) => format!("pm[({c}) as usize]"),
             Ty::IntAtom(..) => {
@@ -3750,6 +3938,20 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
 }
 "#;
 
+/// The domain and codomain types of a function value that @@ can join (None if not a function)
+fn pfun_parts(t: &Ty) -> Option<(Ty, Ty)> {
+    match t {
+        Ty::PFun(d, c) | Ty::Fun(d, c) => Some((d.as_ref().clone(), c.as_ref().clone())),
+        Ty::Rec(fs) if fs.is_empty() => Some((Ty::Enum(vec![]), Ty::Enum(vec![]))),
+        _ => None,
+    }
+}
+
+/// The type a function over part of a type is stored as: an optional value per element
+fn pfun_repr(d: &Ty, c: &Ty) -> Ty {
+    Ty::Fun(d.clone().into(), Ty::Opt(c.clone().into()).into())
+}
+
 /// The function type a bag is stored as: element -> count (0 when absent)
 fn bag_fun(e: &Ty) -> Ty {
     Ty::Fun(e.clone().into(), Ty::Int(0, BIG).into())
@@ -3759,7 +3961,7 @@ fn bag_fun(e: &Ty) -> Ty {
 /// as a number in Rust, but by size and then elements in TLC
 fn needs_tlc_order(t: &Ty) -> bool {
     match t {
-        Ty::Bag(_) => true,
+        Ty::Bag(_) | Ty::PFun(..) => true,
         Ty::Set(_) => !is_sparse(t),
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
         Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),

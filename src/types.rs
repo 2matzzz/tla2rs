@@ -29,6 +29,9 @@ pub enum Ty {
     /// A bag (Bags module) of elements of this (enumerable) type: a count per element, 0 for an
     /// element not in it. As a TLA+ value it is the function from its elements to their counts
     Bag(Box<Ty>),
+    /// A function whose domain is a subset of an enumerable type (built over a set from the state,
+    /// or by :> and @@): stored as an optional value per element of the type
+    PFun(Box<Ty>, Box<Ty>),
     /// An optional record field (arises when records whose fields differ by variant are merged into
     /// one type). Represented as (present, value); an absent field holds the default value
     Opt(Box<Ty>),
@@ -104,7 +107,7 @@ impl Ty {
             Ty::IntAtom(lo, hi, v) => int_count(*lo, *hi)?.checked_add(v.len() as u64),
             Ty::Rec(fs) => fs.iter().try_fold(1u64, |acc, (_, t)| acc.checked_mul(t.size()?)),
             Ty::Opt(t) => t.size()?.checked_add(1),
-            Ty::Fun(..) | Ty::Set(..) | Ty::Seq(_) | Ty::Bag(_) => None,
+            Ty::Fun(..) | Ty::Set(..) | Ty::Seq(_) | Ty::Bag(_) | Ty::PFun(..) => None,
         }
     }
 
@@ -118,6 +121,7 @@ impl Ty {
             Ty::Set(e) if is_sparse(self) => format!("SSet<{}, SCAP>", e.repr()),
             Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),
             Ty::Bag(e) => format!("[i64; {}]", e.size().unwrap_or(0)),
+            Ty::PFun(d, c) => format!("[(bool, {}); {}]", c.repr(), d.size().unwrap_or(0)),
             Ty::Set(_) => "u128".into(),
             Ty::Opt(t) => format!("(bool, {})", t.repr()),
         }
@@ -145,6 +149,7 @@ impl Ty {
             (Ty::Set(_), Ty::Set(_)) => is_sparse(self) == is_sparse(o),
             (Ty::Seq(a), Ty::Seq(b)) => a.kind_eq(b),
             (Ty::Bag(a), Ty::Bag(b)) => a == b,
+            (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => d1 == d2 && c1.kind_eq(c2),
             (Ty::Opt(a), Ty::Opt(b)) => a.kind_eq(b),
             _ => false,
         }
@@ -244,6 +249,7 @@ impl Ty {
             }
             (Ty::Fun(d, c), Value::Tuple(xs)) if seq_domain(d) == Some(xs.len()) => xs.iter().all(|x| c.conforms(x)),
             (Ty::Seq(e), Value::Tuple(xs)) => xs.iter().all(|x| e.conforms(x)),
+            (Ty::PFun(d, c), v) => crate::value::as_fun(v).is_some_and(|m| m.iter().all(|(k, x)| d.enc(k).is_some() && c.conforms(x))),
             (Ty::Bag(e), v) => crate::value::as_fun(v)
                 .is_some_and(|m| m.iter().all(|(k, c)| e.enc(k).is_some() && matches!(c, Value::Int(n) if *n > 0))),
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
@@ -329,6 +335,10 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::Seq(_), t) | (t, Ty::Seq(_)) if seq_elems(t).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(join(x, y)?.into()),
         (Ty::Bag(x), Ty::Bag(y)) => Ty::Bag(join(x, y)?.into()),
+        // A function over part of a type joins with one over all of it (or with the empty one)
+        (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
+        (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) | (Ty::Fun(d2, c2), Ty::PFun(d1, c1)) if d1 == d2 => Ty::PFun(d1.clone(), join(c1, c2)?.into()),
+        (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if fs.is_empty() => Ty::PFun(d.clone(), c.clone()),
         // <<>> is the empty function, so also the empty bag
         (Ty::Bag(x), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Bag(x)) if fs.is_empty() => Ty::Bag(x.clone()),
         // A bag over 1..n is a tuple of counts (SetToBag({1}) = <<1>>)
