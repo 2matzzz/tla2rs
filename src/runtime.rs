@@ -302,7 +302,7 @@ fn bits(mut x: u128) -> impl Iterator<Item = u64> {
 #[inline]
 fn tla_div(a: i64, b: i64) -> i64 {
     if b == 0 {
-        eval_error("division by zero".into());
+        arith_error("The second argument of \\div is 0.".into());
     }
     let q = a / b;
     if a % b != 0 && ((a < 0) != (b < 0)) { q - 1 } else { q }
@@ -311,7 +311,7 @@ fn tla_div(a: i64, b: i64) -> i64 {
 #[inline]
 fn tla_mod(a: i64, b: i64) -> i64 {
     if b <= 0 {
-        eval_error(format!("The second argument of % should be a positive number, but instead it is: {b}"));
+        arith_error(format!("The second argument of % should be a positive number, but instead it is: {b}"));
     }
     a.rem_euclid(b)
 }
@@ -321,7 +321,10 @@ fn tla_mod(a: i64, b: i64) -> i64 {
 enum EvalErr {
     /// A value outside the type declared in TypeOK (a set element, a function argument, etc.).
     Type(String),
-    /// Anything else (no matching CASE arm, a non-positive right operand of %, etc.).
+    /// A failed arithmetic operation (`\div` by zero, `%` by a non-positive number). TLC exits
+    /// with a different code for these than for the other errors (see `eval_code`).
+    Arith(String),
+    /// Anything else (no matching CASE arm, a missing record field, etc.).
     Other(String),
 }
 
@@ -457,6 +460,11 @@ fn eval_error(msg: String) -> ! {
     std::panic::panic_any(EvalErr::Other(msg))
 }
 
+#[cold]
+fn arith_error(msg: String) -> ! {
+    std::panic::panic_any(EvalErr::Arith(msg))
+}
+
 fn describe_panic(p: Box<dyn std::any::Any + Send>) -> EvalErr {
     match p.downcast::<EvalErr>() {
         Ok(e) => *e,
@@ -467,12 +475,31 @@ fn describe_panic(p: Box<dyn std::any::Any + Send>) -> EvalErr {
     }
 }
 
-/// The exit code when stopping on an evaluation error. As in TLC, it is distinct from that of an
-/// invariant violation (12); it is 12 only when leaving the type is reported as a TypeOK violation.
+/// The exit code when stopping on an evaluation error while computing successors. TLC exits with
+/// 255 for a failed arithmetic operation and with 75 for the other errors. Leaving the type exits
+/// with 12 when it is reported as a TypeOK violation.
 fn eval_code(e: &EvalErr) -> i32 {
     match e {
         EvalErr::Type(_) if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) => 12,
-        _ => 255,
+        EvalErr::Type(_) | EvalErr::Arith(_) => 255,
+        EvalErr::Other(_) => 75,
+    }
+}
+
+/// The exit code for an evaluation error while computing or checking the initial states: TLC
+/// exits with 75 whatever the error.
+fn init_eval_code(e: &EvalErr) -> i32 {
+    match e {
+        EvalErr::Type(_) => eval_code(e),
+        _ => 75,
+    }
+}
+
+impl EvalErr {
+    fn msg(&self) -> &str {
+        match self {
+            EvalErr::Type(m) | EvalErr::Arith(m) | EvalErr::Other(m) => m,
+        }
     }
 }
 
@@ -490,7 +517,7 @@ fn report_eval(e: &EvalErr) {
             }
             println!("  ({m}; tla2rs cannot represent that state)");
         }
-        EvalErr::Other(m) => println!("Error: {m}"),
+        EvalErr::Arith(m) | EvalErr::Other(m) => println!("Error: {m}"),
     }
 }
 
@@ -537,6 +564,71 @@ fn check_invariants(s: &State) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// `check_invariants`, with an evaluation error returned along with the invariant that raised it.
+fn eval_invariants(s: &State) -> Result<Option<&'static str>, (&'static str, EvalErr)> {
+    match std::panic::catch_unwind(|| check_invariants(s)) {
+        Ok(v) => Ok(v),
+        // Evaluation is deterministic, so evaluating them one at a time again finds the one that
+        // failed.
+        Err(p) => {
+            for (name, f) in INVARIANTS {
+                match std::panic::catch_unwind(|| f(s)) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Some(name)),
+                    Err(p) => return Err((name, describe_panic(p))),
+                }
+            }
+            Err(("?", describe_panic(p)))
+        }
+    }
+}
+
+/// TLC checks the invariants on a successor that violates the CONSTRAINT too (every time it is
+/// generated; it is counted as generated but never added or explored). Returns what stops the
+/// search, if anything.
+fn check_out_of_model(t: &State) -> Option<SMsg> {
+    match eval_invariants(t) {
+        Ok(Some(inv)) => Some(SMsg::Inv(inv)),
+        Err((inv, e)) => Some(SMsg::InvEval(inv, e)),
+        // The type invariant is not evaluated at run time; packing checks the same thing.
+        Ok(None) if TYPE_INV_SUBSUMED && pack(t).is_none() => Some(SMsg::OutOfType),
+        Ok(None) => None,
+    }
+}
+
+/// Prints the message for a detected error and returns the exit code. `in_model` is false for a
+/// state outside the CONSTRAINT.
+fn report_msg(msg: &SMsg, in_model: bool) -> i32 {
+    match msg {
+        SMsg::Inv(inv) => {
+            println!("Error: Invariant {inv} is violated.");
+            12
+        }
+        SMsg::InvEval(inv, e) => {
+            println!("Error: Evaluating invariant {inv} failed.\n{}", e.msg());
+            // TLC's code for a failed invariant, except on a state outside the CONSTRAINT, where it
+            // is the code of the error itself
+            if in_model { 76 } else { eval_code(e) }
+        }
+        SMsg::Deadlock => {
+            println!("Error: Deadlock reached.");
+            11
+        }
+        SMsg::Action(name) => {
+            println!("Error: Action property {name} is violated.");
+            12
+        }
+        SMsg::Eval(e) => {
+            report_eval(e);
+            eval_code(e)
+        }
+        SMsg::OutOfType => {
+            report_eval(&EvalErr::Type("a variable".into()));
+            eval_code(&EvalErr::Type(String::new()))
+        }
+    }
 }
 
 /// The visited set, split into shards with a lock each. `at` follows each shard's table (address
@@ -589,14 +681,15 @@ impl Shards {
 }
 
 enum Found {
-    /// A newly found state violates an invariant (worker, index within the worker, invariant).
-    Inv(usize, usize, &'static str),
-    /// A successor leaves its type (parent, successor, label, violated invariant if any).
-    Type(u32, State, u32, Option<&'static str>),
+    /// A newly found state violates an invariant or fails to evaluate one (worker, index within
+    /// the worker, SMsg::Inv or SMsg::InvEval).
+    New(usize, usize, SMsg),
+    /// A successor that stops the search without being added: one that leaves its type, violates
+    /// [][A]_v, or is outside the CONSTRAINT and fails the invariants (parent, successor, label,
+    /// what, whether it satisfies the CONSTRAINT).
+    Succ(u32, State, u32, SMsg, bool),
     /// An evaluation error while expanding the parent state.
     Eval(u32, EvalErr),
-    /// [][A]_v is violated (parent, successor, label, property).
-    Action(u32, State, u32, &'static str),
     Deadlock(u32),
 }
 
@@ -634,9 +727,8 @@ fn expand_one(
     fps: &mut Vec<Vec<Fp>>,
 ) -> Option<Found> {
     let s = unpack(&g.states[head]);
-    buf.clear();
-    next(&s, buf);
-    if buf.is_empty() && check_deadlock {
+    let failed = successors(&s, buf);
+    if failed.is_none() && buf.is_empty() && check_deadlock {
         return Some(Found::Deadlock(head as u32));
     }
     // Liveness: for each WF instance, the targets (fingerprints) of its <<A>>_v steps and whether
@@ -668,17 +760,21 @@ fn expand_one(
     let sfp = if LIVENESS { state_fp(&s, &g.states[head]) } else { 0 };
     for &(t, l) in buf.iter() {
         c.generated += 1;
-        // Drop states that violate CONSTRAINT (as in TLC, they are not counted).
+        // States that violate CONSTRAINT are not added (as in TLC, they are not counted as
+        // distinct), but their invariants are checked.
         if !constraint(&t) {
+            if let Some(msg) = check_out_of_model(&t) {
+                return Some(Found::Succ(head as u32, t, l, msg, false));
+            }
             continue;
         }
         for (name, f) in ACTION_PROPS {
             if !f(&s, &t) {
-                return Some(Found::Action(head as u32, t, l, name));
+                return Some(Found::Succ(head as u32, t, l, SMsg::Action(name), true));
             }
         }
         let Some(w) = pack(&t) else {
-            return Some(Found::Type(head as u32, t, l, check_invariants(&t)));
+            return Some(Found::Succ(head as u32, t, l, pack_failed(0, t, l).msg, true));
         };
         let tfp = state_fp(&t, &w);
         if LIVENESS && tfp != sfp {
@@ -694,10 +790,15 @@ fn expand_one(
         if seen.insert(tfp) {
             c.states.push(w);
             c.parent.push((head as u32, l));
-            if let Some(inv) = check_invariants(&t) {
-                return Some(Found::Inv(me, c.states.len() - 1, inv));
+            match eval_invariants(&t) {
+                Ok(None) => {}
+                Ok(Some(inv)) => return Some(Found::New(me, c.states.len() - 1, SMsg::Inv(inv))),
+                Err((inv, e)) => return Some(Found::New(me, c.states.len() - 1, SMsg::InvEval(inv, e))),
             }
         }
+    }
+    if let Some(p) = failed {
+        std::panic::resume_unwind(p);
     }
     None
 }
@@ -937,44 +1038,64 @@ impl Iterator for Batches {
     }
 }
 
-/// Computes the initial states, checks them against the invariants and constraints, and returns
-/// them along with their fingerprints.
-fn initial_states() -> Vec<(State, Packed, Fp)> {
-    let mut inits = Vec::new();
-    if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))) {
-        let e = describe_panic(p);
+/// Computes the initial states and checks each one the way TLC does while generating them: every
+/// state counts as generated, one that satisfies the CONSTRAINT is kept if it is new, and the
+/// invariants are checked on the new ones and on those outside the CONSTRAINT. Returns the kept
+/// states with their fingerprints, and the number of states generated.
+fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
+    // TLC shows no behavior for an evaluation error in the initial states, only the counts so far.
+    fn stop(e: EvalErr, while_: &str, generated: u64, distinct: usize) -> ! {
         report_eval(&e);
-        println!("  (while computing the initial states)");
-        std::process::exit(eval_code(&e));
+        println!("  (while {while_})");
+        println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
+        std::process::exit(init_eval_code(&e));
     }
+    let mut inits = Vec::new();
+    // The states computed before an error are still checked first, as TLC checks each one as soon
+    // as it is generated.
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err();
     let mut out = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut generated = 0u64;
     for s in inits {
-        if !constraint(&s) {
-            continue;
-        }
-        let inv = match std::panic::catch_unwind(|| check_invariants(&s)) {
+        generated += 1;
+        let step = std::panic::catch_unwind(|| {
+            let in_model = constraint(&s);
+            let w = pack(&s);
+            let fp = w.filter(|_| in_model).map(|w| state_fp(&s, &w));
+            (in_model, w, fp)
+        });
+        let (in_model, w, fp) = match step {
             Ok(v) => v,
-            Err(p) => {
-                let e = describe_panic(p);
-                report_eval(&e);
-                println!("{}", show(&s));
-                std::process::exit(eval_code(&e));
-            }
+            Err(p) => stop(describe_panic(p), "checking an initial state", generated, out.len()),
         };
-        if let Some(inv) = inv {
-            println!("Error: Invariant {inv} is violated by the initial state:\n{}", show(&s));
-            std::process::exit(12);
+        if let (Some(w), Some(fp)) = (w, fp) {
+            if !seen.insert(fp) {
+                continue;
+            }
+            out.push((s, w, fp));
         }
-        let Some(w) = pack(&s) else {
+        match eval_invariants(&s) {
+            Ok(None) => {}
+            Ok(Some(inv)) => {
+                println!("Error: Invariant {inv} is violated by the initial state:\n{}", show(&s));
+                std::process::exit(12);
+            }
+            Err((inv, e)) => {
+                stop(e, &format!("evaluating invariant {inv} on an initial state"), generated, out.len())
+            }
+        }
+        if w.is_none() && (in_model || TYPE_INV_SUBSUMED) {
             let e = EvalErr::Type("an initial state".into());
             report_eval(&e);
             println!("{}", show(&s));
             std::process::exit(eval_code(&e));
-        };
-        let fp = state_fp(&s, &w);
-        out.push((s, w, fp));
+        }
     }
-    out
+    if let Some(p) = failed {
+        stop(describe_panic(p), "computing the initial states", generated, out.len());
+    }
+    (out, generated)
 }
 
 /// A detected error. The trace is shown by following fingerprints back from `fp`; if `extra` is
@@ -983,10 +1104,21 @@ struct SFound {
     fp: Fp,
     extra: Option<(State, u32)>,
     msg: SMsg,
+    /// False for a successor outside the CONSTRAINT (`extra`), which TLC does not count as
+    /// distinct.
+    in_model: bool,
+}
+
+impl SFound {
+    fn new(fp: Fp, extra: Option<(State, u32)>, msg: SMsg) -> Self {
+        SFound { fp, extra, msg, in_model: true }
+    }
 }
 
 enum SMsg {
     Inv(&'static str),
+    /// Evaluating an invariant failed.
+    InvEval(&'static str, EvalErr),
     Deadlock,
     Action(&'static str),
     Eval(EvalErr),
@@ -1032,11 +1164,26 @@ struct SChunk {
 /// A successor that does not fit the packed layout: an invariant it violates, else an out-of-type
 /// error
 fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
-    let msg = match check_invariants(&t) {
-        Some(inv) => SMsg::Inv(inv),
-        None => SMsg::OutOfType,
+    let msg = match eval_invariants(&t) {
+        Ok(Some(inv)) => SMsg::Inv(inv),
+        Err((inv, e)) => SMsg::InvEval(inv, e),
+        Ok(None) => SMsg::OutOfType,
     };
-    SFound { fp: sfp, extra: Some((t, l)), msg }
+    SFound::new(sfp, Some((t, l)), msg)
+}
+
+/// A successor outside the CONSTRAINT that stops the search (see `check_out_of_model`).
+fn out_of_model(sfp: Fp, t: &State, l: u32) -> Option<SFound> {
+    let msg = check_out_of_model(t)?;
+    Some(SFound { fp: sfp, extra: Some((*t, l)), msg, in_model: false })
+}
+
+/// Computes the successors of s into buf. If that fails, buf keeps the successors computed before
+/// the error, and the error is returned to be raised once they have been processed: TLC checks
+/// each successor as soon as it is generated, so those come first.
+fn successors(s: &State, buf: &mut Vec<(State, u32)>) -> Option<Box<dyn std::any::Any + Send>> {
+    buf.clear();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, buf))).err()
 }
 
 /// Per-thread working storage for `expand_safety_one`.
@@ -1052,11 +1199,10 @@ struct SWork {
 /// Expands a single state, pushing newly found states onto c.next.
 fn expand_safety_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
     let s = unpack(w);
-    ws.buf.clear();
     ws.cand.clear();
-    next(&s, &mut ws.buf);
-    if ws.buf.is_empty() && opt.check_deadlock {
-        return Some(SFound { fp: sfp, extra: None, msg: SMsg::Deadlock });
+    let failed = successors(&s, &mut ws.buf);
+    if failed.is_none() && ws.buf.is_empty() && opt.check_deadlock {
+        return Some(SFound::new(sfp, None, SMsg::Deadlock));
     }
     // All successors are fingerprinted before any is looked up, so that their table lines arrive
     // meanwhile. The successors are still reported on in order, as TLC does: an evaluation error in
@@ -1072,7 +1218,14 @@ fn expand_safety_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChu
         return found;
     }
     c.generated = examined;
-    stopped.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    match stopped {
+        Err(p) => std::panic::resume_unwind(p),
+        Ok(Some(f)) => Some(f),
+        Ok(None) => match failed {
+            Some(p) => std::panic::resume_unwind(p),
+            None => None,
+        },
+    }
 }
 
 /// Fills ws.cand with the successors in ws.buf that may be new and prefetches the table line of
@@ -1081,11 +1234,14 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
     for (i, &(ref t, l)) in ws.buf.iter().enumerate() {
         c.generated += 1;
         if !constraint(t) {
+            if let Some(f) = out_of_model(sfp, t, l) {
+                return Some(f);
+            }
             continue;
         }
         for (name, f) in ACTION_PROPS {
             if !f(s, t) {
-                return Some(SFound { fp: sfp, extra: Some((*t, l)), msg: SMsg::Action(name) });
+                return Some(SFound::new(sfp, Some((*t, l)), SMsg::Action(name)));
             }
         }
         // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
@@ -1123,8 +1279,10 @@ fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &SWo
             return Some(pack_failed(sfp, *t, *l));
         };
         c.distinct += 1;
-        if let Some(inv) = check_invariants(t) {
-            return Some(SFound { fp: tfp, extra: None, msg: SMsg::Inv(inv) });
+        match eval_invariants(t) {
+            Ok(None) => {}
+            Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
+            Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
         c.next.push((tw, tfp));
     }
@@ -1152,7 +1310,7 @@ fn expand_safety(
         }));
         let found = match r {
             Ok(f) => f,
-            Err(p) => Some(SFound { fp: *sfp, extra: None, msg: SMsg::Eval(describe_panic(p)) }),
+            Err(p) => Some(SFound::new(*sfp, None, SMsg::Eval(describe_panic(p)))),
         };
         if found.is_some() {
             c.found = found;
@@ -1199,13 +1357,13 @@ fn fp_chain(seen: &dyn Visited, target: Fp) -> Option<Vec<Fp>> {
 
 /// Rebuilds the actual states by replaying a sequence of fingerprints from an initial state.
 fn replay(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
-    let first = initial_states().into_iter().find(|(_, _, fp)| *fp == chain[0])?;
+    let first = initial_states().0.into_iter().find(|(_, _, fp)| *fp == chain[0])?;
     let mut out = vec![(first.0, u32::MAX)];
     let mut cur = first.0;
     let mut buf: Vec<(State, u32)> = vec![];
     for want in &chain[1..] {
-        buf.clear();
-        next(&cur, &mut buf);
+        // An error raised after the wanted successor was computed (see `successors`) is ignored.
+        let _ = successors(&cur, &mut buf);
         let hit = buf.iter().find_map(|&(t, l)| {
             let w = pack(&t)?;
             (state_fp(&t, &w) == *want).then_some((t, l))
@@ -1257,11 +1415,10 @@ fn report_trace(seen: &dyn Visited, f: &SFound) -> usize {
 fn run_safety(opt: &Opt) {
     let t0 = std::time::Instant::now();
     let seen = Shards::new(opt.keep_pred);
-    let mut generated: u64 = 0;
+    let (inits, mut generated) = initial_states();
     let mut frontier = Level::new(opt.mem_limit);
     let mut first = vec![];
-    for (_, w, fp) in initial_states() {
-        generated += 1;
+    for (_, w, fp) in inits {
         if seen.insert_with(fp, fp) {
             first.push((w, fp));
         }
@@ -1359,22 +1516,14 @@ fn merge_chunk(c: SChunk, generated: &mut u64, distinct: &mut u64, nxt: &mut Lev
 
 /// Reports a detected error and exits. Never returns.
 fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distinct: u64, left: usize) -> ! {
-    let code = match &f.msg {
-        SMsg::Deadlock => 11,
-        SMsg::Eval(e) => eval_code(e),
-        SMsg::OutOfType => eval_code(&EvalErr::Type(String::new())),
-        _ => 12,
-    };
-    match &f.msg {
-        SMsg::Inv(inv) => println!("Error: Invariant {inv} is violated."),
-        SMsg::Deadlock => println!("Error: Deadlock reached."),
-        SMsg::Action(name) => println!("Error: Action property {name} is violated."),
-        SMsg::Eval(e) => report_eval(e),
-        SMsg::OutOfType => report_eval(&EvalErr::Type("a variable".into())),
-    }
-    // As in TLC, a successor that left its type counts as one state.
+    let code = report_msg(&f.msg, f.in_model);
+    // As in TLC, a successor that left its type counts as one state, and so does a new successor
+    // that could not be packed (unless it is outside the CONSTRAINT).
     let pseudo = matches!(f.msg, SMsg::Eval(EvalErr::Type(_)));
-    if pseudo || matches!(f.msg, SMsg::OutOfType) || (f.extra.is_some() && matches!(f.msg, SMsg::Inv(_))) {
+    let unpacked = f.in_model
+        && (matches!(f.msg, SMsg::OutOfType)
+            || (f.extra.is_some() && matches!(f.msg, SMsg::Inv(_) | SMsg::InvEval(..))));
+    if pseudo || unpacked {
         distinct += 1;
     }
     if pseudo {
@@ -1715,42 +1864,46 @@ fn collect_phase(
         let (w, sfp) = &frontier[i];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let s = unpack(w);
-            buf.clear();
-            next(&s, &mut buf);
-            if buf.is_empty() && opt.check_deadlock {
-                return Some(SFound { fp: *sfp, extra: None, msg: SMsg::Deadlock });
+            let failed = successors(&s, &mut buf);
+            if failed.is_none() && buf.is_empty() && opt.check_deadlock {
+                return Some(SFound::new(*sfp, None, SMsg::Deadlock));
             }
             for &(t, l) in buf.iter() {
                 out.generated += 1;
                 if !constraint(&t) {
+                    if let Some(f) = out_of_model(*sfp, &t, l) {
+                        return Some(f);
+                    }
                     continue;
                 }
                 for (name, f) in ACTION_PROPS {
                     if !f(&s, &t) {
-                        return Some(SFound { fp: *sfp, extra: Some((t, l)), msg: SMsg::Action(name) });
+                        return Some(SFound::new(*sfp, Some((t, l)), SMsg::Action(name)));
                     }
                 }
                 let Some(tw) = pack(&t) else {
-                    let msg = match check_invariants(&t) {
-                        Some(inv) => SMsg::Inv(inv),
-                        None => SMsg::OutOfType,
-                    };
-                    return Some(SFound { fp: *sfp, extra: Some((t, l)), msg });
+                    return Some(pack_failed(*sfp, t, l));
                 };
                 let Some(tfp) = fresh_state_fp(&t, &tw, &mut mine) else { continue };
+                let inv = eval_invariants(&t);
                 out.parts[part_of(tfp, parts)].push(Cand { w: tw, fp: tfp, pred: *sfp });
                 // Stop generating once a violating state is found (so we stop at the same count as
                 // the non-batched path). This candidate also goes into the table in phase 3, so the
                 // counterexample can be traced back from its fingerprint.
-                if let Some(inv) = check_invariants(&t) {
-                    return Some(SFound { fp: tfp, extra: None, msg: SMsg::Inv(inv) });
+                match inv {
+                    Ok(None) => {}
+                    Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
+                    Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
                 }
+            }
+            if let Some(p) = failed {
+                std::panic::resume_unwind(p);
             }
             None
         }));
         let found = match r {
             Ok(f) => f,
-            Err(p) => Some(SFound { fp: *sfp, extra: None, msg: SMsg::Eval(describe_panic(p)) }),
+            Err(p) => Some(SFound::new(*sfp, None, SMsg::Eval(describe_panic(p)))),
         };
         if found.is_some() {
             out.found = found;
@@ -1815,16 +1968,14 @@ fn run_safety_batched(opt: &Opt) {
     if use_gpu {
         gpu_set_table(&tbl);
     }
-    let mut generated: u64 = 0;
     let mut frontier = Level::new(opt.mem_limit);
     let mut first = vec![];
-    let inits = initial_states();
+    let (inits, mut generated) = initial_states();
     tbl.reserve(inits.len(), opt.workers);
     if use_gpu {
         gpu_set_table(&tbl);
     }
     for (_, w, fp) in inits {
-        generated += 1;
         if tbl.insert_range(fp, fp, 0, SHARDS) {
             first.push((w, fp));
         }
@@ -2002,9 +2153,8 @@ fn run_liveness(opt: &Opt) {
     let t0 = std::time::Instant::now();
     let mut g = Graph { states: Vec::new(), parent: Vec::new() };
     let seen = Shards::new(false);
-    let mut generated: u64 = 0;
-    for (_, w, fp) in initial_states() {
-        generated += 1;
+    let (inits, mut generated) = initial_states();
+    for (_, w, fp) in inits {
         if seen.insert(fp) {
             g.states.push(w);
             g.parent.push((u32::MAX, u32::MAX));
@@ -2056,46 +2206,40 @@ fn run_liveness(opt: &Opt) {
         }
         if let Some((_, f)) = found {
             let mut distinct = g.states.len();
-            let code = match &f {
-                Found::Deadlock(_) => 11,
-                Found::Type(_, _, _, None) => eval_code(&EvalErr::Type(String::new())),
-                Found::Eval(_, e) => eval_code(e),
-                _ => 12,
-            };
-            match f {
-                Found::Inv(w, idx, inv) => {
-                    println!("Error: Invariant {inv} is violated.");
+            let code = match f {
+                Found::New(w, idx, msg) => {
+                    let code = report_msg(&msg, true);
                     g.print_trace((base[w] + idx) as u32, None);
+                    code
                 }
                 Found::Deadlock(id) => {
                     println!("Error: Deadlock reached.");
                     g.print_trace(id, None);
+                    11
                 }
-                Found::Type(p, t, l, inv) => {
-                    // The out-of-type state counts as one state too (to match TLC).
-                    distinct += 1;
-                    match inv {
-                        Some(inv) => println!("Error: Invariant {inv} is violated."),
-                        None => report_eval(&EvalErr::Type("a variable".into())),
+                Found::Succ(p, t, l, msg, in_model) => {
+                    // A new state that could not be packed counts as one state too (to match TLC).
+                    if in_model && !matches!(msg, SMsg::Action(_)) {
+                        distinct += 1;
                     }
+                    let code = report_msg(&msg, in_model);
                     g.print_trace(p, Some((&t, l)));
-                }
-                Found::Action(p, t, l, name) => {
-                    println!("Error: Action property {name} is violated.");
-                    g.print_trace(p, Some((&t, l)));
+                    code
                 }
                 Found::Eval(p, e) => {
-                    report_eval(&e);
+                    let pseudo = matches!(e, EvalErr::Type(_));
+                    let code = report_msg(&SMsg::Eval(e), true);
                     g.print_trace(p, None);
-                    if let EvalErr::Type(_) = e {
+                    if pseudo {
                         // As in TLC, the out-of-type successor counts as one state (its contents
                         // can't be represented).
                         generated += 1;
                         distinct += 1;
                         println!("State {}: <a successor that tla2rs cannot represent>\n", g.trace_len(p) + 1);
                     }
+                    code
                 }
-            }
+            };
             println!(
                 "{generated} states generated, {distinct} distinct states found, {} states left on queue.",
                 g.states.len() - lo
