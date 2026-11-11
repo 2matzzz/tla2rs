@@ -14,6 +14,8 @@ pub struct Parser {
     limits: Vec<Option<usize>>,
     /// Names declared RECURSIVE, and the operators recursive function definitions become
     recursive: Vec<String>,
+    /// Count of `<<x, y>> \in S` bound variables, for fresh names
+    tuple_binders: usize,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -32,7 +34,7 @@ fn tok_width(t: &Tok) -> usize {
 }
 
 pub fn parse_module(src: &str) -> R<Module> {
-    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![], recursive: vec![] };
+    let mut p = Parser { toks: lex(src)?, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0 };
     p.module()
 }
 
@@ -68,6 +70,7 @@ fn infix(t: &Tok) -> Option<(u8, bool, &'static str)> {
         "\\div" => (13, false, "\\div"),
         // In TLA+, % is 10-11 (looser than * and \div, and looser than unary -)
         "%" => (11, false, "%"),
+        "^" => (14, true, "^"),
         _ => return None,
     })
 }
@@ -114,6 +117,7 @@ fn bin(op: &str, a: Expr, b: Expr) -> Expr {
         "\\div" => BOp::Div,
         "%" => BOp::Mod,
         "\\o" => return Expr::Call("\\o".into(), vec![a, b]),
+        "^" => return Expr::Call("^".into(), vec![a, b]),
         _ => unreachable!(),
     };
     Expr::Bin(o, a.b(), b.b())
@@ -457,8 +461,42 @@ impl Parser {
     }
 
     fn binders(&mut self) -> R<Vec<(String, Expr)>> {
+        let (bs, lets) = self.binders_pat()?;
+        if !lets.is_empty() {
+            return self.err("a tuple of bound variables `<<x, y>> \\in S` is only supported after \\E, \\A, and in {e : ...}");
+        }
+        Ok(bs)
+    }
+
+    /// Bound variables `x, y \in S, <<a, b>> \in T`. A tuple of variables binds a fresh variable t
+    /// and returns the definitions `a == t[1]`, `b == t[2]` to wrap the body in.
+    fn binders_pat(&mut self) -> R<(Vec<(String, Expr)>, Vec<Def>)> {
         let mut out = vec![];
+        let mut lets = vec![];
         loop {
+            if self.is("<<") {
+                self.pos += 1;
+                let mut names = vec![self.ident()?];
+                while self.is(",") {
+                    self.pos += 1;
+                    names.push(self.ident()?);
+                }
+                self.expect(">>")?;
+                self.expect("\\in")?;
+                let s = self.expr(4)?;
+                self.tuple_binders += 1;
+                let t = format!("#tup{}", self.tuple_binders);
+                for (i, n) in names.into_iter().enumerate() {
+                    let body = Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b());
+                    lets.push(Def { name: n, params: vec![], arity: vec![], body });
+                }
+                out.push((t, s));
+                if self.is(",") {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
             let mut names = vec![self.ident()?];
             while self.is(",") {
                 self.pos += 1;
@@ -475,7 +513,7 @@ impl Parser {
                 break;
             }
         }
-        Ok(out)
+        Ok((out, lets))
     }
 
     fn prefix(&mut self) -> R<Expr> {
@@ -501,9 +539,10 @@ impl Parser {
             Tok::Sym(s) if s == "\\E" || s == "\\A" => {
                 let ex = s == "\\E";
                 self.pos += 1;
-                let bs = self.binders()?;
+                let (bs, lets) = self.binders_pat()?;
                 self.expect(":")?;
                 let body = self.expr(0)?;
+                let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
                 Ok(Expr::Quant(ex, bs, body.b()))
             }
             Tok::Ident(k) => match k.as_str() {
@@ -724,8 +763,9 @@ impl Parser {
                     return Ok(Expr::SetFilter(x.clone(), s.clone(), p.b()));
                 }
             }
-            let bs = self.binders()?;
+            let (bs, lets) = self.binders_pat()?;
             self.expect("}")?;
+            let first = if lets.is_empty() { first } else { Expr::Let(lets, first.b()) };
             return Ok(Expr::SetMap(first.b(), bs));
         }
         let mut v = vec![first];

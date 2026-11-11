@@ -47,6 +47,8 @@ pub struct Gen<'a> {
     tys: Vec<Ty>,
     ty_ids: HashMap<Ty, usize>,
     convs: BTreeSet<(usize, usize)>,
+    /// Whether `subsets_tlc` is used
+    need_subsets: bool,
     pub labels: Vec<String>,
     tmp: usize,
     /// Fairness instances
@@ -79,6 +81,7 @@ impl<'a> Gen<'a> {
             tys: vec![],
             ty_ids: HashMap::new(),
             convs: BTreeSet::new(),
+            need_subsets: false,
             labels: vec!["Init".into(), "Next".into()],
             tmp: 0,
             fair: vec![],
@@ -787,6 +790,56 @@ impl<'a> Gen<'a> {
                 }
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
+                ("IsFiniteSet", [s]) => {
+                    let (c, t) = self.gen(s, env, None)?;
+                    if !matches!(t, Ty::Set(_)) {
+                        return Err("IsFiniteSet of a non-set".into());
+                    }
+                    (format!("{{ let _ = {c}; true }}"), Ty::Bool)
+                }
+                ("Assert", [p, m]) => {
+                    let pc = self.gen_as(p, env, &Ty::Bool)?;
+                    let shown = match self.try_const(m, env) {
+                        Some(v) => crate::compile::show_value(self.atoms, &v),
+                        None => short(m),
+                    };
+                    let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
+                    (format!("(if {pc} {{ true }} else {{ eval_error({msg:?}.to_string()) }})"), Ty::Bool)
+                }
+                // Print and PrintT write to stderr (TLC prints to its output); the checker's verdict
+                // does not depend on them
+                ("PrintT", [x]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    let id = self.ty_id(&t)?;
+                    (format!("{{ eprintln!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
+                }
+                ("Print", [x, v]) => {
+                    let (c, t) = self.gen(x, env, None)?;
+                    let id = self.ty_id(&t)?;
+                    let (vc, vt) = self.gen(v, env, want)?;
+                    (format!("{{ eprintln!(\"{{}}\", fmt_{id}(&{c})); {vc} }}"), vt)
+                }
+                ("^", [a, b]) => {
+                    let (ac, (alo, ahi)) = self.gen_int(a, env)?;
+                    let (bc, (blo, bhi)) = self.gen_int(b, env)?;
+                    // Monotone in both arguments when both are natural numbers
+                    let t = match (alo >= 0, int_pow(alo, blo.max(0)), int_pow(ahi, bhi)) {
+                        (true, Some(lo), Some(hi)) if hi <= BIG => Ty::Int(if alo == 0 { 0 } else { lo }, hi.max(1)),
+                        _ => Ty::Int(-BIG, BIG),
+                    };
+                    (
+                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ eval_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => eval_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
+                        t,
+                    )
+                }
+                ("Cardinality", [s]) if matches!(s.strip(), Un(UOp::Subset, _)) && self.try_const(s, env).is_none() => {
+                    let Un(_, x) = s.strip() else { unreachable!() };
+                    let (c, t) = self.gen(x, env, None)?;
+                    let Ty::Set(el) = &t else { return Err("SUBSET of a non-set".into()) };
+                    let n = if is_sparse(&t) { self.scap as u32 } else { el.size().unwrap_or(0) as u32 };
+                    let hi = if n >= 62 { BIG } else { 1i64 << n };
+                    (format!("(1i64 << {})", self.s_card(&c, &t)), Ty::Int(1, hi))
+                }
                 ("Cardinality", [s]) => {
                     let (c, t) = self.gen(s, env, None)?;
                     let Ty::Set(el) = &t else { return Err("Cardinality of a non-set".into()) };
@@ -834,6 +887,54 @@ impl<'a> Gen<'a> {
                     parts.push(format!("{p} == s.v_{v}"));
                 }
                 (format!("({})", if parts.is_empty() { "true".into() } else { parts.join(" && ") }), Ty::Bool)
+            }
+            // UNION {e : x \in S} and UNION {A, B, ...}: the union of the sets as they are built
+            Un(UOp::Union, x) if matches!(x.strip(), SetMap(..) | SetLit(_)) => {
+                let we = want.cloned();
+                match x.strip() {
+                    SetMap(f, bs) => {
+                        let mut env2 = env.clone();
+                        let mut heads = vec![];
+                        for (x, s) in bs {
+                            let (it, et, ix) = self.iter_of_indexed(s, &env2)?;
+                            let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                            heads.push((it, lx));
+                        }
+                        let (fc, ft) = self.gen(f, &env2, we.as_ref())?;
+                        if !matches!(ft, Ty::Set(_)) {
+                            return Err("UNION of a set whose elements are not sets".into());
+                        }
+                        let st = Self::layout(we.as_ref(), ft.clone());
+                        let fc = self.coerce(fc, &ft, &st)?;
+                        let acc = self.fresh("acc");
+                        let mut body = format!("{acc} = {};", self.s_bin(BOp::Cup, &acc, &fc, &st));
+                        for (it, lx) in heads.into_iter().rev() {
+                            body = format!("for {lx} in {it} {{ {body} }}");
+                        }
+                        let empty = self.s_empty(&st)?;
+                        (format!("{{ let mut {acc} = {empty}; {body} {acc} }}"), st)
+                    }
+                    SetLit(xs) => {
+                        let mut parts = vec![];
+                        let mut t = Ty::Enum(vec![]);
+                        for x in xs {
+                            let (c, ct) = self.gen(x, env, we.as_ref())?;
+                            if !matches!(ct, Ty::Set(_)) {
+                                return Err("UNION of a set whose elements are not sets".into());
+                            }
+                            t = join(&t, &ct)?;
+                            parts.push((c, ct));
+                        }
+                        let st = Self::layout(we.as_ref(), t);
+                        let mut code = self.s_empty(&st)?;
+                        for (c, ct) in parts {
+                            let c = self.coerce(c, &ct, &st)?;
+                            code = self.s_bin(BOp::Cup, &code, &c, &st);
+                        }
+                        (code, st)
+                    }
+                    _ => unreachable!(),
+                }
             }
             Un(op, _) => return Err(format!("{op:?} is not supported here")),
             Bin(op, a, b) => self.gen_bin(*op, a, b, env, want)?,
@@ -1357,6 +1458,42 @@ impl<'a> Gen<'a> {
                 parts.push(self.lit(x, &et)?);
             }
             return Ok((format!("[{}].into_iter()", parts.join(", ")), *et, None));
+        }
+        // A product of sets that depend on the state, in TLC's order (the first element varies
+        // slowest)
+        if let Expr::Call(f, parts) = s {
+            if f == "\\X" {
+                let mut heads = vec![];
+                let mut tys = vec![];
+                let mut vals = vec![];
+                for part in parts {
+                    let (it, et, ix) = self.iter_of_indexed(part, env)?;
+                    let lx = self.fresh("x");
+                    let val = match ix {
+                        Some(_) => format!("dec_{}({lx})", self.ty_id(&et)?),
+                        None => lx.clone(),
+                    };
+                    heads.push((it, lx));
+                    vals.push(val);
+                    tys.push(et);
+                }
+                let tt = tuple_ty(tys)?;
+                let v = self.fresh("v");
+                let mut body = format!("{v}.push(({},));", vals.join(", "));
+                for (it, lx) in heads.into_iter().rev() {
+                    body = format!("for {lx} in {it} {{ {body} }}");
+                }
+                return Ok((format!("{{ let mut {v}: Vec<{}> = Vec::new(); {body} {v} }}.into_iter()", tt.repr()), tt, None));
+            }
+        }
+        // SUBSET of a set that depends on the state, in TLC's order (smaller subsets first)
+        if let Expr::Un(UOp::Subset, x) = s {
+            let (c, t) = self.gen(x, env, None)?;
+            if !matches!(t, Ty::Set(_)) || is_sparse(&t) {
+                return Err(format!("SUBSET of {t:?} that depends on the state is not supported"));
+            }
+            self.need_subsets = true;
+            return Ok((format!("subsets_tlc({c}).into_iter()"), t, None));
         }
         if let Expr::Bin(BOp::Range, a, b) = s {
             let (ac, (alo, _)) = self.gen_int(a, env)?;
@@ -2090,6 +2227,13 @@ impl<'a> Gen<'a> {
 
     pub fn helpers(&mut self) -> R<String> {
         let mut s = String::new();
+        if self.need_subsets {
+            // The subsets of a bitmask set in TLC's order: by size, then by their elements in order
+            // (the lowest element where two subsets differ belongs to the earlier one)
+            s += "fn subsets_tlc(m: u128) -> Vec<u128> { if m.count_ones() > 20 { eval_error(format!(\"SUBSET of a set of {} elements is too large to enumerate\", m.count_ones())) } \
+                  let mut v = vec![]; let mut sub = m; loop { v.push(sub); if sub == 0 { break; } sub = (sub - 1) & m; } \
+                  v.sort_by(|a, b| a.count_ones().cmp(&b.count_ones()).then_with(|| { let d = a ^ b; if d == 0 { std::cmp::Ordering::Equal } else if a & d & d.wrapping_neg() != 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } })); v }\n";
+        }
         // fmt is needed for every type reachable from the variables' types, so register those first
         for (_, t) in self.vars.clone() {
             self.ty_id(&t)?;

@@ -147,7 +147,31 @@ impl ConstEval<'_> {
             Label(_, _, b) => self.eval(b, env)?,
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("Cardinality", [s]) => Value::Int(self.eval(s, env)?.as_set()?.len() as i64),
-                ("IsFiniteSet", [_]) => Value::Bool(true),
+                ("IsFiniteSet", [s]) => {
+                    self.eval(s, env)?.as_set()?;
+                    Value::Bool(true)
+                }
+                ("^", [a, b]) => {
+                    let (a, b) = (self.eval(a, env)?.as_int()?, self.eval(b, env)?.as_int()?);
+                    if b < 0 {
+                        return Err(format!("{a}^{b}: the exponent must be a natural number"));
+                    }
+                    Value::Int(int_pow(a, b).ok_or(format!("{a}^{b} overflows"))?)
+                }
+                ("Assert", [p, m]) => {
+                    if !self.eval(p, env)?.as_bool()? {
+                        return Err(format!("The first argument of Assert evaluated to FALSE; the second argument was: {:?}", self.eval(m, env)?));
+                    }
+                    Value::Bool(true)
+                }
+                ("PrintT", [x]) => {
+                    self.eval(x, env)?;
+                    Value::Bool(true)
+                }
+                ("Print", [x, v]) => {
+                    self.eval(x, env)?;
+                    self.eval(v, env)?
+                }
                 ("\\X", parts) => {
                     let mut out: Vec<Vec<Value>> = vec![vec![]];
                     for s in parts {
@@ -528,6 +552,11 @@ impl ConstEval<'_> {
             }
         })
     }
+}
+
+/// a^b for b >= 0, or None on overflow
+pub fn int_pow(a: i64, b: i64) -> Option<i64> {
+    a.checked_pow(u32::try_from(b).ok()?)
 }
 
 /// TLA+ \div is floor division
