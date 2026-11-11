@@ -11,7 +11,7 @@ It has no crate dependencies.
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, and `-deadlock` are passed on to the
     generated checker, which also accepts them directly
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 309 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 420 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -88,6 +88,25 @@ compile time and numbers them after the others. Reproducing TLC is not possible 
 - With several workers the order depends on thread scheduling: CHOOSE over `{ToString(n) \o "w" : n \in 1..2000}`
   after the search created those strings gave `"4w"`, `"1w"`, `"2w"` and `"4w"` in four runs with `-workers 4`, and
   `"1w"` every time with one worker
+
+### How TLC reads SPECIFICATION
+
+Measured on TLC 2.19 (`tests/tlc/SpecConj*`, `SpecShape*`, `SpecInst*`, `RtSpec*`):
+
+- TLC splits the formula through conjunctions and definitions without arguments (also those of an instance, after
+  substitution), but not through LET, `\E`, labels or operators with arguments. A conjunct of level 0 or 1 belongs to
+  the initial predicate, `[][A]_v` gives the next-state action (a second one is refused, exit 151), and any other
+  temporal conjunct (`[]P`, `<>P`, `WF` inside `\/`, `RTnow(v)`, ...) is checked by nothing. When there are temporal
+  properties, TLC checks them under all those conjuncts (so `[](x < 3)` in the spec can make `<>[](x < 3)` hold), and a
+  property `[]P` with P a state predicate is still checked as an invariant on every state. `resolve_spec` follows this;
+  WF / SF conjuncts become conditions on the cycles, the others are conjoined to each property's negation (`live.rs`)
+- Without an initial predicate TLC stops (exit 151). Without a next-state action it stops (exit 151) if anything must
+  be checked on steps (an invariant, `[]P`, an action or temporal property); otherwise it computes and checks the
+  initial states and then stops with exit 75
+- An invariant or property of constant level is evaluated once before exploring; if it is not TRUE, TLC stops (exit
+  151). TLC also evaluates every definition of constant level without arguments when it starts, then the ASSUMEs, and
+  keeps the values: `Print` / `PrintT` in them print once, before anything else (`STARTUP_PRINTS`), and not when the
+  definition is used later
 
 ### Liveness counterexamples are not compared
 
