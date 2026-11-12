@@ -270,7 +270,8 @@ impl ConstEval<'_> {
                 }
                 ("Assert", [p, m]) => {
                     if !self.eval(p, env)?.as_bool()? {
-                        return Err(format!("The first argument of Assert evaluated to FALSE; the second argument was: {:?}", self.eval(m, env)?));
+                        let v = self.eval(m, env)?;
+                        return Err(format!("The first argument of Assert evaluated to FALSE; the second argument was:\n{}", crate::compile::show_value(self.atoms, &v)));
                     }
                     Value::Bool(true)
                 }

@@ -883,7 +883,8 @@ fn compile_inner(
     for d in &m.defs {
         let e = if d.params.is_empty() { ex.expand_def(&d.name).ok() } else { Some(d.body.clone()) };
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
-            let msg = format!("Error: {msg} (in {})\nError: Parsing or semantic analysis failed.", d.name);
+            // As SANY reports it, with the definition where SANY gives the position of the formula
+            let msg = format!("Semantic errors:\n\n*** Errors: 1\n\nin definition {}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.", d.name);
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)) });
         }
     }

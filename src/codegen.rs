@@ -495,7 +495,13 @@ impl<'a> Gen<'a> {
     fn fun_set_member(&mut self, x: &str, xt: &Ty, d: &Expr, r: &Expr, s: &Expr, env: &Env) -> R<String> {
         let not_fun = |g: &mut Self| -> R<String> {
             let tid = g.ty_id(xt)?;
-            let msg = format!("Attempted to check if \n{{}}\nwhich is not a TLC function value, is in the set of functions:\n{}", short(s));
+            // TLC prints the set of functions as its value
+            let set = match g.try_const(s, env) {
+                Some(v) => crate::compile::show_value(g.atoms, &v),
+                None => short(s),
+            };
+            let set = set.replace('{', "{{").replace('}', "}}");
+            let msg = format!("Attempted to check if \n{{}}\nwhich is not a TLC function value, is in the set of functions:\n{set}");
             Ok(format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{x}))); __b }}"))
         };
         let in_r = |g: &mut Self, v: &str, t: &Ty| -> R<String> {
@@ -1872,7 +1878,7 @@ impl<'a> Gen<'a> {
                     // As in TLC, fail only on evaluation (harmless if the branch is never reached)
                     None => {
                         let t = self.var_ty(n);
-                        (format!("{{ let __v: {} = eval_error(\"{n}' is read before the action determines it\".into()); __v }}", t.repr()), t)
+                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
                     }
                 },
                 x => {
@@ -1963,7 +1969,7 @@ impl<'a> Gen<'a> {
                         Some(v) => crate::compile::show_value(self.atoms, &v),
                         None => short(m),
                     };
-                    let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
+                    let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was:\n{shown}");
                     (format!("(if {pc} {{ true }} else {{ assert_error({msg:?}.to_string()) }})"), Ty::Bool)
                 }
                 // Print and PrintT write to stdout as TLC does, when the checker evaluates them
@@ -2308,7 +2314,19 @@ impl<'a> Gen<'a> {
                     let (qc, st) = self.as_seq(q, env, "SubSeq")?;
                     let (mc, _) = self.gen_int(m, env)?;
                     let (nc, _) = self.gen_int(n, env)?;
-                    (format!("({qc}).sub({mc}, {nc})"), st)
+                    // TLC's message shows the sequence and the index
+                    let id = self.ty_id(&st)?;
+                    let msg = |which: &str| format!("The {which} argument of SubSeq must be in the domain of its first argument:\n{{}}\n, but instead it is\n{{}}");
+                    (
+                        format!(
+                            "{{ let __q = {qc}; let (__m, __n): (i64, i64) = ({mc}, {nc}); if __m <= __n {{ \
+                             if __m < 1 || __m > __q.len as i64 {{ arith_error(format!({:?}, fmt_{id}(&__q), __m)) }} \
+                             if __n > __q.len as i64 {{ arith_error(format!({:?}, fmt_{id}(&__q), __n)) }} }} __q.sub(__m, __n) }}",
+                            msg("second"),
+                            msg("third")
+                        ),
+                        st,
+                    )
                 }
                 ("\\o", [a, b]) => {
                     let (ac, at) = self.gen(a, env, None)?;
@@ -2774,10 +2792,11 @@ impl<'a> Gen<'a> {
                             let c = self.coerce(format!("{r}{}", rec_field(fs.len(), k)), ft, &t)?;
                             write!(arms, "{} => {c}, ", k + 1).unwrap();
                         }
+                        // TLC's message shows the tuple
+                        let tid = self.ty_id(&ft)?;
                         return Ok((
                             format!(
-                                "{{ let {r} = {fc}; let {i}: i64 = {ic}; match {i} {{ {arms}_ => eval_error(format!(\"Attempted to apply a tuple of length {} to the index {{}}\", {i})) }} }}",
-                                fs.len()
+                                "{{ let {r} = {fc}; let {i}: i64 = {ic}; match {i} {{ {arms}_ => eval_error(format!(\"Attempted to apply tuple\\n{{}}\\nto integer {{}} which is out of domain.\", fmt_{tid}(&{r}), {i})) }} }}"
                             ),
                             t,
                         ));
@@ -5382,7 +5401,7 @@ impl<'a> Gen<'a> {
              // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\
              fn mixed_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
              if ai != bi {{ let at = if ai {{ b }} else {{ a }}; let n = if ai {{ a }} else {{ b }}; if IS_STR[(at - i64::MIN) as usize] {{ \
-             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer {{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
+             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
             names.len(),
             names.join(", "),
             strs.len(),

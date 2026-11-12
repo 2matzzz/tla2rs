@@ -322,7 +322,7 @@ fn tla_div(a: i64, b: i64) -> i64 {
 #[inline]
 fn tla_mod(a: i64, b: i64) -> i64 {
     if b <= 0 {
-        arith_error(format!("The second argument of % should be a positive number, but instead it is: {b}"));
+        arith_error(format!("The second argument of % should be a positive number, but instead it is:\n{b}"));
     }
     a.rem_euclid(b)
 }
