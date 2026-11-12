@@ -1,6 +1,8 @@
-key 2a07dbfe2a378320cce414b7fef6ded7b1e2f5e9cccc5aec4b796f0d7db02f2d
+key 4e0743bd4fe27b1c6a71248af7297d0e357cabcee819a92e8d375573d507620b
 tlc Version 2.19
 rc 12
 Invariant NotPair is violated
 30 states generated 27 distinct states found
 trace=3
+states 27 bf4d4cf34eb485a65125d967a6d180b12c2a1396d5756ae46d108f12851f5a26
+edges 29 16a7ed6339c24d55827cb8398ec77a0768d16f58c681c8cf75547c6ce4d4d73c

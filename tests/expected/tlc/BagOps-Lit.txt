@@ -1,6 +1,8 @@
-key 31770fbdfbde878a5670e527b2a42499724d1fa13eb16655272f93b0a9ade8e7
+key b78c10999a48054855725b1bcfa456c9b407ececa6d7f5e641fd397a7fd023e4
 tlc Version 2.19
 rc 76
 Evaluating invariant Lit failed
 4 states generated 3 distinct states found
 trace=3
+states 3 63f73a1bd721318a42f281b57c1de1fe3f525e729cca28e18292ca19d7801d00
+edges 4 72e3d534bb0a15bbc330d30ed0a1f66eceec811b12c6c10ffb6f0c0cb24f219f

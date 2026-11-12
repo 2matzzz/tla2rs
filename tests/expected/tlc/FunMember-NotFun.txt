@@ -1,6 +1,8 @@
-key bfca553258b57562029d2a9841d4e7a59e05f6d3835d959faf7ee6281687a077
+key 4eb5475d7413b29a0780ca9098157fc3be402205d1c63b1111410d7a353cd42a
 tlc Version 2.19
 rc 76
 Evaluating invariant NotFun failed
 4 states generated 4 distinct states found
 trace=2
+states 4 15a9b9d17651b84a42312e084bb8f513677e223809bf686f4fa00a76c2fee571
+edges 4 fc153d8a80d335cf22f8ca9a57b34d118e8085ed52fe4631f85b786cf5cf61d1

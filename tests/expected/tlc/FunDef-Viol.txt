@@ -1,6 +1,8 @@
-key 08127bf26d9cc11f3b17977f6962bab8fcf6e1a99bc258bc98514c74497df59c
+key 395af4e9d9a4f6f93a7ac3eab0ded4ad2485d9fa4ddf8e0a669935bf31855e83
 tlc Version 2.19
 rc 12
 Invariant Light is violated
 8 states generated 6 distinct states found
 trace=3
+states 6 f582fbb16b22195969a8617aed475df95018328a49be56187730acc5c4efc750
+edges 5 767938aa9a628fa9e84ca4e03e7adc2436074c32cc6714061b1242b39f090852

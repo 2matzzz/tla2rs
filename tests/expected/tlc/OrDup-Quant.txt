@@ -1,6 +1,8 @@
-key 07276a48f3a77c55729b67710d4051517858535d8c6fcb7786623bc35d65db47
+key bf66c32f8204420c17cce66815e83fbe75ec87ecdd3590f32b4617ea9cb6a0ae
 tlc Version 2.19
 rc 11
 Deadlock reached
 6 states generated 4 distinct states found
 trace=4
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29
