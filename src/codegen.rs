@@ -4844,6 +4844,8 @@ impl<'a> Gen<'a> {
                 Ty::Int(..) => "v.to_string()".into(),
                 Ty::Enum(_) => "ATOMS[*v as usize].to_string()".into(),
                 Ty::IntAtom(..) => "if *v < i64::MIN + 65536 { ATOMS[(*v - i64::MIN) as usize].to_string() } else { v.to_string() }".into(),
+                // The empty tuple (as TLC prints it)
+                Ty::Rec(fs) if fs.is_empty() => "\"<< >>\".to_string()".into(),
                 Ty::Rec(fs) if fs.iter().all(|(n, _)| n.starts_with('#')) => {
                     // Tuple
                     let mut parts = vec![];
