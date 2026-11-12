@@ -226,7 +226,8 @@ memory.
 generated and distinct state counts, the states left on TLC's queue when it stops at an error, the counterexample, exit code, the messages and printed lines, and the state
 graph: the set of states reached
 and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a SHA-256
-hash (with the variables of each state sorted, since TLC's order comes from a hash table). A safety counterexample is
+hash (each state with its variables in the order TLC prints them, which the checker follows: the order of SANY's
+hash table of the root module's names, replayed by tla2rs). A safety counterexample is
 compared step by step: each state and the action that led to it, as TLC names it (with one worker TLC's is the same
 on every run). A liveness counterexample depends on TLC's random fingerprint polynomial, so instead TLC is run on the
 spec `-lassocheck` writes, and must confirm that tla2rs's lasso is a fair behavior of the spec that violates the

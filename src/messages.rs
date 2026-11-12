@@ -24,7 +24,7 @@
 //!   error on, not what it is
 //! - A state printed after a message without a `State N:` line (`... is violated by the initial
 //!   state:`, `While working on the initial state:`) becomes one line in the canonical form of a
-//!   state (its variables sorted, as in `graph.rs`)
+//!   state (as in `graph.rs`)
 //!
 //! The error lines are the lines of the canonical text that start with `Error:`, except TLC's
 //! `Error: TLC was unable to fingerprint.`, a second error TLC reports after some failures while

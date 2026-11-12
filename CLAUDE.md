@@ -381,6 +381,24 @@ counts match TLC). Over a constant set or with constant arguments, tla2rs unroll
   `rec_action_fn`). In Init the function starts from the state under construction, whose assigned variables are all
   it reads of the variables (`RecInit`)
 
+### The order of variables
+
+TLC prints a state's variables in the order of `ModuleNode.getVariableDecls` of the root module: SANY's context of
+the module, a Java `Hashtable` keyed by name, enumerated and then reversed. `String.hashCode` is deterministic, so the
+order is too, and it depends only on the names and on how many names were in the table when each variable came, which
+decides when the table grew (11 slots, then 2n+1 once it holds three quarters; growing walks the old slots from the
+last and each chain from the front, and a new name goes to the front of its chain). Measured on SANY 2.19 with a
+dump of the context (a small Java program calling SANY's classes, not kept here): 72 built-in operators come first,
+then what each module in EXTENDS exports, in order and without repeats, then each statement of the module (a
+declaration, definition, theorem, named ASSUME, RECURSIVE declaration or nested module adds its name; `N == INSTANCE
+M` adds `N!d` for each definition d that M exports, then N; an unnamed INSTANCE adds the definitions M exports that
+are not there yet); a module exports all of these but the LOCAL ones. `sany::var_order` replays this, and the
+checker prints in that order (`Gen::print_order`; `tests/tlc/VarOrder*`, where 151 names grow the table to 383
+slots). The order agreed with SANY's on every root module of `examples/`, `tests/tlc/` and the corpus, and on 94
+generated modules (random names, 0 to 120 definitions, extended and instantiated modules). TLC lists the variables
+an action leaves unassigned in the order of their names instead (`VarOrder-Partial`). With VIEW and SYMMETRY the
+order also decides which permuted state is the smallest (see "VIEW and SYMMETRY together").
+
 ### State graphs
 
 Matching counts does not show that tla2rs reached the same states or took the same transitions, so the cross-check
@@ -411,9 +429,8 @@ The canonical form (`src/graph.rs`) is the sorted set of state texts, each marke
 set of edges as pairs of those texts; the expected file keeps `states N <sha256>` and `edges M <sha256>` of them,
 not the graphs. Reducing to it:
 
-- The `/\ var = value` lines of a state are sorted. TLC lists the variables in the order of a Java `Hashtable` of
-  SANY's symbols (`Context.getVariableDecls`, reversed by `ModuleNode`), which depends on the hash of every symbol
-  of the module and its extensions, not on the state
+- The `/\ var = value` lines of a state stay in the order printed, which a checker prints in TLC's order (see "The
+  order of variables")
 - `<<>>` is read as `<< >>`. TLC prints the empty function as `<<>>` when it is held as a function and as `<< >>`
   when it is held as a tuple, depending on the expression that built it (`DynDomain`, `NatDom`, `PartFuns`,
   `SparseFun`, ...)
@@ -440,7 +457,7 @@ are for the 483 configurations at the time of writing):
 A safety counterexample (invariant, action property, deadlock, an evaluation error with a behavior) is compared
 with TLC's as a whole: each step's first line, `State N: <Name line L, col C to line L2, col C2 of module M>`, and
 its state. `src/trace.rs` reduces both to that list, each state in the canonical form of the state graphs (its
-variables sorted, `<<>>` read as `<< >>`), and the expected file keeps `trace N <sha256>` of it.
+variables in the order printed, `<<>>` read as `<< >>`), and the expected file keeps `trace N <sha256>` of it.
 
 With one worker TLC's counterexample is deterministic: for all 186 configurations that have one, four runs (two with
 random fingerprint seeds, `-fp 1`, `-fp 50`) gave the same text. TLC rebuilds it from fingerprints, taking for each
@@ -506,7 +523,7 @@ counterexample. No configuration printed a Java stack trace. The rules:
 | TLC's evaluation stacks: `The error occurred when TLC was evaluating the nested expressions at the following positions:` with its numbered positions, and `Fingerprint Stack Trace:` with its frames | Dropped: deterministic, but they list TLC's own nested evaluations, which a checker that inlines every definition does not have |
 | SANY's parser stack (`Residual stack trace follows:` and its lines) and `tla2sany.semantic.AbortException` | Dropped (SANY's internals) |
 | `The exception was a java.lang.RuntimeException` and a Java class name before the message on the next line (`: tlc2.tool.EvalException: ...`) | The class lines are dropped and the message kept: they say how TLC passed the error on |
-| A state after a message (`... is violated by the initial state:`, `While working on the initial state:`) | One line, in the canonical form of a state (variables sorted) |
+| A state after a message (`... is violated by the initial state:`, `While working on the initial state:`) | One line, in the canonical form of a state |
 | Empty lines | Dropped |
 
 How TLC words an evaluation error depends on where it happens, measured on the `ErrCon*`, `EvalNext*`,

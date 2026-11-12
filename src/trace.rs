@@ -4,8 +4,8 @@
 //! A counterexample is a list of steps. Each starts with a line `State N: <Action line L, col C to
 //! line L2, col C2 of module M>` (`<Initial predicate>` for the first), `State N: Stuttering` or
 //! `Back to state N: <...>`, followed by the state as TLC prints it, up to an empty line. The state
-//! is reduced as in a state graph (`graph::canon_state_text`: its variables sorted, `<<>>` read as
-//! `<< >>`).
+//! is reduced as in a state graph (`graph::canon_state_text`: its variables in the order printed,
+//! `<<>>` read as `<< >>`).
 //!
 //! `tla2rs --trace FILE` prints `trace N <sha256>` (N is the number of `State N:` lines) or
 //! `trace 0`; `--trace-text FILE` prints the canonical form, two lines per step, for diffing.
