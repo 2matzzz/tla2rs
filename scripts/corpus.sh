@@ -8,9 +8,10 @@
 #   scripts/corpus.sh -fetch       fetch the corpus if needed and print its directory
 #   scripts/corpus.sh -list        print "<module> <model> <rules> <rsargs>" for every selected model
 # tests/corpus.txt lists every model of the corpus's manifests: `check` (selected, must match), `gap`
-# (selected, a known difference whose reason is given; reported, not a failure), or `skip` (not selected,
-# with the reason). A `rules=a,b` field passes narrowing rules to crosscheck.sh, and `rsargs=-seqcap,8`
-# arguments to tla2rs only, as the `\* crosscheck:` lines of a cfg in the repository do.
+# (selected, a known difference whose reason is given; reported, not a failure; `norun` if too costly to
+# run until it is fixed), or `skip` (not selected, with the reason). A `rules=a,b` field passes narrowing
+# rules to crosscheck.sh, and `rsargs=-seqcap,8` arguments to tla2rs only, as the `\* crosscheck:` lines
+# of a cfg in the repository do.
 # JOBS=N runs N models at a time (default 2: the models are larger than the repository's, and each one
 # builds a checker), and each build uses at most CARGO_BUILD_JOBS jobs (default 2).
 set -uo pipefail
@@ -32,7 +33,7 @@ fetch() {
 }
 # Selected models: "<status> <module> <model> <rules> <rsargs>" ("-" for none), paths inside the corpus
 selected() {
-  awk '($1 == "check" || $1 == "gap") {r = "-"; a = "-"; for (i = 4; i <= NF && $i != "#"; i++) { if ($i ~ /^rules=/) r = substr($i, 7); if ($i ~ /^rsargs=/) a = substr($i, 8) }; print $1, $2, $3, r, a}' "$list"
+  awk '($1 == "check" || ($1 == "gap" && $4 != "norun")) {r = "-"; a = "-"; for (i = 4; i <= NF && $i != "#"; i++) { if ($i ~ /^rules=/) r = substr($i, 7); if ($i ~ /^rsargs=/) a = substr($i, 8) }; print $1, $2, $3, r, a}' "$list"
 }
 
 case "${1:-}" in

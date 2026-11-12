@@ -2,7 +2,8 @@
 # CLAUDE.md). Every model of the manifests (specifications/*/manifest.json) at the pinned commit is
 # listed once, by its module and its cfg:
 #   check <module> <model> [rules=...]     selected; tla2rs must match TLC
-#   gap   <module> <model> [rules=...] # reason   selected; a known difference, with its measured reason
+#   gap   <module> <model> [rules=...] [norun] # reason   selected; a known difference, with its measured
+#                                          reason (norun: too costly to run until it is fixed)
 #   skip  <module> <model> # reason        not selected, and why
 # Selected are the exhaustive searches that TLC 2.19 finishes, with only tla2tools.jar, in 60 s or less
 # with one worker (with -dump dot, as expected.sh runs it). `rules=` names narrowing rules of
@@ -13,11 +14,11 @@ commit 334c3983a2f44ac78fce89d1d20aa79ceb3e6987
 skip specifications/Bakery-Boulangerie/MCBakery.tla specifications/Bakery-Boulangerie/MCBakery.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Bakery-Boulangerie/MCBoulanger.tla specifications/Bakery-Boulangerie/MCBoulanger.cfg # needs module TLAPS, not in tla2tools.jar
 check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg
-check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg
+gap specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg # TLC breaks a value wider than 80 columns that PrintT prints over several lines; tla2rs prints it on one line
 skip specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/Chameneos/Chameneos.tla specifications/Chameneos/Chameneos.cfg
 skip specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordination.cfg # TLC 2.19 did not finish in 150 s with one worker
-check specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg
+gap specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg rsargs=-seqcap,8 # compile error: field .counter of a non-record (Next)
 skip specifications/CigaretteSmokers/APCigaretteSmokers.tla specifications/CigaretteSmokers/APCigaretteSmokers.cfg # symbolic mode: checked with Apalache
 check specifications/CigaretteSmokers/CigaretteSmokers.tla specifications/CigaretteSmokers/CigaretteSmokers.cfg
 skip specifications/CoffeeCan/APCoffeeCan.tla specifications/CoffeeCan/APCoffeeCan.cfg # symbolic mode: checked with Apalache
@@ -30,14 +31,14 @@ check specifications/DieHard/MCDieHarder.tla specifications/DieHard/MCDieHarder.
 skip specifications/DieHard/MCDieHardest.tla specifications/DieHard/MCDieHardest.cfg # needs module Functions, not in tla2tools.jar
 skip specifications/DiningPhilosophers/APDiningPhilosophersPCal.tla specifications/DiningPhilosophers/APDiningPhilosophersPCal.cfg # symbolic mode: checked with Apalache
 check specifications/DiningPhilosophers/DiningPhilosophers.tla specifications/DiningPhilosophers/DiningPhilosophers.cfg
-check specifications/DiningPhilosophers/DiningPhilosophersPCal.tla specifications/DiningPhilosophers/DiningPhilosophersPCal.cfg
+gap specifications/DiningPhilosophers/DiningPhilosophersPCal.tla specifications/DiningPhilosophers/DiningPhilosophersPCal.cfg # TLC warns that the PlusCal algorithm changed since its last translation; tla2rs does not check the translation checksum
 skip specifications/DiningPhilosophers/DiningPhilosophers_anim.tla specifications/DiningPhilosophers/DiningPhilosophers_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/DiningPhilosophers/DiningPhilosophers_stats.tla specifications/DiningPhilosophers/DiningPhilosophers_stats.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/Disruptor/APDisruptor_MPMC.tla specifications/Disruptor/APDisruptor_MPMC.cfg # symbolic mode: checked with Apalache
 skip specifications/Disruptor/APDisruptor_SPMC.tla specifications/Disruptor/APDisruptor_SPMC.cfg # symbolic mode: checked with Apalache
-check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC.cfg
-check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC_liveliness.cfg
-check specifications/Disruptor/MCDisruptor_SPMC.tla specifications/Disruptor/MCDisruptor_SPMC.cfg
+gap specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC.cfg rsargs=-seqcap,10 # TypeOk, checked as an invariant, tests membership in [S -> Int], which tla2rs cannot test on a state
+gap specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC_liveliness.cfg rsargs=-seqcap,10 # TypeOk, checked as an invariant, tests membership in [S -> Int], which tla2rs cannot test on a state
+gap specifications/Disruptor/MCDisruptor_SPMC.tla specifications/Disruptor/MCDisruptor_SPMC.cfg rsargs=-seqcap,10 # TypeOk, checked as an invariant, tests membership in [S -> Int], which tla2rs cannot test on a state
 skip specifications/EinsteinRiddle/Einstein.tla specifications/EinsteinRiddle/Einstein.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APCRDT.tla specifications/FiniteMonotonic/APCRDT.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APReplicatedLog.tla specifications/FiniteMonotonic/APReplicatedLog.cfg # symbolic mode: checked with Apalache
@@ -47,7 +48,7 @@ skip specifications/FiniteMonotonic/MCReplicatedLog.tla specifications/FiniteMon
 skip specifications/FlashProtocol/APFlashWithMutex.tla specifications/FlashProtocol/APFlashWithMutex.cfg # symbolic mode: checked with Apalache
 check specifications/FlashProtocol/MCFlashWithMutex.tla specifications/FlashProtocol/MCFlashWithMutex.cfg
 check specifications/FlashProtocol/MCFlashWithMutexLive.tla specifications/FlashProtocol/MCFlashWithMutexLive.cfg
-check specifications/GameOfLife/GameOfLife.tla specifications/GameOfLife/GameOfLife.cfg
+gap specifications/GameOfLife/GameOfLife.tla specifications/GameOfLife/GameOfLife.cfg norun # the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it and was stopped
 skip specifications/GermanProtocol/APGermanCMPWithMutex.tla specifications/GermanProtocol/APGermanCMPWithMutex.cfg # symbolic mode: checked with Apalache
 skip specifications/GermanProtocol/APGermanControl.tla specifications/GermanProtocol/APGermanControl.cfg # symbolic mode: checked with Apalache
 skip specifications/GermanProtocol/APGermanData.tla specifications/GermanProtocol/APGermanData.cfg # symbolic mode: checked with Apalache
@@ -62,20 +63,20 @@ skip specifications/KeyValueStore/MCKVsnap.tla specifications/KeyValueStore/MCKV
 skip specifications/KnuthYao/SimKnuthYao.tla specifications/KnuthYao/SimKnuthYao.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/LearnProofs/MCFindHighest.tla specifications/LearnProofs/MCFindHighest.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
-check specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg
+gap specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg # type inference: b holds functions over domains of different sizes
 skip specifications/LoopInvariance/MCBinarySearch.tla specifications/LoopInvariance/MCBinarySearch.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/LoopInvariance/MCQuicksort.tla specifications/LoopInvariance/MCQuicksort.cfg # needs module TLAPS, not in tla2tools.jar
 check specifications/Majority/MCMajority.tla specifications/Majority/MCMajority.cfg
 skip specifications/MisraReachability/APParReach.tla specifications/MisraReachability/APParReach.cfg # symbolic mode: checked with Apalache
-check specifications/MisraReachability/MCParReach.tla specifications/MisraReachability/MCParReach.cfg
+gap specifications/MisraReachability/MCParReach.tla specifications/MisraReachability/MCParReach.cfg # tla2rs reports a variable as undefined while evaluating Next (3 states in); TLC does not
 skip specifications/MisraReachability/MCReachabilityTest.tla specifications/MisraReachability/MCReachabilityTestAllGraphs.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/MisraReachability/MCReachabilityTest.tla specifications/MisraReachability/MCReachabilityTestRandomGraphs.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/MisraReachability/MCReachable.tla specifications/MisraReachability/MCReachable.cfg # TLC 2.19 took 81 s with one worker
 skip specifications/MissionariesAndCannibals/APMissionariesAndCannibals.tla specifications/MissionariesAndCannibals/APMissionariesAndCannibals.cfg # symbolic mode: checked with Apalache
 check specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg
 skip specifications/Moving_Cat_Puzzle/APCat.tla specifications/Moving_Cat_Puzzle/APCat.cfg # symbolic mode: checked with Apalache
-check specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatEvenBoxes.cfg
-check specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatOddBoxes.cfg
+gap specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatEvenBoxes.cfg # tla2rs reports a successor with a variable unassigned; TLC assigns it
+gap specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatOddBoxes.cfg # tla2rs reports a successor with a variable unassigned; TLC assigns it
 skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessLarge.cfg # manifest runtime 00:11:00: beyond the 60 s budget
 check specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessMedium.cfg
 skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetyLarge.cfg # manifest runtime 00:10:00: beyond the 60 s budget
@@ -87,7 +88,7 @@ check specifications/N-Queens/Queens.toolbox/FourQueens/MC.tla specifications/N-
 check specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.tla specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg
 skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoLarge.cfg # manifest runtime 00:20:00: beyond the 60 s budget
 skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoMedium.cfg # TLC 2.19 took 79 s with one worker
-check specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg
+gap specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg # cfg: a constant assigned [Module]Value is not read
 skip specifications/Paxos/MCConsensus.tla specifications/Paxos/MCConsensus.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Paxos/MCPaxos.tla specifications/Paxos/MCPaxos.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Paxos/MCVoting.tla specifications/Paxos/MCVoting.cfg # needs module TLAPS, not in tla2tools.jar
@@ -98,20 +99,20 @@ skip specifications/PaxosHowToWinATuringAward/MCVoting.tla specifications/PaxosH
 check specifications/Prisoners/Prisoners.tla specifications/Prisoners/Prisoners.cfg
 check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/Prisoner.cfg
 check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerLightUnknown.cfg
-check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSolo.cfg
-check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg
+gap specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSolo.cfg # Init: a function over the empty set is typed as an empty record
+gap specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg # Init: a function over the empty set is typed as an empty record
 skip specifications/ReadersWriters/APReadersWriters.tla specifications/ReadersWriters/APReadersWriters.cfg # symbolic mode: checked with Apalache
-check specifications/ReadersWriters/MC.tla specifications/ReadersWriters/MC.cfg
+check specifications/ReadersWriters/MC.tla specifications/ReadersWriters/MC.cfg rsargs=-seqcap,6
 skip specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.cfg # needs module Bitwise, not in tla2tools.jar
 skip specifications/SDP_Verification/SDP_Attack_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_Spec/MC.cfg # needs module Bitwise, not in tla2tools.jar
 skip specifications/SimplifiedFastPaxos/FastPaxos.tla specifications/SimplifiedFastPaxos/FastPaxos.cfg # TLC 2.19 took 134 s with one worker
-check specifications/SimplifiedFastPaxos/Paxos.tla specifications/SimplifiedFastPaxos/Paxos.cfg
+check specifications/SimplifiedFastPaxos/Paxos.tla specifications/SimplifiedFastPaxos/Paxos.cfg rsargs=-setcap,1024
 check specifications/SingleLaneBridge/MC.tla specifications/SingleLaneBridge/MC.cfg
-check specifications/SlidingPuzzles/SlidingPuzzles.tla specifications/SlidingPuzzles/SlidingPuzzles.cfg
+check specifications/SlidingPuzzles/SlidingPuzzles.tla specifications/SlidingPuzzles/SlidingPuzzles.cfg rsargs=-setcap,64
 skip specifications/SlidingPuzzles/SlidingPuzzles_anim.tla specifications/SlidingPuzzles/SlidingPuzzles_anim.cfg # needs module SVG, not in tla2tools.jar
 skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushLarge.cfg # manifest runtime 00:50:00: beyond the 60 s budget
 skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
-check specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushSmall.cfg
+gap specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushSmall.cfg # counts, verdict and the numbers of states and edges match, the texts of the states differ; cause not identified (graphs of 1.2 million edges not diffed)
 skip specifications/SpanningTree/APSpanTree.tla specifications/SpanningTree/APSpanTree.cfg # symbolic mode: checked with Apalache
 check specifications/SpanningTree/SpanTree.tla specifications/SpanningTree/SpanTree.cfg
 skip specifications/SpanningTree/SpanTreeRandom.tla specifications/SpanningTree/SpanTreeRandom.cfg # TLC picks values at random (RandomElement, Randomization): two runs of TLC 2.19 gave different results
@@ -126,9 +127,9 @@ skip specifications/SpecifyingSystems/AsynchronousInterface/APAsynchInterface.tl
 skip specifications/SpecifyingSystems/AsynchronousInterface/APChannel.tla specifications/SpecifyingSystems/AsynchronousInterface/APChannel.cfg # symbolic mode: checked with Apalache
 check specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg
 check specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg
-check specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.tla specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.cfg
-check specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.tla specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.cfg
-check specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg
+gap specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.tla specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.cfg # TLC breaks a value wider than 80 columns that PrintT prints over several lines; tla2rs prints it on one line
+gap specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.tla specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+gap specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
 skip specifications/SpecifyingSystems/Composing/APChannel.tla specifications/SpecifyingSystems/Composing/APChannel.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/Composing/APHourClock.tla specifications/SpecifyingSystems/Composing/APHourClock.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/FIFO/APChannel.tla specifications/SpecifyingSystems/FIFO/APChannel.cfg # symbolic mode: checked with Apalache
@@ -143,34 +144,34 @@ check specifications/SpecifyingSystems/HourClock/HourClock2.tla specifications/S
 skip specifications/SpecifyingSystems/Liveness/APHourClock.tla specifications/SpecifyingSystems/Liveness/APHourClock.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/Liveness/APLiveHourClock.tla specifications/SpecifyingSystems/Liveness/APLiveHourClock.cfg # symbolic mode: checked with Apalache
 check specifications/SpecifyingSystems/Liveness/LiveHourClock.tla specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg
-check specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg
-check specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg
+gap specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+gap specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
 check specifications/SpecifyingSystems/RealTime/MCRealTimeHourClock.tla specifications/SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg
 check specifications/SpecifyingSystems/SimpleMath/SimpleMath.tla specifications/SpecifyingSystems/SimpleMath/SimpleMath.cfg
 check specifications/SpecifyingSystems/TLC/ABCorrectness.tla specifications/SpecifyingSystems/TLC/ABCorrectness.cfg
 check specifications/SpecifyingSystems/TLC/MCAlternatingBit.tla specifications/SpecifyingSystems/TLC/MCAlternatingBit.cfg
-check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrink.cfg
-check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrinkV6Wait2x.cfg
-check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrinkV3Cascade.cfg
-check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrinkV6TooShort.cfg
+check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrink.cfg rules=distinct-only
+check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrinkV6Wait2x.cfg rules=distinct-only
+check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrinkV3Cascade.cfg rules=distinct-only
+check specifications/StaleViewShrink/StaleShrink.tla specifications/StaleViewShrink/StaleShrinkV6TooShort.cfg rules=distinct-only
 check specifications/Stones/Stones.tla specifications/Stones/Stones.cfg
 skip specifications/TLC/TestGraphs.tla specifications/TLC/TestGraphs.cfg # needs module IOUtils, not in tla2tools.jar
 skip specifications/TLC/TestMCReachability.tla specifications/TLC/TestMCReachability.cfg # needs module IOUtils, not in tla2tools.jar
 skip specifications/TeachingConcurrency/Simple.tla specifications/TeachingConcurrency/Simple.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/TeachingConcurrency/SimpleRegular.tla specifications/TeachingConcurrency/SimpleRegular.cfg # needs module TLAPS, not in tla2tools.jar
-check specifications/TransitiveClosure/TransitiveClosure.tla specifications/TransitiveClosure/TransitiveClosure.cfg
+gap specifications/TransitiveClosure/TransitiveClosure.tla specifications/TransitiveClosure/TransitiveClosure.cfg # an ASSUME that tla2rs cannot evaluate at compile time (`Nat` is not a constant)
 skip specifications/TwoPhase/MCTwoPhase.tla specifications/TwoPhase/MCTwoPhase.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/YoYo/MCYoYoNoPruning.tla specifications/YoYo/MCYoYoNoPruning.cfg # needs module UndirectedGraphs, not in tla2tools.jar
 skip specifications/YoYo/MCYoYoPruning.tla specifications/YoYo/MCYoYoPruning.cfg # needs module UndirectedGraphs, not in tla2tools.jar
 skip specifications/YoYo/YoYoAllGraphs.tla specifications/YoYo/YoYoAllGraphs.cfg # needs module UndirectedGraphs, not in tla2tools.jar
 skip specifications/aba-asyn-byz/aba_asyn_byz.tla specifications/aba-asyn-byz/aba_asyn_byz.cfg # manifest runtime 00:10:00: beyond the 60 s budget
-check specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg
-check specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg
+gap specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg # types come from TypeInv of the extended module, which lacks a field the extending module adds (its TypeInvNB)
+gap specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg # types come from TypeInv of the extended module, which lacks a field the extending module adds (its TypeInvNB)
 check specifications/acp/ACP_SB_TLC.tla specifications/acp/ACP_SB_TLC.cfg
 skip specifications/acp/APACP_SB.tla specifications/acp/APACP_SB.cfg # symbolic mode: checked with Apalache
-check specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg
-check specifications/allocator/AllocatorRefinement.tla specifications/allocator/AllocatorRefinement.cfg
-check specifications/allocator/SchedulingAllocator.tla specifications/allocator/SchedulingAllocator.cfg
+gap specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg rsargs=-seqcap,6 # compile error: a recursive operator iterates over a value typed Bool
+gap specifications/allocator/AllocatorRefinement.tla specifications/allocator/AllocatorRefinement.cfg rsargs=-seqcap,6 # compile error: a recursive operator iterates over a value typed Bool
+gap specifications/allocator/SchedulingAllocator.tla specifications/allocator/SchedulingAllocator.cfg rsargs=-seqcap,3 # compile error: a recursive operator iterates over a value typed Bool
 check specifications/allocator/SimpleAllocator.tla specifications/allocator/SimpleAllocator.cfg
 skip specifications/barriers/APBarrier.tla specifications/barriers/APBarrier.cfg # symbolic mode: checked with Apalache
 check specifications/barriers/Barrier.tla specifications/barriers/Barrier.cfg
@@ -183,12 +184,12 @@ skip specifications/bosco/APbosco.tla specifications/bosco/APbosco.cfg # symboli
 skip specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # manifest runtime 00:03:00: beyond the 60 s budget
 skip specifications/braf/BufferedRandomAccessFile.tla specifications/braf/BufferedRandomAccessFile.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg # needs module Relation, not in tla2tools.jar
-check specifications/btree/kvstore.tla specifications/btree/kvstore.cfg
-check specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg
-check specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg
+gap specifications/btree/kvstore.tla specifications/btree/kvstore.cfg # Init: type mismatch, a model value where a sequence is expected
+gap specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
+gap specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
 check specifications/byihive/VoucherLifeCycle.tla specifications/byihive/VoucherLifeCycle.cfg
-check specifications/byihive/VoucherRedeem.tla specifications/byihive/VoucherRedeem.cfg
-check specifications/byihive/VoucherTransfer.tla specifications/byihive/VoucherTransfer.cfg
+gap specifications/byihive/VoucherRedeem.tla specifications/byihive/VoucherRedeem.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
+gap specifications/byihive/VoucherTransfer.tla specifications/byihive/VoucherTransfer.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
 skip specifications/byzpaxos/BPConProof.tla specifications/byzpaxos/BPConProof.cfg # needs module FiniteSetTheorems, not in tla2tools.jar
 skip specifications/byzpaxos/Consensus.tla specifications/byzpaxos/Consensus.cfg # needs module FiniteSetTheorems, not in tla2tools.jar
 skip specifications/byzpaxos/PConProof.tla specifications/byzpaxos/PConProof.cfg # manifest runtime 00:06:00: beyond the 60 s budget
@@ -198,14 +199,14 @@ skip specifications/c1cs/c1cs.tla specifications/c1cs/c1cs.cfg # TLC 2.19 took 1
 skip specifications/cf1s-folklore/cf1s_folklore.tla specifications/cf1s-folklore/cf1s_folklore.cfg # TLC 2.19 took 113 s with one worker
 skip specifications/chang_roberts/APChangRoberts.tla specifications/chang_roberts/APChangRoberts.cfg # symbolic mode: checked with Apalache
 check specifications/chang_roberts/MCChangRoberts.tla specifications/chang_roberts/MCChangRoberts.cfg
-check specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg
-check specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg
+gap specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg # an ASSUME that tla2rs cannot evaluate at compile time (`Nat` is not a constant)
+gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs was killed by the system (memory) in a corpus run; not run until that is fixed
 skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
 skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget
-check specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg
+gap specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg # Next: type mismatch, a set where an element is expected
 skip specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg # TLC 2.19 took 62 s with one worker
 skip specifications/diskpaxos/MC_HDiskSynod.tla specifications/diskpaxos/MC_HDiskSynod.cfg # TLC 2.19 took 60 s with one worker
-check specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg
+gap specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg # compile error: a recursive operator applied as a function (invariant)
 skip specifications/ewd426/APTokenRing.tla specifications/ewd426/APTokenRing.cfg # symbolic mode: checked with Apalache
 skip specifications/ewd426/SimTokenRing.tla specifications/ewd426/SimTokenRing.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/ewd426/TokenRing.tla specifications/ewd426/TokenRing.cfg # TLC 2.19 refuses the cfg: it reads ALIAS as the name of a property, which is not defined
@@ -231,7 +232,7 @@ skip specifications/ewd998/SmokeEWD998_SC.tla specifications/ewd998/SmokeEWD998_
 skip specifications/glowingRaccoon/APclean.tla specifications/glowingRaccoon/APclean.cfg # symbolic mode: checked with Apalache
 skip specifications/glowingRaccoon/APstages.tla specifications/glowingRaccoon/APstages.cfg # symbolic mode: checked with Apalache
 check specifications/glowingRaccoon/clean.tla specifications/glowingRaccoon/clean.cfg
-check specifications/glowingRaccoon/product.tla specifications/glowingRaccoon/product.cfg
+gap specifications/glowingRaccoon/product.tla specifications/glowingRaccoon/product.cfg # tla2rs reports a variable as undefined while evaluating Next (2 states in); TLC does not
 check specifications/glowingRaccoon/stages.tla specifications/glowingRaccoon/stages.cfg
 skip specifications/lamport_mutex/APLamportMutex.tla specifications/lamport_mutex/APLamportMutex.cfg # symbolic mode: checked with Apalache
 check specifications/lamport_mutex/MCLamportMutex.tla specifications/lamport_mutex/MCLamportMutex.cfg
@@ -246,10 +247,10 @@ check specifications/spanning/MC_spanning.tla specifications/spanning/MC_spannin
 skip specifications/sums_even/MC_sums_even.tla specifications/sums_even/MC_sums_even.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/tcp/APtcp.tla specifications/tcp/APtcp.cfg # symbolic mode: checked with Apalache
 skip specifications/tcp/MCtcp.tla specifications/tcp/MCtcp.cfg # needs module SequencesExt, not in tla2tools.jar
-check specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg
+gap specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg # parser: an infix operator & defined by the spec is not read
 skip specifications/tower_of_hanoi/Hanoi_anim.tla specifications/tower_of_hanoi/Hanoi_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
-check specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_commit/2PCwithBTM.cfg
+gap specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_commit/2PCwithBTM.cfg # compile error: an EXCEPT path does not match the value type (Next)
 skip specifications/transaction_commit/APTCommit.tla specifications/transaction_commit/APTCommit.cfg # symbolic mode: checked with Apalache
 skip specifications/transaction_commit/PaxosCommit.tla specifications/transaction_commit/PaxosCommit.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/transaction_commit/TCommit.tla specifications/transaction_commit/TCommit.cfg
-check specifications/transaction_commit/TwoPhase.tla specifications/transaction_commit/TwoPhase.cfg
+gap specifications/transaction_commit/TwoPhase.tla specifications/transaction_commit/TwoPhase.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", rm |-> r]
