@@ -13,7 +13,8 @@
 //! its definitions and RECURSIVE declarations), since SANY's context, and with it the order TLC
 //! prints variables in, depends on them (see `sany::var_order`). The operators listed in
 //! `UNSUPPORTED` are refused when used: TLC 2.19 cannot evaluate them without their Java overrides
-//! (they enumerate `Seq(S)`), or they are not written yet.
+//! (they enumerate `Seq(S)`). The modules not here (files, commands, reals, animation) are listed
+//! with the reason in CLAUDE.md, "CommunityModules".
 
 /// The source of each module, by name
 pub fn source(name: &str) -> Option<&'static str> {
@@ -27,6 +28,11 @@ pub fn source(name: &str) -> Option<&'static str> {
         "Relation" => RELATION,
         "BagsExt" => BAGS_EXT,
         "Graphs" => GRAPHS,
+        "Combinatorics" => COMBINATORICS,
+        "Statistics" => STATISTICS,
+        "GraphViz" => GRAPH_VIZ,
+        "DyadicRationals" => DYADIC_RATIONALS,
+        "VectorClocks" => VECTOR_CLOCKS,
         _ => return None,
     })
 }
@@ -333,5 +339,69 @@ Roots(G) == {n \in G.node : \A m \in G.node : <<m, n>> \notin G.edge}
 Leaves(G) == {n \in G.node : \A m \in G.node : <<n, m>> \notin G.edge}
 EmptyGraph == [node |-> {}, edge |-> {}]
 Graphs(S) == [node : {S}, edge : SUBSET (S \X S)]
+====
+"#;
+
+/// `factorial` is a function over Nat, applied where it is used
+const COMBINATORICS: &str = r#"
+---- MODULE Combinatorics ----
+EXTENDS Naturals
+factorial[n \in Nat] == IF n > 0 THEN n * factorial[n - 1] ELSE 1
+choose(n, k) == factorial[n] \div (factorial[n - k] * factorial[k])
+====
+"#;
+
+/// The module's definition is TRUE (the test is its Java override, which TLC 2.19 does not load)
+const STATISTICS: &str = r#"
+---- MODULE Statistics ----
+EXTENDS Naturals
+ChiSquare(expected, actual, alpha) == TRUE
+====
+"#;
+
+/// The module's definition is TRUE (the drawing is its Java override, which TLC 2.19 does not load)
+const GRAPH_VIZ: &str = r#"
+---- MODULE GraphViz ----
+DotDiGraph(G, VL(_), EL(_)) == TRUE
+====
+"#;
+
+/// Rationals `[num |-> n, den |-> d]` whose denominator is a power of two. Reducing takes the
+/// greatest common divisor among 1..num, so a numerator of 0 or less is an evaluation error, as in
+/// the module's definition
+const DYADIC_RATIONALS: &str = r#"
+---- MODULE DyadicRationals ----
+LOCAL INSTANCE Integers
+LOCAL INSTANCE Sequences
+LOCAL INSTANCE TLC
+LOCAL Gcd(a, b) ==
+  LET Common == {d \in (1..a) \cap (1..b) : a % d = 0 /\ b % d = 0} IN CHOOSE d \in Common : \A e \in Common : e <= d
+LOCAL Lowest(p) ==
+  LET g == Gcd(p.num, p.den) IN IF g = 1 THEN p ELSE [num |-> p.num \div g, den |-> p.den \div g]
+IsDyadicRational(r) == \E k \in 0..r.den : 2^k = r.den
+Zero == [num |-> 0, den |-> 1]
+One == [num |-> 1, den |-> 1]
+Add(p, q) ==
+  IF p = Zero THEN q
+  ELSE LET d == IF p.den < q.den THEN q.den ELSE p.den
+       IN Lowest([num |-> q.num * (d \div q.den) + p.num * (d \div p.den), den |-> d])
+Half(p) == Lowest([num |-> p.num, den |-> 2 * p.den])
+PrettyPrint(p) == CASE p = Zero -> "0" [] p = One -> "1" [] OTHER -> ToString(p.num) \o "/" \o ToString(p.den)
+====
+"#;
+
+/// Vector clocks: functions from nodes to counters, a missing node counting 0
+const VECTOR_CLOCKS: &str = r#"
+---- MODULE VectorClocks ----
+EXTENDS Naturals, Sequences, Functions
+LOCAL Before(a, b, D) == (\A d \in D : a[d] <= b[d]) /\ \E d \in D : a[d] < b[d]
+LOCAL Apart(a, b, D) == \E d, e \in D : d # e /\ a[d] < b[d] /\ a[e] > b[e]
+IsCausalOrder(log, clock(_)) ==
+  \A i \in 1..Len(log) : \A j \in 1..i - 1 :
+    LET D == DOMAIN clock(log[i]) \cup DOMAIN clock(log[j])
+        Full(c) == [d \in D |-> IF d \in DOMAIN c THEN c[d] ELSE 0]
+    IN Before(Full(clock(log[j])), Full(clock(log[i])), D) \/ Apart(Full(clock(log[j])), Full(clock(log[i])), D)
+CausalOrder(log, clock(_), node(_), domain(_)) ==
+  CHOOSE f \in {g \in [1..Len(log) -> Range(log)] : Range(g) = Range(log)} : IsCausalOrder(f, clock)
 ====
 "#;
