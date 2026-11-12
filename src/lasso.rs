@@ -142,7 +142,7 @@ pub fn tla(e: &Expr) -> Result<String, String> {
         BoxAction(a, v) => format!("[{}]_{}", tla(a)?, sub(v)?),
         Fair(w, v, a) => format!("{}_{}({})", if *w { "WF" } else { "SF" }, sub(v)?, tla(a)?),
         // Labels change nothing in what a formula means
-        Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() || n.ends_with("::") || n.starts_with(crate::ast::SUBVAR) || n == crate::ast::ENINST => tla(b)?,
+        Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() || n.ends_with("::") || n.starts_with(crate::ast::SUBVAR) || n.starts_with(crate::ast::FN) || n == crate::ast::ENINST => tla(b)?,
         Label(n, _, b) if n == crate::parser::INFIX_JUNCTION => tla(b)?,
         _ => return Err(format!("cannot write out {}", crate::codegen::short(e))),
     })

@@ -965,7 +965,7 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
     let lines = PRINTED.with(|p| p.borrow_mut().take()).unwrap_or_default();
     for l in lines {
         // TLC pretty-prints each value printed (80 columns)
-        out.push(l.iter().map(|v| crate::ppr::ppr(&show_value(ce.atoms, v))).collect::<Vec<_>>().join("  "));
+        out.push(l.iter().map(|v| crate::ppr::ppr(v)).collect::<Vec<_>>().join("  "));
     }
     r
 }

@@ -173,12 +173,13 @@ pub const REC_STACK_BYTES: usize = 1 << 20;
 
 thread_local! {
     static REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// While set, what Print and PrintT print: one line each, as the values printed on it (TLC
-    /// prints those of the constant definitions and ASSUMEs when it starts)
-    pub static PRINTED: std::cell::RefCell<Option<Vec<Vec<Value>>>> = const { std::cell::RefCell::new(None) };
+    /// While set, what Print and PrintT print: one line each, as the values printed on it, each
+    /// as TLC prints it before pretty-printing (TLC prints those of the constant definitions and
+    /// ASSUMEs when it starts)
+    pub static PRINTED: std::cell::RefCell<Option<Vec<Vec<String>>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn record_print(line: Vec<Value>) {
+fn record_print(line: Vec<String>) {
     PRINTED.with(|p| {
         if let Some(v) = p.borrow_mut().as_mut() {
             v.push(line);
@@ -244,6 +245,40 @@ pub struct ConstEval<'a> {
 }
 
 impl ConstEval<'_> {
+    /// How TLC prints `f` when it is a function over a set TLC cannot enumerate (see
+    /// `codegen::lazy_fun_string`), else None
+    fn lazy_fun_shown(&self, f: &Expr, env: &HashMap<String, Value>) -> Option<String> {
+        fn dom(e: &Expr) -> Option<&Expr> {
+            match e {
+                Expr::Label(_, _, b) | Expr::Except(b, _) => dom(b),
+                Expr::FunCons(_, d, _) => Some(d),
+                _ => None,
+            }
+        }
+        if self.eval(dom(f)?, env).is_ok() {
+            return None;
+        }
+        crate::codegen::lazy_fun_string(f, &mut |p| self.lazy_set_shown(p, env))
+    }
+
+    fn lazy_set_shown(&self, s: &Expr, env: &HashMap<String, Value>) -> Option<String> {
+        match s.strip() {
+            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
+                Some(n.clone())
+            }
+            Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Some(format!("Seq({})", self.lazy_set_shown(&a[0], env)?)),
+            Expr::Call(f, parts) if f == "\\X" => {
+                let ps: Vec<String> = parts.iter().map(|p| self.lazy_set_shown(p, env)).collect::<Option<_>>()?;
+                Some(format!("({})", ps.join(" \\X ")))
+            }
+            Expr::Bin(BOp::Range, a, b) => match (self.eval(a, env).ok()?, self.eval(b, env).ok()?) {
+                (Value::Int(a), Value::Int(b)) => Some(format!("{a}..{b}")),
+                _ => None,
+            },
+            s => Some(crate::compile::show_value(self.atoms, &self.eval(s, env).ok()?)),
+        }
+    }
+
     pub fn eval(&self, e: &Expr, env: &HashMap<String, Value>) -> R<Value> {
         use Expr::*;
         Ok(match e {
@@ -368,6 +403,10 @@ impl ConstEval<'_> {
                         _ => return Err(format!("`{f}` with {} arguments", args.len())),
                     };
                     Value::Atom(self.atoms.made(self.atoms.intern(false, &out)))
+                }
+                ("ToString", [x]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    Value::Atom(self.atoms.made(self.atoms.intern(false, &s)))
                 }
                 ("ToString", [x]) => {
                     let v = self.eval(x, env)?;
@@ -523,14 +562,20 @@ impl ConstEval<'_> {
                     Value::Tuple(out)
                 }
                 ("PrintT", [x]) => {
-                    let x = self.eval(x, env)?;
+                    let x = match self.lazy_fun_shown(x, env) {
+                        Some(s) => s,
+                        None => crate::compile::show_value(self.atoms, &self.eval(x, env)?),
+                    };
                     record_print(vec![x]);
                     Value::Bool(true)
                 }
                 ("Print", [x, v]) => {
-                    let x = self.eval(x, env)?;
+                    let x = match self.lazy_fun_shown(x, env) {
+                        Some(s) => s,
+                        None => crate::compile::show_value(self.atoms, &self.eval(x, env)?),
+                    };
                     let v = self.eval(v, env)?;
-                    record_print(vec![x, v.clone()]);
+                    record_print(vec![x, crate::compile::show_value(self.atoms, &v)]);
                     v
                 }
                 ("\\X", parts) => {

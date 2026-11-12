@@ -1374,6 +1374,35 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// How TLC prints a function over a set it cannot enumerate (see `lazy_fun_string`), when f is
+    /// one whose domain TLC prints as tla2rs can: Nat, Int, STRING, `Seq(S)` and products of
+    /// those and of finite sets, the finite ones printed as their values
+    fn lazy_fun_shown(&mut self, f: &Expr, env: &Env) -> Option<String> {
+        let d = self.lazy_fun_domain(f, env)?;
+        if self.try_const(d, env).is_some() {
+            return None;
+        }
+        lazy_fun_string(f, &mut |p| self.lazy_set_shown(p, env))
+    }
+
+    /// A domain part of a function over a set TLC cannot enumerate, as TLC prints its value
+    fn lazy_set_shown(&mut self, s: &Expr, env: &Env) -> Option<String> {
+        match s.strip() {
+            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && self.lazy_domain(s, env) => Some(n.clone()),
+            Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Some(format!("Seq({})", self.lazy_set_shown(&a[0], env)?)),
+            Expr::Call(f, parts) if f == "\\X" => {
+                let ps: Vec<String> = parts.iter().map(|p| self.lazy_set_shown(p, env)).collect::<Option<_>>()?;
+                Some(format!("({})", ps.join(" \\X ")))
+            }
+            // TLC prints an interval as written
+            Expr::Bin(BOp::Range, a, b) => match (self.try_const(a, env)?, self.try_const(b, env)?) {
+                (Value::Int(a), Value::Int(b)) => Some(format!("{a}..{b}")),
+                _ => None,
+            },
+            s => Some(crate::compile::show_value(self.atoms, &self.try_const(s, env)?)),
+        }
+    }
+
     /// The domain of `f` when it is a function evaluated only where it is applied (see
     /// `lazy_domain`), possibly with EXCEPT
     fn lazy_fun_domain<'e>(&self, f: &'e Expr, env: &Env) -> Option<&'e Expr> {
@@ -2285,6 +2314,13 @@ impl<'a> Gen<'a> {
                 // ToString of a value from the state: the string of every value of its type is
                 // interned now. A Boolean, integer, string, model value or tuple of them indexes a
                 // table by its encoding; other values print at run time and look their string up.
+                // ToString of a function over a set TLC cannot enumerate: its text, the same each time
+                ("ToString", [x]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    let id = self.atoms.intern(false, &s);
+                    let code = self.lit(&Value::Atom(id), &Ty::Enum(vec![id]))?;
+                    return Ok((self.note_made(code, &[id]), Ty::Enum(vec![id])));
+                }
                 ("ToString", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     fn scalar_or_tuple(t: &Ty) -> bool {
@@ -2423,6 +2459,16 @@ impl<'a> Gen<'a> {
                         ),
                         st,
                     )
+                }
+                ("PrintT", [x]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    (format!("{{ tlc_print(ppr({s:?})); true }}"), Ty::Bool)
+                }
+                ("Print", [x, v]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    let (vc, vt) = self.gen(v, env, want)?;
+                    let vid = self.ty_id(&vt)?;
+                    (format!("{{ let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr({s:?}), ppr(&fmt_{vid}(&__v)))); __v }}"), vt)
                 }
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
@@ -6156,6 +6202,43 @@ fn pfun_parts(t: &Ty) -> Option<(Ty, Ty)> {
         Ty::Rec(fs) if fs.is_empty() => Some((Ty::Enum(vec![]), Ty::Enum(vec![]))),
         _ => None,
     }
+}
+
+/// How TLC prints function `f` (possibly after EXCEPT, which changes nothing in it) when it cannot
+/// enumerate its domain: `[x \in Nat |-> <expression line 5, col 26 to line 5, col 30 of module
+/// M>]`, with the bound variables as SANY groups them (only the first name of `a, c \in S`), each
+/// group's domain as TLC prints its value (`part`, None when it is not supported), and the body's
+/// position, or a number as written. Measured on TLC 2.19 (`tests/tlc/LazyFunText*`). None when f
+/// is not a function constructor
+pub fn lazy_fun_string(f: &Expr, part: &mut dyn FnMut(&Expr) -> Option<String>) -> Option<String> {
+    let mut e = f;
+    let (shape, inner) = loop {
+        match e {
+            Expr::Label(n, _, b) => match n.strip_prefix(crate::ast::FN) {
+                Some(shape) => break (shape, b.as_ref()),
+                None => e = b,
+            },
+            Expr::Except(b, _) => e = b,
+            _ => return None,
+        }
+    };
+    let Expr::FunCons(_, dom, _) = inner.strip() else { return None };
+    let (bounds, body) = shape.split_once('\u{1}')?;
+    let mut out = String::new();
+    let mut rest = bounds;
+    while let Some((pre, after)) = rest.split_once('\u{2}') {
+        let (k, after) = after.split_once('\u{3}')?;
+        out += pre;
+        let d = match (k, dom.strip()) {
+            ("*", _) => dom.as_ref(),
+            (k, Expr::Call(x, parts)) if x == "\\X" => parts.get(k.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+        out += &part(d)?;
+        rest = after;
+    }
+    out += rest;
+    Some(format!("[{out} |-> <expression {body}>]"))
 }
 
 /// `[x \in S |-> ...]` for messages, with the bound variable's name as written

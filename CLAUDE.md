@@ -258,11 +258,17 @@ TLC evaluates `[x \in S |-> e]` lazily. Measured on TLC 2.19 with S = Nat (`test
 - Storing it in a variable fails ("Attempted to compute the number of elements in the overridden value Nat.", exit
   75), and so do comparing it, `DOMAIN f = Nat` and `f \in [Nat -> Nat]` in an invariant (when TLC fingerprints it).
   A finite function in `[Nat -> Nat]` fails too ("Attempted to check equality of the set ... with the value: Nat")
-- `ToString(f)` succeeds and prints the source text of the function
+- `ToString(f)`, `Print` and `PrintT` print `[n \in Nat |-> <expression line 5, col 26 to line 5, col 30 of module
+  M>]` (`tests/tlc/LazyFunText`): the bound variables, each group with the domain as TLC prints its value (`Seq({1,
+  2})`, `(Nat \X {1, 2})`), but only the first name of `a, c \in Nat`; then the position of the body without the
+  parentheses around it, or the body itself when it is a number (`<expression 007>`). EXCEPT changes nothing in it.
+  Over a set TLC can enumerate (`-5..-3`, or 0..200000), it prints the function as a value
 
 tla2rs compiles `f[k]` (also after EXCEPT with one index per update) and `k \in DOMAIN f` to the membership test and
-the body (`Gen::lazy_apply`), also over a constant set of more than 65536 elements (`lazy_domain`), and refuses such a
-function over an infinite set anywhere else. Constant folding applies `[x \in S |-> e][k]` the same way (`value.rs`).
+the body (`Gen::lazy_apply`), also over a constant set of more than 65536 elements (`lazy_domain`). The parser keeps
+how TLC prints a function in an FN label around it (`ast::FN`), which `codegen::lazy_fun_string` fills in for
+ToString, Print and PrintT, with the domains Nat, Int, STRING, `Seq(S)` and products of those and finite sets. Such a
+function over an infinite set is refused anywhere else, as are those three over another domain. Constant folding applies `[x \in S |-> e][k]` the same way (`value.rs`).
 
 ### Tuples compared with strings
 

@@ -23,6 +23,9 @@ pub struct Parser {
     /// A prefix operator (`[]`, `<>`, ENABLED, UNCHANGED) whose operand is being parsed: SANY
     /// refuses a postfix operator on that operand (`[]x'`)
     postfix_guard: Option<&'static str>,
+    /// The groups of bound variables `binders_pat` read last, as TLC prints them in a function
+    /// (`<<a, b>>`, or the first name of `a, c \in S`), each with the index of its first binding
+    last_binders: Vec<(String, usize)>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -53,7 +56,7 @@ pub fn parse_module(src: &str) -> R<Module> {
     // reads them: binary and left-associative. Only then are they kept so (see INFIX_JUNCTION)
     let positional = toks.windows(2).any(|w| matches!(&w[0].tok, Tok::Sym(b) if b == "!") && is_selector(&w[1].tok));
     NEST_JUNCTIONS.with(|n| n.set(positional));
-    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new(), postfix_guard: None };
+    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new(), postfix_guard: None, last_binders: vec![] };
     let r = p.module();
     NEST_JUNCTIONS.with(|n| n.set(false));
     r
@@ -846,15 +849,23 @@ impl Parser {
             let at = self.pos;
             self.pos += 1;
             let (bs, lets) = self.nested(|p| p.binders_pat())?;
+            let groups = std::mem::take(&mut self.last_binders);
             self.expect("]")?;
             self.expect("==")?;
+            let b0 = self.pos;
             let body = self.expr(0)?;
+            let b1 = self.pos;
             let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
             let _ = at;
+            let n = bs.len();
             if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
-                return Ok(Ok(self.rec_fun(name, bs, body)));
+                let mut defs = self.rec_fun(name, bs, body);
+                let whole = defs.last_mut().unwrap();
+                whole.body = self.fn_label(&groups, n, b0, b1, std::mem::replace(&mut whole.body, Expr::Bool(true)));
+                return Ok(Ok(defs));
             }
-            return Ok(Ok(vec![Def { name, params, arity, body: fun_cons(bs, body) }]));
+            let f = self.fn_label(&groups, n, b0, b1, fun_cons(bs, body));
+            return Ok(Ok(vec![Def { name, params, arity, body: f }]));
         }
         self.expect("==")?;
         if self.is_kw("INSTANCE") {
@@ -1010,6 +1021,7 @@ impl Parser {
     fn binders_pat(&mut self) -> R<(Vec<(String, Expr)>, Vec<Def>)> {
         let mut out = vec![];
         let mut lets = vec![];
+        let mut groups = vec![];
         loop {
             if self.is("<<") {
                 self.pos += 1;
@@ -1020,6 +1032,7 @@ impl Parser {
                 }
                 self.expect(">>")?;
                 self.expect("\\in")?;
+                groups.push((format!("<<{}>>", names.join(", ")), out.len()));
                 let s = self.expr(4)?;
                 self.tuple_binders += 1;
                 let t = format!("#tup{}", self.tuple_binders);
@@ -1040,6 +1053,7 @@ impl Parser {
                 names.push(self.ident()?);
             }
             self.expect("\\in")?;
+            groups.push((names[0].clone(), out.len()));
             let s = self.expr(4)?; // stops at `,` and `:`; only binds tighter than \in
             for n in names {
                 out.push((n, s.clone()));
@@ -1050,7 +1064,27 @@ impl Parser {
                 break;
             }
         }
+        self.last_binders = groups;
         Ok((out, lets))
+    }
+
+    /// Function constructor `f`, whose body was parsed from the token at `start` to the token
+    /// before `end`, in an FN label saying how TLC prints it when it cannot enumerate its domain
+    /// (see ast::FN): its bound variables (`groups`, for `n` bindings) and its body, a number as
+    /// written or the body's position
+    fn fn_label(&self, groups: &[(String, usize)], n: usize, start: usize, end: usize, f: Expr) -> Expr {
+        let bounds: Vec<String> = if n == 1 {
+            vec![format!("{} \\in \u{2}*\u{3}", groups.first().map_or("", |g| g.0.as_str()))]
+        } else {
+            groups.iter().map(|(d, k)| format!("{d} \\in \u{2}{k}\u{3}")).collect()
+        };
+        let span = self.span_text(start, end - 1);
+        let single = (start..end).filter(|&i| !matches!(&self.toks[i].tok, Tok::Sym(p) if p == "(" || p == ")")).collect::<Vec<_>>();
+        let body = match single.as_slice() {
+            [i] if self.toks[*i].raw.is_some() => self.toks[*i].raw.clone().unwrap(),
+            _ => span,
+        };
+        Expr::Label(format!("{}{}\u{1}{body}", crate::ast::FN, bounds.join(", ")), vec![], f.b())
     }
 
     /// At the bound variables of `\\E x, y : P` (or \\A, CHOOSE) without a set: the quantifier,
@@ -1635,11 +1669,15 @@ impl Parser {
             // A tuple of bound variables `<<a, b>> \in S` among them names the components of
             // that argument
             let (bs, lets) = self.binders_pat()?;
+            let groups = std::mem::take(&mut self.last_binders);
             self.expect("|->")?;
+            let b0 = self.pos;
             let body = self.expr(0)?;
+            let b1 = self.pos;
             self.expect("]")?;
             let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
-            return Ok(fun_cons(bs, body));
+            let n = bs.len();
+            return Ok(self.fn_label(&groups, n, b0, b1, fun_cons(bs, body)));
         }
         if self.is_kw("EXCEPT") {
             self.pos += 1;
@@ -1682,18 +1720,25 @@ impl Parser {
             if let Expr::Bin(BOp::In, x, s) = &e {
                 if let Expr::Ident(x) = x.as_ref() {
                     self.pos += 1;
+                    let b0 = self.pos;
                     let body = self.expr(0)?;
+                    let b1 = self.pos;
                     self.expect("]")?;
-                    return Ok(Expr::FunCons(x.clone(), s.clone(), body.b()));
+                    let f = Expr::FunCons(x.clone(), s.clone(), body.b());
+                    return Ok(self.fn_label(&[(x.clone(), 0)], 1, b0, b1, f));
                 }
                 // [<<x, y>> \in S |-> e]
                 if let Expr::Tuple(xs) = x.as_ref() {
                     if let Some(names) = xs.iter().map(|x| if let Expr::Ident(n) = x { Some(n.clone()) } else { None }).collect::<Option<Vec<_>>>() {
                         self.pos += 1;
+                        let b0 = self.pos;
                         let body = self.expr(0)?;
+                        let b1 = self.pos;
                         self.expect("]")?;
                         let t = self.fresh_tuple_name();
-                        return Ok(Expr::FunCons(t.clone(), s.clone(), Expr::Let(tuple_lets(&t, names), body.b()).b()));
+                        let shown = format!("<<{}>>", names.join(", "));
+                        let f = Expr::FunCons(t.clone(), s.clone(), Expr::Let(tuple_lets(&t, names), body.b()).b());
+                        return Ok(self.fn_label(&[(shown, 0)], 1, b0, b1, f));
                     }
                 }
             }

@@ -161,10 +161,11 @@ memory.
   (key, value) pairs, whose capacity grows as a set's does (`Cardinality(DOMAIN f) <= K` in `TypeOK` sets where it
   starts). A tuple literal has at most 99,999 elements (each is a field of the generated
   type)
-- A function over a set that cannot be enumerated (Nat, Int, STRING, `Seq(S)`) is supported only applied to an argument
-  (also after EXCEPT with one index per update) or in `x \in DOMAIN f`, where TLC evaluates it without enumerating its
-  domain. Used as a value (assigned to a variable, compared, printed, passed to `ToString`) it is refused: TLC stops
-  with an error on most such uses, and prints its source text for `ToString`
+- A function over a set that cannot be enumerated (Nat, Int, STRING, `Seq(S)`) is supported applied to an argument
+  (also after EXCEPT with one index per update), in `x \in DOMAIN f`, and in `ToString`, `Print` and `PrintT`, where
+  TLC evaluates it without enumerating its domain (it prints `[n \in Nat |-> <expression line 5, col 26 to line 5, col
+  30 of module M>]`, with the position of the body). Used as a value otherwise (assigned to a variable, compared,
+  inside another value) it is refused: TLC stops with an error on most such uses
 - Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC
