@@ -2,7 +2,7 @@
 //! lists are delimited by column.
 
 use crate::ast::*;
-use crate::lexer::{lex_module, Tok, Token, R, SANY};
+use crate::lexer::{lex_module, Tok, Token, R, SANY, SANY_ABORT};
 
 static EOF: Tok = Tok::Eof;
 
@@ -173,6 +173,22 @@ fn sany_range(op: &str) -> Option<(u8, u8, bool)> {
         "SUBSET" | "UNION" | "DOMAIN" => (10, 13, false),
         _ => return None,
     })
+}
+
+/// The name SANY gives an operator in its reports (measured on SANY 2.19)
+fn sany_name(op: &str) -> &str {
+    match op {
+        "/\\" => "\\land",
+        "\\/" => "\\lor",
+        "#" => "/=",
+        "<=" => "\\leq",
+        ">=" => "\\geq",
+        "<=>" => "\\equiv",
+        "\\cup" => "\\union",
+        "\\cap" => "\\intersect",
+        "\\X" => "\\times",
+        _ => op,
+    }
 }
 
 /// Whether SANY refuses `a op1 b op2 c` without parentheses (see `sany_range`)
@@ -862,10 +878,10 @@ impl Parser {
 
     /// An expression whose operators bind at least as tightly as `min`; `parent` is the infix
     /// operator it is the right operand of
-    fn expr_in(&mut self, min: u8, parent: Option<&'static str>) -> R<Expr> {
+    fn expr_in(&mut self, min: u8, parent: Option<(&'static str, usize)>) -> R<Expr> {
         let lhs_start = self.pos;
         let mut lhs = self.prefix(parent)?;
-        let mut prev: Option<&'static str> = None;
+        let mut prev: Option<(&'static str, usize)> = None;
         // Whether lhs is a disjunction built in this loop (its operands are in POS labels)
         let mut chain_or = false;
         loop {
@@ -873,10 +889,10 @@ impl Parser {
             if prec < min {
                 break;
             }
-            if let Some(other) = [prev, parent].into_iter().flatten().find(|o| precedence_conflict(o, op)) {
-                return self.err(&format!("{SANY}Precedence conflict between ops {other} and {op}."));
+            if let Some((other, at)) = [prev, parent].into_iter().flatten().find(|(o, _)| precedence_conflict(o, op)) {
+                return self.precedence_err(other, at, op);
             }
-            prev = Some(op);
+            prev = Some((op, self.pos));
             self.pos += 1;
             if op == "\\X" {
                 // A \X B \X C is the set of triples, not of pairs whose first element is a pair
@@ -895,7 +911,7 @@ impl Parser {
                 self.pos = at;
             }
             let rhs_start = self.pos;
-            let rhs = self.expr_in(if right { prec } else { prec + 1 }, Some(op))?;
+            let rhs = self.expr_in(if right { prec } else { prec + 1 }, Some((op, rhs_start - 1)))?;
             let rhs = if op == "\\/" { self.at(rhs_start, rhs) } else { rhs };
             chain_or = op == "\\/";
             lhs = bin(op, lhs, rhs);
@@ -1034,17 +1050,35 @@ impl Parser {
     /// precedence `min`. SANY refuses an infix operator whose range overlaps op's right after it,
     /// inside the operand (`[]x = 1`, `ENABLED x' = 1`) or after it (`-a \X b`)
     fn prefix_operand(&mut self, op: &'static str, min: u8) -> R<Expr> {
-        let e = self.expr_in(min, Some(op))?;
+        // Called right after the operator's token
+        let at = self.pos - 1;
+        let e = self.expr_in(min, Some((op, at)))?;
         if let Some((_, _, next)) = infix(self.peek()) {
             if precedence_conflict(op, next) {
-                return self.err(&format!("{SANY}Precedence conflict between ops {op} and {next}."));
+                return self.precedence_err(op, at, next);
             }
         }
         Ok(e)
     }
 
+    /// SANY's report of two operators next to each other whose precedences overlap: the first
+    /// with its position (`at`, a token index), then the second
+    fn precedence_err<T>(&self, first: &str, at: usize, second: &str) -> R<T> {
+        let second = if second == "-." { "-." } else { sany_name(second) };
+        self.sany_parse(&format!(
+            "  Precedence conflict between ops {} in block {} and {second}.",
+            sany_name(first),
+            self.span_text(at, at)
+        ))
+    }
+
+    /// An error that stops SANY while it parses the module, as SANY reports it
+    fn sany_parse<T>(&self, msg: &str) -> R<T> {
+        Err(format!("{SANY}{SANY_ABORT}{}\n***Parse Error***\n{msg}", self.module))
+    }
+
     /// `parent` is the infix operator whose right operand this is
-    fn prefix(&mut self, parent: Option<&'static str>) -> R<Expr> {
+    fn prefix(&mut self, parent: Option<(&'static str, usize)>) -> R<Expr> {
         let guard = self.postfix_guard.take();
         let t = self.peek().clone();
         match &t {
@@ -1056,8 +1090,8 @@ impl Parser {
             Tok::Sym(s) if s == "-" => {
                 // SANY refuses unary minus as the operand of an operator that binds tighter
                 // (`a * -b`, `a ^ -b`)
-                if let Some(p) = parent.filter(|p| sany_range(p).is_some_and(|(lo, _, _)| lo > 12)) {
-                    return self.err(&format!("{SANY}Precedence conflict between ops {p} and -."));
+                if let Some((p, at)) = parent.filter(|(p, _)| sany_range(p).is_some_and(|(lo, _, _)| lo > 12)) {
+                    return self.precedence_err(p, at, "-.");
                 }
                 self.pos += 1;
                 Ok(Expr::Un(UOp::Neg, self.prefix_operand("-.", 12)?.b()))
@@ -1186,6 +1220,23 @@ impl Parser {
                     Ok(Expr::Let(defs, body.b()))
                 }
                 "LAMBDA" => {
+                    // SANY accepts LAMBDA only as an operator's argument (or in an INSTANCE's
+                    // substitutions) and fails to parse it elsewhere. After `(` or `,` it may be
+                    // an argument, which `sany.rs` decides
+                    let before = self.pos.checked_sub(1).map(|i| &self.toks[i].tok);
+                    let image = match before {
+                        Some(Tok::Sym(x)) | Some(Tok::Ident(x)) => x.clone(),
+                        _ => String::new(),
+                    };
+                    if !["(", ",", "<-"].contains(&image.as_str()) {
+                        let t = self.raw();
+                        let expecting = if image == "==" { "Was expecting \"Expression or Instance\"\n" } else { "" };
+                        return self.sany_parse(&format!(
+                            "{expecting}Encountered \"LAMBDA\" at line {}, column {} and token \"{image}\" ",
+                            t.line,
+                            t.col + 1
+                        ));
+                    }
                     self.pos += 1;
                     let mut ps = vec![self.ident()?];
                     while self.is(",") {
@@ -1237,8 +1288,10 @@ impl Parser {
         let guard = self.postfix_guard.take();
         let mut e = self.primary()?;
         loop {
+            // SANY gives the position of the postfix operator here, and no indent
             if let (Some(p), Some(op)) = (guard, ["'", "^+", "^*", "^#"].iter().find(|o| self.is(o))) {
-                return self.err(&format!("{SANY}Precedence conflict between ops {p} and {op}."));
+                let at = self.span_text(self.pos, self.pos);
+                return self.sany_parse(&format!("Precedence conflict between ops {p} in block {at} and {op}."));
             }
             // The postfix operators a spec may define (a ^+ == ...)
             if let Some(op) = ["^+", "^*", "^#"].iter().find(|o| self.is(o)) {

@@ -826,7 +826,14 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
             let msg = e.replacen(crate::lexer::SANY, "", 1);
-            let mut msg = format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed.");
+            let mut msg = match msg.strip_prefix(crate::lexer::SANY_ABORT).and_then(|m| m.split_once('\n')) {
+                // An error that stops SANY while it parses a module, which it reports as such
+                Some((module, report)) => format!(
+                    "{report}\n\nFatal errors while parsing TLA+ spec in file {}\n\n*** Abort messages: 1\n\nIn module {module}\n\nCould not parse module {module} from file {module}.tla\n\nError: Parsing or semantic analysis failed.",
+                    crate::lexer::module_name(tla)
+                ),
+                None => format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed."),
+            };
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
             }
