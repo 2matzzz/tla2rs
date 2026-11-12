@@ -88,7 +88,7 @@ check specifications/N-Queens/Queens.toolbox/FourQueens/MC.tla specifications/N-
 check specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.tla specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg
 skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoLarge.cfg # manifest runtime 00:20:00: beyond the 60 s budget
 skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoMedium.cfg # TLC 2.19 took 79 s with one worker
-gap specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg # Next: an operator of the instantiated module (SignHash) is reported unknown; cause not identified
+check specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg
 skip specifications/Paxos/MCConsensus.tla specifications/Paxos/MCConsensus.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Paxos/MCPaxos.tla specifications/Paxos/MCPaxos.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Paxos/MCVoting.tla specifications/Paxos/MCVoting.cfg # needs module TLAPS, not in tla2tools.jar

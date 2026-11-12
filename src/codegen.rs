@@ -1420,7 +1420,7 @@ impl<'a> Gen<'a> {
                 let mut parts = vec![];
                 for (i, (_, ft)) in fs.iter().enumerate() {
                     let fp = rec_field(fs.len(), i);
-                    parts.push(self.tlc_cmp(ft, &format!("&{a}{fp}"), &format!("&{b}{fp}"))?);
+                    parts.push(self.tlc_cmp(ft, &format!("(&{a}{fp})"), &format!("(&{b}{fp})"))?);
                 }
                 let mut code = parts.pop().unwrap();
                 while let Some(p) = parts.pop() {
