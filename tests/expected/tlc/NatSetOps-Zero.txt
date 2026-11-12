@@ -1,0 +1,10 @@
+key 9ce2a7f864f2890c6192f12730124f482227f89e0885e1b8b5109262510f9dbe
+tlc Version 2.19
+rc 10
+Assumption line 6, col 8 to line 6, col 22 of module NatSetOps is false
+
+trace 0
+states incomplete
+edges incomplete
+messages 1 e1167ebcf6c19f64adc806fee38b3534921a850469bd086a603f13d6c9eac638
+errors 1 e1167ebcf6c19f64adc806fee38b3534921a850469bd086a603f13d6c9eac638

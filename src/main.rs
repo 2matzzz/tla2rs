@@ -170,6 +170,13 @@ fn main() {
     // A false ASSUME, or a temporal formula TLC cannot check: as in TLC, stop before exploring, with
     // the same message and exit code
     if let Some((msg, code)) = &output.rejected {
+        // Nothing to explore (compile::NO_BEHAVIOR): the state graph is empty, and TLC ends its file
+        if *code == 0 {
+            if let Some(f) = pass.iter().position(|a| a == "-dumpgraph").and_then(|i| pass.get(i + 1)) {
+                let empty = "strict digraph DiskGraph {\nnodesep=0.35;\nsubgraph cluster_graph {\ncolor=\"white\";\n}\n}";
+                std::fs::write(f, empty).expect("write the state graph");
+            }
+        }
         println!("{msg}");
         exit(*code);
     }

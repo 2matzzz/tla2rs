@@ -1,0 +1,10 @@
+key afb9991b26013b9fc7252186cc42124cc353ee899abb6684a87a1b2b1112d7b3
+tlc Version 2.19
+rc 0
+No error has been found
+3459 states generated 2733 distinct states found
+trace 0
+states 2733 48c84fe748087231d846ad5cea7f63f0d483339c87dd93261a99a2cbe0b13ffa
+edges 2367 b85350270572335c46a5f4e24ff46c246334fa8032f2cf38763f9830fd8e90b4
+messages 0
+errors 0

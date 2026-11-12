@@ -19,7 +19,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --messages FILE` reduces the messages and printed lines in such an output to `messages N
   <sha256>` and its error lines to `errors M <sha256>`; `--messages-text FILE` prints the canonical form (see
   "Messages and printed lines")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 484 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 500 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -40,6 +40,10 @@ It has no crate dependencies.
   of a run as `DIR/<cfg>.tlc.dot` (with `expected.sh`) and `DIR/<cfg>.rs.dot`, and the outputs as `DIR/<cfg>.tlc.out`
   and `DIR/<cfg>.rs.out`
 - The TLC jar comes from `TLA_TOOLS` (default `~/.tla/tla2tools.jar`)
+- `scripts/corpus.sh` cross-checks the models selected from a public corpus, the tlaplus/Examples repository
+  at the commit pinned in `tests/corpus.txt`, against TLC's results in `tests/expected/corpus/` (see "The
+  corpus"). It is separate from `all.sh`, which it does not slow down. `scripts/expected.sh -corpus` writes
+  those results; `JOBS` defaults to 2 for both
 
 ## Layout
 
@@ -51,7 +55,7 @@ It has no crate dependencies.
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first) |
 | `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element). Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
 | `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
-| `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture |
+| `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
@@ -129,6 +133,12 @@ Measured on TLC 2.19 (`tests/tlc/SpecConj*`, `SpecShape*`, `SpecInst*`, `RtSpec*
 - Without an initial predicate TLC stops (exit 151). Without a next-state action it stops (exit 151) if anything must
   be checked on steps (an invariant, `[]P`, an action or temporal property); otherwise it computes and checks the
   initial states and then stops with exit 75
+- A module without variables, with a cfg that has no SPECIFICATION, INIT or NEXT (one that only checks its ASSUMEs),
+  is not refused: TLC evaluates the ASSUMEs and reports no error with no states, and writes an empty state graph
+  (`compile::NO_BEHAVIOR`, `tests/tlc/NoBehavior*`). With variables, it is refused for lack of an initial predicate
+- Before anything else TLC evaluates the definitions of constant level, then the invariants and properties of
+  constant level, then reads the spec (refusing it without an initial predicate), and only then evaluates the
+  ASSUMEs (`tests/tlc/NoBehavior*`, `NoBehaviorVar*`): a false constant invariant hides the ASSUMEs' prints
 - An invariant or property of constant level is evaluated once before exploring; if it is not TRUE, TLC stops (exit
   151). TLC also evaluates every definition of constant level without arguments when it starts, then the ASSUMEs, and
   keeps the values: `Print` / `PrintT` in them print once, before anything else (`STARTUP_PRINTS`), and not when the
@@ -246,6 +256,11 @@ not the graphs. Reducing to it:
   `SparseFun`, ...)
 - Duplicate edges collapse, and dashed stuttering edges are dropped (they are not transitions of the next-state
   relation)
+- An interval `a..b` outside strings is read as the set it denotes. TLC prints a value in the form it holds it, so a
+  variable assigned `1..3` prints as `1..3` until an operation turns it into an enumerated set, while tla2rs prints
+  `{1, 2, 3}` (measured on the corpus's `DiningPhilosophers`). This applies to a variable printed on one line whose
+  value fits in 80 columns once expanded, where TLC's pretty printer would also keep it on one line; a longer one is
+  kept as printed and then differs (no configuration has one)
 
 Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
 are for the 483 configurations at the time of writing):
@@ -257,9 +272,6 @@ are for the 483 configurations at the time of writing):
 | VIEW and SYMMETRY together (automatic), see below | 1 (`ViewSym-Both`) | The verdict only. `ViewSymSet-Both` has `\* crosscheck: exact`: TLC was measured to keep no two states with equal views there, and everything matches |
 
 `distinct-only` (three configurations) leaves the graph compared: duplicate edges collapse anyway.
-
-Known gap, not hit by any configuration: TLC prints a value in the form it holds it, so a variable assigned `1..3`
-prints as `1..3` until an operation turns it into an enumerated set, while tla2rs prints `{1, 2, 3}`.
 
 ### Counterexamples
 
@@ -385,6 +397,47 @@ reports after the behavior in some configurations (below). 40 configurations, by
 | TLC shows the values it compared when a tuple meets another value; tla2rs decides that failure from the types | 4: `RejTupleEq`, `RejTupleIn`, `TupleStr-InDef`, `RejTupleCross` (also above) |
 | TLC names the Java method and the cast that failed (a model value in `+`) | 1: `ArithNone` |
 | Order of evaluation: TLC reports the error from ENABLED of a fair action, tla2rs from its step; Print in the search (above) | 2: `LiveErr-Fair`, `PrintNext` |
+
+### The corpus
+
+The configurations in `tests/tlc/` cover the forms someone thought of. `scripts/corpus.sh` also cross-checks the
+models of the tlaplus/Examples repository (https://github.com/tlaplus/Examples, commit
+334c3983a2f44ac78fce89d1d20aa79ceb3e6987, pinned in `tests/corpus.txt`). The corpus is fetched into
+`target/corpus/<commit>/` and only read by TLC and tla2rs. No spec text of it is copied into this repository: only
+TLC's results (`tests/expected/corpus/<path>.txt`, the same summaries as for `tests/tlc/`), and the tests added for
+the gaps it showed are written from scratch, reproducing only the form that failed.
+
+`tests/corpus.txt` lists all 243 models of the corpus's manifests. Selected are the exhaustive searches that TLC 2.19
+finishes with only `tla2tools.jar`, in 60 s or less with one worker and `-dump dot` (measured; the manifest's runtimes
+are for several workers). Skipped, with the reason on each line: 46 symbolic (Apalache), 6 random generation or
+simulation, 2 that need a TLC flag for action composition, 49 that need a module not in `tla2tools.jar` (community
+modules, TLAPS), 35 that take longer (from the manifest's runtime, or measured), 5 whose cfg TLC 2.19 refuses (an
+`ALIAS` section), and 2 where TLC picks values at random (two TLC runs differed). That leaves 98 selected.
+
+The cfgs of the corpus are not edited, so a line of the list gives what a `\* crosscheck:` line would: `rules=`
+(narrowing rules, passed as `CROSSCHECK_RULES`) and `rsargs=` (arguments for tla2rs only, `CROSSCHECK_RSARGS`; here
+`-seqcap` and `-setcap` where the spec bounds a sequence or set only by its logic). A selected model tla2rs does not
+match is listed as `gap` with the reason measured; `corpus.sh` still runs it and says when it starts to match, and
+fails only on a `check` that differs. A gap marked `norun` is not run: `GameOfLife` (6 MB of generated Rust that
+rustc did not finish building in 9 minutes) and `TLCSailfish1` (the system killed tla2rs for memory in one run).
+
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2, 50 s with built checkers cached): 59 match, of which 4 with `distinct-only`
+(`StaleViewShrink`: graphs, counterexamples and distinct counts match, only the generated counts differ, as TLC's
+counting per `\/` branch does; not confirmed by rewriting) and 3 with a bound for tla2rs. 39 are gaps (37 run, 2 `norun`), by how many
+models each blocks:
+
+| Gap | Models |
+|---|---|
+| A set of records with different fields prints in another order (TLC lists `[type \|-> "Abort"]` first) | 5 |
+| A variable holds records and model values in one function: no type for it | 4 |
+| TypeOK, checked as an invariant, tests membership in `[S -> Int]` on a state | 3 |
+| A recursive operator iterates over a value typed Bool (compile error) | 3 |
+| tla2rs reports a variable undefined, or unassigned in a successor, where TLC does not | 4 |
+| PrintT of a value wider than 80 columns: TLC breaks it over lines | 2 |
+| An ASSUME tla2rs cannot evaluate at compile time (`Nat`) | 2 |
+| Types from TypeInv of the extended module, which lacks a field the extending module adds | 2 |
+| A function over the empty set typed as an empty record | 2 |
+| One each: the PlusCal checksum warning, a field read of a non-record, functions over domains of different sizes, `[Module]Value` in a cfg, a model value where a sequence is expected, a set where an element is expected, a recursive operator applied as a function, an infix `&` defined by the spec, an EXCEPT path, state texts that differ in a 1.2-million-edge graph (cause not identified), and the two `norun` | 12 |
 
 ### VIEW and SYMMETRY together
 

@@ -32,9 +32,20 @@ while [[ $# -gt 0 ]]; do
     *) extra+=("$1"); shift ;;
   esac
 done
+# A narrowing rule (`distinct-only`, `exact`, `ignore-exit`, `error-lines`) applies when the cfg has a line
+# `\* crosscheck: <rule>`, or when CROSSCHECK_RULES names it (scripts/corpus.sh passes the rules of
+# tests/corpus.txt this way, since the corpus's cfgs are not edited)
+has_rule() {
+  grep -qE "^[[:space:]]*\\\\\*[[:space:]]*crosscheck:[[:space:]]*$1" "$cfg_abs" || [[ " ${CROSSCHECK_RULES:-} " == *" $1 "* ]]
+}
 # A cfg line like `\* crosscheck: rsargs -memlimit 0` adds those arguments to tla2rs only
 if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*rsargs[[:space:]].*' "$cfg"); then
   read -r -a more <<< "${a#*rsargs}"
+  rsonly+=("${more[@]}")
+fi
+# CROSSCHECK_RSARGS does the same (scripts/corpus.sh passes the rsargs= of tests/corpus.txt this way)
+if [[ -n "${CROSSCHECK_RSARGS:-}" ]]; then
+  read -r -a more <<< "$CROSSCHECK_RSARGS"
   rsonly+=("${more[@]}")
 fi
 jar="${TLA_TOOLS:-$HOME/.tla/tla2tools.jar}"
@@ -101,6 +112,8 @@ expected=""
 case "$cfg_rel" in
   examples/*.cfg) expected="$root/tests/expected/examples/$(basename "$cfg_rel" .cfg).txt" ;;
   tests/tlc/*.cfg) expected="$root/tests/expected/tlc/$(basename "$cfg_rel" .cfg).txt" ;;
+  # A model of the corpus fetched by scripts/corpus.sh, by its path in the corpus
+  target/corpus/*/specifications/*.cfg) p="${cfg_rel#target/corpus/*/specifications/}"; expected="$root/tests/expected/corpus/${p%.cfg}.txt" ;;
 esac
 key=$(tlc_key)
 if [[ -z "${CROSSCHECK_NO_CACHE:-}" ]]; then export TLA2RS_BUILD_CACHE="$root/target/crosscheck/build"; fi
@@ -134,7 +147,7 @@ fresh=0
 [[ -n "$expected" && -f "$expected" && "$(sed -n 1p "$expected")" == "key $key" ]] && fresh=1
 
 if [[ $mode != compare ]]; then
-  [[ -n "$expected" ]] || { echo "ERROR $cfg_rel: not in examples/ or tests/tlc/"; exit 1; }
+  [[ -n "$expected" ]] || { echo "ERROR $cfg_rel: not in examples/, tests/tlc/ or the corpus"; exit 1; }
   if [[ $mode == expected && $fresh == 1 ]]; then echo "fresh $cfg_rel"; exit 0; fi
 fi
 work="$(mktemp -d)"
@@ -189,14 +202,14 @@ if grep -qE '^[[:space:]]*VIEW[[:space:]]' "$c" && grep -qE '^[[:space:]]*SYMMET
 fi
 # `\* crosscheck: exact` in such a cfg compares everything after all: TLC has been measured to keep
 # no two states with equal views there, so the counts and the state graph agree
-if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*exact' "$c"; then
+if has_rule exact; then
   verdict_only=0
 fi
 # If the cfg says `\* crosscheck: distinct-only`, don't compare generated-state counts.
 # TLC counts successors per \/ branch, so in specs where both branches can hold it counts the
 # same successor more than once (distinct counts and verdicts still match).
 distinct_only=0
-if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*distinct-only' "$c"; then
+if has_rule distinct-only; then
   distinct_only=1
 fi
 
@@ -220,7 +233,7 @@ exit=$(norm $rc_tlc)"; b="$b
 exit=$(norm $rc_rs)"
 # `\* crosscheck: ignore-exit` skips the exit-code comparison, for a case where TLC reports an
 # error but exits with 0 (an error in a temporal property on an initial state)
-if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*ignore-exit' "$c"; then
+if has_rule ignore-exit; then
   a=$(echo "$a" | grep -v '^exit='); b=$(echo "$b" | grep -v '^exit=')
 fi
 # The state graph is compared as a whole (states and edges, see "State graphs" in CLAUDE.md), except:
@@ -240,7 +253,7 @@ fi
 # `\* crosscheck: error-lines (reason)` compares only the error lines among the messages, for a
 # configuration where tla2rs cannot print all of TLC's text (the reason says why; see "Messages and
 # printed lines" in CLAUDE.md)
-if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*error-lines' "$c"; then
+if has_rule error-lines; then
   a=$(grep -v '^messages ' <<< "$a"); b=$(grep -v '^messages ' <<< "$b")
   graph_note="$graph_note; messages: error lines only"
 fi

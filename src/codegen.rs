@@ -983,6 +983,10 @@ impl<'a> Gen<'a> {
             // prints then, see compile.rs)
             Expr::Call(n, _) if n == "PrintT" || n == "Print" => false,
             Expr::Label(n, a, b) if a.is_empty() && self.zero_defs.contains(n) => self.is_const_quiet(b, env),
+            // A call site keeps its arguments only as a trace: the body has them substituted. A
+            // definition of an instantiated module takes the module's variables as leading
+            // arguments even where its body reads none of them
+            Expr::Label(_, _, b) => self.is_const(b, env),
             Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
             Expr::Ident(n) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
             _ => e.children().into_iter().all(|c| self.is_const(c, env)),
@@ -991,11 +995,13 @@ impl<'a> Gen<'a> {
 
     /// Whether e is constant, printing or not
     fn is_const_quiet(&self, e: &Expr, env: &Env) -> bool {
-        !e.any(&|x| match x {
-            Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => true,
-            Expr::Ident(n) => self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n),
-            _ => false,
-        })
+        match e {
+            Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
+            Expr::Ident(n) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
+            // The arguments of a call site are only a trace (see is_const)
+            Expr::Label(_, _, b) => self.is_const_quiet(b, env),
+            _ => e.children().into_iter().all(|c| self.is_const_quiet(c, env)),
+        }
     }
 
     fn try_const(&self, e: &Expr, env: &Env) -> Option<Value> {
@@ -4838,6 +4844,8 @@ impl<'a> Gen<'a> {
                 Ty::Int(..) => "v.to_string()".into(),
                 Ty::Enum(_) => "ATOMS[*v as usize].to_string()".into(),
                 Ty::IntAtom(..) => "if *v < i64::MIN + 65536 { ATOMS[(*v - i64::MIN) as usize].to_string() } else { v.to_string() }".into(),
+                // The empty tuple (as TLC prints it)
+                Ty::Rec(fs) if fs.is_empty() => "\"<< >>\".to_string()".into(),
                 Ty::Rec(fs) if fs.iter().all(|(n, _)| n.starts_with('#')) => {
                     // Tuple
                     let mut parts = vec![];

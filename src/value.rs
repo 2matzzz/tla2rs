@@ -561,14 +561,10 @@ impl ConstEval<'_> {
                     _ => return Err(format!("{op:?} is not a constant operator")),
                 }
             }
-            // `x \in Nat` / `x \in Int` (common in assumptions). The set itself can't be built, so
-            // only test membership
-            Bin(op @ (BOp::In | BOp::NotIn), x, set)
-                if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int" || n == "Any" || n == "STRING")
-                    && !env.contains_key(n) && !self.constants.contains_key(n)) =>
-            {
-                let Ident(n) = set.strip() else { unreachable!() };
-                let inside = self.in_builtin_set(n, self.eval(x, env)?)?;
+            // `x \in Nat` / `x \in Int` (common in assumptions), also inside `\`, `\cup`, `\cap` and
+            // `{y \in S : P}` (`N \in Nat \ {0}`). The set itself can't be built, so only test membership
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if self.lazy_set(set, env) => {
+                let inside = self.member(&self.eval(x, env)?, set, env)?;
                 Value::Bool(inside == matches!(op, BOp::In))
             }
             // x \in [D -> R]: decided without enumerating the set of functions
@@ -943,6 +939,24 @@ impl ConstEval<'_> {
             Expr::Ident(n) if ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
                 self.in_builtin_set(n, v.clone())
             }
+            // TLC tests membership in these without building the set: the right operand of `\` only
+            // when v is in the left one, the right one of `\cup` only when v is not in the left one
+            Expr::Bin(op @ (BOp::Cup | BOp::Cap | BOp::SetMinus), a, b) if self.lazy_set(set, env) => {
+                let in_a = self.member(v, a, env)?;
+                Ok(match op {
+                    BOp::Cup => in_a || self.member(v, b, env)?,
+                    BOp::Cap => in_a && self.member(v, b, env)?,
+                    _ => in_a && !self.member(v, b, env)?,
+                })
+            }
+            Expr::SetFilter(x, s, p) if self.lazy_set(set, env) => {
+                if !self.member(v, s, env)? {
+                    return Ok(false);
+                }
+                let mut env = env.clone();
+                env.insert(x.clone(), v.clone());
+                self.eval(p, &env)?.as_bool()
+            }
             _ => {
                 let s = self.eval(set, env)?;
                 let s = s.as_set()?;
@@ -951,6 +965,17 @@ impl ConstEval<'_> {
                 }
                 Ok(s.contains(v))
             }
+        }
+    }
+
+    /// Whether `set` cannot be built because it is, or is made with `\`, `\cup`, `\cap` or a filter
+    /// from, Nat, Int, STRING or TLC's Any
+    fn lazy_set(&self, set: &Expr, env: &HashMap<String, Value>) -> bool {
+        match set.strip() {
+            Expr::Ident(n) => ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n),
+            Expr::Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.lazy_set(a, env) || self.lazy_set(b, env),
+            Expr::SetFilter(_, s, _) => self.lazy_set(s, env),
+            _ => false,
         }
     }
 
