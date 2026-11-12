@@ -247,7 +247,7 @@ check specifications/spanning/MC_spanning.tla specifications/spanning/MC_spannin
 skip specifications/sums_even/MC_sums_even.tla specifications/sums_even/MC_sums_even.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/tcp/APtcp.tla specifications/tcp/APtcp.cfg # symbolic mode: checked with Apalache
 skip specifications/tcp/MCtcp.tla specifications/tcp/MCtcp.cfg # needs module SequencesExt, not in tla2tools.jar
-gap specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg # parser: an infix operator & defined by the spec is not read
+check specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg
 skip specifications/tower_of_hanoi/Hanoi_anim.tla specifications/tower_of_hanoi/Hanoi_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 gap specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_commit/2PCwithBTM.cfg # compile error: an EXCEPT path does not match the value type (Next)
 skip specifications/transaction_commit/APTCommit.tla specifications/transaction_commit/APTCommit.cfg # symbolic mode: checked with Apalache
