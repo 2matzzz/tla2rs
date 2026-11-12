@@ -878,7 +878,7 @@ fn compile_inner(
         }
     }
 
-    let SpecParts { init, next, temporal } = match resolve_spec(&m, &cfg, &mut ex)? {
+    let SpecParts { init, next, temporal, written } = match resolve_spec(&m, &cfg, &mut ex)? {
         Ok(p) => p,
         Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r) }),
     };
@@ -1232,6 +1232,7 @@ fn compile_inner(
     let fp_bits = if fp128 { 128 } else { 64 };
     writeln!(src, "const FP_BITS: usize = {fp_bits};\ntype Fp = u{fp_bits};").unwrap();
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
+    src += &crate::lasso::template(&m, &cfg, &written);
     src += crate::runtime::RUNTIME;
     src += crate::runtime::LIVENESS_RT;
     Ok(Output { rust: src, warnings, rejected: None })
@@ -1402,6 +1403,8 @@ pub struct SpecParts {
     pub init: Expr,
     pub next: Option<Expr>,
     pub temporal: Vec<Expr>,
+    /// The same parts as written (for the lasso check), or why they cannot be written out
+    pub written: Result<crate::lasso::Written, String>,
 }
 
 const NO_INIT: &str = "Error: The configuration file did not specify the initial state predicate.\nCan also be caused by trying to run TLC on a specification from\na module imported with a parameterized INSTANCE statement.";
@@ -1419,10 +1422,18 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
             }
             None => None,
         };
-        return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![] }));
+        let written = Ok(crate::lasso::Written {
+            init: vec![Expr::Ident(i.clone())],
+            next: cfg.next.as_ref().map(|n| {
+                let vars = Expr::Tuple(m.variables.iter().map(|v| Expr::Ident(v.clone())).collect());
+                Expr::BoxAction(Expr::Ident(n.clone()).b(), vars.b())
+            }),
+            temporal: vec![],
+        });
+        return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![], written }));
     }
     let spec = cfg.specification.as_ref().ok_or("cfg needs SPECIFICATION or INIT/NEXT")?;
-    let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false };
+    let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false, written: Ok(Default::default()) };
     if !ex.has_def(spec) {
         return Err(format!("no definition `{spec}`"));
     }
@@ -1438,7 +1449,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
         return Ok(Err((msg.into(), 151)));
     }
     let init = if w.init.len() == 1 { w.init.pop().unwrap() } else { Expr::And(w.init) };
-    Ok(Ok(SpecParts { init, next: w.next, temporal: w.temporal }))
+    Ok(Ok(SpecParts { init, next: w.next, temporal: w.temporal, written: w.written }))
 }
 
 struct SpecWalk {
@@ -1446,6 +1457,7 @@ struct SpecWalk {
     next: Option<Expr>,
     temporal: Vec<Expr>,
     twice: bool,
+    written: Result<crate::lasso::Written, String>,
 }
 
 impl SpecWalk {
@@ -1471,8 +1483,16 @@ impl SpecWalk {
                     let a = ex.expand_top(a);
                     ex.keep_pos = false;
                     self.set_next(a?);
+                    if let Ok(w) = &mut self.written {
+                        w.next = Some(x.as_ref().clone());
+                    }
                 }
-                _ => self.temporal.push(ex.expand_top(e)?),
+                _ => {
+                    self.temporal.push(ex.expand_top(e)?);
+                    if let Ok(w) = &mut self.written {
+                        w.temporal.push(e.clone());
+                    }
+                }
             },
             Expr::Ident(n) if ex.def(n).is_some_and(|d| d.params.is_empty()) => {
                 let b = ex.def(n).unwrap().body.clone();
@@ -1484,16 +1504,29 @@ impl SpecWalk {
                     let x = ex.expand_top(e);
                     ex.keep_pos = false;
                     self.walk_expanded(&x?, None, false);
+                    self.written = Err(format!("the spec is split inside the instance `{n}`"));
                 } else if is_temporal(e, m, &mut HashSet::new()) {
                     self.walk(&b, m, ex)?;
                 } else {
                     self.init.push(ex.expand_top(e)?);
+                    if let Ok(w) = &mut self.written {
+                        w.init.push(e.clone());
+                    }
                 }
             }
             // RTnow(v) and RTBound(..) of RealTime are temporal formulas
-            Expr::Call(n, _) if n == "RTnow" || n == "RTBound" => self.temporal.push(ex.expand_top(e)?),
-            e if is_temporal(e, m, &mut HashSet::new()) => self.temporal.push(ex.expand_top(e)?),
-            e => self.init.push(ex.expand_top(e)?),
+            e if matches!(e, Expr::Call(n, _) if n == "RTnow" || n == "RTBound") || is_temporal(e, m, &mut HashSet::new()) => {
+                self.temporal.push(ex.expand_top(e)?);
+                if let Ok(w) = &mut self.written {
+                    w.temporal.push(e.clone());
+                }
+            }
+            e => {
+                self.init.push(ex.expand_top(e)?);
+                if let Ok(w) = &mut self.written {
+                    w.init.push(e.clone());
+                }
+            }
         }
         Ok(())
     }

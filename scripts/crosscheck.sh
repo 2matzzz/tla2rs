@@ -170,7 +170,7 @@ else
   run_tlc
 fi
 s1=$(date +%s.%N)
-"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
+"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 s2=$(date +%s.%N)
 
 # With both VIEW and SYMMETRY, TLC may keep states with equal views as distinct (its choice of
@@ -234,6 +234,29 @@ if [[ $verdict_only == 1 ]]; then
 elif [[ $distinct_only == 1 ]]; then
   a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
 fi
+# A liveness counterexample (lasso) is not compared with TLC's, which depends on TLC's random
+# fingerprint polynomial. TLC checks tla2rs's instead: the checker writes a spec whose only behavior
+# is the lasso (-lassocheck, see src/lasso.rs), and TLC must report that it violates the properties,
+# with one distinct state per state of the lasso. That holds only if the lasso starts in an initial
+# state, each step is a step of the spec, it satisfies the spec's fairness and violates a property
+lasso_note=""
+if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
+  if [[ ! -f Tla2rsLasso.tla ]]; then
+    echo "  LASSO NOT CHECKED: $(grep -m1 'lasso check is not written' rs.out || echo 'the checker wrote no lasso check')"
+    exit 1
+  fi
+  n_lasso=$(grep -cE '^State [0-9]+: <' rs.out || true)
+  rc_lasso=0
+  mkdir -p "$work/jtmp"
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
+  found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
+  if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
+    echo "  LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
+    grep -E '^Error|distinct states found|No error' lasso.out | head -5 | sed 's/^/    tlc: /'
+    exit 1
+  fi
+  lasso_note="  (lasso of $n_lasso states confirmed by TLC)"
+fi
 note=""; [[ $tlc_cached == 1 ]] && note=" cached"
 printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)"
 if [[ "$a" == "$b" ]]; then
@@ -246,6 +269,7 @@ if [[ "$a" == "$b" ]]; then
   else
     echo "  MATCH: $(echo "$a" | tr '\n' ' ')"
   fi
+  [[ -z $lasso_note ]] || echo "$lasso_note"
 else
   echo "  MISMATCH"; echo "  TLC:    $(echo "$a" | tr '\n' ' ')"; echo "  tla2rs: $(echo "$b" | tr '\n' ' ')"
   sed 's/^/    rs.err: /' rs.err | head -20
