@@ -126,6 +126,29 @@ pub struct Module {
     /// prefix TLC names them with (`N!` or nothing), and the number of constants and variables
     /// substituted
     pub inst_prefixes: Vec<(String, String, usize)>,
+    /// The module's statements in the order written, for SANY's scoping (see `sany.rs`)
+    pub units: Vec<Unit>,
+}
+
+/// A statement of a module, in the order written. SANY resolves a name only against what is
+/// declared or defined before it
+#[derive(Clone, Debug)]
+pub enum Unit {
+    /// A CONSTANT or VARIABLE
+    Decl(String),
+    /// A definition (an index into `defs`); `true` for a function definition `f[x \in S] == e`,
+    /// whose name is in scope in its body
+    Def(usize, bool),
+    /// The name of a THEOREM (or the like), whose formula is not checked
+    Theorem(String),
+    /// An unnamed ASSUME (an index into `assumes`)
+    Assume(usize),
+    /// An INSTANCE statement or definition (an index into `instances`); `true` when LOCAL
+    Inst(usize, bool),
+    /// A RECURSIVE declaration
+    Recursive(String),
+    /// A nested module (an index into `nested`)
+    Nested(usize),
 }
 
 /// `[LOCAL] INSTANCE M WITH x <- e, ...` (no name) or `N(p, ...) == INSTANCE M WITH ...`

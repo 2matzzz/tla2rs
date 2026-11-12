@@ -408,6 +408,33 @@ impl<'a> Expander<'a> {
     /// expanded as a definition whose parameters are those of Op, followed by the bound variables
     /// and label parameters set along the way.
     fn subexpr(&mut self, base: &Expr, sels: &[Expr], env: &Env) -> R<Expr> {
+        let (name, sub, denv, args) = self.subexpr_def(base, sels, env)?;
+        self.call(&name, &sub, denv, &args, env)
+    }
+
+    /// The errors SANY reports for the subexpression names in e (SANY checks every definition,
+    /// used or not): those of a name whose operator is a definition of the module
+    pub fn check_subexprs(&self, e: &Expr) -> R<()> {
+        let env = Env::default();
+        let r = match e {
+            Expr::Call(n, parts) if n == crate::parser::SUBEXPR => Some(self.subexpr_def(&parts[0], &parts[1..], &env)),
+            // `Op!lab`
+            Expr::Ident(n) | Expr::Call(n, _) if n.contains('!') && !self.defs.contains_key(n.as_str()) && self.label_path(n, &env).is_some() => {
+                Some(self.subexpr_def(e, &[], &env))
+            }
+            _ => None,
+        };
+        if let Some(Err(m)) = r {
+            if m.starts_with(SANY) {
+                return Err(m);
+            }
+        }
+        e.children().into_iter().try_for_each(|c| self.check_subexprs(c))
+    }
+
+    /// The definition a subexpression name stands for (see `subexpr`): the name, the definition,
+    /// its environment and the arguments
+    fn subexpr_def(&self, base: &Expr, sels: &[Expr], env: &Env) -> R<(String, Def, Env, Vec<Expr>)> {
         use Expr::*;
         let (name, mut args) = match base {
             Ident(n) => (n.clone(), vec![]),
@@ -531,7 +558,7 @@ impl<'a> Expander<'a> {
             cur = Let(defs, cur.b());
         }
         let sub = Def { name: format!("{}#sub", d.name), params, arity, body: cur };
-        self.call(&name, &sub, denv, &args, env)
+        Ok((name, sub, denv, args))
     }
 }
 
