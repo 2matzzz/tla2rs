@@ -149,10 +149,13 @@ memory.
   the spec loads, as in TLC: the floor of the quotient with Integers, and with Naturals only, rounded toward zero
   and then down when that is negative (`(0 - 1) \div 3` is 0)
 - Modules of the [CommunityModules](https://github.com/tlaplus/CommunityModules), which tla2rs provides itself
-  when no module of that name is next to the spec: `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt` (but
-  `Interleave`, `AllSubSeqs`, `IndexFirstSubSeq`, `ReplaceFirstSubSeq` and `ReplaceAllSubSeqs`), `UndirectedGraphs`
-  (but `Path`, `SimplePath`, `AreConnectedIn`, `ConnectedComponents` and `IsStronglyConnected`, which TLC 2.19
-  cannot evaluate either; see below) and `Bitwise`. TLC 2.19 cannot load the Java overrides in the CommunityModules
+  when no module of that name is next to the spec: `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`,
+  `UndirectedGraphs` (but `Path`, `SimplePath`, `AreConnectedIn`, `ConnectedComponents` and `IsStronglyConnected`,
+  which TLC 2.19 cannot evaluate either; see below), `Graphs` (but the same operators over paths and
+  `IsTreeWithRoot`), `Relation`, `BagsExt`, `Bitwise`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals`
+  and `VectorClocks`. Not provided: the modules that read or write files or run commands (`IOUtils`, `CSV`,
+  `CBOR`, `Json`), `ShiViz` and `DifferentialEquations`, whose definitions TLC 2.19 cannot evaluate, and `HTML` and
+  `SVG` (see CLAUDE.md, "CommunityModules"). TLC 2.19 cannot load the Java overrides in the CommunityModules
   jar, so it evaluates the modules' TLA+ definitions, and tla2rs's give the same values (what CHOOSE picks, the
   order a fold takes elements in). An operator not provided is refused where it is used
 - Records are ordered as TLC orders them (by their number of fields first), model values come before strings, and

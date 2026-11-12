@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 680 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 687 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -702,8 +702,8 @@ not measured this way. 3 are gaps, all `norun`:
 | `norun`: the system killed tla2rs for memory in a corpus run | `TLCSailfish1` |
 
 Forms the corpus showed, each with a test in `tests/tlc/`: the CommunityModules (`CmFun`, `CmSet`, `CmSeq`,
-`CmGraph`, `CmBits`; see "CommunityModules"), `[1..n -> S]` with n from the state as a set of sequences
-(`SeqFunSet`), a definition of an instantiated module passed as an operator argument (`InstOpArg`), a recursive
+`CmGraph`, `CmBits`, and since then `CmSeqSub`, `CmRel`, `CmDigraph`, `CmBag`, `CmMisc`; see "CommunityModules"),
+`[1..n -> S]` with n from the state as a set of sequences (`SeqFunSet`), a definition of an instantiated module passed as an operator argument (`InstOpArg`), a recursive
 operator called inside the operator passed to it (`RecNestOp`), the field of an element of a set that starts empty
 (`EmptyField`), records of different fields in TLC's
 order (`RecMix`), a value that is a record or a model value (`RecAtom`), primed substituted variables in ENABLED
@@ -729,16 +729,33 @@ modules only, extracted into
 in `crosscheck.sh` (202611060952, the one current at the corpus's commit); a spec that uses it has the hash in the
 key of its expected file.
 
-tla2rs provides `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`, `UndirectedGraphs` and `Bitwise` itself
+tla2rs provides `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`, `UndirectedGraphs`, `Bitwise`, `Relation`,
+`BagsExt`, `Graphs`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals` and `VectorClocks` itself
 (`src/community.rs`), as TLA+ source written for tla2rs, read when no module of that name is next to the spec.
 Since TLC evaluates the modules' own definitions, these give the same values: CHOOSE over the same set with the
-same predicate (`SetToSeq`, `Max`, `LongestCommonPrefix`, `Inverse`), and folds that take the elements in the same
-order (`MapThenFoldSet` applies `op(f(x), rest)` with x chosen first, so `FoldFunction` takes the smallest index
-first, `FoldLeft` the largest). Each module exports the same names in the same order as the release's, with what it
-extends (`SequencesExt` extends Bags and TLC, for example), since SANY's context, and the order TLC prints variables
-in, depend on them (see "The order of variables"). Operators listed in `community::UNSUPPORTED` are refused where
-they are used: five of SequencesExt not written yet, and UndirectedGraphs' operators over paths, which quantify over
-`Seq(S)`, so TLC 2.19 stops on them too ("non-enumerable quantifier bound").
+same predicate (`SetToSeq`, `Max`, `LongestCommonPrefix`, `Inverse`, `CausalOrder`), and folds that take the elements
+in the same order (`MapThenFoldSet` applies `op(f(x), rest)` with x chosen first, so `FoldFunction` takes the
+smallest index first, `FoldLeft` the largest; `MapThenFoldBag` applies op once per copy of each element). Where the
+definition gives a value its documentation does not, the definition wins: `AllSubSeqs` lists each subsequence
+backwards (it folds with `Snoc` from the smallest index), `ReplaceAllSubSeqs` replaces the leftmost occurrences
+(measured on every sequence over {1, 2} up to length 3, and over {1} up to 4, against the module's definition, which
+enumerates sequences of sequences), `ChiSquare` and `DotDiGraph` are TRUE, and `DyadicRationals` fails on a
+numerator of 0 or less when it reduces (`Half(Zero)`), as the definition's divisors of 0 are none. Each module
+exports the same names in the same order as the release's, with what it extends (`SequencesExt` extends Bags and
+TLC, for example), since SANY's context, and the order TLC prints variables in, depend on them (see "The order of
+variables"). Operators listed in `community::UNSUPPORTED` are refused where they are used: the operators over paths
+of UndirectedGraphs and Graphs (and Graphs' `IsTreeWithRoot`, which uses one), which quantify over `Seq(S)`, so TLC
+2.19 stops on them too ("non-enumerable quantifier bound").
+
+The other modules of the release are not provided, so a spec that names one is refused. Measured on TLC 2.19 with the
+release's modules only:
+
+| Module | Why |
+|---|---|
+| `IOUtils`, `CSV`, `CBOR`, and `Json`'s `JsonDeserialize` / `ndJsonDeserialize` | They read or write files, run commands or read the environment. Their definitions stop TLC 2.19: CHOOSE without a set (`JsonDeserialize`, `CSVRecords`), CHOOSE over a set it cannot enumerate (`atoi`, `IOEnv`), `Assert(FALSE, ...)` (`ToCBOR`) |
+| `ShiViz` | `Host` and `Clock` read `TLCGet` and the Toolbox module; TLC 2.19 stops on `Host` ("Attempted to enumerate S \ T when S: Nat is not enumerable") |
+| `DifferentialEquations` | `Integrate` is a CHOOSE without a set over functions of reals; TLC 2.19 stops ("TLC attempted to evaluate an unbounded CHOOSE") |
+| `Json`'s `ToJson`, `ToJsonArray`, `ToJsonObject`, `JsonSerialize` (TRUE), `HTML`, `SVG`, `IOUtils`' `zeroPadN` | TLC 2.19 evaluates them (strings built for animations and output); not written yet |
 
 Not followed: the identifiers and strings of these modules are not in `tlc_string_ranks` (TLC creates them when it
 parses the modules), so a string literal of the spec equal to one of their identifiers, and not to one of the spec's,
