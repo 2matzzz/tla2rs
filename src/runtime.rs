@@ -541,7 +541,46 @@ fn capacity_exceeded(kind: u8, msg: String) -> ! {
 
 #[cold]
 fn eval_error(msg: String) -> ! {
+    if FP_DEPTH.with(|d| d.get()) > 0 {
+        *FP_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.clone());
+    }
     std::panic::panic_any(EvalErr::Other(msg))
+}
+
+// TLC reports a second error after the behavior, `TLC was unable to fingerprint.` with the same
+// reason, when the error is raised inside a value it built from an expression written in the
+// spec, such as a set `{...}`, a tuple `<<...>>`, `[S -> T]` or `S \X T`: measured on TLC 2.19,
+// `x \in {5, 6}`, `x \in {5} \cup {6}`, `{x} \subseteq S`, `f \in [Nat -> Nat]` and `<<5, 6, 7>>[i]`
+// do, while `x \in S` for S from the state or a constant definition, `x \in 5..6`, `\E y \in {5, 6} :
+// y = x` and a string's or tuple's own comparison (`<<"a">> \in {"ab"}`, `<<1, 2>> # s`) do not. Code generation puts such an operation inside an
+// `FpSource` when it can fail (`Gen::fp_source`)
+thread_local! {
+    static FP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The message of the last error raised inside an `FpSource`
+static FP_ERR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+struct FpSource;
+
+impl FpSource {
+    fn enter() -> Self {
+        FP_DEPTH.with(|d| d.set(d.get() + 1));
+        FpSource
+    }
+}
+
+impl Drop for FpSource {
+    fn drop(&mut self) {
+        FP_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// TLC's second error after an error raised inside an `FpSource` (see above)
+fn fp_note(e: &EvalErr) {
+    if FP_ERR.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(e.msg()) {
+        println!("Error: TLC was unable to fingerprint.\nReason:\n{}", e.msg());
+    }
 }
 
 // ---------------------------------------------------------------- the order of printed lines
@@ -1751,6 +1790,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         if let Some(s) = state.filter(|_| !tlc_eval_exception(&e) && !matches!(e, EvalErr::Type(_))) {
             println!("While working on the initial state:\n{}\n", show(s));
         }
+        fp_note(&e);
         eprintln!("  (while {while_})");
         println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
         exit(init_eval_code(&e));
@@ -2427,6 +2467,9 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     let shown = if matches!(f.msg, SMsg::Untraced(_) | SMsg::Live(..)) { 0 } else { report_trace(seen, &f) };
     if pseudo && shown > 0 {
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
+    }
+    if let SMsg::Eval(e) | SMsg::InvEval(_, e) | SMsg::ActionEval(_, e) = &f.msg {
+        fp_note(e);
     }
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
@@ -3240,6 +3283,9 @@ fn run_liveness(opt: &Opt) {
                     }
                     let code = report_msg(&msg, true);
                     g.print_trace((base[w] + idx) as u32, None, true);
+                    if let SMsg::InvEval(_, e) = &msg {
+                        fp_note(e);
+                    }
                     code
                 }
                 Found::Deadlock(id) => {
@@ -3261,12 +3307,11 @@ fn run_liveness(opt: &Opt) {
                 Found::Eval(p, e) => {
                     let pseudo = matches!(e, EvalErr::Type(_));
                     let unassigned = matches!(e, EvalErr::Incomplete(_));
-                    let again = PRINT_ORDER.then(|| e.clone());
+                    let again = e.clone();
                     let code = report_msg(&SMsg::Eval(e), true);
                     g.print_trace(p, None, false);
-                    if let Some(e) = again {
-                        eval_again_prints(&unpack(&g.states[p as usize]), &e);
-                    }
+                    eval_again_prints(&unpack(&g.states[p as usize]), &again);
+                    fp_note(&again);
                     if unassigned {
                         generated += show_incomplete(g.trace_len(p));
                     }

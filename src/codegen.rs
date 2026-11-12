@@ -2021,7 +2021,46 @@ impl<'a> Gen<'a> {
     // ---------------------------------------------------------------- Expressions
 
     pub fn gen(&mut self, e: &Expr, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
-        self.gen_inner(e, env, want)
+        let (c, t) = self.gen_inner(e, env, want)?;
+        // An operation TLC performs inside a value built from what is written there, when it can
+        // fail (see FpSource in the runtime). A string compared with a tuple fails in the string's
+        // own comparison, which TLC does not report so (`<<"a">> \in {"ab"}`, measured)
+        let can_fail = c.contains("eval_error") || c.contains("mixed_eq(");
+        if can_fail && !c.contains("Attempted to check equality of string") && self.fp_source(e, env) {
+            return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
+        }
+        Ok((c, t))
+    }
+
+    /// Whether TLC evaluates e by asking a value built from an expression written in the spec
+    /// (a set, tuple or record written out, a set of functions or records, a product, or set
+    /// operations on those): membership in it, whether it is a subset, or applying it. Not `=`:
+    /// `<<1, 2>> # s` fails in the tuple's comparison, which TLC does not report so (measured)
+    fn fp_source(&mut self, e: &Expr, env: &Env) -> bool {
+        use Expr::*;
+        match e.strip() {
+            Bin(BOp::In | BOp::NotIn, _, s) => self.built(s, env),
+            Bin(BOp::Subseteq, a, _) => self.built(a, env),
+            App(f, _) => self.built(f, env),
+            _ => false,
+        }
+    }
+
+    /// Whether TLC builds the value of e from e as written when it evaluates e (a definition of
+    /// constant level has a value computed when TLC starts)
+    fn built(&mut self, e: &Expr, env: &Env) -> bool {
+        use Expr::*;
+        match e {
+            Label(n, _, b) if n.starts_with('#') => self.built(b, env),
+            Label(_, _, b) => !self.is_const(e, env) && self.built(b, env),
+            SetLit(_) | Tuple(_) | RecLit(_) => true,
+            // TLC holds a set of functions or records it can enumerate as the set of its elements,
+            // which it does not count as built there (`k \notin [{1} -> {1}]`, measured)
+            RecSet(_) | FunSet(..) => self.try_const(e, env).is_none(),
+            Call(f, _) => f == "\\X",
+            Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.built(a, env) || self.built(b, env),
+            _ => false,
+        }
     }
 
     fn gen_inner(&mut self, e: &Expr, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
