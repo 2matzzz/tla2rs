@@ -168,8 +168,9 @@ impl<'a> Expander<'a> {
         if let Some(&i) = self.rec_ids.get(key) {
             return Ok(i);
         }
-        let prefix = format!("{}|", d.name);
-        if self.rec_ids.keys().filter(|k| k.starts_with(&prefix)).count() >= 16 {
+        // Operators that change on every recursive call expand without end, each expansion inside
+        // the one before; separate calls (each LAMBDA is a new operator) do not nest
+        if self.stack.iter().filter(|s| **s == d.name).count() >= 16 {
             return Err(format!("`{name}`: the operators passed to it keep changing between recursive calls"));
         }
         let i = REC_DEFS.with(|r| {

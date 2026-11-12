@@ -930,8 +930,13 @@ impl<'a> Gen<'a> {
                     out.push(x.clone());
                 }
             }
-            for c in e.children() {
-                walk(c, bound, out);
+            // The arguments of a call site are only a trace (an operator passed is named there)
+            if let Expr::Label(_, _, b) = e {
+                walk(b, bound, out);
+            } else {
+                for c in e.children() {
+                    walk(c, bound, out);
+                }
             }
             bound.truncate(n);
         }
