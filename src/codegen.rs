@@ -930,8 +930,13 @@ impl<'a> Gen<'a> {
                     out.push(x.clone());
                 }
             }
-            for c in e.children() {
-                walk(c, bound, out);
+            // The arguments of a call site are only a trace (an operator passed is named there)
+            if let Expr::Label(_, _, b) = e {
+                walk(b, bound, out);
+            } else {
+                for c in e.children() {
+                    walk(c, bound, out);
+                }
             }
             bound.truncate(n);
         }
@@ -3310,6 +3315,11 @@ impl<'a> Gen<'a> {
             }
             Field(r, k) => {
                 let (rc, rt) = self.gen(r, env, None)?;
+                // An element of a set that has no elements yet (while types are inferred from a
+                // variable that starts as {}): there is no value to take the field of
+                if rt == Ty::Enum(vec![]) {
+                    return Ok((format!("{{ let _ = {rc}; type_error(\"a record\", \"with a field {k}\") }}"), Ty::Enum(vec![])));
+                }
                 let Ty::Rec(fs) = rt else { return Err(format!("field .{k} of a non-record")) };
                 let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
                 let fp = rec_field(fs.len(), i);
@@ -3858,6 +3868,31 @@ impl<'a> Gen<'a> {
                     body = format!("for {lx} in {it} {{ {body} }}");
                 }
                 return Ok((format!("{{ let mut {v}: Vec<{}> = Vec::new(); {body} {v} }}.into_iter()", tt.repr()), tt, None));
+            }
+        }
+        // [1..n -> T] with n from the state: the sequences of length n over T, in the same order
+        // as below (TLC's functions over 1..n are tuples)
+        if let Expr::FunSet(d, r) = s {
+            if let Expr::Bin(BOp::Range, lo, hi) = d.as_ref() {
+                if matches!(lo.as_ref(), Expr::Num(1)) && self.try_const(d, env).is_none() {
+                    let (hc, _) = self.gen_int(hi, env)?;
+                    let (rit, rt, rix) = self.iter_of_indexed(r, env)?;
+                    let rid_ = self.ty_id(&rt)?;
+                    let rval = if rix.is_some() { format!("dec_{rid_}(__r)") } else { "__r".to_string() };
+                    let st = Ty::Seq(rt.clone().into());
+                    self.ty_id(&st)?;
+                    let code = format!(
+                        "{{ let __n = ({hc}).max(0) as usize; let __r: Vec<{}> = {rit}.map(|__r| {rval}).collect(); let mut __v: Vec<{}> = Vec::new(); \
+                         if !__r.is_empty() || __n == 0 {{ let mut __c = vec![0usize; __n]; loop {{ let mut __f = {}; \
+                         for __k in 0..__n {{ __f.push(__r[__c[__k]]); }} __v.push(__f); \
+                         let mut __k = __n; loop {{ if __k == 0 {{ break; }} __k -= 1; __c[__k] += 1; if __c[__k] < __r.len() {{ break; }} __c[__k] = 0; if __k == 0 {{ __k = usize::MAX; break; }} }} \
+                         if __k == usize::MAX || __n == 0 {{ break; }} }} }} __v }}.into_iter()",
+                        rt.repr(),
+                        st.repr(),
+                        Self::default_code(&st)
+                    );
+                    return Ok((code, st, None));
+                }
             }
         }
         // SUBSET of a set that depends on the state, in TLC's order (smaller subsets first)

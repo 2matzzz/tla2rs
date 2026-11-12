@@ -339,8 +339,26 @@ fn find_module(name: &str, how: &str, dir: &std::path::Path, warnings: &mut Vec<
         return load_parsed(m, dir, warnings, depth);
     }
     let path = dir.join(format!("{name}.tla"));
-    let src = std::fs::read_to_string(&path).map_err(|_| format!("{how} {name}: module not found next to the spec"))?;
+    let src = match std::fs::read_to_string(&path) {
+        Ok(src) => src,
+        // A module of the CommunityModules that tla2rs provides (see src/community.rs)
+        Err(_) => match crate::community::source(name) {
+            Some(src) => return community_module(name, src, dir, warnings, depth),
+            None => return Err(format!("{how} {name}: module not found next to the spec")),
+        },
+    };
     load_module(&src, dir, warnings, depth)
+}
+
+/// A module of the CommunityModules, whose operators listed in `community::UNSUPPORTED` are
+/// refused where they are used
+fn community_module(name: &str, src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
+    let mut m = load_module(src, dir, warnings, depth)?;
+    for &(module, op, why) in crate::community::UNSUPPORTED.iter().filter(|u| u.0 == name) {
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
+        d.body = Expr::Call(format!("{op} of the CommunityModules' {module}, which tla2rs does not support: {why}"), vec![]);
+    }
+    Ok(m)
 }
 
 fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
@@ -732,8 +750,20 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     out.inst_prefixes.push((raw(""), inst.name.as_ref().map_or(String::new(), |n| format!("{n}!")), params.len()));
     let names: HashSet<&str> = mm.defs.iter().map(|d| d.name.as_str()).collect();
     let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone())).collect();
-    fn rename(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]) -> Expr {
+    // The number of parameters of each definition, for one passed as an operator argument
+    let arities: HashMap<String, usize> = mm.defs.iter().map(|d| (d.name.clone(), d.params.len())).collect();
+    let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, &arities);
+    fn rename_inst(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr], arities: &HashMap<String, usize>) -> Expr {
+        let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, arities);
         match e {
+            // A definition with parameters named without arguments is an operator argument
+            // (`Test(S, Op)`): the hidden definition with the leading parameters bound
+            Expr::Ident(n) if names.contains(n.as_str()) && !pargs.is_empty() && arities.get(n).is_some_and(|&k| k > 0) => {
+                let ps: Vec<String> = (0..arities[n]).map(|i| format!("{n}#arg{i}")).collect();
+                let mut a = pargs.to_vec();
+                a.extend(ps.iter().map(|p| Expr::Ident(p.clone())));
+                Expr::Lambda(ps, Expr::Call(raw(n), a).b())
+            }
             Expr::Ident(n) if names.contains(n.as_str()) => {
                 if pargs.is_empty() { Expr::Ident(raw(n)) } else { Expr::Call(raw(n), pargs.to_vec()) }
             }

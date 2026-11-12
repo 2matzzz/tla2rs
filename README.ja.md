@@ -97,6 +97,7 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
   フィールドの違うレコードとモデル値を一つの変数に混ぜてもよい（`[P -> Reqs \cup {NoVal}]`）。そのときは `TypeOK` を状態ごとに確かめる。モデル値は、長さの違うタプル・集合・関数・真偽値とも一つの変数に混ぜられる（`Seq(S) \cup {NoVal}` や、モデル値とモデル値の集合を値に持つ関数）。定義域の大きさが違う関数（n の違う `[i \in 0..n |-> e]`）を一つの変数に持たせてもよい
 - 要素の型が 128 通りまでの集合はビットマスクで持つ。それより大きいもの（集合の集合を含む）は容量の決まった整列した配列で、列も最大の長さの決まった配列で持つ。こうしておくと、状態をコピーしたり詰めたりするときにメモリを確保しなくて済む。集合の容量は 8 から始める（`TypeOK` に `Cardinality(x) <= K` があればそこから、Init が変数に入れる定数の集合のほうが大きければその大きさから）。要素の型の値の数より大きくはしない。列の最大の長さは、`TypeOK` か `CONSTRAINT` に `Len(x) <= N`（や `UNION {[1..n -> S] : n \in 0..N}`）があればその 1 つ上から始める。なければ Init と Next から長さを伸びなくなるまで求め（アクションの中の `Len(q) < N` のような長さの判定は、そこでの `q` の上限になる）、それも求まらなければ仕様の中の長さの判定から、それもなければ 8 から始める。値が容量を超えると、tla2rs は `tla2rs: a set grew beyond N elements; checking again from the start with room for 2N`（列なら a sequence）と表示し、チェッカーを作り直して最初から動かす。その行より前に出た表示（進み具合や ASSUME の Print）は、もう一度出る。作り直すたびにビルドの数秒がかかるが、容量に収まる仕様は今までと同じ速さで動く。どちらも 65535 までで、それを超える値は評価エラーになる
 - 標準モジュール：`Naturals`、`Integers`、`FiniteSets`、`Sequences`（`SortSeq` も。文字列は `\o`・`Len`・`Head`・`Tail`・`Append`・`SubSeq` では文字の列。`SelectSeq`・`SortSeq`・タプルの後に文字列を続ける `\o` では TLC と同じく文字のタプルになる）、`Bags`、`STRING`、`TLC` の `Print`・`PrintT`・`Assert`・`ToString`・`TLCEval`・`Any`・`:>`・`@@`・`Permutations`。負の数の `\div` は TLC と同じく仕様が読み込むモジュールで決まる。Integers を読み込めば商を小さいほうへ丸めた値、Naturals だけなら 0 に向けて丸めてから、それが負のときだけ 1 を引く（`(0 - 1) \div 3` は 0 になる）
+- [CommunityModules](https://github.com/tlaplus/CommunityModules) のモジュール：仕様の隣に同じ名前のモジュールが無ければ、tla2rs が自前で用意する。`Folds`、`Functions`、`FiniteSetsExt`、`SequencesExt`（`Interleave`・`AllSubSeqs`・`IndexFirstSubSeq`・`ReplaceFirstSubSeq`・`ReplaceAllSubSeqs` を除く）、`UndirectedGraphs`（`Path`・`SimplePath`・`AreConnectedIn`・`ConnectedComponents`・`IsStronglyConnected` を除く。これらは TLC 2.19 も評価できない。下を参照）、`Bitwise` に対応する。TLC 2.19 は CommunityModules の jar にある Java の上書きを読み込めないので、モジュールの TLA+ の定義をそのまま評価する。tla2rs の定義も同じ値になるように書いてある（CHOOSE が選ぶ値や、畳み込みで要素を取る順も同じ）。用意していない演算子は、使ったところで拒否する
 - レコードの並びは TLC と同じく、まずフィールドの数で決まる。モデル値は文字列より前に並ぶ。`Print` と `PrintT` は 80 桁を超える値を TLC と同じく折り返して表示する
 - レコードは TLC と同じ順序（TLC がフィールド名を初めて作った順）でフィールドを比べ、表示する。文字列の上の関数はレコードとして表示する。状態の値の `ToString` は型のすべての値の文字列をコンパイル時に作るので、型の値の数は 16 bit の文字列 ID に収まる分（文字列とモデル値を合わせて 65536 個）まで。仕様がフィールドを TLC と違う順に書いたレコードの `ToString` は拒否する。TLC はそのレコードを初めて比べるまでは書いた順に表示するので、文字列がそのタイミングで変わるため
 - 型の一部を定義域にする関数（とバッグ）は、型が 65536 通りまでなら型全体の上の配列で持つ。それより大きい型や上限のない型（Nat、広い整数の範囲、集合、それらのレコード）の上では（キー, 値）の組を整列して持ち、キーの容量は集合と同じように増える（`TypeOK` に `Cardinality(DOMAIN f) <= K` と書けば、そこから始まる）。タプルのリテラルは 99,999 要素まで（要素ごとに生成する型のフィールドになる）
@@ -125,7 +126,15 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 ## 確かめ方
 
 `scripts/crosscheck.sh` は TLC（`-workers 1`）と tla2rs で同じ構成を回し、結果・生成状態数・distinct 状態数・エラーで止まったときに TLC のキューに残っていた状態の数・反例・終了コード・メッセージと表示した行に加えて状態グラフを比べる。状態グラフとは、たどり着いた状態の集合と、状態どうしの遷移の集合のことで、TLC の `-dump dot` と tla2rs の `-dumpgraph` の出力をそれぞれ SHA-256 のハッシュにまとめて比べる。各状態の変数は TLC が表示する順のまま比べる。TLC はルートモジュールの名前を入れた SANY のハッシュ表の順に変数を並べるので、tla2rs も同じ表の順を計算して、その順に表示する。安全性の反例は 1 ステップずつ、状態と、そこへ至ったアクション（TLC の付ける名前と位置）を比べる。ワーカーが 1 つなら TLC の反例は毎回同じになる。液性の反例は TLC が乱数で選ぶ指紋の多項式に左右されるので、代わりに `-lassocheck` が書き出す仕様を TLC にかけ、tla2rs のラッソが仕様の公平な振る舞いで、性質を破っていることを TLC に確かめさせる。メッセージとは、TLC が出すエラーと警告の行と、仕様が `Print` / `PrintT` で表示した行を、出た順に並べたものである。進み具合の行は除き、TLC の内部の事情を表す部分（評価していた入れ子の式の一覧や Java のクラス名）も除く。TLC の文面をすべては出せない構成（tla2rs が持たない位置や、TLC が内部の規則で出すメッセージがある）は、cfg にその理由を書き、エラーの行だけを比べる。グラフ全体を比べられない場合（初期状態の計算中に止まると TLC はグラフのファイルを最後まで書かない、tla2rs が表せない後続状態がある）は比べる範囲を狭め、`all.sh` がどの規則を使ったかを表示する。規則の一覧は CLAUDE.md にある。
-`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は構成ごとに `tests/expected/` にコミットしてある。中身は判定・状態数・反例の長さとハッシュ・終了コード・状態グラフとメッセージのハッシュと、jar・cfg・引数・仕様が読むモジュール・`src/graph.rs`・`src/trace.rs`・`src/messages.rs` のハッシュである。時刻・指紋の種・liveness の反例の形は TLC の実行ごとに変わるので記録せず、ファイルはどの実行でも同じになる。`crosscheck.sh` と `all.sh` はこのファイルと比べるだけで、構成そのものに TLC は回さない（回すのはラッソの確認だけ）。ファイルが無いか古いときは失敗にする。TLC を回すのは `scripts/expected.sh [cfg ...]` だけで、無いものと古いものだけを書き、ほかには触らないので、2 回目は何も変えない。`expected.sh -check` は TLC を回し直して食い違うファイルを報告し、書き込みはしない。`-force` はすべて書き直す。ビルドした検査器は、生成コードと rustc の版のハッシュで `target/crosscheck/build` に残す(`CROSSCHECK_NO_CACHE=1` で毎回ビルドし直す)。
+`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。CommunityModules のモジュールを EXTENDS や INSTANCE で使う仕様では、TLC のために `scripts/crosscheck.sh` が固定しているリリース（202611060952、sha256 `a3b27c40f1fb5085f30c6ead37e918457f8cfc62c1e50a1dc668ef592ad2b5fb`）を `COMMUNITY_MODULES` で渡す（既定 `~/.tla/CommunityModules-deps.jar`）。
+
+```sh
+curl -L -o ~/.tla/CommunityModules-deps.jar \
+  https://github.com/tlaplus/CommunityModules/releases/download/202611060952/CommunityModules-deps-202611060952.jar
+shasum -a 256 ~/.tla/CommunityModules-deps.jar
+```
+
+TLC 2.19 はこの jar の Java の上書きを読み込めない。2023 年 12 月から 2026 年 11 月までの、試したリリースはどれも TLC 2.19 に無いクラスを使っていて、どんな仕様でも `NoClassDefFoundError: tlc2/value/impl/KSubsetValue` で止まる。そこで `crosscheck.sh` は jar からモジュールだけを `target/community/` に取り出して TLC に渡す。そういう仕様の結果ファイルのキーには jar のハッシュも入る。`tests/expected/` と比べるだけなら jar は要らない。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は構成ごとに `tests/expected/` にコミットしてある。中身は判定・状態数・反例の長さとハッシュ・終了コード・状態グラフとメッセージのハッシュと、jar・cfg・引数・仕様が読むモジュール・`src/graph.rs`・`src/trace.rs`・`src/messages.rs` のハッシュである。時刻・指紋の種・liveness の反例の形は TLC の実行ごとに変わるので記録せず、ファイルはどの実行でも同じになる。`crosscheck.sh` と `all.sh` はこのファイルと比べるだけで、構成そのものに TLC は回さない（回すのはラッソの確認だけ）。ファイルが無いか古いときは失敗にする。TLC を回すのは `scripts/expected.sh [cfg ...]` だけで、無いものと古いものだけを書き、ほかには触らないので、2 回目は何も変えない。`expected.sh -check` は TLC を回し直して食い違うファイルを報告し、書き込みはしない。`-force` はすべて書き直す。ビルドした検査器は、生成コードと rustc の版のハッシュで `target/crosscheck/build` に残す(`CROSSCHECK_NO_CACHE=1` で毎回ビルドし直す)。
 
 ```
 $ scripts/all.sh
@@ -139,7 +148,7 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 
 ### 公開されている仕様集との突き合わせ
 
-上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` だけで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 98 モデルのうち 95 が TLC と一致する（うち 6 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。残る 3 つの差分はどれも今は回していない。理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
+上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` と CommunityModules のモジュールで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 105 モデルのうち 101 が TLC と一致する（うち 6 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。残る 4 つの差分の理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
 
 | 例 | 中身 |
 |---|---|
@@ -156,4 +165,4 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 
 ## ライセンス表記
 
-tla2rs の一部は TLC と TLA+ Examples から派生している。どちらも MIT License で、表示と許諾文は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にある。
+tla2rs の一部は TLC、TLA+ Examples、CommunityModules から派生している。どれも MIT License で、表示と許諾文は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にある。

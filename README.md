@@ -148,6 +148,13 @@ memory.
   `ToString`, `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`. `\div` of a negative number follows the module
   the spec loads, as in TLC: the floor of the quotient with Integers, and with Naturals only, rounded toward zero
   and then down when that is negative (`(0 - 1) \div 3` is 0)
+- Modules of the [CommunityModules](https://github.com/tlaplus/CommunityModules), which tla2rs provides itself
+  when no module of that name is next to the spec: `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt` (but
+  `Interleave`, `AllSubSeqs`, `IndexFirstSubSeq`, `ReplaceFirstSubSeq` and `ReplaceAllSubSeqs`), `UndirectedGraphs`
+  (but `Path`, `SimplePath`, `AreConnectedIn`, `ConnectedComponents` and `IsStronglyConnected`, which TLC 2.19
+  cannot evaluate either; see below) and `Bitwise`. TLC 2.19 cannot load the Java overrides in the CommunityModules
+  jar, so it evaluates the modules' TLA+ definitions, and tla2rs's give the same values (what CHOOSE picks, the
+  order a fold takes elements in). An operator not provided is refused where it is used
 - Records are ordered as TLC orders them (by their number of fields first), model values come before strings, and
   `Print` / `PrintT` break a value wider than 80 columns over lines, as TLC does
 - Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),
@@ -242,7 +249,21 @@ cannot be compared as a whole (TLC stops before ending its graph file when it st
 the initial states; a successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied;
 CLAUDE.md lists them. `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
-`TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). `all.sh` runs four configurations at a time
+`TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). A spec that names a module of the CommunityModules
+in EXTENDS or INSTANCE needs, for TLC, the release `scripts/crosscheck.sh` pins (202611060952, sha256
+`a3b27c40f1fb5085f30c6ead37e918457f8cfc62c1e50a1dc668ef592ad2b5fb`), at `COMMUNITY_MODULES` (default
+`~/.tla/CommunityModules-deps.jar`):
+
+```sh
+curl -L -o ~/.tla/CommunityModules-deps.jar \
+  https://github.com/tlaplus/CommunityModules/releases/download/202611060952/CommunityModules-deps-202611060952.jar
+shasum -a 256 ~/.tla/CommunityModules-deps.jar
+```
+
+TLC 2.19 cannot load that jar's Java overrides (the releases tried, from 2023-12 to 2026-11, need a class TLC 2.19 does not have, and
+TLC stops with `NoClassDefFoundError: tlc2/value/impl/KSubsetValue` on any spec), so `crosscheck.sh` extracts the
+jar's modules into `target/community/` and gives TLC only those; the jar's hash is part of the key of such a spec's
+expected file. Comparing against `tests/expected/` does not need the jar. `all.sh` runs four configurations at a time
 (`JOBS=N` to change). TLC's result for each configuration is committed in `tests/expected/`: the verdict, the
 state counts, the length and a hash of the counterexample, the exit code, the hashes of the state graph and of the
 messages, with a hash of the jar, the cfg, the arguments, the modules the spec reads, `src/graph.rs`, `src/trace.rs`
@@ -272,11 +293,11 @@ same way, against the models of the tlaplus/Examples repository (https://github.
 pinned in `tests/corpus.txt`. It fetches the corpus into `target/corpus/<commit>/` and only lets TLC and tla2rs read
 it; nothing of the corpus is copied into this repository except TLC's results for it (`tests/expected/corpus/`,
 written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model of the corpus's manifests: those
-selected (the exhaustive searches that TLC 2.19 finishes, with only `tla2tools.jar`, in 60 seconds or less with one
-worker) and, for each of the others, why it is skipped. A selected model that tla2rs does not match yet is listed as
-a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost. Of the 98 selected models,
-95 match TLC (6 of them on everything but the generated count, which TLC counts once per `\/` branch); the 3 gaps,
-none of them run for now, and their reasons are in `tests/corpus.txt` and CLAUDE.md.
+selected (the exhaustive searches that TLC 2.19 finishes, with `tla2tools.jar` and the CommunityModules' modules, in
+60 seconds or less with one worker) and, for each of the others, why it is skipped. A selected model that tla2rs does
+not match yet is listed as a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost.
+Of the 105 selected models, 101 match TLC (6 of them on everything but the generated count, which TLC counts once per
+`\/` branch); the 4 gaps and their reasons are in `tests/corpus.txt` and CLAUDE.md.
 
 | Example | What it is |
 |---|---|
@@ -293,5 +314,6 @@ none of them run for now, and their reasons are in `tests/corpus.txt` and CLAUDE
 
 ## License notices
 
-Parts of tla2rs are derived from TLC and from the TLA+ Examples, both under the MIT License; see
+Parts of tla2rs are derived from TLC, from the TLA+ Examples and from the CommunityModules, all under the MIT
+License; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

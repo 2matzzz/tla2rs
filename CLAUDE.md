@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 671 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 680 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -44,7 +44,10 @@ It has no crate dependencies.
   sets how many configurations `all.sh` and `expected.sh` run at once. `CROSSCHECK_GRAPH_DIR=DIR` keeps the graphs
   of a run as `DIR/<cfg>.tlc.dot` (with `expected.sh`) and `DIR/<cfg>.rs.dot`, and the outputs as `DIR/<cfg>.tlc.out`
   and `DIR/<cfg>.rs.out`
-- The TLC jar comes from `TLA_TOOLS` (default `~/.tla/tla2tools.jar`)
+- The TLC jar comes from `TLA_TOOLS` (default `~/.tla/tla2tools.jar`). For a spec that names a module of the
+  CommunityModules in EXTENDS or INSTANCE (without a module of that name next to it), TLC also needs the release
+  `crosscheck.sh` pins (`cm_version`, `cm_sha256`), from `COMMUNITY_MODULES` (default
+  `~/.tla/CommunityModules-deps.jar`); see "CommunityModules"
 - `scripts/corpus.sh` cross-checks the models selected from a public corpus, the tlaplus/Examples repository
   at the commit pinned in `tests/corpus.txt`, against TLC's results in `tests/expected/corpus/` (see "The
   corpus"). It is separate from `all.sh`, which it does not slow down. `scripts/expected.sh -corpus` writes
@@ -62,6 +65,7 @@ It has no crate dependencies.
 | `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A value that is a record or a model value (`[op : S] \cup {NoVal}`) is a record type whose fields are all optional, with the model values in a field of its own (`ATOM_FIELD`); a type invariant giving such a type is checked on every state, since packing does not check which records it lists. A value that is a model value or a value of another kind (a sequence, tuple, set, function, bag or boolean: `Seq(S) \cup {NoVal}`, `SUBSET P \cup P`) is such a record type too, with that value in a field of its own (`VAL_FIELD`, named to sort before `ATOM_FIELD`, so model values come first as in TLC); an operation that takes the value apart (application, DOMAIN, iteration, set operations, Cardinality, the sequence operators) takes it out of that field (`Gen::gen_val`), and fails on a model value. A record type with optional fields of at most 4096 values is numbered in TLC's order of records (`tlc_perm`: the number of fields first), so sets of such records print, CHOOSE and enumerate as in TLC. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). An `SSet` holds at most SCAP elements, and never more than its element type has values (`set_cap`); both capacities grow at run time (see "Capacities"). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element); functions over different domains (other than 1..n, which are sequences) join into one. Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
 | `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). When the types from TypeOK fail in Init or Next (a module that extends another and adds a record field its type invariant lacks), the spec is compiled again with every type inferred (`INFER_ALL`). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
+| `src/community.rs` | The modules of the CommunityModules tla2rs provides (see "CommunityModules"): TLA+ source written for tla2rs, loaded by `compile::find_module` when no module of that name is next to the spec |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
@@ -654,11 +658,14 @@ TLC's results (`tests/expected/corpus/<path>.txt`, the same summaries as for `te
 the gaps it showed are written from scratch, reproducing only the form that failed.
 
 `tests/corpus.txt` lists all 243 models of the corpus's manifests. Selected are the exhaustive searches that TLC 2.19
-finishes with only `tla2tools.jar`, in 60 s or less with one worker and `-dump dot` (measured; the manifest's runtimes
-are for several workers). Skipped, with the reason on each line: 46 symbolic (Apalache), 6 random generation or
-simulation, 2 that need a TLC flag for action composition, 49 that need a module not in `tla2tools.jar` (community
-modules, TLAPS), 35 that take longer (from the manifest's runtime, or measured), 5 whose cfg TLC 2.19 refuses (an
-`ALIAS` section), and 2 where TLC picks values at random (two TLC runs differed). That leaves 98 selected.
+finishes with `tla2tools.jar` and the CommunityModules' modules, in 60 s or less with one worker and `-dump dot`
+(measured; the manifest's runtimes are for several workers). Skipped, with the reason on each line: 46 symbolic
+(Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 33 that need a module
+neither in `tla2tools.jar` nor in the CommunityModules (the proof system's library: TLAPS, NaturalsInduction,
+FiniteSetTheorems; TLCExt), 36 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
+refuses (an `ALIAS` section), 2 where TLC picks values at random (two TLC runs differed), 5 where TLC 2.19 stops in a
+CommunityModules definition that needs its Java override (IOUtils, and quantifiers over `Seq(S)` in Graphs and
+UndirectedGraphs), and 1 that reads `TLCGet("config")`, which TLC 2.19 does not define. That leaves 105 selected.
 
 The cfgs of the corpus are not edited, so a line of the list gives what a `\* crosscheck:` line would: `rules=`
 (narrowing rules, passed as `CROSSCHECK_RULES`) and `rsargs=` (arguments for tla2rs only, `CROSSCHECK_RSARGS`; no
@@ -667,21 +674,26 @@ match is listed as `gap` with the reason measured; `corpus.sh` still runs it and
 fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
 below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 95 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 101 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
 more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
 with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
 states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
 4682 distinct edges; `MCCheckpointCoordinationFailure` has 1297994 and 1297595 edges, and the same 611225 distinct
 edges. The graph hashes compare the distinct edges, so the state space and transitions match. `StaleViewShrink` (4) is
-not measured this way. 3 are gaps, all `norun`:
+not measured this way. 4 are gaps, 3 of them `norun`:
 
 | Gap | Model |
 |---|---|
+| A liveness counterexample under a VIEW: verdict, counts and state graph match, but tla2rs's lasso goes through the first state reached of each view, which is not always a successor of the state before it, so TLC deadlocks on the lasso check | `MCDistributedReplicatedLog` |
 | `norun`: the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it | `GameOfLife` |
 | `norun`: evaluating its ASSUMEs at compile time took 1.5 GB in 2.5 minutes (LET definitions are expanded at each use, so recursion through them repeats work) | `BlockDagTest` |
 | `norun`: the system killed tla2rs for memory in a corpus run | `TLCSailfish1` |
 
-Forms the corpus showed, each with a test in `tests/tlc/`: records of different fields in TLC's
+Forms the corpus showed, each with a test in `tests/tlc/`: the CommunityModules (`CmFun`, `CmSet`, `CmSeq`,
+`CmGraph`, `CmBits`; see "CommunityModules"), `[1..n -> S]` with n from the state as a set of sequences
+(`SeqFunSet`), a definition of an instantiated module passed as an operator argument (`InstOpArg`), a recursive
+operator called inside the operator passed to it (`RecNestOp`), the field of an element of a set that starts empty
+(`EmptyField`), records of different fields in TLC's
 order (`RecMix`), a value that is a record or a model value (`RecAtom`), primed substituted variables in ENABLED
 written in an instance (`EnSubst`), a fair action leaving variables its subscript does not read undetermined
 (`FairSub`), `x \in UNION {S}` without enumerating S (`UnionMem`), recursive functions typed from a set, function or
@@ -693,6 +705,33 @@ values before strings (`ModelStr`), records compared field by field in an array 
 conditions (`ManyFair`), tuples of different lengths or sets held beside model values (`SeqAtom`, `SetAtom`),
 functions over domains of different sizes (`DomGrow`), and TLC's warning that a PlusCal algorithm changed since its
 translation (`PcalSum`).
+
+### CommunityModules
+
+The CommunityModules (https://github.com/tlaplus/CommunityModules) are modules TLC finds on its class path. Every
+release tried (2023-12 to 2026-11) carries Java overrides that need a class TLC 2.19 does not have: with the jar on
+the class path TLC 2.19 stops on any spec (`NoClassDefFoundError: tlc2/value/impl/KSubsetValue`). TLC 2.19 is built
+from the 1.7 line of TLC, which branched before that class was added. So `crosscheck.sh` gives TLC the release's
+modules only, extracted into
+`target/community/<sha256>/`, and TLC evaluates their TLA+ definitions. The release is pinned by version and sha256
+in `crosscheck.sh` (202611060952, the one current at the corpus's commit); a spec that uses it has the hash in the
+key of its expected file.
+
+tla2rs provides `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`, `UndirectedGraphs` and `Bitwise` itself
+(`src/community.rs`), as TLA+ source written for tla2rs, read when no module of that name is next to the spec.
+Since TLC evaluates the modules' own definitions, these give the same values: CHOOSE over the same set with the
+same predicate (`SetToSeq`, `Max`, `LongestCommonPrefix`, `Inverse`), and folds that take the elements in the same
+order (`MapThenFoldSet` applies `op(f(x), rest)` with x chosen first, so `FoldFunction` takes the smallest index
+first, `FoldLeft` the largest). Each module exports the same names in the same order as the release's, with what it
+extends (`SequencesExt` extends Bags and TLC, for example), since SANY's context, and the order TLC prints variables
+in, depend on them (see "The order of variables"). Operators listed in `community::UNSUPPORTED` are refused where
+they are used: five of SequencesExt not written yet, and UndirectedGraphs' operators over paths, which quantify over
+`Seq(S)`, so TLC 2.19 stops on them too ("non-enumerable quantifier bound").
+
+Not followed: the identifiers and strings of these modules are not in `tlc_string_ranks` (TLC creates them when it
+parses the modules), so a string literal of the spec equal to one of their identifiers, and not to one of the spec's,
+may be ordered differently; no configuration has one. Errors inside the modules' definitions (Max of an empty set,
+Last of an empty sequence) are reported with positions in TLC's modules that tla2rs does not have.
 
 ### PlusCal checksums
 
