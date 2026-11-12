@@ -438,10 +438,13 @@ fails only on a `check` that differs. A gap marked `norun` is not run, as runnin
 below).
 
 Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 91 match, of which 6 with `distinct-only` and 10
-with a bound for tla2rs. Only the generated count differs in those 6, as TLC counts a successor once per `\/` branch
-that yields it: `StaleViewShrink` (4, not confirmed by rewriting), `MCCheckpointCoordinationFailure` (not confirmed)
-and `2PCwithBTM` (rewriting one guard whose two branches both hold as IF lowered TLC's count from 5841 to 5673; tla2rs
-gives 5291). 7 are gaps (4 run, 3 `norun`), each blocking one model:
+with a bound for tla2rs. Only the generated count differs in those 6: TLC generates the same successor of a state
+more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
+with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
+states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
+4682 distinct edges; `MCCheckpointCoordinationFailure` has 1297994 and 1297595 edges, and the same 611225 distinct
+edges. The graph hashes compare the distinct edges, so the state space and transitions match. `StaleViewShrink` (4) is
+not measured this way. 7 are gaps (4 run, 3 `norun`), each blocking one model:
 
 | Gap | Model |
 |---|---|
