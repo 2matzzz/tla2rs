@@ -21,7 +21,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 581 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 583 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -201,7 +201,7 @@ TLC stops with exit 150 before checking anything when SANY refuses a spec. tla2r
   standard modules export what TLC's jar defines in them; those that instantiate Naturals LOCALly (Sequences,
   FiniteSets, TLC, Bags) do not export Nat or `+`. An INSTANCE brings the instantiated module's definitions into
   scope at that point (a LOCAL INSTANCE too, without exporting them), `N == INSTANCE M` only N. A RECURSIVE
-  declaration puts its name in scope. A nested module sees what is in scope where it starts
+  declaration puts its name in scope, and is exported even when the definition is LOCAL. A nested module sees what is in scope where it starts
 - Every name used must be in scope (`Unknown operator`, `Could not find declaration or definition of symbol`),
   in every definition, used or not; this covers the operators of standard modules not extended (`Len`, `+`, unary
   minus as `-.`, `:>`). The sets of `\E x \in S, y \in T` are read outside the quantifier, so T cannot use x
@@ -230,7 +230,7 @@ TLC stops with exit 150 before checking anything when SANY refuses a spec. tla2r
 - String escapes other than `\\ \" \n \t \r \f`
 
 LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile::hide_locals`), since they are not
-in scope in the module that reads it, which may define the same name.
+in scope in the module that reads it, which may define the same name (`tests/tlc/SanyScope`, `SanyLocalRec`).
 
 Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
 (their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
@@ -433,12 +433,12 @@ new states only (`PrintConst` printed the invariant of a revisited state twice o
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
 compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.`, a second error TLC
-reports after the behavior in some configurations (below). 60 configurations, by reason:
+reports after the behavior in some configurations (below). 61 configurations, by reason:
 
 | Reason | Configurations |
 |---|---|
 | TLC gives a position tla2rs does not keep: of an identifier it fails to evaluate (also a variable a fair action leaves unspecified, which tla2rs reports in its own words), of an `x' \in S` it cannot enumerate | 9: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `FairPartial`, `RealSet-NextE` |
-| SANY's report: the position of the expression it refuses and its wording (`Semantic errors:`, `***Parse Error***`, a lexical error) | 33: `RejLevel`, `RejSanyChoose`, `-Escape`, `-Minus`, `-Prec`, `-PrecUser`, `-Shadow`, `-TlcOps`, `-Builtin`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-Lambda`, `-OwnParam`, `-Postfix`, `-PrecAlways`, `-PrecDomain`, `-PrecEnabled`, `-PrecMinus`, `-QuantSet`, `-RecParam`, `-StdName`, `-StdUnext`, `-Subexpr`, `-Unknown`, `RejTempBox`, `-Ev`, `-Leads`, `-Mix`, `SubexprBad` |
+| SANY's report: the position of the expression it refuses and its wording (`Semantic errors:`, `***Parse Error***`, a lexical error) | 34: `RejLevel`, `RejSanyChoose`, `-Escape`, `-Minus`, `-Prec`, `-PrecUser`, `-Shadow`, `-TlcOps`, `-Builtin`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-LocalRec`, `-Lambda`, `-OwnParam`, `-Postfix`, `-PrecAlways`, `-PrecDomain`, `-PrecEnabled`, `-PrecMinus`, `-QuantSet`, `-RecParam`, `-StdName`, `-StdUnext`, `-Subexpr`, `-Unknown`, `RejTempBox`, `-Ev`, `-Leads`, `-Mix`, `SubexprBad` |
 | TLC warns about an EXCEPT outside the domain on some of the evaluations that do one (3 of many in `SparseFun`), by a rule not found; `LazyFun*` also show the position of a function's body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
 | TLC reports a second error after the behavior: `TLC was unable to fingerprint.` with its reason | 5: `MixedIn`, `NatDom-InNat`, `RealSet-Sub`, `SeqIdx`, `RejTupleCross` |
 | TLC shows the values it compared when a tuple meets another value; tla2rs decides that failure from the types | 4: `RejTupleEq`, `RejTupleIn`, `TupleStr-InDef`, `RejTupleCross` (also above) |
