@@ -1,7 +1,7 @@
 ---- MODULE PrintConst ----
 \* Print and PrintT: TLC evaluates the definitions of constant level without arguments when it
 \* starts (and uses those values later), then the ASSUMEs; elsewhere they print each time they
-\* are evaluated. crosscheck.sh does not compare printed lines; they were compared by hand
+\* are evaluated. crosscheck.sh compares the lines printed, in order
 EXTENDS Naturals, TLC
 CONSTANT N
 VARIABLE x

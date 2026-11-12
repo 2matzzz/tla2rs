@@ -16,25 +16,29 @@ It has no crate dependencies.
   diffing two graphs (see "State graphs")
 - `target/release/tla2rs --trace FILE` reduces the counterexample in an output of TLC or of a checker to `trace N
   <sha256>`; `--trace-text FILE` prints its canonical form (see "Counterexamples")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 483 currently
+- `target/release/tla2rs --messages FILE` reduces the messages and printed lines in such an output to `messages N
+  <sha256>` and its error lines to `errors M <sha256>`; `--messages-text FILE` prints the canonical form (see
+  "Messages and printed lines")
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 484 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
   one worker, and it compares the verdict, generated and distinct state counts, the counterexample (its states and
-  the action of each step; see "Counterexamples"), exit code, and the state graph (the set of states and the set of
-  transitions; see "State graphs"). A liveness counterexample is instead checked by TLC (it runs TLC on the
+  the action of each step; see "Counterexamples"), exit code, the messages and printed lines (see "Messages and
+  printed lines"), and the state graph (the set of states and the set of transitions; see "State graphs"). A liveness counterexample is instead checked by TLC (it runs TLC on the
   `-lassocheck` output). If TLC produces no verdict, the check fails. `all.sh` prints, after `ok`, the rule that
   narrowed a comparison, if any
 - TLC's summary for each configuration (verdict, counts, the length and hash of its counterexample, exit code, the
-  hashes of its state graph, and a key hashing the jar, cfg, arguments, the modules the spec reads, `src/graph.rs`
-  and `src/trace.rs`) is committed in
+  hashes of its state graph and of its messages, and a key hashing the jar, cfg, arguments, the modules the spec
+  reads, `src/graph.rs`, `src/trace.rs` and `src/messages.rs`) is committed in
   `tests/expected/`. `crosscheck.sh` and `all.sh` compare
   against these files only (they run TLC only on a lasso check not yet confirmed, cached in `target/crosscheck/lasso` by a hash of the check, its modules and the jar) and fail on a missing or stale one. After adding or changing a test, run
   `scripts/expected.sh` (it runs TLC for missing and stale files only) and commit the files with the test.
   `expected.sh -check` reruns TLC and reports differences without writing. Built checkers are cached in
   `target/crosscheck/build` (key: generated code and rustc version; `CROSSCHECK_NO_CACHE=1` rebuilds); `JOBS=N`
   sets how many configurations `all.sh` and `expected.sh` run at once. `CROSSCHECK_GRAPH_DIR=DIR` keeps the graphs
-  of a run as `DIR/<cfg>.tlc.dot` (with `expected.sh`) and `DIR/<cfg>.rs.dot`
+  of a run as `DIR/<cfg>.tlc.dot` (with `expected.sh`) and `DIR/<cfg>.rs.dot`, and the outputs as `DIR/<cfg>.tlc.out`
+  and `DIR/<cfg>.rs.out`
 - The TLC jar comes from `TLA_TOOLS` (default `~/.tla/tla2tools.jar`)
 
 ## Layout
@@ -53,6 +57,7 @@ It has no crate dependencies.
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
 | `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
 | `src/trace.rs` | `--trace`: reduces the counterexample in an output of TLC or of a checker to its canonical form and hashes it |
+| `src/messages.rs` | `--messages`: reduces the messages and printed lines in an output of TLC or of a checker to their canonical form and hashes it, and its error lines (see "Messages and printed lines") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos). Also TLC's pretty printer for values (`ppr`, used for every state printed) and the `-dumpgraph` output |
 
@@ -305,6 +310,78 @@ fairness for both processes in `Peterson-Unfair`: no error). VIEW and SYMMETRY a
 lasso is checked as a behavior of the spec itself (`LiveSym` passes). `crosscheck.sh` runs this for each of the 37
 liveness violations (about a second of TLC each) and fails if TLC does not confirm it, or if the spec's parts cannot
 be written out (`lasso::tla` refuses a SPECIFICATION split inside an INSTANCE, and LET or LAMBDA in its conjuncts).
+
+### Messages and printed lines
+
+What TLC prints besides its progress and the counterexample is compared too: its error and warning
+messages and the lines the spec prints (Print, PrintT), in order. `src/messages.rs` reduces an output
+to a canonical text; the expected file keeps `messages N <sha256>` of it and `errors M <sha256>` of
+its error lines (the lines that start with `Error:`). `tla2rs --messages-text FILE` prints the text,
+for diffing.
+
+Measured on TLC 2.19, two runs of every configuration with one worker (as `expected.sh -check`,
+each with its own random fingerprint seed) gave the same canonical text for all of them. What varies
+between runs is in lines that are dropped anyway: the banner (fingerprint seed, process id), the
+temporary paths of the modules TLC parses, times and dates, and the shape of a liveness
+counterexample. No configuration printed a Java stack trace. The rules:
+
+| Part of the output | Rule |
+|---|---|
+| Banner, modules parsed, progress, statistics (counts, depth, outdegree, collision estimates), times, and a checker's equivalents | Dropped (the counts are compared on their own) |
+| Counterexample (`State N:` / `Back to state N:` and the state after it) | Dropped (compared by `trace.rs`) |
+| TLC's evaluation stacks: `The error occurred when TLC was evaluating the nested expressions at the following positions:` with its numbered positions, and `Fingerprint Stack Trace:` with its frames | Dropped: deterministic, but they list TLC's own nested evaluations, which a checker that inlines every definition does not have |
+| SANY's parser stack (`Residual stack trace follows:` and its lines) and `tla2sany.semantic.AbortException` | Dropped (SANY's internals) |
+| `The exception was a java.lang.RuntimeException` and a Java class name before the message on the next line (`: tlc2.tool.EvalException: ...`) | The class lines are dropped and the message kept: they say how TLC passed the error on |
+| A state after a message (`... is violated by the initial state:`, `While working on the initial state:`) | One line, in the canonical form of a state (variables sorted) |
+| Empty lines | Dropped |
+
+How TLC words an evaluation error depends on where it happens, measured on the `ErrCon*`, `EvalNext*`,
+`InvEval*`, `LiveErr*` and `Unbounded*` configurations, and `runtime.rs` (`report_eval_as`) follows it:
+
+- While computing successors, TLC reports its own evaluation errors (a failed arithmetic operation,
+  a false Assert; the exit code is then 255 or that of Assert) as `Error: <message>`, and any other
+  error as an exception it did not expect: `Error: TLC threw an unexpected exception.`, two more
+  lines, the Java class, then the message. In the CONSTRAINT, ACTION_CONSTRAINT, VIEW and the
+  liveness checks, every error is reported that way
+- While computing or checking the initial states every error is plain. One that is not TLC's own
+  evaluation error, raised while checking an initial state (CONSTRAINT, invariant, property), is
+  followed by `While working on the initial state:` and the state
+- TLC gives the position of a CASE with no true condition (`In computing next states, TLC
+  encountered a CASE ...` for a CASE among the conjuncts of an action, `In computing ENABLED, ...`
+  while computing whether an action is enabled), of a CHOOSE no element satisfies, of an unbounded
+  quantifier, of a temporal formula it refuses, and names a part of a property by position. The
+  parser keeps these positions in AT labels (`ast::AT`), which expansion keeps
+- tla2rs's own notes (which state it cannot represent, what it was evaluating) go to stderr
+
+TLC warns that SYMMETRY and constraints are dangerous when it checks temporal properties. It prints
+these warnings after the Print and PrintT of the constant definitions and before those of the
+ASSUMEs, and the note `(Use the -nowarning option to disable this warning.)` after the first warning
+of a run only (`compile::Startup`; with its default garbage collector, TLC's first warning is about
+that instead, which `-XX:+UseParallelGC` avoids).
+
+Printed lines: with one worker TLC prints them in a fixed order. They match in order for Print and
+PrintT in the constant definitions and ASSUMEs (printed once, when TLC starts), and in the search
+when the order of evaluation is the same (`PrintConst`). TLC checks the invariants of each initial
+state and of each successor as soon as it generates it, and evaluates the initial predicate and the
+actions again while rebuilding a counterexample. tla2rs computes all initial states, or all
+successors of a state, before checking them, and replays a counterexample its own way, so lines
+printed in Init, an action or an invariant come in another order (and number) when a state has more
+than one initial state or successor (`PrintNext`).
+
+Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
+makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
+compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.`, a second error TLC
+reports after the behavior in some configurations (below). 40 configurations, by reason:
+
+| Reason | Configurations |
+|---|---|
+| TLC gives a position tla2rs does not keep: of an identifier it fails to evaluate (also a variable a fair action leaves unspecified, which tla2rs reports in its own words), of an `x' \in S` it cannot enumerate | 9: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `FairPartial`, `RealSet-NextE` |
+| SANY's report: the position of the expression it refuses and its wording (`Semantic errors:`, `***Parse Error***`, a lexical error) | 13: `RejLevel`, `RejSanyChoose`, `-Escape`, `-Minus`, `-Prec`, `-PrecUser`, `-Shadow`, `-TlcOps`, `RejTempBox`, `-Ev`, `-Leads`, `-Mix`, `SubexprBad` |
+| TLC warns about an EXCEPT outside the domain on some of the evaluations that do one (3 of many in `SparseFun`), by a rule not found; `LazyFun*` also show the position of a function's body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
+| TLC reports a second error after the behavior: `TLC was unable to fingerprint.` with its reason | 5: `MixedIn`, `NatDom-InNat`, `RealSet-Sub`, `SeqIdx`, `RejTupleCross` |
+| TLC shows the values it compared when a tuple meets another value; tla2rs decides that failure from the types | 4: `RejTupleEq`, `RejTupleIn`, `TupleStr-InDef`, `RejTupleCross` (also above) |
+| TLC names the Java method and the cast that failed (a model value in `+`) | 1: `ArithNone` |
+| Order of evaluation: TLC reports the error from ENABLED of a fair action, tla2rs from its step; Print in the search (above) | 2: `LiveErr-Fair`, `PrintNext` |
 
 ### VIEW and SYMMETRY together
 

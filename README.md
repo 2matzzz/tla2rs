@@ -51,8 +51,11 @@ cargo build --release
   the lasso is a fair behavior of the spec that violates them (see CLAUDE.md, "Counterexamples")
 - `tla2rs --trace FILE` reduces the counterexample in an output of TLC or of a checker to its length and a hash of its
   states and actions; `--trace-text FILE` prints the canonical form
+- `tla2rs --messages FILE` reduces the messages and printed lines in such an output (everything but the progress,
+  statistics and counterexample) to a hash, and its error lines to another; `--messages-text FILE` prints the
+  canonical form
 - Output (state counts, counterexample format, including the name and position of each step's action, values wider
-  than 80 columns broken over lines) follows TLC, and so do exit codes: 10 = assumption (false or failing to
+  than 80 columns broken over lines, error and warning messages) follows TLC, and so do exit codes: 10 = assumption (false or failing to
   evaluate), 11 = deadlock, 12 = invariant, 13 = temporal or action property. An evaluation error exits with 76 in an
   invariant, 75 in the initial states, and otherwise 255 for a failed arithmetic operation (such as `\div` by zero) and
   75 for the rest
@@ -147,6 +150,9 @@ memory.
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC
   does, those in definitions of constant level without arguments and in ASSUMEs once, when the checker starts
+- Print and PrintT in the initial predicate, an action or an invariant print in another order than TLC's when a state
+  has more than one initial state or successor: TLC checks each new state as soon as it generates it and evaluates
+  the actions again while rebuilding a counterexample (see CLAUDE.md, "Messages and printed lines")
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
   reason), sets that may hold both strings and integers, `Name <- [Module] Def` for a CONSTANT (TLC rejects it too),
   `Op!@`, and a recursive operator that assigns variables called in Init with arguments that are not constant. `\A`
@@ -176,20 +182,26 @@ memory.
 ## Cross-checking against TLC
 
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
-generated and distinct state counts, the counterexample, exit code, and the state graph: the set of states reached
+generated and distinct state counts, the counterexample, exit code, the messages and printed lines, and the state
+graph: the set of states reached
 and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a SHA-256
 hash (with the variables of each state sorted, since TLC's order comes from a hash table). A safety counterexample is
 compared step by step: each state and the action that led to it, as TLC names it (with one worker TLC's is the same
 on every run). A liveness counterexample depends on TLC's random fingerprint polynomial, so instead TLC is run on the
 spec `-lassocheck` writes, and must confirm that tla2rs's lasso is a fair behavior of the spec that violates the
-properties. Where the graph cannot be compared as a whole (TLC stops before ending its graph file when it stops in
+properties. The messages are TLC's error and warning lines and what the spec prints with Print and PrintT, in order,
+without the progress lines and with the parts that are TLC's internals left out (the stack of nested expressions
+TLC was evaluating, Java class names); where tla2rs cannot print all of TLC's text (a position it does not keep,
+a message TLC prints by an internal rule), the cfg says why and only the error lines are compared. Where the graph
+cannot be compared as a whole (TLC stops before ending its graph file when it stops in
 the initial states; a successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied;
 CLAUDE.md lists them. `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
 `TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). `all.sh` runs four configurations at a time
 (`JOBS=N` to change). TLC's result for each configuration is committed in `tests/expected/`: the verdict, the
-state counts, the length and a hash of the counterexample, the exit code and the hashes of the state graph, with a
-hash of the jar, the cfg, the arguments, the modules the spec reads, `src/graph.rs` and `src/trace.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
+state counts, the length and a hash of the counterexample, the exit code, the hashes of the state graph and of the
+messages, with a hash of the jar, the cfg, the arguments, the modules the spec reads, `src/graph.rs`, `src/trace.rs`
+and `src/messages.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
 recorded, so the files are the same for every TLC run. `crosscheck.sh` and `all.sh` only compare against these
 files and never run TLC on the configurations themselves (only on a lasso check whose confirmation is not yet cached in `target/crosscheck/lasso`); a missing or stale file fails
 the check. `scripts/expected.sh [cfg ...]` is what

@@ -4,11 +4,13 @@
 //!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]
 //!   tla2rs --graph FILE | --graph-text FILE
 //!   tla2rs --trace FILE | --trace-text FILE
+//!   tla2rs --messages FILE | --messages-text FILE
 //!
 //! Builds the generated crate with `cargo build --release` and runs it. With --emit-only, it only
 //! writes the Rust code. `--graph` reduces a state graph written by `-dumpgraph` or by TLC's
 //! `-dump dot` to hashes (see graph.rs); `--trace` reduces the counterexample in the output of TLC
-//! or of a checker to a hash (see trace.rs).
+//! or of a checker to a hash (see trace.rs); `--messages` reduces the messages and printed lines
+//! in such an output to a hash (see messages.rs).
 
 mod ast;
 mod cfg;
@@ -18,6 +20,7 @@ mod expand;
 mod graph;
 mod lasso;
 mod lexer;
+mod messages;
 mod std_modules;
 mod live;
 mod ltl;
@@ -56,6 +59,7 @@ fn usage() -> ! {
     eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]");
     eprintln!("       tla2rs --graph FILE | --graph-text FILE");
     eprintln!("       tla2rs --trace FILE | --trace-text FILE");
+    eprintln!("       tla2rs --messages FILE | --messages-text FILE");
     exit(2)
 }
 
@@ -67,6 +71,9 @@ fn main() {
         }
         if mode == "--trace" || mode == "--trace-text" {
             exit(trace::main(mode, path));
+        }
+        if mode == "--messages" || mode == "--messages-text" {
+            exit(messages::main(mode, path));
         }
     }
     let mut tla: Option<PathBuf> = None;
