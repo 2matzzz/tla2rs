@@ -602,6 +602,15 @@ since TLC checks new states only.
 
 Other messages tla2rs words as TLC does, measured on TLC 2.19:
 
+- An identifier TLC fails to evaluate (a variable read primed before it is assigned, also under
+  UNCHANGED or in the subscript of a fair action; a variable ENABLED reads in Init before it is
+  assigned; a substituted variable of an instance in ENABLED, see "ENABLED in an instantiated
+  module"; a variable in the bound of a quantifier over a temporal formula): `In evaluation, the
+  identifier x is either undefined or not an operator.` and the position of x where it is written,
+  also as an operator's argument, in a LET or under a quantifier (`tests/tlc/IdentPos*`). Every
+  `Expr::Ident` keeps where it is written (`ast::Pos`, set by the parser and kept when expansion
+  renames a bound variable; a SUBVAR label gets it after `SUBVAR_AT`). It never takes part in
+  comparing expressions, so only the text of these errors changes in the generated code
 - A successor that leaves variables unassigned (`tests/tlc/Unassigned*`): `Successor state is not
   completely specified by the next-state action.` when the next-state relation is one action, `by
   action A of the next-state relation.` otherwise (counting each element of a split `\E` as an
@@ -647,17 +656,21 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   with `lexer::SANY_ABORT`). A level error of a temporal formula gives the position of the innermost
   operator whose arguments break the rules, infix junctions read as binary and to the left, and a
   bulleted list is a `Conjunction list` or `Disjunction list`: the root module is parsed again with
-  SPAN labels (`parser::parse_module_spans`) and the definition checked as written
+  SPAN labels (`parser::parse_module_spans`) and the definition checked as written. A semantic
+  error comes under `Semantic errors:` and `*** Errors: 1`; an unknown name (`Unknown operator:
+  `x'.`) and a label that leaves out a bound variable give the position of the name, or from the
+  label's name to the end of its body (`sany::SEMANTIC`). The other semantic errors are reported
+  without a position, in tla2rs's words where SANY's need more than the one error
 
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
-compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 39
+compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 26
 configurations, by reason:
 
 | Reason | Configurations |
 |---|---|
-| SANY's semantic errors give the position of each name involved (also of the declaration it clashes with, in a standard module, or `--TLA+ BUILTINS--`) and add follow-on errors (an operator's arity, an infix symbol it cannot resolve) and warnings; tla2rs's syntax tree keeps no positions of names | 20: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-LocalRec`, `-Minus`, `-OwnParam`, `-QuantSet`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `-Unknown`, `SubexprBad` |
-| TLC gives the position of an identifier it fails to evaluate (also a substituted variable in ENABLED, and a variable a fair action leaves unspecified, which tla2rs reports in its own words) or of an `x' \in S` it cannot enumerate; tla2rs keeps no positions of identifiers | 11: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `EnSubst-EEarly`, `-Outer`, `FairPartial`, `RealSet-NextE` |
+| SANY's semantic errors give the position of each name involved, and tla2rs keeps positions only of identifiers in expressions (`ast::Pos`): not of bound variables, parameters, declarations and definitions (whose position is the whole statement, LOCAL included), operator symbols, operators called with arguments or selectors of subexpression names. SANY also gives the position of the declaration a name clashes with (in a standard module, or `--TLA+ BUILTINS--`), and adds follow-on errors (an operator's arity, an infix or prefix symbol it cannot resolve) and warnings (a definition repeated) | 17: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-LocalRec`, `-Minus`, `-OwnParam`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `SubexprBad` |
+| TLC gives the position of the whole `x' \in S` it cannot enumerate; when S names a definition, expansion replaces the name with the body, and the end of the position is lost | 1: `RealSet-NextE` |
 | TLC warns, with the position of the function, about an EXCEPT outside the domain only on its first evaluations: twice whether 3 or about 100 evaluations do one (measured), once when only one does, by a rule not found; `LazyFun*` also print a lazy function with the position of its body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
 | TLC reports the error from ENABLED of the fair action, tla2rs from the step of that action, which it evaluates first; why TLC does not is not found | 1: `LiveErr-Fair` |
 

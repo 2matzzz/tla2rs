@@ -196,8 +196,10 @@ memory.
   scope at that point (also a definition of an extended or instantiated module, or of a standard module extended);
   labels that do not list the bound variables around them; LAMBDA anywhere but as an argument; wrong positional
   subexpression names, also in definitions nothing uses; invalid string escapes. Parse errors (precedence, string
-  escapes, LAMBDA) and the level errors of temporal formulas are reported in SANY's words with its positions; for
-  the other checks the wording and positions differ from SANY's. A name is in scope only after the
+  escapes, LAMBDA), the level errors of temporal formulas, an unknown name and a label that leaves out a bound
+  variable are reported in SANY's words with its positions; for the other checks the wording and positions differ
+  from SANY's (SANY also gives the position of the declaration a name clashes with, and adds follow-on errors and
+  warnings). A name is in scope only after the
   statement that introduces it, as in SANY: an operator parameter may be named like a VARIABLE declared later. Not
   repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and `\AA`; positional names of LET
   definitions; and SANY's other checks (see CLAUDE.md, "What SANY refuses")
