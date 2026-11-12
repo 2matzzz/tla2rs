@@ -1202,7 +1202,9 @@ fn compile_inner(
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
+    g.actions = 0;
     g.gen_action(&[next_pos], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
+    let actions = g.actions;
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
@@ -1415,16 +1417,24 @@ fn compile_inner(
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a
-    // conjunction unless there is only one
-    let mut show = String::from("fn show(s: &State) -> String { let mut o = String::new(); ");
+    // conjunction unless there is only one. `show_with` prints the variables in `null` as null, as
+    // TLC prints a successor that leaves them unassigned
+    let mut show = String::from(
+        "fn show(s: &State) -> String { show_with(s, &[]) }\nfn show_with(s: &State, null: &[&str]) -> String { let mut o = String::new(); ",
+    );
     let one = g.vars.len() == 1;
     for (i, (v, t)) in g.vars.clone().iter().enumerate() {
         let tid = g.ty_id_pub(t)?;
         let nl = if i + 1 < g.vars.len() { "\\n" } else { "" };
         let bullet = if one { "" } else { "/\\\\ " };
-        write!(show, "o += &format!(\"{bullet}{v} = {{}}{nl}\", ppr(&fmt_{tid}(&s.v_{v}))); ").unwrap();
+        write!(
+            show,
+            "o += &format!(\"{bullet}{v} = {{}}{nl}\", if null.contains(&{v:?}) {{ \"null\".to_string() }} else {{ ppr(&fmt_{tid}(&s.v_{v})) }}); "
+        )
+        .unwrap();
     }
     show += "o }\n";
+    writeln!(show, "const ACTIONS: usize = {actions};").unwrap();
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
     writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();

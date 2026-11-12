@@ -64,6 +64,8 @@ pub struct Gen<'a> {
     /// Whether `subsets_tlc` is used
     need_subsets: bool,
     pub labels: Vec<String>,
+    /// The number of actions the next-state relation splits into (see `gen_split`)
+    pub actions: usize,
     tmp: usize,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
@@ -119,6 +121,7 @@ impl<'a> Gen<'a> {
             convs: BTreeSet::new(),
             need_subsets: false,
             labels: vec!["Init".into(), "Next".into()],
+            actions: 0,
             tmp: 0,
             scap: 8,
             qcap: 0,
@@ -4056,7 +4059,17 @@ impl<'a> Gen<'a> {
                     // Renew on every iteration so writes from the previous one do not carry over
                     env2 = self.renew_work(&env2, out);
                 }
+                // While splitting, TLC makes an action of each element: the actions of the body
+                // count once per element
+                let sizes: Option<Vec<usize>> = bs
+                    .iter()
+                    .map(|(_, s)| self.try_const(s, env).and_then(|v| v.as_set().ok().map(|x| x.len())))
+                    .collect();
+                let before = self.actions;
                 self.gen_action(&with(vec![body.as_ref().clone()]), &env2, out)?;
+                if let (true, Some(sizes)) = (env.split, sizes) {
+                    self.actions = before + (self.actions - before) * sizes.iter().product::<usize>();
+                }
                 out.push_str(&"}\n".repeat(closes));
                 return Ok(());
             }
@@ -4833,13 +4846,32 @@ impl<'a> Gen<'a> {
             writeln!(out, "__res.push(({}, {mask}u64));", env.work.as_ref().unwrap()).unwrap();
             return Ok(());
         }
-        for (v, _) in &self.vars {
-            if env.primed.contains_key(v) || env.partial {
-                continue;
+        let mut unassigned: Vec<&str> =
+            self.vars.iter().map(|(v, _)| v.as_str()).filter(|v| !env.partial && !env.primed.contains_key(*v)).collect();
+        if !unassigned.is_empty() {
+            // Fail only if this branch is reached. TLC shows the state with those variables as
+            // null, and names them in the order of their names
+            let st = match &env.work {
+                Some(w) => w.clone(),
+                None => {
+                    let fields: Vec<String> = self
+                        .vars
+                        .iter()
+                        .map(|(v, t)| {
+                            let val = env.primed.get(v).map_or_else(|| Self::default_code(t), |p| p.0.clone());
+                            format!("v_{v}: {val}")
+                        })
+                        .collect();
+                    format!("State {{ {} }}", fields.join(", "))
+                }
+            };
+            unassigned.sort_unstable();
+            let names: Vec<String> = unassigned.iter().map(|v| format!("{v:?}")).collect();
+            if env.init {
+                writeln!(out, "incomplete_init({st}, &[{}]);", names.join(", ")).unwrap();
+            } else {
+                writeln!(out, "incomplete_succ({st}, {}, &[{}]);", env.label.unwrap_or(1), names.join(", ")).unwrap();
             }
-            // Fail only if this branch is reached (TLC: Successor state is not completely specified)
-            let what = if env.init { "Initial state" } else { "Successor state" };
-            writeln!(out, "eval_error(\"{what} is not completely specified: {v} is not assigned\".into());").unwrap();
             return Ok(());
         }
         // All assignments are already in the state under construction, so emit it as is
@@ -4957,6 +4989,7 @@ impl<'a> Gen<'a> {
             None => name.to_string(),
         };
         env2.label = Some(self.label_id(&label));
+        self.actions += 1;
         env2.split = false;
         self.gen_action(&with(&strip_pos(h)), &env2, out)?;
         Ok(true)

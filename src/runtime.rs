@@ -342,6 +342,9 @@ enum EvalErr {
     Assert(String),
     /// Anything else (no matching CASE arm, a missing record field, etc.).
     Other(String),
+    /// A successor or initial state that leaves variables unassigned (see `incomplete_succ`).
+    /// TLC reports it as its own error.
+    Incomplete(String),
 }
 
 /// A type whose default value is a constant. An empty `SSet` is then copied from a constant as one
@@ -540,6 +543,50 @@ fn eval_error(msg: String) -> ! {
     std::panic::panic_any(EvalErr::Other(msg))
 }
 
+/// The state that left variables unassigned (with the label of its action, `u32::MAX` for an
+/// initial state, and the variables), shown at the end of the behavior with those variables null
+static INCOMPLETE: std::sync::Mutex<Option<(State, u32, &'static [&'static str])>> = std::sync::Mutex::new(None);
+
+fn incomplete() -> Option<(State, u32, &'static [&'static str])> {
+    *INCOMPLETE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An action that leaves the variables `null` unassigned. TLC counts the successor as generated,
+/// and names the action when the next-state relation has more than one
+#[cold]
+fn incomplete_succ(st: State, label: u32, null: &'static [&'static str]) -> ! {
+    let by = if ACTIONS > 1 {
+        let name = LABELS[label as usize].split(" line ").next().unwrap_or("");
+        format!("action {name} of the next-state relation")
+    } else {
+        "the next-state action".to_string()
+    };
+    let (s, are) = if null.len() > 1 { ("s", "are") } else { ("", "is") };
+    let msg = format!(
+        "Successor state is not completely specified by {by}. The following variable{s} {are} not assigned: {}.",
+        null.join(", ")
+    );
+    INCOMPLETE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert((st, label, null));
+    std::panic::panic_any(EvalErr::Incomplete(msg))
+}
+
+/// After the behavior up to the state whose successor left variables unassigned (`shown` states):
+/// TLC shows that successor last, and counts it as generated. Returns the count to add
+fn show_incomplete(shown: usize) -> u64 {
+    let Some((s, l, null)) = incomplete() else { return 0 };
+    if shown > 0 {
+        println!("State {}: <{}>\n{}\n", shown + 1, LABELS[l as usize], show_with(&s, null));
+    }
+    1
+}
+
+/// An initial state that leaves the variables `null` unassigned
+#[cold]
+fn incomplete_init(st: State, null: &'static [&'static str]) -> ! {
+    INCOMPLETE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert((st, u32::MAX, null));
+    std::panic::panic_any(EvalErr::Incomplete("current state is not a legal state".into()))
+}
+
 #[cold]
 fn arith_error(msg: String) -> ! {
     std::panic::panic_any(EvalErr::Arith(msg))
@@ -568,7 +615,7 @@ fn eval_code(e: &EvalErr) -> i32 {
         EvalErr::Type(_) if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) => 12,
         EvalErr::Type(_) | EvalErr::Arith(_) => 255,
         EvalErr::Assert(_) => 14,
-        EvalErr::Other(_) => 75,
+        EvalErr::Other(_) | EvalErr::Incomplete(_) => 75,
     }
 }
 
@@ -584,7 +631,7 @@ fn init_eval_code(e: &EvalErr) -> i32 {
 impl EvalErr {
     fn msg(&self) -> &str {
         match self {
-            EvalErr::Type(m) | EvalErr::Arith(m) | EvalErr::Assert(m) | EvalErr::Other(m) => m,
+            EvalErr::Type(m) | EvalErr::Arith(m) | EvalErr::Assert(m) | EvalErr::Other(m) | EvalErr::Incomplete(m) => m,
         }
     }
 }
@@ -607,7 +654,7 @@ fn report_type(e: &EvalErr) -> bool {
 /// Whether TLC raises the error as its own evaluation error (`EvalException`), as opposed to a
 /// runtime exception: a failed arithmetic operation and a false Assert
 fn tlc_eval_exception(e: &EvalErr) -> bool {
-    matches!(e, EvalErr::Arith(_) | EvalErr::Assert(_))
+    matches!(e, EvalErr::Arith(_) | EvalErr::Assert(_) | EvalErr::Incomplete(_))
 }
 
 /// Reports an evaluation error as TLC does. TLC reports an error as an exception it did not expect
@@ -1550,7 +1597,13 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         }
     }
     if let Some(p) = failed {
-        stop(describe_panic(p), "computing the initial states", None, generated, out.len());
+        let e = describe_panic(p);
+        // TLC shows the state with the variables it leaves unassigned null, and no counts
+        if let (EvalErr::Incomplete(m), Some((s, _, null))) = (&e, incomplete()) {
+            println!("Error: {m}\nWhile working on the initial state:\n{}\n", show_with(&s, null));
+            exit(255);
+        }
+        stop(e, "computing the initial states", None, generated, out.len());
     }
     (out, generated)
 }
@@ -2107,6 +2160,9 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     let shown = if matches!(f.msg, SMsg::Untraced(_) | SMsg::Live(..)) { 0 } else { report_trace(seen, &f) };
     if pseudo && shown > 0 {
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
+    }
+    if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
+        generated += show_incomplete(shown);
     }
     println!("{generated} states generated, {distinct} distinct states found, {left} states left on queue.");
     exit(code);
@@ -2904,8 +2960,12 @@ fn run_liveness(opt: &Opt) {
                 Found::Live(m) => report_msg(&m, true),
                 Found::Eval(p, e) => {
                     let pseudo = matches!(e, EvalErr::Type(_));
+                    let unassigned = matches!(e, EvalErr::Incomplete(_));
                     let code = report_msg(&SMsg::Eval(e), true);
                     g.print_trace(p, None);
+                    if unassigned {
+                        generated += show_incomplete(g.trace_len(p));
+                    }
                     if pseudo {
                         // As in TLC, the out-of-type successor counts as one state (its contents
                         // can't be represented).
