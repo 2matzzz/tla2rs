@@ -22,6 +22,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "Functions" => FUNCTIONS,
         "FiniteSetsExt" => FINITE_SETS_EXT,
         "SequencesExt" => SEQUENCES_EXT,
+        "UndirectedGraphs" => UNDIRECTED_GRAPHS,
         _ => return None,
     })
 }
@@ -33,6 +34,11 @@ pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
     ("SequencesExt", "IndexFirstSubSeq", "not written yet"),
     ("SequencesExt", "ReplaceFirstSubSeq", "not written yet"),
     ("SequencesExt", "ReplaceAllSubSeqs", "not written yet"),
+    ("UndirectedGraphs", "Path", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
+    ("UndirectedGraphs", "SimplePath", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
+    ("UndirectedGraphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("UndirectedGraphs", "ConnectedComponents", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("UndirectedGraphs", "IsStronglyConnected", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
 ];
 
 /// Folding a set: `op(f(x1), op(f(x2), ... op(f(xn), base)))` where x1 is `choose(S)`, x2 is
@@ -156,5 +162,25 @@ IndexFirstSubSeq(s, t) == FALSE
 ReplaceSubSeqAt(i, r, s, t) == SubSeq(t, 1, i - 1) \o r \o SubSeq(t, i + Len(s), Len(t))
 ReplaceFirstSubSeq(r, s, t) == FALSE
 ReplaceAllSubSeqs(r, s, t) == FALSE
+====
+"#;
+
+const UNDIRECTED_GRAPHS: &str = r#"
+---- MODULE UndirectedGraphs ----
+LOCAL INSTANCE Naturals
+LOCAL INSTANCE FiniteSets
+IsUndirectedGraph(G) ==
+  /\ G = [node |-> G.node, edge |-> G.edge]
+  /\ \A e \in G.edge : \E a, b \in G.node : e = {a, b}
+IsLoopFreeUndirectedGraph(G) ==
+  /\ G = [node |-> G.node, edge |-> G.edge]
+  /\ \A e \in G.edge : \E a, b \in G.node : a # b /\ e = {a, b}
+UndirectedSubgraph(G) == {H \in [node : SUBSET G.node, edge : SUBSET G.edge] : IsUndirectedGraph(H)}
+Path(G) == FALSE
+SimplePath(G) == FALSE
+AreConnectedIn(m, n, G) == FALSE
+ConnectedComponents(G) == FALSE
+IsStronglyConnected(G) == FALSE
+UndirectedGraphs(S) == [node : {S}, edge : SUBSET {{a, b} : <<a, b>> \in S \X S}]
 ====
 "#;
