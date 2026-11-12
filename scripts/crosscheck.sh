@@ -66,6 +66,23 @@ while [[ ${#queue[@]} -gt 0 ]]; do
   modules+=("$m")
   for f in $(grep -owF "$local_names" "$spec_dir/$m.tla" | sort -u); do queue+=("$f"); done
 done
+# The CommunityModules (https://github.com/tlaplus/CommunityModules), for a spec that names one of
+# them in EXTENDS or INSTANCE without a module of that name next to it. TLC reads them from the
+# release jar given by COMMUNITY_MODULES (default ~/.tla/CommunityModules-deps.jar), which must be
+# the release pinned here. TLC 2.19 cannot load the jar's Java overrides of their operators (they
+# need classes TLC 2.19 does not have: `NoClassDefFoundError: tlc2/value/impl/KSubsetValue` for
+# every spec, measured with every release since 2023), so it gets the jar's modules only, extracted
+# into target/community/<sha256>/, and evaluates their TLA+ definitions. tla2rs does not read them
+# (see src/community.rs)
+cm_version=202611060952
+cm_sha256=a3b27c40f1fb5085f30c6ead37e918457f8cfc62c1e50a1dc668ef592ad2b5fb
+cm_names="BagsExt Bitwise CBOR CSV Combinatorics DifferentialEquations DyadicRationals FiniteSetsExt Folds Functions GraphViz Graphs HTML IOUtils Json Relation SVG SequencesExt ShiViz Statistics UndirectedGraphs VectorClocks"
+uses_cm=0
+for m in ${modules[@]+"${modules[@]}"}; do
+  for n in $(tr '\n' ' ' < "$spec_dir/$m.tla" | grep -oE '(EXTENDS|INSTANCE)[[:space:]]+[A-Za-z0-9_]+([[:space:]]*,[[:space:]]*[A-Za-z0-9_]+)*' | sed -E 's/^(EXTENDS|INSTANCE)//' | tr ',' ' '); do
+    if [[ " $cm_names " == *" $n "* && ! -f "$spec_dir/$n.tla" ]]; then uses_cm=1; fi
+  done
+done
 
 summarize() {
   # Line 1: verdict (ok / violated invariant / deadlock / failed invariant or assumption), line 2:
@@ -108,6 +125,7 @@ summarize() {
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
   { echo "v5 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
+    [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
 expected=""
@@ -120,11 +138,34 @@ esac
 key=$(tlc_key)
 if [[ -z "${CROSSCHECK_NO_CACHE:-}" ]]; then export TLA2RS_BUILD_CACHE="$root/target/crosscheck/build"; fi
 
+# TLC's class path: the jar, and the CommunityModules' modules for a spec that uses them (set by
+# set_tlc_cp before TLC runs, so that comparing against tests/expected/ does not need their jar)
+tlc_cp="$jar"
+set_tlc_cp() {
+  [[ $uses_cm == 1 ]] || return 0
+  local d; d=$(community_dir) || exit 1
+  tlc_cp="$jar:$d"
+}
+community_dir() {
+  local cmjar="${COMMUNITY_MODULES:-$HOME/.tla/CommunityModules-deps.jar}" dir="$root/target/community/$cm_sha256"
+  if [[ ! -f "$dir/.extracted" ]]; then
+    [[ -f "$cmjar" ]] || { echo "ERROR $cfg_rel: needs the CommunityModules release $cm_version: download CommunityModules-deps-$cm_version.jar to $cmjar (or set COMMUNITY_MODULES)" >&2; return 1; }
+    [[ "$(shasum -a 256 "$cmjar" | cut -d' ' -f1)" == "$cm_sha256" ]] || { echo "ERROR $cfg_rel: $cmjar is not CommunityModules-deps-$cm_version.jar (sha256 $cm_sha256)" >&2; return 1; }
+    # Into a directory of its own first, as several checks may extract at once
+    local tmp="$dir.tmp$$"
+    rm -rf "$tmp" && mkdir -p "$tmp" && unzip -q -o "$cmjar" '*.tla' -d "$tmp" && touch "$tmp/.extracted" || return 1
+    if [[ -d "$dir" ]]; then rm -rf "$tmp"; else mv "$tmp" "$dir" 2> /dev/null; fi
+    rm -rf "$tmp" "$dir/$(basename "$tmp")"
+    [[ -f "$dir/.extracted" ]] || return 1
+  fi
+  echo "$dir"
+}
 run_tlc() {
   rc_tlc=0
+  set_tlc_cp
   # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
   mkdir -p "$work/jtmp"
-  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -dump dot tlc.dot -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 -dump dot tlc.dot -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
   a="$(summarize tlc.out)
 $(graph tlc.dot)
 $(messages tlc.out)"
@@ -276,13 +317,14 @@ if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
   # TLC's answer depends only on the jar, the generated check and the spec's modules, so a
   # confirmation is kept in target/crosscheck/lasso under a hash of those, and TLC runs again only
   # when tla2rs writes a different lasso (CROSSCHECK_NO_CACHE=1 always runs it)
-  lasso_key=$({ echo "lasso v1 $n_lasso"; shasum -a 256 "$jar" | cut -d' ' -f1
+  lasso_key=$({ echo "lasso v1 $n_lasso"; shasum -a 256 "$jar" | cut -d' ' -f1; [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
     for f in Tla2rsLasso.tla Tla2rsLasso.cfg "${modules[@]/%/.tla}"; do echo "== $f"; cat "$f"; done; } | shasum -a 256 | cut -d' ' -f1)
   lasso_ok="$root/target/crosscheck/lasso/$lasso_key"
   if [[ -n "${CROSSCHECK_NO_CACHE:-}" || ! -f "$lasso_ok" ]]; then
     rc_lasso=0
+    set_tlc_cp
     mkdir -p "$work/jtmp"
-    java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
+    java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
     found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
     if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
       echo "  LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
