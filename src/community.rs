@@ -21,12 +21,18 @@ pub fn source(name: &str) -> Option<&'static str> {
         "Folds" => FOLDS,
         "Functions" => FUNCTIONS,
         "FiniteSetsExt" => FINITE_SETS_EXT,
+        "SequencesExt" => SEQUENCES_EXT,
         _ => return None,
     })
 }
 
 /// The operators of each module that are refused when used, with the reason
 pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
+    ("SequencesExt", "Interleave", "not written yet"),
+    ("SequencesExt", "AllSubSeqs", "not written yet"),
+    ("SequencesExt", "IndexFirstSubSeq", "not written yet"),
+    ("SequencesExt", "ReplaceFirstSubSeq", "not written yet"),
+    ("SequencesExt", "ReplaceAllSubSeqs", "not written yet"),
 ];
 
 /// Folding a set: `op(f(x1), op(f(x2), ... op(f(xn), base)))` where x1 is `choose(S)`, x2 is
@@ -84,5 +90,71 @@ Max(S) == CHOOSE a \in S : \A b \in S : a >= b
 Min(S) == CHOOSE a \in S : \A b \in S : a =< b
 Choices(Sets) == {Range(g) : g \in {g \in [Sets -> UNION Sets] : \A T \in Sets : g[T] \in T}}
 ChooseUnique(S, P(_)) == CHOOSE a \in S : P(a) /\ \A b \in S : P(b) => b = a
+====
+"#;
+
+const SEQUENCES_EXT: &str = r#"
+---- MODULE SequencesExt ----
+EXTENDS Sequences, Naturals, FiniteSets, FiniteSetsExt, Folds, Functions, Bags, TLC
+ToSet(s) == {s[i] : i \in DOMAIN s}
+ToBag(s) == [a \in Range(s) |-> Cardinality({i \in DOMAIN s : s[i] = a})]
+SetToSeq(S) == CHOOSE f \in [1..Cardinality(S) -> S] : IsInjective(f)
+SetToSeqs(S) == {f \in [1..Cardinality(S) -> S] : IsInjective(f)}
+SetToSortSeq(S, op(_, _)) == SortSeq(SetToSeq(S), op)
+SetToAllKPermutations(S) == UNION {SetToSeqs(T) : T \in SUBSET S}
+TupleOf(set, n) == [1..n -> set]
+SeqOf(set, n) == UNION {[1..k -> set] : k \in 0..n}
+BoundedSeq(S, n) == SeqOf(S, n)
+Contains(s, e) == \E i \in 1..Len(s) : s[i] = e
+IsSorted(s, op(_, _)) == \A i, j \in 1..Len(s) : i < j => op(s[i], s[j])
+Reverse(s) == [i \in 1..Len(s) |-> s[(Len(s) - i) + 1]]
+Remove(s, e) == SelectSeq(s, LAMBDA a : a # e)
+ReplaceAll(s, old, new) == [i \in 1..Len(s) |-> IF s[i] = old THEN new ELSE s[i]]
+SelectInSeq(seq, Test(_)) ==
+  LET I == {i \in 1..Len(seq) : Test(seq[i])} IN IF I # {} THEN Min(I) ELSE 0
+SelectInSubSeq(seq, from, to, Test(_)) ==
+  LET I == {i \in from..to : Test(seq[i])} IN IF I # {} THEN Min(I) ELSE 0
+SelectLastInSeq(seq, Test(_)) ==
+  LET I == {i \in 1..Len(seq) : Test(seq[i])} IN IF I # {} THEN Max(I) ELSE 0
+SelectLastInSubSeq(seq, from, to, Test(_)) ==
+  LET I == {i \in from..to : Test(seq[i])} IN IF I # {} THEN Max(I) ELSE 0
+InsertAt(s, i, e) == SubSeq(s, 1, i - 1) \o <<e>> \o SubSeq(s, i, Len(s))
+ReplaceAt(s, i, e) == [s EXCEPT ![i] = e]
+RemoveAt(s, i) == SubSeq(s, 1, i - 1) \o SubSeq(s, i + 1, Len(s))
+RemoveFirst(s, e) ==
+  IF \E i \in 1..Len(s) : s[i] = e THEN RemoveAt(s, SelectInSeq(s, LAMBDA a : a = e)) ELSE s
+RemoveFirstMatch(s, Test(_)) ==
+  IF \E i \in 1..Len(s) : Test(s[i]) THEN RemoveAt(s, SelectInSeq(s, Test)) ELSE s
+Cons(elt, seq) == <<elt>> \o seq
+Snoc(elt, seq) == Append(seq, elt)
+Front(s) == SubSeq(s, 1, Len(s) - 1)
+Last(s) == s[Len(s)]
+IsPrefix(s, t) == Len(s) <= Len(t) /\ SubSeq(s, 1, Len(s)) = SubSeq(t, 1, Len(s))
+IsStrictPrefix(s, t) == IsPrefix(s, t) /\ s # t
+IsSuffix(s, t) == IsPrefix(Reverse(s), Reverse(t))
+IsStrictSuffix(s, t) == IsSuffix(s, t) /\ s # t
+Prefixes(s) == {SubSeq(s, 1, k) : k \in 0..Len(s)}
+CommonPrefixes(S) == {p \in UNION {Prefixes(s) : s \in S} : \A t \in S : IsPrefix(p, t)}
+LongestCommonPrefix(S) ==
+  CHOOSE p \in CommonPrefixes(S) : \A q \in CommonPrefixes(S) : Len(q) <= Len(p)
+Suffixes(s) == {SubSeq(s, k, Len(s)) : k \in 1..Len(s)} \cup {<<>>}
+SeqMod(a, b) == IF a % b = 0 THEN b ELSE a % b
+FoldSeq(op(_, _), base, seq) == FoldFunction(op, base, seq)
+FoldLeft(op(_, _), base, seq) ==
+  MapThenFoldSet(LAMBDA a, b : op(b, a), base, LAMBDA i : seq[i], LAMBDA T : Max(T), DOMAIN seq)
+FoldRight(op(_, _), seq, base) ==
+  MapThenFoldSet(op, base, LAMBDA i : seq[i], LAMBDA T : Min(T), DOMAIN seq)
+FoldLeftDomain(op(_, _), base, seq) == FoldLeft(op, base, [i \in DOMAIN seq |-> i])
+FoldRightDomain(op(_, _), seq, base) == FoldRight(op, [i \in DOMAIN seq |-> i], base)
+FlattenSeq(seqs) == IF Len(seqs) = 0 THEN seqs ELSE FoldLeft(LAMBDA a, b : a \o b, <<>>, seqs)
+Zip(s, t) ==
+  LET n == IF Len(s) <= Len(t) THEN Len(s) ELSE Len(t) IN [i \in 1..n |-> <<s[i], t[i]>>]
+Interleave(s, t) == FALSE
+SubSeqs(s) == {SubSeq(s, i + 1, j) : i, j \in 0..Len(s)}
+AllSubSeqs(s) == FALSE
+IndexFirstSubSeq(s, t) == FALSE
+ReplaceSubSeqAt(i, r, s, t) == SubSeq(t, 1, i - 1) \o r \o SubSeq(t, i + Len(s), Len(t))
+ReplaceFirstSubSeq(r, s, t) == FALSE
+ReplaceAllSubSeqs(r, s, t) == FALSE
 ====
 "#;
