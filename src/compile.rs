@@ -20,6 +20,45 @@ pub struct Output {
     pub rejected: Option<(String, i32)>,
 }
 
+/// What TLC prints when it starts, in its order: Print and PrintT in the definitions of constant
+/// level, its warnings about the configuration, then Print and PrintT in the ASSUMEs
+#[derive(Default)]
+pub struct Startup {
+    pub consts: Vec<String>,
+    pub warnings: Vec<String>,
+    pub assumes: Vec<String>,
+}
+
+/// TLC's note after the first warning it prints
+pub const NOWARNING: &str = "(Use the -nowarning option to disable this warning.)";
+
+impl Startup {
+    pub fn lines(&self) -> Vec<String> {
+        let mut v = self.consts.clone();
+        for (i, w) in self.warnings.iter().enumerate() {
+            v.push(w.clone());
+            if i == 0 {
+                v.push(NOWARNING.into());
+            }
+        }
+        v.extend(self.assumes.iter().cloned());
+        v
+    }
+
+    /// TLC's warnings when it checks temporal properties (`live`) with SYMMETRY or constraints
+    fn liveness_warnings(&mut self, cfg: &Cfg, live: bool) {
+        if !live || !self.warnings.is_empty() {
+            return;
+        }
+        if cfg.symmetry.is_some() {
+            self.warnings.push("Warning: Declaring symmetry during liveness checking is dangerous. It might cause TLC to miss violations of the stated liveness properties. Please check liveness without symmetry defined.".into());
+        }
+        if !cfg.constraints.is_empty() || !cfg.action_constraints.is_empty() {
+            self.warnings.push("Warning: Declaring state or action constraints during liveness checking is dangerous: Please read section 14.3.5 on page 247 of Specifying Systems (https://lamport.azurewebsites.net/tla/book.html) and optionally the discussion at https://discuss.tlapl.us/msg00994.html for more details.".into());
+        }
+    }
+}
+
 const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv", "TypeCorrect"];
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
@@ -683,7 +722,7 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
-    let mut startup = vec![];
+    let mut startup = Startup::default();
     let mut out = match compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup) {
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
@@ -695,8 +734,9 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     };
     // What TLC prints when it starts comes before its verdict on the spec
     if let Some((msg, _)) = &mut out.rejected {
-        if !startup.is_empty() {
-            *msg = format!("{}\n{msg}", startup.join("\n"));
+        let lines = startup.lines();
+        if !lines.is_empty() {
+            *msg = format!("{}\n{msg}", lines.join("\n"));
         }
     }
     Ok(out)
@@ -753,7 +793,7 @@ fn compile_inner(
     seqcap: usize,
     fp128: bool,
     metal: bool,
-    startup: &mut Vec<String>,
+    startup: &mut Startup,
 ) -> R<Output> {
     let mut warnings = vec![];
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
@@ -861,7 +901,7 @@ fn compile_inner(
                 continue;
             }
             // TLC ignores a definition it fails to evaluate here
-            if eval_printing(&ce, &uncache_prints(&e, &cached), startup).is_ok() {
+            if eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.consts).is_ok() {
                 cached.insert(n);
             }
         }
@@ -875,7 +915,7 @@ fn compile_inner(
             let (l1, c1, l2, c2) = a.span;
             let at = format!("line {l1}, col {c1} to line {l2}, col {c2} of module {}", a.module);
             let e = ex.expand_top(&a.expr).map_err(|e| format!("ASSUME at {at}: {e}"))?;
-            match eval_printing(&ce, &uncache_prints(&e, &cached), startup) {
+            match eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.assumes) {
                 Ok(Value::Bool(true)) => {}
                 Ok(Value::Bool(false)) => {
                     return Ok(Output {
@@ -1051,6 +1091,7 @@ fn compile_inner(
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
         if uses_real_time(&e) {
+            startup.liveness_warnings(&cfg, true);
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
         }
@@ -1096,6 +1137,7 @@ fn compile_inner(
         let msg = "Error: The configuration file did not specify the next state predicate.";
         return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)) });
     }
+    startup.liveness_warnings(&cfg, !live_parts.is_empty());
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
@@ -1245,7 +1287,8 @@ fn compile_inner(
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
     writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();
-    writeln!(src, "static STARTUP_PRINTS: &[&str] = &{startup:?};").unwrap();
+    startup.liveness_warnings(&cfg, !live_parts.is_empty());
+    writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
     writeln!(src, "const QCAP: usize = {};", g.qcap).unwrap();
     src += crate::codegen::SQ_RUNTIME;

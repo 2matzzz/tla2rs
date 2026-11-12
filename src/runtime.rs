@@ -1482,7 +1482,8 @@ fn main() {
     // Evaluation errors are caught and reported where they occur. Anything that reaches this point
     // is unexpected, so print a message instead of exiting silently (the default panic output is
     // suppressed above).
-    // What TLC prints when it starts: Print and PrintT in the constant definitions and ASSUMEs
+    // What TLC prints when it starts: Print and PrintT in the constant definitions, its warnings,
+    // Print and PrintT in the ASSUMEs
     for l in STARTUP_PRINTS {
         println!("{l}");
     }
@@ -2992,10 +2993,7 @@ fn run_liveness(opt: &Opt) {
     let check_deadlock = opt.check_deadlock;
     let workers = opt.workers;
     let t0 = std::time::Instant::now();
-    if !PERMS.is_empty() {
-        // As TLC warns: the search runs on the graph folded by symmetry
-        println!("Warning: Declaring symmetry during liveness checking is dangerous. It might cause the checker to miss violations of the stated liveness properties. Please check liveness without symmetry defined.");
-    }
+    // TLC's warning that the search runs on the graph folded by symmetry is among STARTUP_PRINTS
     let mut g = Graph { states: Vec::new(), parent: Vec::new(), sbits: Vec::new() };
     let seen = Shards::new(false);
     let (inits, mut generated) = initial_states();
