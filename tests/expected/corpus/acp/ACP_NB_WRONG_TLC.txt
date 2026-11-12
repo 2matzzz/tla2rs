@@ -1,8 +1,8 @@
-key 72c84512fd83d62b74e6132a9d523c100cbc42341272a6d7fa8f1bd9ce14edba
+key 2ff4ead5858124a7a6c75858215040ca5736baf7aea8e09d9853af5f296e1638
 tlc Version 2.19
 rc 12
 Invariant AC1 is violated
-59286 states generated 11852 distinct states found
+59286 states generated 11852 distinct states found 1248 states left on queue
 trace 13 2b8bb3b47337d48606ee117cb261aba8ed868f4f5f9c7e2f0b4780c707fd19d7
 states 11852 ffc6f0bc8a3c81d4a6792cdb27296c755cccb3209aa513a1578aa07fa3c87218
 edges 33224 4c4e8a15dc7404ac28e752425ce4ae787a4df01d459b4de5e4bd64cd60e60489

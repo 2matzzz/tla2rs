@@ -1,8 +1,8 @@
-key 57ba0a22176f095cd5678ab1bdcd88eb319f13fbfd4423a80b26c9eac4a5ab7e
+key 649b6c5e2946d2fe3153a3845f374ef3aa34e2bb6d1db2705ee91709ef16ce57
 tlc Version 2.19
 rc 12
 Invariant NoSolutions is violated
-62 states generated 40 distinct states found
+62 states generated 40 distinct states found 25 states left on queue
 trace 5 1e3cafc98c832f25936ccad77427572df1df7197fa25c8a10275a361f0bc81b8
 states 40 a843077cbe6c27e9bc0680611f9b1d37dacc8fa45bea0d1642dccf5003b05a61
 edges 61 c397608117156b73463d3e6792709b3ddc9fe7b78991097a50425322775689ce
