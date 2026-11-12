@@ -4,7 +4,7 @@
 //!
 //! The definitions below are written for tla2rs from the documented meaning of each operator, and
 //! checked against TLC 2.19 (`tests/tlc/Cm*`). TLC 2.19 cannot load the Java overrides in the
-//! CommunityModules jar (every release since 2023 needs a class TLC 2.19 does not have), so it
+//! CommunityModules jar (the releases from 2023-12 on need a class TLC 2.19 does not have), so it
 //! evaluates the modules' TLA+ definitions, and so do these: an operator defined with CHOOSE picks
 //! what the module's definition picks, and a fold applies its operator in the order the module's
 //! definition does.

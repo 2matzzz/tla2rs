@@ -71,7 +71,7 @@ done
 # release jar given by COMMUNITY_MODULES (default ~/.tla/CommunityModules-deps.jar), which must be
 # the release pinned here. TLC 2.19 cannot load the jar's Java overrides of their operators (they
 # need classes TLC 2.19 does not have: `NoClassDefFoundError: tlc2/value/impl/KSubsetValue` for
-# every spec, measured with every release since 2023), so it gets the jar's modules only, extracted
+# every spec, measured with the releases from 2023-12 to 2026-11), so it gets the jar's modules only, extracted
 # into target/community/<sha256>/, and evaluates their TLA+ definitions. tla2rs does not read them
 # (see src/community.rs)
 cm_version=202611060952

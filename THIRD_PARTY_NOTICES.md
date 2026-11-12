@@ -79,3 +79,36 @@ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+## CommunityModules (tlaplus/CommunityModules)
+
+`src/community.rs` provides modules of the CommunityModules (`Folds`, `Functions`, `FiniteSetsExt`,
+`SequencesExt`, `UndirectedGraphs`, `Bitwise`) for specs that extend or instantiate them. Their definitions are
+written for tla2rs from each operator's documented meaning and from TLC 2.19's measured results on them; what is
+taken from the modules is their interface (the names each module exports, in order, with their parameters, and what
+it extends), so that SANY's context, and the order TLC prints variables in, come out the same. No text of the
+modules and no Java code of the release is copied. Source: https://github.com/tlaplus/CommunityModules
+
+```
+MIT License
+
+Copyright (c) 2019 TLA+
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
