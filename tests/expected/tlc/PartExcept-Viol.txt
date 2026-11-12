@@ -1,8 +1,8 @@
-key d9ddec5e707e1bfa9110d752e473cf4754f68a7edc23a02ee450baa1be813cbe
+key f865f4963b4cde58d912f28fcbeb506255484263df1e54a6674ddb6a4d27e62b
 tlc Version 2.19
 rc 12
 Invariant AllBusy is violated
-7 states generated 6 distinct states found
+7 states generated 6 distinct states found 0 states left on queue
 trace 5 838b88a3653307963ba6fe45f206eb7fb94bb62ef3254638200116f33c34e20e
 states 6 b0cc8224150d4a3af21020e79974734d43e827d5e4161a5c67f96f8b09eea69b
 edges 6 b9843ba11514f84bc66f704b10914973ec0636b7786f7bd9a038937a6cfc2ea0

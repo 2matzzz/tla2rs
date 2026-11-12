@@ -1,8 +1,8 @@
-key cb64e1f2512ff9a4295bcb14c2124d4efd77282c0df6fc748fa72d7dbb411ea0
+key 5320dba91b8b2d3f64cbdf7867569b33208beb197e4907b139ee53b983a4bfcd
 tlc Version 2.19
 rc 12
 Invariant InWritten is violated
-2 states generated 2 distinct states found
+2 states generated 2 distinct states found 0 states left on queue
 trace 2 fd5349ed5550bd2216893ba4430f06ca46c2b9fc8cae8dd71afb114a56fd570c
 states 2 1ace21ece2b6d5292b641fa46ea2cd623c931db15f9d9b1e470dab6c4311326d
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

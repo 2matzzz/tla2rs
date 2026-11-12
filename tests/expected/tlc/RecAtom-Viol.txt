@@ -1,8 +1,8 @@
-key c6cf2a1072568a3c68909792a2b30df1542e8e1ffcee632024987ba218c7c735
+key 89b27d22c1706bdbc112abfbc2ce0dd8ca011c4f3836a8252cc3cc58a2508793
 tlc Version 2.19
 rc 12
 Invariant GetsStay is violated
-2 states generated 2 distinct states found
+2 states generated 2 distinct states found 0 states left on queue
 trace 2 d858b18fb0e6492384b0d5548d8682adbb3c329f2cbcb15c8b744c666c7e4c0c
 states 2 87c90719a1380b089c28202c5685e1151490b0bf7d5145900c530cdb154411a7
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

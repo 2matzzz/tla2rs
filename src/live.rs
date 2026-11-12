@@ -151,6 +151,20 @@ pub(crate) fn sany_level(e: &Expr) -> Result<u8, String> {
             sany_level(b)?;
             2
         }
+        // The innermost SPAN label around the formula SANY refuses gives its position (see
+        // `parser::parse_module_spans`)
+        Label(n, _, b) if n.starts_with(crate::ast::SPAN) => match sany_level(b) {
+            Err(m) if !m.starts_with(crate::ast::SPAN) => {
+                let list = matches!(b.as_ref(), Label(l, ..) if l == crate::parser::LIST);
+                let m = match m.split_once(" has both") {
+                    Some(("\\land", r)) if list => format!("Conjunction list has both{r}"),
+                    Some(("\\lor", r)) if list => format!("Disjunction list has both{r}"),
+                    _ => m,
+                };
+                return Err(format!("{n}\n{m}"));
+            }
+            r => r?,
+        },
         Label(_, _, b) => sany_level(b)?,
         Un(UOp::Enabled, x) => {
             sany_level(x)?;

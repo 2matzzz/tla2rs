@@ -6,6 +6,28 @@ pub type R<T> = Result<T, String>;
 /// The start of an error that SANY reports too (TLC then stops with exit 150, before checking)
 pub const SANY: &str = "SANY: ";
 
+/// After SANY: an error that stops SANY while it parses a module (a lexical or parse error), with
+/// the module's name on the rest of the line and SANY's report on the lines after it
+pub const SANY_ABORT: &str = "abort ";
+
+/// A string as Java escapes it when SANY shows what it read (`"` as `\"`, `\` as `\\`)
+pub fn java_escape(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            '\'' => o.push_str("\\'"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            '\x0c' => o.push_str("\\f"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
@@ -161,6 +183,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
             }
             Tok::Sym("====".into())
         } else if c == '"' {
+            let i0 = i;
             adv!();
             let mut s = String::new();
             while i < cs.len() && cs[i] != '"' {
@@ -172,7 +195,17 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                         'r' => '\r',
                         'f' => '\x0c',
                         x @ ('\\' | '"') => x,
-                        x => return Err(format!("{SANY}Lexical error at line {line}: the escape \\{x} in a string")),
+                        // As SANY reports it: the character, its code, and the string read up to it
+                        x => {
+                            let read: String = cs[i0..i].iter().collect();
+                            return Err(format!(
+                                "{SANY}{SANY_ABORT}{}\nLexical error at line {line}, column {}.  Encountered: \"{x}\" ({}), after : \"{}\"",
+                                module_name(&cs.iter().collect::<String>()),
+                                col + 1,
+                                x as u32,
+                                java_escape(&read)
+                            ));
+                        }
                     });
                 } else {
                     s.push(cs[i]);
@@ -280,4 +313,11 @@ fn ident_ahead(cs: &[char], mut i: usize) -> bool {
         i += 1;
     }
     i < cs.len() && (cs[i].is_ascii_alphabetic() || cs[i] == '_')
+}
+
+/// The name of the first module in a source (after `MODULE`), for SANY's reports
+pub fn module_name(text: &str) -> String {
+    text.split_once("MODULE")
+        .map(|(_, r)| r.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect())
+        .unwrap_or_default()
 }

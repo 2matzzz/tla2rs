@@ -69,7 +69,7 @@ done
 
 summarize() {
   # Line 1: verdict (ok / violated invariant / deadlock / failed invariant or assumption), line 2:
-  # state counts, line 3: the counterexample (its length and a hash of its states and actions; see
+  # state counts (generated, distinct, left on queue), line 3: the counterexample (its length and a hash of its states and actions; see
   # src/trace.rs)
   local f="$1"
   local res
@@ -84,8 +84,10 @@ summarize() {
   if grep -qE 'Temporal propert(y .* is|ies were) violated' "$f"; then
     res="Temporal property violated"; temporal=1
   fi
+  # The states left on queue are those of TLC's queue when it stops (0 when the search ends); with
+  # one worker they are deterministic (see "Messages and printed lines" in CLAUDE.md)
   local counts
-  counts=$(grep -oE '[0-9,]+ states generated, [0-9,]+ distinct states found' "$f" | tail -1 | tr -d ',' || true)
+  counts=$(grep -oE '[0-9,]+ states generated, [0-9,]+ distinct states found(, [0-9,]+ states left on queue)?' "$f" | tail -1 | tr -d ',' || true)
   local trace
   trace=$("$bin" --trace "$f" || echo "trace unreadable")
   # A liveness counterexample (lasso) depends on TLC's random fingerprint polynomial, so it is not
@@ -105,7 +107,7 @@ summarize() {
 # same for every TLC run.
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  { echo "v4 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
+  { echo "v5 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
 expected=""

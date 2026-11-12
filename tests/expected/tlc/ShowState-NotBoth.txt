@@ -1,8 +1,8 @@
-key 129df57d43624efbf1f5f96dcb5e5d95fb5bbb586bf653e325a8a993a7436e45
+key ea0f5cdb6312f6c648908c6418c9e4dd710a867a50240bc858755f433071418b
 tlc Version 2.19
 rc 12
 Invariant NotBoth is violated
-14 states generated 13 distinct states found
+14 states generated 13 distinct states found 9 states left on queue
 trace 3 b362e812cea594cb0075c7d285f80cc3acec6b4f9b6dec2d065ba9d812f30da2
 states 13 7914796a6637e01b7a3250d65ce8399ece891cabb593f7465c4cb304bdcd82e9
 edges 13 efee4d0e708892e0e129c8035060aa2b172a89ea438373c71146e88633d693d3

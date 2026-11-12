@@ -1,8 +1,8 @@
-key 21f588598943104f396abbd9d5accae2e085d085681b54ddd9cb0b92397e6a28
+key f7472bb3a4d91d90d03e339d437a7b252a4078f2828df8efcae8b42da86a698f
 tlc Version 2.19
 rc 12
 Invariant NotBusy is violated
-3 states generated 3 distinct states found
+3 states generated 3 distinct states found 0 states left on queue
 trace 3 308b4feef2beff4622292d3450063752842977a5213ae55b793ab66dc2e08663
 states 3 ec4b9342da4350e2b3fc603435fe307f6c91806fa4409c6c43f897be3ef0a95b
 edges 2 37b290122a29937f90202e51c35fa2d487d9cfc192ceaadf623f7c72b477a87c

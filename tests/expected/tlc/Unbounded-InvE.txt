@@ -1,8 +1,8 @@
-key 6a4ef82069b096c92d3517b74f974f54a4dfd56509ccf9e3c1c809ec3e88ed19
+key a49c5b6f4d6f6a0cc2687992d785c25f104f0d1aee12e7f8454869e0a318f34b
 tlc Version 2.19
 rc 76
 Evaluating invariant InvE failed
-3 states generated 3 distinct states found
+3 states generated 3 distinct states found 0 states left on queue
 trace 3 6b3c1e4e3a6d06460d757e61627a52ce0d865b27eb7015cfa1fa03551dfd55d5
 states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
 edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1

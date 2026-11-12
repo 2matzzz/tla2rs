@@ -188,6 +188,10 @@ pub const POS: &str = "#pos ";
 /// liveness compiler read it (`codegen::err_at`, `live::refused`, `split_property`).
 pub const AT: &str = "#at ";
 
+/// The name of the label `parse_module_spans` puts around temporal operators and infix junctions:
+/// `#span ` followed by the position as SANY prints it, for SANY's report of a level error
+pub const SPAN: &str = "#span ";
+
 /// `e` wrapped in an AT label for the position `at`
 pub fn at_err(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{AT}{at}"), vec![], e.b())

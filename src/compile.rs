@@ -437,13 +437,23 @@ fn hide_locals(mut m: Module) -> Module {
     m
 }
 
+thread_local! {
+    /// Whether the spec loads Integers (or Reals), whose Java methods TLC then evaluates
+    /// arithmetic with (see `Gen::int_module`)
+    static INTEGERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Whether `name` is a standard module that tla2rs provides itself (an error for the standard
 /// modules it does not support)
 fn standard_module(name: &str, how: &str) -> R<bool> {
     match name {
         // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
         // for the Toolbox's trace explorer.
-        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" | "Bags" => Ok(true),
+        "Integers" | "Reals" => {
+            INTEGERS.with(|i| i.set(true));
+            Ok(true)
+        }
+        "Naturals" | "FiniteSets" | "TLC" | "Sequences" | "Toolbox" | "Bags" => Ok(true),
         // Handled by `real_time` (EXTENDS only)
         "RealTime" => Err(format!("{how} {name}: only EXTENDS RealTime is supported")),
         // TLC picks the subsets at random, so its results cannot be reproduced
@@ -826,7 +836,14 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
             let msg = e.replacen(crate::lexer::SANY, "", 1);
-            let mut msg = format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed.");
+            let mut msg = match msg.strip_prefix(crate::lexer::SANY_ABORT).and_then(|m| m.split_once('\n')) {
+                // An error that stops SANY while it parses a module, which it reports as such
+                Some((module, report)) => format!(
+                    "{report}\n\nFatal errors while parsing TLA+ spec in file {}\n\n*** Abort messages: 1\n\nIn module {module}\n\nCould not parse module {module} from file {module}.tla\n\nError: Parsing or semantic analysis failed.",
+                    crate::lexer::module_name(tla)
+                ),
+                None => format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed."),
+            };
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
             }
@@ -900,7 +917,9 @@ fn compile_inner(
     startup: &mut Startup,
 ) -> R<Output> {
     let mut warnings = vec![];
+    INTEGERS.with(|i| i.set(false));
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
+    crate::value::NAT_DIV.with(|n| n.set(!INTEGERS.with(|i| i.get())));
     let cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
 
@@ -994,8 +1013,16 @@ fn compile_inner(
     for d in &m.defs {
         let e = if d.params.is_empty() { ex.expand_def(&d.name).ok() } else { Some(d.body.clone()) };
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
-            // As SANY reports it, with the definition where SANY gives the position of the formula
-            let msg = format!("Semantic errors:\n\n*** Errors: 1\n\nin definition {}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.", d.name);
+            // As SANY reports it, with the position of the formula it refuses: the root module is
+            // parsed again with the positions of temporal formulas (see `parse_module_spans`), and
+            // the definition as written checked again. Otherwise the definition is named
+            let at = crate::parser::parse_module_spans(tla)
+                .ok()
+                .and_then(|m| m.defs.into_iter().find(|x| x.name == d.name))
+                .and_then(|x| crate::live::sany_level(&x.body).err())
+                .and_then(|m| m.strip_prefix(crate::ast::SPAN).and_then(|m| m.split_once('\n')).map(|(at, m)| (at.to_string(), m.to_string())));
+            let (at, msg) = at.unwrap_or_else(|| (format!("in definition {}", d.name), msg));
+            let msg = format!("Semantic errors:\n\n*** Errors: 1\n\n{at}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.");
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), caps: (0, 0) });
         }
     }
@@ -1093,6 +1120,7 @@ fn compile_inner(
     let next = strip_pos(&next_pos);
 
     let mut g = Gen::new(&atoms, &constants);
+    g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
     g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
     g.def_pos = m.defs.iter().filter_map(|d| match &d.body {
         Expr::Label(n, _, _) => pos_of(n).map(|p| (d.name.clone(), p.to_string())),
@@ -1198,11 +1226,18 @@ fn compile_inner(
     }
     g.scap = g.scap.max(start);
 
-    // Init / Next
+    // Init / Next. When they or an invariant print (Print, PrintT), the checker follows TLC's
+    // order of the lines printed (see PRINT_ORDER in the runtime)
+    let print_order = has_prints(&init)
+        || has_prints(&next_pos)
+        || cfg.invariants.iter().any(|n| ex.expand_def(n).is_ok_and(|e| has_prints(&e)));
+    g.print_order = print_order;
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
+    g.actions = 0;
     g.gen_action(&[next_pos], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
+    let actions = g.actions;
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
@@ -1412,19 +1447,28 @@ fn compile_inner(
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
+    writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a
-    // conjunction unless there is only one
-    let mut show = String::from("fn show(s: &State) -> String { let mut o = String::new(); ");
+    // conjunction unless there is only one. `show_with` prints the variables in `null` as null, as
+    // TLC prints a successor that leaves them unassigned
+    let mut show = String::from(
+        "fn show(s: &State) -> String { show_with(s, &[]) }\nfn show_with(s: &State, null: &[&str]) -> String { let mut o = String::new(); ",
+    );
     let one = g.vars.len() == 1;
     for (i, (v, t)) in g.vars.clone().iter().enumerate() {
         let tid = g.ty_id_pub(t)?;
         let nl = if i + 1 < g.vars.len() { "\\n" } else { "" };
         let bullet = if one { "" } else { "/\\\\ " };
-        write!(show, "o += &format!(\"{bullet}{v} = {{}}{nl}\", ppr(&fmt_{tid}(&s.v_{v}))); ").unwrap();
+        write!(
+            show,
+            "o += &format!(\"{bullet}{v} = {{}}{nl}\", if null.contains(&{v:?}) {{ \"null\".to_string() }} else {{ ppr(&fmt_{tid}(&s.v_{v})) }}); "
+        )
+        .unwrap();
     }
     show += "o }\n";
+    writeln!(show, "const ACTIONS: usize = {actions};").unwrap();
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
     writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();

@@ -1,8 +1,8 @@
-key 5799c7bf1bf4c03e38f1d4b2acf70ee90e387c91905d6b1e0b08d011b190e1c8
+key df5af54dfd1c9cb1b89333efc7c6ab39877e225b5a5a02f360a40bf08fab7514
 tlc Version 2.19
 rc 12
 Invariant Low is violated
-4 states generated 4 distinct states found
+4 states generated 4 distinct states found 0 states left on queue
 trace 4 1707d7a16195b175ef4d9dc24bf497868c3e1c7fca0f8318af69b1802ad87b74
 states 4 36c74a64c67fff98b3d7fa2d0d902eb08e25c231e03cfc56b911b8ee8c7c8301
 edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29

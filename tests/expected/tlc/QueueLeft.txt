@@ -1,0 +1,10 @@
+key d5bd88928c0e1f66bc28c71441bed91d6f4a8a2f68fa1fd3b0df6d7c255059b3
+tlc Version 2.19
+rc 12
+Invariant NotEleven is violated
+6 states generated 6 distinct states found 3 states left on queue
+trace 3 c00beb3298a8a104c4704e87bc4ecc2d0708589410912f2db8ba3960a3df9716
+states 6 b53b93406f6c38207de0e2357db59b2593e85ce8a314ffdeabdcc96c1360c51c
+edges 5 2eb19b979764ee38427ede8d7794f6b4bbe8f94d6b5f61debbe6b28ea748cbd0
+messages 2 34f3b1a58c94463ccdc2113a43f044544670e2efa2d09df5445c88ba4cdc895c
+errors 2 34f3b1a58c94463ccdc2113a43f044544670e2efa2d09df5445c88ba4cdc895c

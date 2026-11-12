@@ -1,8 +1,8 @@
-key f660f2c42061d80425045b39866b788236ee02be8844816f4cc9530e202a97c3
+key de3bf1ac01f597946ba33cda1b5872fa4dc5c1a8ea48582b2b1dc267c6b045f8
 tlc Version 2.19
 rc 76
 Evaluating invariant NotFun failed
-4 states generated 4 distinct states found
+4 states generated 4 distinct states found 2 states left on queue
 trace 2 b285778463494d51532a06c1df0b840f0c24b0fc41395054a3d5c9a5b66fe36d
 states 4 15a9b9d17651b84a42312e084bb8f513677e223809bf686f4fa00a76c2fee571
 edges 4 fc153d8a80d335cf22f8ca9a57b34d118e8085ed52fe4631f85b786cf5cf61d1

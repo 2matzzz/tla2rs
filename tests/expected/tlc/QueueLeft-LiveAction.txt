@@ -1,0 +1,10 @@
+key 70d250cff8611cbe7650a1d8ae61d8f49d6e67fe42c770cf10c9d02e3651c5bf
+tlc Version 2.19
+rc 13
+Action property NeverEleven is violated
+6 states generated 6 distinct states found 3 states left on queue
+trace 3 c00beb3298a8a104c4704e87bc4ecc2d0708589410912f2db8ba3960a3df9716
+states 6 b53b93406f6c38207de0e2357db59b2593e85ce8a314ffdeabdcc96c1360c51c
+edges 5 2eb19b979764ee38427ede8d7794f6b4bbe8f94d6b5f61debbe6b28ea748cbd0
+messages 2 4ebdceda9bef83565174204acd7eb4451cd20ee97f64a42d96b4bf48651706ef
+errors 2 4ebdceda9bef83565174204acd7eb4451cd20ee97f64a42d96b4bf48651706ef

@@ -1,8 +1,8 @@
-key 77508aba8cab0f6f4e117270b15309492eb603da929ca44d94b10a37591f5f2c
+key dbab117bd2d04a2932c6878edd99cbe6b9be18bdcfb9802b81176503bd73fa13
 tlc Version 2.19
 rc 12
 Invariant SafetyInvariant is violated
-1302999 states generated 88152 distinct states found
+1302999 states generated 88152 distinct states found 39290 states left on queue
 trace 12 366db1b25e8affe1954dc86d1c88e9397c8ac8b7022ea3d53f80d3f99053a987
 states 88152 cba6d4a53a7af6ed555cdc4cd4bde8534768a579561b2005ba2f67fc3df5166b
 edges 611225 b22b52b16b192854bc91978e18318fd6b3de27b0a860cc27bab8c3ea5e1f2561

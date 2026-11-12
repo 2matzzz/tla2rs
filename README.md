@@ -145,7 +145,9 @@ memory.
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
   characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`, and, giving tuples as in TLC, `SelectSeq`,
   `SortSeq` and a tuple followed by a string in `\o`), `Bags`, `STRING`, and from `TLC` `Print`, `PrintT`, `Assert`,
-  `ToString`, `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+  `ToString`, `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`. `\div` of a negative number follows the module
+  the spec loads, as in TLC: the floor of the quotient with Integers, and with Naturals only, rounded toward zero
+  and then down when that is negative (`(0 - 1) \div 3` is 0)
 - Records are ordered as TLC orders them (by their number of fields first), model values come before strings, and
   `Print` / `PrintT` break a value wider than 80 columns over lines, as TLC does
 - Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),
@@ -167,9 +169,10 @@ memory.
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC
   does, those in definitions of constant level without arguments and in ASSUMEs once, when the checker starts
-- Print and PrintT in the initial predicate, an action or an invariant print in another order than TLC's when a state
-  has more than one initial state or successor: TLC checks each new state as soon as it generates it and evaluates
-  the actions again while rebuilding a counterexample (see CLAUDE.md, "Messages and printed lines")
+- Print and PrintT in the initial predicate, an action or an invariant print in TLC's order with one worker: each
+  state's lines before its checks, nothing past the state that stops the search, and the lines TLC prints again
+  while it rebuilds a counterexample (see CLAUDE.md, "Messages and printed lines"). Such specs are searched without
+  `-batched`
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
   reason), sets that may hold both strings and integers, `Name <- [Module] Def` for a CONSTANT (TLC rejects it too),
   `Op!@`, and a recursive operator that assigns variables called in Init with arguments that are not constant. `\A`
@@ -182,7 +185,9 @@ memory.
   unary minus); a declaration, definition, parameter, LET definition or bound variable named like something in
   scope at that point (also a definition of an extended or instantiated module, or of a standard module extended);
   labels that do not list the bound variables around them; LAMBDA anywhere but as an argument; wrong positional
-  subexpression names, also in definitions nothing uses; invalid string escapes. A name is in scope only after the
+  subexpression names, also in definitions nothing uses; invalid string escapes. Parse errors (precedence, string
+  escapes, LAMBDA) and the level errors of temporal formulas are reported in SANY's words with its positions; for
+  the other checks the wording and positions differ from SANY's. A name is in scope only after the
   statement that introduces it, as in SANY: an operator parameter may be named like a VARIABLE declared later. Not
   repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and `\AA`; positional names of LET
   definitions; and SANY's other checks (see CLAUDE.md, "What SANY refuses")
@@ -209,7 +214,7 @@ memory.
 ## Cross-checking against TLC
 
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
-generated and distinct state counts, the counterexample, exit code, the messages and printed lines, and the state
+generated and distinct state counts, the states left on TLC's queue when it stops at an error, the counterexample, exit code, the messages and printed lines, and the state
 graph: the set of states reached
 and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a SHA-256
 hash (with the variables of each state sorted, since TLC's order comes from a hash table). A safety counterexample is

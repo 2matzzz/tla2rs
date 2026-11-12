@@ -1,8 +1,8 @@
-key 854bbdb8d18ccd01deeed47c55819ccdee649339df533b720e4386dd611f3fda
+key 510777a42b5cfc8eb678362716541352118259a8379b7228fe2e6518f97d0aeb
 tlc Version 2.19
 rc 13
 Evaluation error
-13 states generated 12 distinct states found
+13 states generated 12 distinct states found 3 states left on queue
 trace 5 3024db8bd509bf3490f698db9a900f8cb04c47809a4365c773382e276a506b5f
 states 12 47a12a1c4bcc2d0f61024437cd07dc2811c497c784fcad889634dce132264f3e
 edges 12 1b3e42b9b5164175a376296f85519767db6ee43bdeac9c75605c2457502cbb59

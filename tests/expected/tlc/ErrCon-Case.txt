@@ -1,8 +1,8 @@
-key 672630962c7056ccee3a7acef763ef22b537ee452b3999de45cac8f0bf5297b8
+key f1f1ba797c3aeab78a8cea03f5392560e85e8c0f5ce673539ad70c256c177c7e
 tlc Version 2.19
 rc 75
 Evaluation error
-3 states generated 2 distinct states found
+3 states generated 2 distinct states found 0 states left on queue
 trace 0
 states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

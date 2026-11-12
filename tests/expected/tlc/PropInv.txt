@@ -1,8 +1,8 @@
-key 381e8a3c40add4489ea1ee407cd6a3cfff59c8d06a400934d2d9ce40ba8ff564
+key a2d6f80712374d71f85c36f7ab177f0372e812c74e9c8d4e93e51880bb959533
 tlc Version 2.19
 rc 12
 Invariant Small is violated
-3 states generated 3 distinct states found
+3 states generated 3 distinct states found 0 states left on queue
 trace 3 85e86d2b93aeea84c342f6e4b4f12761e4ce4150dc77d01b3ef3fe6d12122eeb
 states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
 edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1

@@ -1,8 +1,8 @@
-key b91dacd61af2ef3f120e21d30a7b7cbf4484ea1d20bcdb19dc7c4e6350f251e2
+key 51eec7cb69a51c9fc8a49aac5e9e1516e4276b96455e0eca5e9d01ba97e19169
 tlc Version 2.19
 rc 12
 Invariant InvBad is violated
-24 states generated 14 distinct states found
+24 states generated 14 distinct states found 3 states left on queue
 trace 5 23ff4a1c05023adfcdde16db044a51d52ee36c7736e999e3a8a8ef797f5c9e99
 states 14 9ba1751c62086b093b39910cb3888587decdc0d0f44192239d926ecbe29eec76
 edges 23 5e923e097da3307fc3aa480bff56de49d1818606bf72bb376cb08f03ab9594bc

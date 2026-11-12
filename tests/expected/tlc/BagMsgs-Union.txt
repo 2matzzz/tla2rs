@@ -1,8 +1,8 @@
-key 1ae96d38b41fc27e98fcffa3e11e75a7493239d014e314db458f711164aee95f
+key 3db19d187498b3640625be05448f10fc100edbda077feb51c4610099b29dc198
 tlc Version 2.19
 rc 12
 Invariant UnionOk is violated
-10 states generated 9 distinct states found
+10 states generated 9 distinct states found 4 states left on queue
 trace 4 6b0f141aa04efcf01ef42fd06c86563831c2328d82868c0d4e9846c3b1cb8f8b
 states 9 d886e6dde233cf4811c6fe68d3a1a2ea6da4ae8dc4e8e3b91eefc488323bc760
 edges 9 0935f8158eac132ca963016c76293c17745e6d4f4e890b32bfcf1f2886ec13cf

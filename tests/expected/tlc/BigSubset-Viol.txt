@@ -1,8 +1,8 @@
-key e4531cddfb544d1925e5379859f3f2089ae63073a5ffc3ccf43199e2b5d926d6
+key 8a4b9ea51de7c67ec88c297303563b7a297429f3080c0e4c3c7c94b818f3daad
 tlc Version 2.19
 rc 12
 Invariant NoPair is violated
-6 states generated 6 distinct states found
+6 states generated 6 distinct states found 3 states left on queue
 trace 3 f2c6436f5f676886fc460e9bb1ac40a23911332efa4997a106dad3376360ba9a
 states 6 ccdaec9f2278464136d70bd7ea97881d875bc70714ea666db593218d030e1769
 edges 5 3b7c078e43eddb0411ba6c86d148748c3204c9299121632e2fef719e8761fd8a

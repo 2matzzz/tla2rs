@@ -1,8 +1,8 @@
-key 344220eec3ff897c4718a2dbd09f61dead43656615b2c8a773519f1f75a9f036
+key 0a465c4ca95d6dfae95a322a02f87280bb46a6ab7ca62129f8c758d5a0086dba
 tlc Version 2.19
 rc 12
 Invariant NotAllOnes is violated
-9 states generated 8 distinct states found
+9 states generated 8 distinct states found 3 states left on queue
 trace 4 a4c628803f5aafbefd0e95ed951ad25a6d58a049a3b332294b62b4c428645235
 states 8 62758469eea5df6a54b720852172d13726166e45fd8353387714b63ba08afd76
 edges 8 4fc671b0c6be94e5f2c6210ca84adde8ad6572663216479faf8eaa32c1df78b2
