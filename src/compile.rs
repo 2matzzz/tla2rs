@@ -20,10 +20,12 @@ pub struct Output {
     pub rejected: Option<(String, i32)>,
 }
 
-/// What TLC prints when it starts, in its order: Print and PrintT in the definitions of constant
-/// level, its warnings about the configuration, then Print and PrintT in the ASSUMEs
+/// What TLC prints when it starts, in its order: its warnings that a PlusCal algorithm or its
+/// translation changed (while it parses the modules), Print and PrintT in the definitions of
+/// constant level, its warnings about the configuration, then Print and PrintT in the ASSUMEs
 #[derive(Default)]
 pub struct Startup {
+    pub pcal: Vec<String>,
     pub consts: Vec<String>,
     pub warnings: Vec<String>,
     pub assumes: Vec<String>,
@@ -34,7 +36,9 @@ pub const NOWARNING: &str = "(Use the -nowarning option to disable this warning.
 
 impl Startup {
     pub fn lines(&self) -> Vec<String> {
-        let mut v = self.consts.clone();
+        // TLC prints the PlusCal warnings itself, not as the messages its note follows
+        let mut v = self.pcal.clone();
+        v.extend(self.consts.iter().cloned());
         for (i, w) in self.warnings.iter().enumerate() {
             v.push(w.clone());
             if i == 0 {
@@ -768,14 +772,15 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
-    let mut startup = Startup::default();
+    let (pcal, notes) = crate::pcal::warnings(tla, dir);
+    let mut startup = Startup { pcal: pcal.clone(), ..Default::default() };
     let mut first = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup);
     // Types from TypeOK that Init or Next contradict (a module that extends another and adds a
     // record field its type invariant lacks): infer every type instead, keeping the first error if
     // that fails too
     if matches!(&first, Err(e) if (e.starts_with("Init: ") || e.starts_with("Next: ")) && !e.contains(crate::lexer::SANY)) {
         INFER_ALL.with(|f| f.set(true));
-        let mut again = Startup::default();
+        let mut again = Startup { pcal: pcal.clone(), ..Default::default() };
         let r = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut again);
         INFER_ALL.with(|f| f.set(false));
         if r.is_ok() {
@@ -787,11 +792,15 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
             let msg = e.replacen(crate::lexer::SANY, "", 1);
-            let msg = format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed.");
-            return Ok(Output { rust: String::new(), warnings: vec![], rejected: Some((msg, 150)) });
+            let mut msg = format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed.");
+            if !pcal.is_empty() {
+                msg = format!("{}\n{msg}", pcal.join("\n"));
+            }
+            return Ok(Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)) });
         }
         r => r?,
     };
+    out.warnings.extend(notes);
     // What TLC prints when it starts comes before its verdict on the spec
     if let Some((msg, _)) = &mut out.rejected {
         let lines = startup.lines();

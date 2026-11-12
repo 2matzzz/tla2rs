@@ -31,7 +31,7 @@ check specifications/DieHard/MCDieHarder.tla specifications/DieHard/MCDieHarder.
 skip specifications/DieHard/MCDieHardest.tla specifications/DieHard/MCDieHardest.cfg # needs module Functions, not in tla2tools.jar
 skip specifications/DiningPhilosophers/APDiningPhilosophersPCal.tla specifications/DiningPhilosophers/APDiningPhilosophersPCal.cfg # symbolic mode: checked with Apalache
 check specifications/DiningPhilosophers/DiningPhilosophers.tla specifications/DiningPhilosophers/DiningPhilosophers.cfg
-gap specifications/DiningPhilosophers/DiningPhilosophersPCal.tla specifications/DiningPhilosophers/DiningPhilosophersPCal.cfg # TLC warns that the PlusCal algorithm changed since its last translation: it checksums the syntax tree of its PlusCal parser (pcal.Validator), which tla2rs does not have
+check specifications/DiningPhilosophers/DiningPhilosophersPCal.tla specifications/DiningPhilosophers/DiningPhilosophersPCal.cfg
 skip specifications/DiningPhilosophers/DiningPhilosophers_anim.tla specifications/DiningPhilosophers/DiningPhilosophers_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/DiningPhilosophers/DiningPhilosophers_stats.tla specifications/DiningPhilosophers/DiningPhilosophers_stats.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/Disruptor/APDisruptor_MPMC.tla specifications/Disruptor/APDisruptor_MPMC.cfg # symbolic mode: checked with Apalache
@@ -63,7 +63,7 @@ skip specifications/KeyValueStore/MCKVsnap.tla specifications/KeyValueStore/MCKV
 skip specifications/KnuthYao/SimKnuthYao.tla specifications/KnuthYao/SimKnuthYao.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/LearnProofs/MCFindHighest.tla specifications/LearnProofs/MCFindHighest.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
-gap specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg # TLC warns that the PlusCal algorithm changed since its last translation, as for DiningPhilosophersPCal; everything else matches (with rules=error-lines it matches)
+check specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg
 skip specifications/LoopInvariance/MCBinarySearch.tla specifications/LoopInvariance/MCBinarySearch.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/LoopInvariance/MCQuicksort.tla specifications/LoopInvariance/MCQuicksort.cfg # needs module TLAPS, not in tla2tools.jar
 check specifications/Majority/MCMajority.tla specifications/Majority/MCMajority.cfg

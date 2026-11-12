@@ -19,7 +19,9 @@ It has no crate dependencies.
 - `target/release/tla2rs --messages FILE` reduces the messages and printed lines in such an output to `messages N
   <sha256>` and its error lines to `errors M <sha256>`; `--messages-text FILE` prints the canonical form (see
   "Messages and printed lines")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 547 currently
+- `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
+  CRC-32 (see "PlusCal checksums")
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 559 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -62,6 +64,7 @@ It has no crate dependencies.
 | `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
 | `src/trace.rs` | `--trace`: reduces the counterexample in an output of TLC or of a checker to its canonical form and hashes it |
 | `src/messages.rs` | `--messages`: reduces the messages and printed lines in an output of TLC or of a checker to their canonical form and hashes it, and its error lines (see "Messages and printed lines") |
+| `src/pcal.rs` | TLC's check of the checksums a PlusCal translator wrote: the warnings for the root module and the modules it extends, and the algorithm's syntax tree as TLC's translator prints it (see "PlusCal checksums") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/ppr.rs` | TLC's pretty printer for values (`ppr`, ported from `tlc2.pprint` and checked against TLC's on 25,000 random values): used by the compiler for what Print and PrintT print when TLC starts, and pasted into every generated checker, which prints states and printed values with it |
 | `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos). Also the `-dumpgraph` output |
@@ -437,18 +440,17 @@ match is listed as `gap` with the reason measured; `corpus.sh` still runs it and
 fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
 below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 93 match, of which 6 with `distinct-only` and 10
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 95 match, of which 6 with `distinct-only` and 10
 with a bound for tla2rs. Only the generated count differs in those 6: TLC generates the same successor of a state
 more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
 with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
 states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
 4682 distinct edges; `MCCheckpointCoordinationFailure` has 1297994 and 1297595 edges, and the same 611225 distinct
 edges. The graph hashes compare the distinct edges, so the state space and transitions match. `StaleViewShrink` (4) is
-not measured this way. 5 are gaps (2 run, 3 `norun`):
+not measured this way. 3 are gaps, all `norun`:
 
 | Gap | Model |
 |---|---|
-| TLC warns that the PlusCal algorithm changed since its last translation: it checksums the syntax tree of its PlusCal parser (`pcal.Validator`), which tla2rs does not have. `MCLeastCircularSubstringSmall` matches on everything else (with `rules=error-lines`) | `DiningPhilosophersPCal`, `MCLeastCircularSubstringSmall` |
 | `norun`: the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it | `GameOfLife` |
 | `norun`: evaluating its ASSUMEs at compile time took 1.5 GB in 2.5 minutes (LET definitions are expanded at each use, so recursion through them repeats work) | `BlockDagTest` |
 | `norun`: the system killed tla2rs for memory in a corpus run | `TLCSailfish1` |
@@ -462,8 +464,44 @@ base-case seed (`RecSetFn`, `RecFunApp`, `RecBase`), Print and PrintT pretty-pri
 inferred when TypeOK's fail (`ExtType`), an infix `&` (`AmpOp`), `name = [Module] value` in a cfg (`ModVal`), LET
 definitions of an instance renamed (`InstLet`), in-place EXCEPT on a function over part of a type (`PartExcept`), model
 values before strings (`ModelStr`), records compared field by field in an array (`RecNest`), up to 128 fairness
-conditions (`ManyFair`), tuples of different lengths or sets held beside model values (`SeqAtom`, `SetAtom`), and
-functions over domains of different sizes (`DomGrow`).
+conditions (`ManyFair`), tuples of different lengths or sets held beside model values (`SeqAtom`, `SetAtom`),
+functions over domains of different sizes (`DomGrow`), and TLC's warning that a PlusCal algorithm changed since its
+translation (`PcalSum`).
+
+### PlusCal checksums
+
+When the translator writes a PlusCal algorithm's translation, it records two checksums in the line that opens it:
+`\* BEGIN TRANSLATION (chksum(pcal) = "..." /\ chksum(tla) = "...")`. TLC computes both again while SANY loads the
+root module and each module reached through EXTENDS (not a module only instantiated), and prints right after
+parsing that module, before anything else that is compared:
+
+- `!! WARNING: The PlusCal algorithm in module M has changed since its last translation.` when only the PlusCal one
+  differs, `... The TLA+ translation in module M has changed since its last translation.` when only the TLA+ one
+  differs, and `... The PlusCal algorithm and its TLA+ translation in module M filename since the last translation.`
+  (sic) when both do. These are printed directly, so TLC's note about `-nowarning` does not follow them
+- Nothing when the line has no checksums or writes one as `\in STRING` (that one is not checked), or when the module
+  has no `--algorithm` / `--fair` or no BEGIN / END TRANSLATION lines
+
+What is hashed, measured on TLC 2.19 (`tests/tlc/PcalSum*`, and the corpus) and read from the published TLC sources
+(`pcal.Validator`, tlaplus/tlaplus, MIT licence); `src/pcal.rs` is written for tla2rs:
+
+- Both are CRC-32 values written in lowercase hexadecimal without leading zeros (`a163d78`)
+- The TLA+ checksum covers the lines strictly between BEGIN TRANSLATION and END TRANSLATION, joined without line
+  breaks, as written: a space added inside the translation changes it, an empty line does not
+- The PlusCal checksum covers the text TLC's translator prints for its syntax tree of the algorithm: TLA+ tokens of
+  each expression, line by line, inside a record per statement. Spaces and comments inside a line do not change it,
+  nor do comment lines between statements or declarations; a line break or a comment line inside an expression does
+  (`PcalSumSpace`, `PcalSumBreak`). The tree is printed after the translator has split the body into labeled steps
+  and expanded them, and that expansion changes the tree it prints: an if or either without labels inside becomes a
+  plain one, and in the statement lists it does not copy first, a last labeled if or either, or goto, is replaced
+  and `pc := "next label"` is appended where control leaves the step. `tla2rs --pcal-text FILE` prints this text;
+  for the corpus, comparing it with the translator's own (a small Java program calling TLC's classes, not kept here)
+  found every one of the 22 algorithms tla2rs reads equal
+
+Not followed: algorithms with procedures, calls, returns or macros, a `PlusCal options` line, names the translator
+renames (two equal labels or variables, as in the corpus's `Sailfish`), or labels it would add (an algorithm without
+labels). For those tla2rs prints a note on stderr and no warning. A spec TLC's translator cannot parse gets the
+warning from TLC; tla2rs then prints the note too. A module reached through two EXTENDS is checked once.
 
 ### VIEW and SYMMETRY together
 

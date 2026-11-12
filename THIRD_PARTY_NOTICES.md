@@ -7,6 +7,10 @@ tla2rs contains parts derived from the following works, used under their license
 `src/ppr.rs` is a Rust port of TLC's pretty printer for values (`tlc2.pprint`), so that tla2rs prints
 states exactly as TLC does. Source: https://github.com/tlaplus/tlaplus
 
+`src/pcal.rs` reproduces the text TLC's PlusCal translator (`pcal.Validator`) checksums, so that tla2rs warns
+about a changed algorithm exactly when TLC does. It is written for tla2rs from TLC's measured behaviour and its
+published sources.
+
 ```
 MIT License
 
