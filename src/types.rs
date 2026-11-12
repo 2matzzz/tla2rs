@@ -214,6 +214,39 @@ pub fn has_atoms(fs: &[(String, Ty)]) -> bool {
     fs.iter().any(|(n, _)| n == ATOM_FIELD)
 }
 
+/// The field that holds a value of another kind (a sequence, tuple, set, function, bag or boolean)
+/// in a record type that also holds model values (ATOM_FIELD), as `Seq(S) \cup {NoVal}` or
+/// `SUBSET S \cup S`: present, it holds the value, and no other field is present. Its name sorts
+/// before ATOM_FIELD, so that a model value, where it is absent, comes first in the Rust order of
+/// the representation, as TLC orders model values before other values
+pub const VAL_FIELD: &str = "(any)";
+
+/// Whether a record type holds values of another kind (see VAL_FIELD)
+pub fn has_val(fs: &[(String, Ty)]) -> bool {
+    fs.iter().any(|(n, _)| n == VAL_FIELD)
+}
+
+/// Whether a value of this type goes into VAL_FIELD when the type is joined with model values
+/// (integers and records have their own forms: IntAtom and ATOM_FIELD)
+pub fn boxable(t: &Ty) -> bool {
+    match t {
+        Ty::Bool | Ty::Seq(_) | Ty::Set(_) | Ty::Fun(..) | Ty::PFun(..) | Ty::Bag(_) => true,
+        Ty::Rec(fs) => is_tuple_fields(fs),
+        _ => false,
+    }
+}
+
+/// The type of VAL_FIELD in a record type, if it has one
+pub fn val_ty(t: &Ty) -> Option<&Ty> {
+    match t {
+        Ty::Rec(fs) => fs.iter().find(|(n, _)| n == VAL_FIELD).map(|(_, t)| match t {
+            Ty::Opt(i) => i.as_ref(),
+            t => t,
+        }),
+        _ => None,
+    }
+}
+
 /// Whether `t` has a record type that also holds model values inside. Packing a value of it does
 /// not check that each value is one of the records or model values a type invariant lists
 pub fn mixes_atoms(t: &Ty) -> bool {
@@ -225,14 +258,24 @@ pub fn mixes_atoms(t: &Ty) -> bool {
     }
 }
 
-/// A value of a record type: a model value when it has only ATOM_FIELD
+/// A value of a record type: a model value when it has only ATOM_FIELD, another value when it has
+/// only VAL_FIELD
 pub fn rec_value(m: std::collections::BTreeMap<String, Value>) -> Value {
     if m.len() == 1 {
-        if let Some(v) = m.get(ATOM_FIELD) {
+        if let Some(v) = m.get(ATOM_FIELD).or(m.get(VAL_FIELD)) {
             return v.clone();
         }
     }
     Value::Rec(m)
+}
+
+/// Whether a value is held in VAL_FIELD of a record type with fields `fs`
+fn boxed_value(fs: &[(String, Ty)], v: &Value) -> bool {
+    has_val(fs) && !matches!(v, Value::Atom(_) | Value::Rec(_))
+}
+
+fn boxed(v: &Value) -> Value {
+    Value::Rec([(VAL_FIELD.to_string(), v.clone())].into_iter().collect())
 }
 
 /// The element types of a tuple type
@@ -414,6 +457,7 @@ impl Ty {
             (Ty::Rec(fs), Value::Atom(a)) if has_atoms(fs) => {
                 self.enc_mixed(&Value::Rec([(ATOM_FIELD.to_string(), Value::Atom(*a))].into_iter().collect()))
             }
+            (Ty::Rec(fs), v) if boxed_value(fs, v) => self.enc_mixed(&boxed(v)),
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 if m.keys().any(|k| !fs.iter().any(|(n, _)| n == k)) {
                     return None;
@@ -455,6 +499,7 @@ impl Ty {
             (Ty::Rec(fs), Value::Atom(a)) if has_atoms(fs) => {
                 self.conforms(&Value::Rec([(ATOM_FIELD.to_string(), Value::Atom(*a))].into_iter().collect()))
             }
+            (Ty::Rec(fs), v) if boxed_value(fs, v) => self.conforms(&boxed(v)),
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
@@ -489,6 +534,20 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         }
         (Ty::Opt(a), Ty::Opt(b)) => Ty::Opt(join(a, b)?.into()),
         (Ty::Opt(a), b) | (b, Ty::Opt(a)) => Ty::Opt(join(a, b)?.into()),
+        // A value of another kind and model values: the value in VAL_FIELD, the model values in
+        // ATOM_FIELD
+        (Ty::Enum(x), t) | (t, Ty::Enum(x)) if boxable(t) => Ty::Rec(sorted_fields(vec![
+            (VAL_FIELD.to_string(), Ty::Opt(t.clone().into())),
+            (ATOM_FIELD.to_string(), Ty::Opt(Ty::Enum(x.clone()).into())),
+        ])),
+        (Ty::Rec(fs), t) | (t, Ty::Rec(fs)) if has_atoms(fs) && boxable(t) => {
+            let mut out = fs.clone();
+            match out.iter().position(|(n, _)| n == VAL_FIELD) {
+                Some(i) => out[i].1 = join(&out[i].1, t)?,
+                None => out.push((VAL_FIELD.to_string(), Ty::Opt(t.clone().into()))),
+            }
+            Ty::Rec(sorted_fields(out))
+        }
         (Ty::Rec(x), Ty::Rec(y)) if is_tuple_fields(x) || is_tuple_fields(y) => {
             if !is_tuple_fields(x) || !is_tuple_fields(y) {
                 return Err(format!("type mismatch: a tuple and a record: {a:?} vs {b:?}"));
