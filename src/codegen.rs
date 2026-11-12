@@ -4644,6 +4644,23 @@ impl<'a> Gen<'a> {
                         }
                         cur = c.as_ref().clone();
                     }
+                    // A function over part of a type: a key outside its domain leaves it
+                    // unchanged, as in TLC (as in the EXCEPT that builds a new value)
+                    (Path::Idx(i), Ty::PFun(d, c)) => {
+                        let ic = self.gen_as(i, env, d)?;
+                        let iv = self.fresh("i");
+                        if is_sparse_fun(&cur) {
+                            writeln!(out, "let {iv} = {ic};").unwrap();
+                            conds.push(format!("({p}).find(&{iv}).is_ok()"));
+                            p = format!("{p}.items[({p}).find(&{iv}).unwrap()].1");
+                        } else {
+                            let did = self.ty_id(d)?;
+                            writeln!(out, "let {iv} = enc_{did}({ic});").unwrap();
+                            conds.push(format!("{iv} != u64::MAX && {p}[{iv} as usize].0"));
+                            p = format!("{p}[{iv} as usize].1");
+                        }
+                        cur = c.as_ref().clone();
+                    }
                     (Path::Field(k), Ty::Rec(fs)) => {
                         let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
                         match &fs[i].1 {

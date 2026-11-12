@@ -249,7 +249,7 @@ skip specifications/tcp/APtcp.tla specifications/tcp/APtcp.cfg # symbolic mode: 
 skip specifications/tcp/MCtcp.tla specifications/tcp/MCtcp.cfg # needs module SequencesExt, not in tla2tools.jar
 check specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg
 skip specifications/tower_of_hanoi/Hanoi_anim.tla specifications/tower_of_hanoi/Hanoi_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
-gap specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_commit/2PCwithBTM.cfg # compile error: an EXCEPT path does not match the value type (Next)
+check specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_commit/2PCwithBTM.cfg rules=distinct-only
 skip specifications/transaction_commit/APTCommit.tla specifications/transaction_commit/APTCommit.cfg # symbolic mode: checked with Apalache
 skip specifications/transaction_commit/PaxosCommit.tla specifications/transaction_commit/PaxosCommit.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/transaction_commit/TCommit.tla specifications/transaction_commit/TCommit.cfg
