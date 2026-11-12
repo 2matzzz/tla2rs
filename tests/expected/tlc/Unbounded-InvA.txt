@@ -1,8 +1,8 @@
-key 72f97488d1b87e171a956e7d85e875a02430ff2ff434f32eec7d59e3931c895c
+key 766ee2dc851c6ad513de3d9394ca987b486f48a6dc507123506079f138e049e9
 tlc Version 2.19
 rc 76
 Evaluating invariant InvA failed
-2 states generated 2 distinct states found
+2 states generated 2 distinct states found 0 states left on queue
 trace 2 269e3c25ea838ffbe034527249d198c9dc6a17b71abf9f09cd25a850fff36dec
 states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

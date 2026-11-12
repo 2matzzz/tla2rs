@@ -1,8 +1,8 @@
-key 5ccc60fc50763a74b98940fd2b62695aa8189782e5121c8791c9c743e062c9c8
+key 281a2d7fa152a27deee59b6f36c29a95a3fbc64370a00f2b10fd8321bd116d86
 tlc Version 2.19
 rc 12
 Invariant Prop is violated
-4 states generated 4 distinct states found
+4 states generated 4 distinct states found 1 states left on queue
 trace 3 9975520a7ac862ac5d369e76841757b9c95a7c6cd2c4ebb228c499f5988aafb0
 states 4 263ba1e03ee4a759b20d84f680e0705a98ac729d1717b5017a16c52ef7c6dae6
 edges 3 7b95f68af1754fc6231b6e8aed173bb40f9543af4da7c9aa4f006553f7a8a96e

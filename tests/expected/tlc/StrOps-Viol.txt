@@ -1,8 +1,8 @@
-key bbfef4609bee430ee17d4e9e9a6fff400355d2dfa0886d7be2acfee7e3608753
+key f6b67abae745ac05cfb9156c29218d895ea78ebe283eb1d8ccb92c3f38b871f7
 tlc Version 2.19
 rc 12
 Invariant NotXc is violated
-11 states generated 9 distinct states found
+11 states generated 9 distinct states found 2 states left on queue
 trace 5 b53074d3c54c33b2d8f618e3bbbc84520d8464902418e684f5e4b4df60a708ab
 states 9 e46982f81d52e79310c503ead31349f278aef63ed4b12bfb5826a41ffd108a89
 edges 10 5ab0973144af6b32c80b0bc65942314d63672cdb84d68a2344c42fc6c3004fc3

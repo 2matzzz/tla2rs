@@ -1,8 +1,8 @@
-key e11cc1b4b3c5aa505940cc3651ba195ffef8370de6b4e07bdbe2302a7dcd2e67
+key 63853b82d30004bec3e4b5775f4e946be4c896eb844426b38f45d2f0ba3f347a
 tlc Version 2.19
 rc 12
 Invariant NotSeven is violated
-25 states generated 18 distinct states found
+25 states generated 18 distinct states found 14 states left on queue
 trace 3 9391bfa0360df7a4c8becb7c9b4adf48727b4ae1f4cb082af00f3d0dff0384cf
 states 18 402b4a19b9d4927ca7e5514eb71d0053643e4e66db9a7e4e4edf2f6ccdc89723
 edges 21 648f086ba7358917b8b928aef9009ce3d3ea94bcdee696f644510ff5d0d08231

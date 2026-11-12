@@ -1,8 +1,8 @@
-key 272a98f4f6ee83c42d3ac1da8692f103d7707c10a806d5fba1247685facae501
+key edc022a667f5a7a2ea6f44451b06442e28f157d8b946f91a30743df24f7ded62
 tlc Version 2.19
 rc 76
 Evaluating invariant InvCase failed
-3 states generated 3 distinct states found
+3 states generated 3 distinct states found 0 states left on queue
 trace 3 09c007f57320fdb61290bd41db5278f99827dfd871c7e4bd31a1f462ec3ed2f8
 states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
 edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1

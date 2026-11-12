@@ -1,8 +1,8 @@
-key d542ed35d03149d3f8027042fdaac2da60ea9515e10d9f8f30bc7ef08cad00f2
+key c76383443ce564c60e4f448a53caa3acaa97a29804e206fade0bfe60229fb951
 tlc Version 2.19
 rc 12
 Invariant NoRun is violated
-40 states generated 40 distinct states found
+40 states generated 40 distinct states found 26 states left on queue
 trace 4 bd30c724d07de9be4a69cbd27fff5889f3c2a95c6451a6f46f02c431d063fbef
 states 40 e4e486640a6bec5717b733a6d2a613b40f824825fba49bcc1de0b47cd4de15ec
 edges 39 c975985ac6b57c842e97e91d1b91ef64bf6d2c0117d5489d7c583366511152c6

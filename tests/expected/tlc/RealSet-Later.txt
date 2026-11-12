@@ -1,8 +1,8 @@
-key fe376c74bb14fac78402c53383bc3c4dbf6f5aaee7c96beeb4fb2a20df990402
+key 65f1eca7b27e1dab607f30aa1fca00d4980f3a38da68b6dc0bc8b4000b3f7e15
 tlc Version 2.19
 rc 76
 Evaluating invariant InvLater failed
-2 states generated 2 distinct states found
+2 states generated 2 distinct states found 0 states left on queue
 trace 2 ebf22541cdb7cde20ee7774d0abdcac75c8fd3943a10e96d366a9c09a607843e
 states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

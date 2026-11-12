@@ -1,8 +1,8 @@
-key 3ca3a894ca12c94c9103458b0079d02ee2c9b9de4a7fe6e528433b5b21ccfb17
+key 8cc3b892d7a6756545c9c382d59a30f8be01a374ebf12b0bb33fe038928c9342
 tlc Version 2.19
 rc 12
 Invariant NotTwos is violated
-10 states generated 10 distinct states found
+10 states generated 10 distinct states found 6 states left on queue
 trace 3 69af7ece0e00b8271f92c90c24542f229b4b40641b06e19e0172cae0fde32354
 states 10 b5d6cc79d2ddbc070a63471264c431e49d2dc72cb495afcc2495c634d6f58693
 edges 9 2568a6efbf1229181c0d6bd14fff4d69e75784a8bb1e399a1b871aae7d0bb18f

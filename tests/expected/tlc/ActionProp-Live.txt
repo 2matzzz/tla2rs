@@ -1,8 +1,8 @@
-key dde7abe61969b9e6371032ca37b25b973a75504bd8e1ebe97b2d8633d711329b
+key 4c6cf57fb203771c80d189dbf452adbef2bacd6830630cdd8552a1c5f3b0c326
 tlc Version 2.19
 rc 13
 Action property Up is violated
-4 states generated 3 distinct states found
+4 states generated 3 distinct states found 0 states left on queue
 trace 4 d7c907ebf7b05d6e73038ae333ba782726adf2c88e1eddfe94b93d5d2f708cfb
 states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
 edges 3 b2d516ac2fbfdf330a3807ea2448b0f4c0e9f82abd7a9eefdb1522aa364ec48e

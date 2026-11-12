@@ -1,8 +1,8 @@
-key 9ae57bef564c405f0a403d8ef9185a12b5a44f4d0f1403cbd35853c25553c0bb
+key 761191db257b5e3c1fa9c950c5a0855af675b3441861cd368e8272e19af07209
 tlc Version 2.19
 rc 76
 Evaluating invariant StrLeft failed
-4 states generated 4 distinct states found
+4 states generated 4 distinct states found 2 states left on queue
 trace 2 c2631417ddcfc16ef89a5a19b032747504a51b85807a03a675bad89b017b5786
 states 4 f3693748935607a06b12e4467d47b092d4bec52438e52062f5466f3b69554745
 edges 2 fc43a4d1a65e77aa2efd88dd6a74cba99df65f78c4d9a5abc4a6297760f8453c

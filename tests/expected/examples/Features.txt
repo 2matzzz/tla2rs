@@ -1,8 +1,8 @@
-key 5dce447e9deba5e8b9cc67871cb7172e37d708e92b5fbb2cd4cd57c73a4e128b
+key 11907c05dc4d0403c0c9a425549155dfe15f2b2f5a5aef189282d18be52ee32a
 tlc Version 2.19
 rc 12
 Invariant SeenOK is violated
-525 states generated 265 distinct states found
+525 states generated 265 distinct states found 36 states left on queue
 trace 12 327c45c72a38666c831f5092ef741fe544b5be08c115b1a81233cafe57bfe6f6
 states 265 43796e51268e9c4554fb540a0028ef400c3a180a4821be97d952e5dd04b90394
 edges 521 bab53f77a761b85b6be3d15f7e6d676f3e6ff559a742f8254389790ddee382e6

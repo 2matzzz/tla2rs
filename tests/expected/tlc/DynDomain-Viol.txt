@@ -1,8 +1,8 @@
-key f48372044013e78c74ff67b7da076877ae2928686ed93df9d99171e7941872a4
+key 5e6af1a83fa6563996f65a7dc6c3144edb4a64d116cb09d283d47f94f7f3d11b
 tlc Version 2.19
 rc 12
 Invariant NotFull is violated
-5 states generated 4 distinct states found
+5 states generated 4 distinct states found 1 states left on queue
 trace 3 66f59797d7b56fa14dde12a6b7644c1bc7cc3031984f157a742cec4072ab874b
 states 4 e093bb91d1ff60e79bad067959ffa061863706de4c387447babe427e5eb67aa0
 edges 4 6da5fd2ba12b8dad48ad3e0299df16e71ad0a2ee3eca76641387a491199ac5e8

@@ -1,8 +1,8 @@
-key 3c0903900ad608a1908c3b4727b5ebbfadf3d110aaa4e8baed95203f7ee9f250
+key dffccf36f1b7ec5ac6d090a0c26da867eb0f592fc7d012468f00d6ca70c2f7be
 tlc Version 2.19
 rc 12
 Invariant NeverBoth is violated
-10 states generated 10 distinct states found
+10 states generated 10 distinct states found 4 states left on queue
 trace 4 c79f73547bf96094859ffcfdaaa81d492a41e30829240cacdc0bc7eccc6ed9e1
 states 10 1931e66dcd9cfc4e7de0c14fbb560bf6329fc567968f639a9400fee94ea7c800
 edges 9 3be03bc0905f89380ff14185a449681ae2303254b7641be5b3ddbef007d25777

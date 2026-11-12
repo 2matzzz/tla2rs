@@ -1,8 +1,8 @@
-key 6b11f9762f9c4e5f5a3db32d6903f03f08001a573586c4235f9e32ae6dd2a32c
+key 3b9e52753f186a8624aa81ec035cf8ec26e21ceb8c172a90c0d146b9bcfc275e
 tlc Version 2.19
 rc 0
 No error has been found
-4 states generated 3 distinct states found
+4 states generated 3 distinct states found 0 states left on queue
 trace 0
 states 3 5720c02caf08102ad2c9dea8eb06a49e4fcf40e40aac4c21dc34be81b5737c24
 edges 3 d5be9fa5bbf6b0f9a8ea1228783e34d043a94be35755f08f533fef4ceea0a3fd

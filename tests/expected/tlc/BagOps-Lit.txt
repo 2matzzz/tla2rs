@@ -1,8 +1,8 @@
-key b9bd922f31f6b9b92ab9d919a724651ec0d6058fcf49d5c09978ba0b1499a9da
+key 855a887a014c5494417d59458b14b878ec9757bd1a673ce6d615b3b76ace4aa2
 tlc Version 2.19
 rc 76
 Evaluating invariant Lit failed
-4 states generated 3 distinct states found
+4 states generated 3 distinct states found 0 states left on queue
 trace 3 93db0558c7f759335aa567780455957f98c87c3c948f4449f824b3b11dacc92b
 states 3 63f73a1bd721318a42f281b57c1de1fe3f525e729cca28e18292ca19d7801d00
 edges 4 72e3d534bb0a15bbc330d30ed0a1f66eceec811b12c6c10ffb6f0c0cb24f219f

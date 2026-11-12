@@ -1,8 +1,8 @@
-key e70c8316fadaafcfc286069373ab45c7e4ee1f05d289ff84b08e759791f7efce
+key 96ea6222750a11a550e84f9afd79cd62ebf79bad52d36d5aea4cb70b4eda11b2
 tlc Version 2.19
 rc 12
 Invariant Bound is violated
-218 states generated 111 distinct states found
+218 states generated 111 distinct states found 81 states left on queue
 trace 5 700f04221aa464e42d8ff2dff0a1dd423c205c2aef15d56aafb4e7b6edc11cac
 states 111 4c1edabb5ccb1203e3ae10eb5236eeda5b20b02bbc730c26a42df6126ac0a988
 edges 217 fd499ccc2742298799f696800cd2e2aef647f61fdd6b480df6459219f02e0113

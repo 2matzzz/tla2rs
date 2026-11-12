@@ -1,8 +1,8 @@
-key fc6744d1bfd516831f279a06ef901a29dad380aa7300142895a56db2f4618488
+key e6c902fe77353984f340d262f9d294c9b3e5af09c20f81999e3f3af8099c018b
 tlc Version 2.19
 rc 11
 Deadlock reached
-25 states generated 16 distinct states found
+25 states generated 16 distinct states found 2 states left on queue
 trace 4 c60e54ab5e7dfbd3ad6ab03e6a10fca075de18d127d2f074f2d90b6b50d9ee06
 states 16 635c8af1b4f46e3f7c44b16669532d9823d75e4586f8edcfbcc58b953ec3fdc9
 edges 24 2a8a834fa702e8b9f451aa4b4dc139b30ae8d43daed26834931b2490ca4bccd1

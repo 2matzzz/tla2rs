@@ -1,8 +1,8 @@
-key 3a1f94b50cf5e5e0926a9f625e78e85adfbac2d5586be1a2d2d4f986229d14f3
+key 8cef2e8adbaafd5162757d9bd3477fd94e8d1f2b0aaa1ccd6a15f7d20fd04aa7
 tlc Version 2.19
 rc 12
 Invariant NeverEmpty is violated
-18 states generated 14 distinct states found
+18 states generated 14 distinct states found 7 states left on queue
 trace 4 bbde2ab0cdd1c8a06b12102fadf9130db3bf9494e892a3cbd5a8adfe226bb24d
 states 14 3733443f8a51d0115998b41dfa112a7b1d32167430fdac469772e853fb9ad772
 edges 17 c54560c30a6fa634fcec0518cbe6987229db6a12271822c7420f2c33faf1b932

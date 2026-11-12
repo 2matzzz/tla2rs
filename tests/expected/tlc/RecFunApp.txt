@@ -1,8 +1,8 @@
-key af3c2a404005c67543f2eee4e25f4ef1db6583990f2be4c5b270214da06c73be
+key 4edf9384817ad8bf13d777a8e0e4b33c4d93dd4e55d9a7a169511c9418cec845
 tlc Version 2.19
 rc 12
 Invariant NoCycle is violated
-9 states generated 9 distinct states found
+9 states generated 9 distinct states found 6 states left on queue
 trace 3 06479a82f21e5bede0b0a568247f35257732b9dbaf981d191dbe0b308070e3dd
 states 9 5f447be7b16ef27a00159ab60ccc59abefd61811666ebb4cd45a8c532387c3ac
 edges 8 34317426872b2c999effb0003e74d77ec1b4941b03f0aad0f3f450fe3b551a89
