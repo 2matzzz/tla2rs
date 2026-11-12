@@ -1,5 +1,5 @@
 ---- MODULE SeqCap ----
-\* A sequence whose bound the spec does not state: -seqcap gives it
+\* A sequence whose bound the spec does not state: Init and Next settle it
 EXTENDS Naturals, Sequences
 VARIABLES q, i
 Init == q = <<>> /\ i = 1
