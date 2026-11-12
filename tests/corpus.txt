@@ -63,7 +63,7 @@ skip specifications/KeyValueStore/MCKVsnap.tla specifications/KeyValueStore/MCKV
 skip specifications/KnuthYao/SimKnuthYao.tla specifications/KnuthYao/SimKnuthYao.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/LearnProofs/MCFindHighest.tla specifications/LearnProofs/MCFindHighest.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
-gap specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg # type inference: b holds functions over domains of different sizes
+gap specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg # TLC warns that the PlusCal algorithm changed since its last translation, as for DiningPhilosophersPCal; everything else matches (with rules=error-lines it matches)
 skip specifications/LoopInvariance/MCBinarySearch.tla specifications/LoopInvariance/MCBinarySearch.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/LoopInvariance/MCQuicksort.tla specifications/LoopInvariance/MCQuicksort.cfg # needs module TLAPS, not in tla2tools.jar
 check specifications/Majority/MCMajority.tla specifications/Majority/MCMajority.cfg
@@ -184,7 +184,7 @@ skip specifications/bosco/APbosco.tla specifications/bosco/APbosco.cfg # symboli
 skip specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # manifest runtime 00:03:00: beyond the 60 s budget
 skip specifications/braf/BufferedRandomAccessFile.tla specifications/braf/BufferedRandomAccessFile.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg # needs module Relation, not in tla2tools.jar
-gap specifications/btree/kvstore.tla specifications/btree/kvstore.cfg # a variable holds tuples of different lengths and a model value; tla2rs has no type for that
+check specifications/btree/kvstore.tla specifications/btree/kvstore.cfg
 check specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg
 check specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg
 check specifications/byihive/VoucherLifeCycle.tla specifications/byihive/VoucherLifeCycle.cfg
@@ -203,7 +203,7 @@ gap specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/B
 gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs was killed by the system (memory) in a corpus run; not run until that is fixed
 skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
 skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget
-gap specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg # a variable holds model values and sets of them in one function; tla2rs has no type for that
+check specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg
 skip specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg # TLC 2.19 took 62 s with one worker
 skip specifications/diskpaxos/MC_HDiskSynod.tla specifications/diskpaxos/MC_HDiskSynod.cfg # TLC 2.19 took 60 s with one worker
 check specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg

@@ -254,6 +254,21 @@ impl<'a> Gen<'a> {
                 Cmp::Normal
             })
         };
+        // A value that may be a model value: unequal when it is one, compared as its other kind
+        // otherwise (types::VAL_FIELD); join refuses the kinds that cannot be compared. TLC
+        // compares a string with a tuple by its characters (see tuple_str_eq), which is not done
+        // for a string held beside a value of another kind
+        if crate::types::val_ty(a).is_some() || crate::types::val_ty(b).is_some() {
+            let tupleish = |t: &Ty| tuple_elems(t).is_some() || matches!(t, Ty::Seq(_)) || crate::types::val_ty(t).is_some_and(|v| tuple_elems(v).is_some() || matches!(v, Ty::Seq(_)));
+            let strs = |t: &Ty| match t {
+                Ty::Rec(fs) => fs.iter().any(|(n, t)| n == crate::types::ATOM_FIELD && matches!(t, Ty::Opt(e) if self.has_str(e))),
+                t => self.has_str(t),
+            };
+            if (strs(a) && tupleish(b)) || (tupleish(a) && strs(b)) {
+                return Err("comparing a value that may be a string with a sequence held beside model values is not supported".into());
+            }
+            return Ok(Cmp::Normal);
+        }
         if let (Ty::Seq(_), t) | (t, Ty::Seq(_)) = (a, b) {
             if seq_elems(t).is_none() && !matches!(t, Ty::Enum(v) if v.is_empty()) {
                 return self.tuple_vs(t).map(|c| if c == Cmp::Normal { Cmp::Normal } else { c });
@@ -262,6 +277,10 @@ impl<'a> Gen<'a> {
         Ok(match (tuple_elems(a), tuple_elems(b)) {
             (Some(x), Some(y)) if x.len() != y.len() => Cmp::Unequal,
             (Some(x), Some(y)) => all(x.iter().zip(&y).map(|(s, t)| self.tuple_cmp(s, t)).collect::<R<_>>()?),
+            // The empty tuple is the function over the empty set, so it compares with a function
+            // over part of a type
+            (Some(x), None) if x.is_empty() && matches!(b, Ty::PFun(..)) => Cmp::Normal,
+            (None, Some(y)) if y.is_empty() && matches!(a, Ty::PFun(..)) => Cmp::Normal,
             (Some(_), None) => self.tuple_vs(b)?,
             (None, Some(_)) => self.tuple_vs(a)?,
             (None, None) => match (a, b) {
@@ -733,7 +752,7 @@ impl<'a> Gen<'a> {
 
     /// The value of `q` as a sequence (converting a tuple or a function over 1..n), and its type
     fn as_seq(&mut self, q: &Expr, env: &Env, op: &str) -> R<(String, Ty)> {
-        let (c, t) = self.gen(q, env, None)?;
+        let (c, t) = self.gen_val(q, env)?;
         if let Ty::Seq(_) = t {
             return Ok((c, t));
         }
@@ -1409,10 +1428,18 @@ impl<'a> Gen<'a> {
                 }
                 let px = present.join(", ");
                 let py = px.replace("__x", "__y");
+                // TLC orders model values before other values (see types::ATOM_FIELD)
+                let first = match fs.iter().position(|(n, _)| n == crate::types::ATOM_FIELD) {
+                    Some(i) => {
+                        let fp = rec_field(fs.len(), i);
+                        format!("if ({a}){fp}.0 != ({b}){fp}.0 {{ if ({a}){fp}.0 {{ std::cmp::Ordering::Less }} else {{ std::cmp::Ordering::Greater }} }} else ")
+                    }
+                    None => String::new(),
+                };
                 format!(
-                    "{{ let (__x, __y) = ({a}, {b}); let __fx: Vec<usize> = [{px}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
+                    "{{ {first}{{ let (__x, __y) = ({a}, {b}); let __fx: Vec<usize> = [{px}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
                      let __fy: Vec<usize> = [{py}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
-                     __fx.len().cmp(&__fy.len()).then_with(|| __fx.iter().zip(__fy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| if __i != __j {{ std::cmp::Ordering::Equal }} else {{ match __i {{ {}, _ => unreachable!() }} }})).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}",
+                     __fx.len().cmp(&__fy.len()).then_with(|| __fx.iter().zip(__fy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| if __i != __j {{ std::cmp::Ordering::Equal }} else {{ match __i {{ {}, _ => unreachable!() }} }})).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }} }}",
                     arms.join(", ")
                 )
             }
@@ -1547,6 +1574,11 @@ impl<'a> Gen<'a> {
 
     pub fn lit(&mut self, v: &Value, t: &Ty) -> R<String> {
         Ok(match (v, t) {
+            // A value of another kind among model values (see types::VAL_FIELD)
+            (v, Ty::Rec(fs)) if crate::types::has_val(fs) && !matches!(v, Value::Atom(_) | Value::Rec(_)) => {
+                let m = [(crate::types::VAL_FIELD.to_string(), v.clone())].into_iter().collect();
+                return self.lit(&Value::Rec(m), t);
+            }
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
@@ -1694,16 +1726,19 @@ impl<'a> Gen<'a> {
             return Ok(format!("{{ let __u: {} = {{ let _ = {code}; unreachable!() }}; __u }}", to.repr()));
         }
         match (from, to) {
-            // A model value as a value that is a record or a model value (see types::ATOM_FIELD)
-            (Ty::Enum(_), Ty::Rec(fs)) if crate::types::has_atoms(fs) => {
-                let mut parts = vec![];
-                for (n, ft) in fs {
-                    parts.push(match ft {
-                        Ty::Opt(inner) if n == crate::types::ATOM_FIELD => format!("(true, {})", self.coerce(code.clone(), from, inner)?),
-                        ft => Self::default_code(ft),
-                    });
-                }
-                Ok(rec_build(&parts))
+            // A model value as a value that is a record or a model value (see types::ATOM_FIELD),
+            // and a value of another kind as one that is that or a model value (VAL_FIELD)
+            (Ty::Enum(_), Ty::Rec(fs)) if crate::types::has_atoms(fs) => self.box_into(code, from, fs, crate::types::ATOM_FIELD),
+            (_, Ty::Rec(fs)) if crate::types::has_val(fs) && crate::types::boxable(from) => self.box_into(code, from, fs, crate::types::VAL_FIELD),
+            // The other way: the model value, or the value of the other kind, which fails on
+            // anything else
+            (Ty::Rec(fs), Ty::Enum(_) | Ty::IntAtom(..)) if crate::types::has_atoms(fs) => {
+                let (c, t) = self.unbox(code, from, crate::types::ATOM_FIELD)?;
+                self.coerce(c, &t, to)
+            }
+            (Ty::Rec(fs), _) if crate::types::has_val(fs) && crate::types::boxable(to) => {
+                let (c, t) = self.unbox(code, from, crate::types::VAL_FIELD)?;
+                self.coerce(c, &t, to)
             }
             // The function over the empty set, built as the empty record (its domain has no
             // element, so the record of no fields is the same value)
@@ -1906,6 +1941,57 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// A value of type `from` as one of the record type with fields `fs` that holds it in `field`
+    /// (see types::ATOM_FIELD, VAL_FIELD), with the other fields absent
+    fn box_into(&mut self, code: String, from: &Ty, fs: &[(String, Ty)], field: &str) -> R<String> {
+        let mut parts = vec![];
+        for (n, ft) in fs {
+            parts.push(match ft {
+                Ty::Opt(inner) if n == field => format!("(true, {})", self.coerce(code.clone(), from, inner)?),
+                ft => Self::default_code(ft),
+            });
+        }
+        Ok(rec_build(&parts))
+    }
+
+    /// The value in `field` (types::ATOM_FIELD or VAL_FIELD) of a value of the record type `t`, and
+    /// its type: where a value of one kind is needed (a function applied, a set iterated, a model
+    /// value compared with one), any other value stops the checker with an error
+    fn unbox(&mut self, code: String, t: &Ty, field: &str) -> R<(String, Ty)> {
+        let Ty::Rec(fs) = t else { unreachable!() };
+        let i = fs.iter().position(|(n, _)| n == field).ok_or(format!("{t:?} has no field {field}"))?;
+        let Ty::Opt(inner) = &fs[i].1 else { unreachable!() };
+        let kind = match inner.as_ref() {
+            Ty::Enum(_) => "a model value",
+            Ty::Bool => "a Boolean",
+            Ty::Set(_) => "a set",
+            Ty::Seq(_) | Ty::Rec(_) => "a sequence",
+            Ty::Bag(_) => "a bag",
+            _ => "a function",
+        };
+        let tid = self.ty_id(t)?;
+        let (fp, u) = (rec_field(fs.len(), i), self.fresh("u"));
+        let msg = format!("The value {{}} is used where {kind} is expected");
+        Ok((
+            format!("{{ let {u} = {code}; if !{u}{fp}.0 {{ eval_error(format!({msg:?}, fmt_{tid}(&{u}))) }} {u}{fp}.1 }}"),
+            inner.as_ref().clone(),
+        ))
+    }
+
+    /// An expression whose value is applied or taken apart: a value that may also be a model value
+    /// (see types::VAL_FIELD) is used as the value of the other kind
+    fn gen_val(&mut self, e: &Expr, env: &Env) -> R<(String, Ty)> {
+        let (c, t) = self.gen(e, env, None)?;
+        self.val_of(c, t)
+    }
+
+    fn val_of(&mut self, c: String, t: Ty) -> R<(String, Ty)> {
+        match &t {
+            Ty::Rec(fs) if crate::types::has_val(fs) => self.unbox(c, &t, crate::types::VAL_FIELD),
+            _ => Ok((c, t)),
+        }
+    }
+
     pub fn gen_as(&mut self, e: &Expr, env: &Env, t: &Ty) -> R<String> {
         let (c, got) = self.gen(e, env, Some(t))?;
         self.coerce(c, &got, t)
@@ -1914,6 +2000,10 @@ impl<'a> Gen<'a> {
     /// Uses the expected type if it subsumes the join, otherwise the join itself
     fn layout(want: Option<&Ty>, j: Ty) -> Ty {
         if let Some(w) = want {
+            // A value that may also be a model value is not a layout of the value alone
+            if crate::types::val_ty(w).is_some() && crate::types::val_ty(&j).is_none() {
+                return j;
+            }
             if join(w, &j).ok().as_ref() == Some(w) {
                 return w.clone();
             }
@@ -2356,7 +2446,7 @@ impl<'a> Gen<'a> {
                     (format!("(1i64 << {})", self.s_card(&c, &t)), Ty::Int(1, hi))
                 }
                 ("Cardinality", [s]) => {
-                    let (c, t) = self.gen(s, env, None)?;
+                    let (c, t) = self.gen_val(s, env)?;
                     let Ty::Set(el) = &t else { return Err("Cardinality of a non-set".into()) };
                     let hi = if is_sparse(&t) { BIG } else { el.size().unwrap_or(0) as i64 };
                     (self.s_card(&c, &t), Ty::Int(0, hi))
@@ -2402,7 +2492,7 @@ impl<'a> Gen<'a> {
                     self.string_table(f, &ac, &[(da.clone(), None), (db.clone(), Some(bc))])?
                 }
                 ("Len", [q]) => {
-                    let (c, t) = self.gen(q, env, None)?;
+                    let (c, t) = self.gen_val(q, env)?;
                     match &t {
                         Ty::Seq(_) => (format!("(({c}).len as i64)"), Ty::Int(0, self.qcap as i64)),
                         _ => {
@@ -2412,7 +2502,7 @@ impl<'a> Gen<'a> {
                     }
                 }
                 ("Append", [q, x]) => {
-                    let (qc, qt) = self.gen(q, env, None)?;
+                    let (qc, qt) = self.gen_val(q, env)?;
                     let (xc, xt) = self.gen(x, env, None)?;
                     let el = join(&seq_elem_join(&[&qt]).map_err(|_| self.seq_op_err("Append", &qt))?, &xt)?;
                     let st = Ty::Seq(el.clone().into());
@@ -2449,9 +2539,9 @@ impl<'a> Gen<'a> {
                     )
                 }
                 ("\\o", [a, b]) => {
-                    let (ac, at) = self.gen(a, env, None)?;
+                    let (ac, at) = self.gen_val(a, env)?;
                     // A tuple followed by a string: the string as its characters (TLC)
-                    let (bc, bt) = if matches!(self.gen(b, env, None), Ok((_, Ty::Enum(_)))) { self.as_seq(b, env, "\\o")? } else { self.gen(b, env, None)? };
+                    let (bc, bt) = if matches!(self.gen(b, env, None), Ok((_, Ty::Enum(_)))) { self.as_seq(b, env, "\\o")? } else { self.gen_val(b, env)? };
                     let el = seq_elem_join(&[&at, &bt]).map_err(|_| self.seq_op_err("\\o", &at))?;
                     let st = Ty::Seq(el.into());
                     let ac = self.coerce(ac, &at, &st)?;
@@ -2527,12 +2617,12 @@ impl<'a> Gen<'a> {
                 (format!("(-{c})"), Ty::Int(-hi, -lo))
             }
             Un(UOp::Domain, f) => {
-                let (_, ft) = self.gen(f, env, None)?;
+                let (_, ft) = self.gen_val(f, env)?;
                 if let Ty::Bag(_) = &ft {
                     return self.bag_domain(f, env);
                 }
                 if let Ty::PFun(d, _) = &ft {
-                    let (fc, _) = self.gen(f, env, None)?;
+                    let (fc, _) = self.gen_val(f, env)?;
                     let st = Ty::Set(d.clone());
                     let empty = self.s_empty(&st)?;
                     if is_sparse_fun(&ft) {
@@ -2544,7 +2634,7 @@ impl<'a> Gen<'a> {
                     return Ok((format!("{{ let __f = {fc}; let mut __s = {empty}; for __i in 0..__f.len() {{ if __f[__i].0 {{ {add} }} }} __s }}"), st));
                 }
                 if let Ty::Seq(_) = &ft {
-                    let (fc, _) = self.gen(f, env, None)?;
+                    let (fc, _) = self.gen_val(f, env)?;
                     let st = Ty::Set(Ty::Int(1, self.qcap as i64).into());
                     if self.qcap > 128 {
                         // More than 128 indices: a sorted array of 1..Len
@@ -2894,7 +2984,7 @@ impl<'a> Gen<'a> {
                 (format!("{{ let {k} = {xc}; {c} }}"), t)
             }
             App(f, x) => {
-                let (fc, ft) = self.gen(f, env, None)?;
+                let (fc, ft) = self.gen_val(f, env)?;
                 if let Ty::Rec(fs) = &ft {
                     if is_tuple_fields(fs) {
                         if self.try_const(x, env).is_some() {
@@ -3328,8 +3418,9 @@ impl<'a> Gen<'a> {
                 (format!("{{ let {x} = {ac}; {m} }}"), Ty::Bool)
             }
             Subseteq => {
-                let (ac, at) = self.gen(a, env, None)?;
+                let (ac, at) = self.gen_val(a, env)?;
                 let (bc, bt) = self.gen(b, env, Some(&at))?;
+                let (bc, bt) = self.val_of(bc, bt)?;
                 let t = join(&at, &bt)?;
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
@@ -3341,7 +3432,9 @@ impl<'a> Gen<'a> {
             }
             Cup | Cap | SetMinus => {
                 let (ac, at) = self.gen(a, env, want)?;
+                let (ac, at) = self.val_of(ac, at)?;
                 let (bc, bt) = self.gen(b, env, want.or(Some(&at)))?;
+                let (bc, bt) = self.val_of(bc, bt)?;
                 let t = Self::layout(want, join(&at, &bt)?);
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
@@ -3485,7 +3578,7 @@ impl<'a> Gen<'a> {
             return Ok((code, ft, None));
         }
         if let Expr::Un(UOp::Subset, x) = s {
-            let (c, t) = self.gen(x, env, None)?;
+            let (c, t) = self.gen_val(x, env)?;
             let it = self.subsets_iter(&c, &t)?;
             return Ok((it, t, None));
         }
@@ -3494,7 +3587,7 @@ impl<'a> Gen<'a> {
             let (bc, (_, bhi)) = self.gen_int(b, env)?;
             return Ok((format!("({ac}..={bc})"), Ty::Int(alo, bhi), None));
         }
-        let (c, t) = self.gen(s, env, None)?;
+        let (c, t) = self.gen_val(s, env)?;
         let Ty::Set(et) = &t else { return Err(format!("cannot iterate over {t:?}")) };
         let it = self.s_iter(&c, &t)?;
         Ok((it, et.as_ref().clone(), None))
@@ -3865,7 +3958,7 @@ impl<'a> Gen<'a> {
             }
             return Ok(if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) });
         }
-        let (sc, st) = self.gen(s, env, None)?;
+        let (sc, st) = self.gen_val(s, env)?;
         if !matches!(st, Ty::Set(_)) {
             return Err(format!("\\in a non-set: {s:?}"));
         }
@@ -5098,8 +5191,9 @@ impl<'a> Gen<'a> {
                     let mut b = String::from("let mut ps: Vec<String> = vec![]; ");
                     for (k, (name, ft)) in fs.iter().enumerate() {
                         let fp = rec_field(fs.len(), k);
-                        if name == crate::types::ATOM_FIELD {
-                            // A model value (see types::ATOM_FIELD)
+                        if name == crate::types::ATOM_FIELD || name == crate::types::VAL_FIELD {
+                            // A model value, or a value of another kind (see types::ATOM_FIELD,
+                            // VAL_FIELD)
                             let Ty::Opt(inner) = ft else { unreachable!() };
                             let fid = self.ty_id(inner)?;
                             write!(b, "if v{fp}.0 {{ return fmt_{fid}(&v{fp}.1); }} ").unwrap();

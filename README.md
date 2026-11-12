@@ -126,7 +126,10 @@ memory.
   range that settles (a `Cardinality`, `x % 3`) stays finite, one that keeps growing becomes unbounded. When the
   types from `TypeOK` do not fit Init or Next (a module that extends another and adds a record field), every type is
   inferred and `TypeOK` is checked as an ordinary invariant. A variable may hold records of different fields and model
-  values together (`[P -> Reqs \cup {NoVal}]`); its `TypeOK` is then checked on every state
+  values together (`[P -> Reqs \cup {NoVal}]`); its `TypeOK` is then checked on every state. A model value may also
+  share a variable with tuples (of different lengths), sets, functions or booleans (`Seq(S) \cup {NoVal}`, a
+  function holding model values and sets of them), and a variable may hold functions over domains of different sizes
+  (`[i \in 0..n |-> e]` for different n)
 - A set whose element type has at most 128 values is a bitmask; a larger one (including sets of sets) is a sorted array
   of up to `-setcap` elements. A sequence holds up to `-seqcap` elements (see above); growing past it is an
   evaluation error
@@ -235,7 +238,7 @@ written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model 
 selected (the exhaustive searches that TLC 2.19 finishes, with only `tla2tools.jar`, in 60 seconds or less with one
 worker) and, for each of the others, why it is skipped. A selected model that tla2rs does not match yet is listed as
 a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost. Of the 98 selected models,
-91 match TLC (6 of them on everything but the generated count, which TLC counts once per `\/` branch); the 7 gaps
+93 match TLC (6 of them on everything but the generated count, which TLC counts once per `\/` branch); the 5 gaps
 and their reasons are in `tests/corpus.txt` and CLAUDE.md.
 
 | Example | What it is |

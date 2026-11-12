@@ -94,7 +94,7 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
   表現（ビット幅）をここから決めるため。変数がこの型の外に出たら、その時点で型エラーとして止まる（TLC は TypeOK を不変条件に入れない限り止まらない）。
   `TypeOK` に無い変数と、`S` から型が決まらない変数（`[D -> Int]` など）は Init と Next から型を推論する。整数の範囲が落ち着くもの（`Cardinality` や `x % 3`）は有限のまま、増え続けるものは上限なしにする。
   `TypeOK` の型が Init や Next に合わないとき（別のモジュールを EXTENDS してレコードにフィールドを足したときなど）は、すべての型を推論し直し、`TypeOK` は普通の不変条件として確かめる。
-  フィールドの違うレコードとモデル値を一つの変数に混ぜてもよい（`[P -> Reqs \cup {NoVal}]`）。そのときは `TypeOK` を状態ごとに確かめる
+  フィールドの違うレコードとモデル値を一つの変数に混ぜてもよい（`[P -> Reqs \cup {NoVal}]`）。そのときは `TypeOK` を状態ごとに確かめる。モデル値は、長さの違うタプル・集合・関数・真偽値とも一つの変数に混ぜられる（`Seq(S) \cup {NoVal}` や、モデル値とモデル値の集合を値に持つ関数）。定義域の大きさが違う関数（n の違う `[i \in 0..n |-> e]`）を一つの変数に持たせてもよい
 - 要素の型が 128 通りまでの集合はビットマスク、それより大きいもの（集合の集合を含む）は `-setcap` 個までの整列した配列。列は `-seqcap` 個まで（上記）で、超えると評価エラー
 - 標準モジュール：`Naturals`、`Integers`、`FiniteSets`、`Sequences`（`SortSeq` も。文字列は `\o`・`Len`・`Head`・`Tail`・`Append`・`SubSeq` では文字の列。`SelectSeq`・`SortSeq`・タプルの後に文字列を続ける `\o` では TLC と同じく文字のタプルになる）、`Bags`、`STRING`、`TLC` の `Print`・`PrintT`・`Assert`・`ToString`・`TLCEval`・`Any`・`:>`・`@@`・`Permutations`
 - レコードの並びは TLC と同じく、まずフィールドの数で決まる。モデル値は文字列より前に並ぶ。`Print` と `PrintT` は 80 桁を超える値を TLC と同じく折り返して表示する
@@ -136,7 +136,7 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 
 ### 公開されている仕様集との突き合わせ
 
-上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` だけで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 98 モデルのうち 91 が TLC と一致する（うち 6 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。残る 7 つの差分とその理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
+上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` だけで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 98 モデルのうち 93 が TLC と一致する（うち 6 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。残る 5 つの差分とその理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
 
 | 例 | 中身 |
 |---|---|
