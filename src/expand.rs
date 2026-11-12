@@ -95,7 +95,7 @@ impl<'a> Expander<'a> {
     fn bind(&mut self, x: &str, env: &mut Env) -> String {
         self.fresh += 1;
         let n = format!("{x}__{}", self.fresh);
-        env.subst.insert(x.to_string(), Expr::Ident(n.clone()));
+        env.subst.insert(x.to_string(), Expr::Ident(n.clone(), NOPOS));
         n
     }
 
@@ -132,7 +132,7 @@ impl<'a> Expander<'a> {
                 let op = self.op_arg(name, p, arity, a, caller)?;
                 env.subst.remove(p);
                 env.locals.insert(p.clone(), op);
-                args.push(Expr::Ident(p.clone()));
+                args.push(Expr::Ident(p.clone(), NOPOS));
             } else {
                 if matches!(a, Expr::Lambda(..)) {
                     return Err(format!("`{name}`: LAMBDA passed for `{p}`, which is not an operator parameter"));
@@ -212,14 +212,14 @@ impl<'a> Expander<'a> {
                 };
                 (d, caller.clone())
             }
-            Expr::Ident(g) => match caller.locals.get(g) {
+            Expr::Ident(g, _) => match caller.locals.get(g) {
                 Some((d, e)) => (d.clone(), e.clone()),
                 None => match self.defs.get(g.as_str()) {
                     Some(d) => ((*d).clone(), Env::default()),
                     // A built-in infix operator, as in SortSeq(s, <)
                     None if crate::parser::is_infix_name(g) => {
                         let ps = vec!["#lhs".to_string(), "#rhs".to_string()];
-                        let body = crate::parser::bin_expr(g, Expr::Ident(ps[0].clone()), Expr::Ident(ps[1].clone()));
+                        let body = crate::parser::bin_expr(g, Expr::Ident(ps[0].clone(), NOPOS), Expr::Ident(ps[1].clone(), NOPOS));
                         (Def { name: format!("{g}#op"), params: ps, arity: vec![0, 0], body }, Env::default())
                     }
                     None => return Err(format!("`{name}`: `{g}` passed for the operator parameter `{p}` is not an operator")),
@@ -249,9 +249,13 @@ impl<'a> Expander<'a> {
         let ex = |s: &mut Self, x: &Expr| s.expand(x, env);
         Ok(match e {
             Num(_) | Str(_) | Bool(_) | At => e.clone(),
-            Ident(n) => {
+            Ident(n, at) => {
                 if let Some(v) = env.subst.get(n) {
-                    v.clone()
+                    match v {
+                        // A bound variable renamed: still written here
+                        Ident(m, p) if !p.known() => Ident(m.clone(), *at),
+                        v => v.clone(),
+                    }
                 } else if let Some((d, denv)) = env.locals.get(n) {
                     let (d, denv) = (d.clone(), with_self(n, &d, denv.clone()));
                     self.call(n, &d, denv, &[], env)?
@@ -336,8 +340,8 @@ impl<'a> Expander<'a> {
             RecSet(fs) => RecSet(fs.iter().map(|(k, v)| Ok((k.clone(), ex(self, v)?))).collect::<R<_>>()?),
             // f[a] for a recursive function definition calls the operator it was turned into, so
             // only the entries needed are evaluated (TLC evaluates such a function lazily too)
-            App(f, x) if matches!(f.as_ref(), Ident(n) if self.rec_fun_app(n, env)) => {
-                let Ident(n) = f.as_ref() else { unreachable!() };
+            App(f, x) if matches!(f.as_ref(), Ident(n, _) if self.rec_fun_app(n, env)) => {
+                let Ident(n, _) = f.as_ref() else { unreachable!() };
                 self.expand(&Call(format!("{n}#app"), vec![x.as_ref().clone()]), env)?
             }
             App(f, x) => App(ex(self, f)?.b(), ex(self, x)?.b()),
@@ -434,7 +438,7 @@ impl<'a> Expander<'a> {
         let r = match e {
             Expr::Call(n, parts) if n == crate::parser::SUBEXPR => Some(self.subexpr_def(&parts[0], &parts[1..], &env)),
             // `Op!lab`
-            Expr::Ident(n) | Expr::Call(n, _) if n.contains('!') && !self.defs.contains_key(n.as_str()) && self.label_path(n, &env).is_some() => {
+            Expr::Ident(n, _) | Expr::Call(n, _) if n.contains('!') && !self.defs.contains_key(n.as_str()) && self.label_path(n, &env).is_some() => {
                 Some(self.subexpr_def(e, &[], &env))
             }
             _ => None,
@@ -452,7 +456,7 @@ impl<'a> Expander<'a> {
     fn subexpr_def(&self, base: &Expr, sels: &[Expr], env: &Env) -> R<(String, Def, Env, Vec<Expr>)> {
         use Expr::*;
         let (name, mut args) = match base {
-            Ident(n) => (n.clone(), vec![]),
+            Ident(n, _) => (n.clone(), vec![]),
             Call(n, a) => (n.clone(), a.clone()),
             _ => return Err("a subexpression name must start with an operator".into()),
         };
@@ -483,12 +487,12 @@ impl<'a> Expander<'a> {
         steps.reverse();
         while let Some(sel) = steps.pop() {
             match sel {
-                Num(_) | Ident(_) => {
+                Num(_) | Ident(_, _) => {
                     let k = match &sel {
                         Num(k) => *k as usize,
-                        Ident(c) if c == "<<" => 1,
-                        Ident(c) if c == ">>" => 2,
-                        Ident(c) if c == ":" => {
+                        Ident(c, _) if c == "<<" => 1,
+                        Ident(c, _) if c == ">>" => 2,
+                        Ident(c, _) if c == ":" => {
                             let Let(defs, body) = strip_labels(&cur).clone() else {
                                 return Err(format!("{SANY}`{name}`: `!:` names the body of a LET"));
                             };
@@ -670,7 +674,7 @@ fn with_self(n: &str, d: &Def, mut denv: Env) -> Env {
 /// Replaces @ in e (except inside the values of nested EXCEPTs) with the identifier name
 fn replace_at(e: &Expr, name: &str) -> Expr {
     match e {
-        Expr::At => Expr::Ident(name.to_string()),
+        Expr::At => Expr::Ident(name.to_string(), NOPOS),
         Expr::Except(f, ups) => Expr::Except(
             replace_at(f, name).b(),
             ups.iter()

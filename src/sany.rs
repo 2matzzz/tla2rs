@@ -524,7 +524,7 @@ impl<'a> Walker<'a> {
         use Expr::*;
         match e {
             Num(_) | Str(_) | Bool(_) | At | RecCall(..) => Ok(()),
-            Ident(n) => self.resolve(n),
+            Ident(n, _) => self.resolve(n),
             Call(n, args) => {
                 if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA" {
                     // Their bound variables are not kept
@@ -533,7 +533,7 @@ impl<'a> Walker<'a> {
                 if n == crate::parser::SUBEXPR {
                     for (k, a) in args.iter().enumerate() {
                         match a {
-                            Ident(x) if k > 0 && ["<<", ">>", ":", "@"].contains(&x.as_str()) => {}
+                            Ident(x, _) if k > 0 && ["<<", ">>", ":", "@"].contains(&x.as_str()) => {}
                             Call(l, la) if l.starts_with("#label") => la.iter().try_for_each(|x| self.expr(x))?,
                             Tuple(vs) if k > 0 => vs.iter().try_for_each(|x| self.expr(x))?,
                             a => self.expr(a)?,
@@ -593,7 +593,7 @@ impl<'a> Walker<'a> {
                 let mut checked_body: Option<&str> = None;
                 for d in defs {
                     // `<<x, y>> \in S` binds x and y as `x == t[1]`, `y == t[2]`
-                    let pattern = matches!(&d.body, App(t, i) if matches!(t.as_ref(), Ident(n) if n.starts_with('#')) && matches!(i.as_ref(), Num(_)));
+                    let pattern = matches!(&d.body, App(t, i) if matches!(t.as_ref(), Ident(n, _) if n.starts_with('#')) && matches!(i.as_ref(), Num(_)));
                     if pattern {
                         w.bind_var(&d.name)?;
                         continue;
