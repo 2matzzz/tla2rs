@@ -1,0 +1,10 @@
+key 70d0b995092786e805e0e2e6492efec71987cb29094ab28e5927b02fa8c267a3
+tlc Version 2.19
+rc 12
+Invariant TypeInv is violated
+
+trace 0
+states incomplete
+edges incomplete
+messages 2 e6a3ba1c62f1044c07fdbb3e208b02b54139f28c76b2335b2ede5ada3be7adac
+errors 1 67c69d1190cd8ec6a53a321d74facb3bd4fae9423fce55f345137d2947782e46

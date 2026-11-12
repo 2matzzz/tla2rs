@@ -165,8 +165,8 @@ skip specifications/YoYo/MCYoYoNoPruning.tla specifications/YoYo/MCYoYoNoPruning
 skip specifications/YoYo/MCYoYoPruning.tla specifications/YoYo/MCYoYoPruning.cfg # needs module UndirectedGraphs, not in tla2tools.jar
 skip specifications/YoYo/YoYoAllGraphs.tla specifications/YoYo/YoYoAllGraphs.cfg # needs module UndirectedGraphs, not in tla2tools.jar
 skip specifications/aba-asyn-byz/aba_asyn_byz.tla specifications/aba-asyn-byz/aba_asyn_byz.cfg # manifest runtime 00:10:00: beyond the 60 s budget
-gap specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg # types come from TypeInv of the extended module, which lacks a field the extending module adds (its TypeInvNB)
-gap specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg # types come from TypeInv of the extended module, which lacks a field the extending module adds (its TypeInvNB)
+check specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg
+check specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg
 check specifications/acp/ACP_SB_TLC.tla specifications/acp/ACP_SB_TLC.cfg
 skip specifications/acp/APACP_SB.tla specifications/acp/APACP_SB.cfg # symbolic mode: checked with Apalache
 gap specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg rsargs=-seqcap,6 # liveness: the properties need more than 64 state predicates, action predicates or fairness conditions, the most tla2rs supports

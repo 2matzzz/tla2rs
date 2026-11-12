@@ -63,6 +63,12 @@ const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv",
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 
+thread_local! {
+    /// Set while compiling again with every variable's type inferred, after the types from TypeOK
+    /// failed in Init or Next (see `compile`)
+    static INFER_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The bounded sequences `UNION {[1..n -> S] : n \in R}`: (R, S)
 pub fn bounded_seq(e: &Expr) -> Option<(&Expr, &Expr)> {
     let Expr::Un(UOp::Union, x) = e.strip() else { return None };
@@ -739,7 +745,21 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
     let mut startup = Startup::default();
-    let mut out = match compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup) {
+    let mut first = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup);
+    // Types from TypeOK that Init or Next contradict (a module that extends another and adds a
+    // record field its type invariant lacks): infer every type instead, keeping the first error if
+    // that fails too
+    if matches!(&first, Err(e) if (e.starts_with("Init: ") || e.starts_with("Next: ")) && !e.contains(crate::lexer::SANY)) {
+        INFER_ALL.with(|f| f.set(true));
+        let mut again = Startup::default();
+        let r = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut again);
+        INFER_ALL.with(|f| f.set(false));
+        if r.is_ok() {
+            first = r;
+            startup = again;
+        }
+    }
+    let mut out = match first {
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
             let msg = e.replacen(crate::lexer::SANY, "", 1);
@@ -1026,7 +1046,8 @@ fn compile_inner(
         }
     }
 
-    // Variable types come from TypeOK
+    // Variable types come from TypeOK (see INFER_ALL)
+    let infer_all = INFER_ALL.with(|f| f.get());
     let tname = TYPE_DECL_NAMES
         .iter()
         .chain(TYPE_OK_NAMES)
@@ -1034,7 +1055,7 @@ fn compile_inner(
         .copied()
         .unwrap_or("TypeOK");
     // Without a TypeOK, every type is inferred
-    let tok = if ex.has_def(tname) { ex.expand_def(tname)? } else { Expr::Bool(true) };
+    let tok = if ex.has_def(tname) && !infer_all { ex.expand_def(tname)? } else { Expr::Bool(true) };
     let mut decl: HashMap<String, Ty> = HashMap::new();
     let mut conj = vec![];
     flatten_and(&tok, &mut conj);
@@ -1102,7 +1123,7 @@ fn compile_inner(
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
     // packing the state and reports a violation under the same name.
-    let type_inv_subsumed = leftover == 0 && ex.has_def(tname) && cfg.invariants.iter().any(|n| n == tname);
+    let type_inv_subsumed = leftover == 0 && ex.has_def(tname) && !infer_all && cfg.invariants.iter().any(|n| n == tname);
     let mut inv_code = String::new();
     let mut inv_list = vec![];
     // Whether an invariant prints (Print, PrintT): see INV_PRINTS in the runtime
