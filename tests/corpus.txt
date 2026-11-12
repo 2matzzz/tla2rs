@@ -159,7 +159,7 @@ skip specifications/TLC/TestGraphs.tla specifications/TLC/TestGraphs.cfg # needs
 skip specifications/TLC/TestMCReachability.tla specifications/TLC/TestMCReachability.cfg # needs module IOUtils, not in tla2tools.jar
 skip specifications/TeachingConcurrency/Simple.tla specifications/TeachingConcurrency/Simple.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/TeachingConcurrency/SimpleRegular.tla specifications/TeachingConcurrency/SimpleRegular.cfg # needs module TLAPS, not in tla2tools.jar
-gap specifications/TransitiveClosure/TransitiveClosure.tla specifications/TransitiveClosure/TransitiveClosure.cfg # an ASSUME that tla2rs cannot evaluate at compile time (`Nat` is not a constant)
+check specifications/TransitiveClosure/TransitiveClosure.tla specifications/TransitiveClosure/TransitiveClosure.cfg
 skip specifications/TwoPhase/MCTwoPhase.tla specifications/TwoPhase/MCTwoPhase.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/YoYo/MCYoYoNoPruning.tla specifications/YoYo/MCYoYoNoPruning.cfg # needs module UndirectedGraphs, not in tla2tools.jar
 skip specifications/YoYo/MCYoYoPruning.tla specifications/YoYo/MCYoYoPruning.cfg # needs module UndirectedGraphs, not in tla2tools.jar
@@ -199,7 +199,7 @@ skip specifications/c1cs/c1cs.tla specifications/c1cs/c1cs.cfg # TLC 2.19 took 1
 skip specifications/cf1s-folklore/cf1s_folklore.tla specifications/cf1s-folklore/cf1s_folklore.cfg # TLC 2.19 took 113 s with one worker
 skip specifications/chang_roberts/APChangRoberts.tla specifications/chang_roberts/APChangRoberts.cfg # symbolic mode: checked with Apalache
 check specifications/chang_roberts/MCChangRoberts.tla specifications/chang_roberts/MCChangRoberts.cfg
-gap specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg # an ASSUME that tla2rs cannot evaluate at compile time (`Nat` is not a constant)
+gap specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg norun # evaluating its ASSUMEs at compile time took 1.5 GB in 2.5 minutes without finishing and was stopped
 gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs was killed by the system (memory) in a corpus run; not run until that is fixed
 skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
 skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget

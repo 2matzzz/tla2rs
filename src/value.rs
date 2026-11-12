@@ -572,14 +572,11 @@ impl ConstEval<'_> {
                 let v = self.eval(x, env)?;
                 Value::Bool(self.member(&v, set, env)? == matches!(op, BOp::In))
             }
-            Bin(BOp::Subseteq, x, set)
-                if matches!(set.strip(), Ident(n) if (n == "Nat" || n == "Int" || n == "STRING")
-                    && !env.contains_key(n) && !self.constants.contains_key(n)) =>
-            {
-                let Ident(n) = set.strip() else { unreachable!() };
+            // S \subseteq T with T such a set (`R \subseteq Nat \ {0}`): each element of S in T
+            Bin(BOp::Subseteq, x, set) if self.lazy_set(set, env) => {
                 let mut all = true;
                 for v in self.eval(x, env)?.as_set()? {
-                    all &= self.in_builtin_set(n, v.clone())?;
+                    all &= self.member(v, set, env)?;
                 }
                 Value::Bool(all)
             }
@@ -949,6 +946,21 @@ impl ConstEval<'_> {
                     _ => in_a && !self.member(v, b, env)?,
                 })
             }
+            // A product with such a set (the domain of `f[n \in Nat, x \in S]`): component by
+            // component. TLC answers FALSE for a string or model value and fails on any other value
+            // that is not a tuple
+            Expr::Call(f, parts) if f == "\\X" && self.lazy_set(set, env) => match v {
+                Value::Tuple(t) if t.len() == parts.len() => {
+                    for (x, p) in t.iter().zip(parts) {
+                        if !self.member(x, p, env)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                Value::Tuple(_) | Value::Atom(_) => Ok(false),
+                v => Err(format!("Attempted to check if the value:\n{}\nis an element of a cartesian product.", crate::compile::show_value(self.atoms, v))),
+            },
             Expr::SetFilter(x, s, p) if self.lazy_set(set, env) => {
                 if !self.member(v, s, env)? {
                     return Ok(false);
@@ -975,6 +987,7 @@ impl ConstEval<'_> {
             Expr::Ident(n) => ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n),
             Expr::Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.lazy_set(a, env) || self.lazy_set(b, env),
             Expr::SetFilter(_, s, _) => self.lazy_set(s, env),
+            Expr::Call(f, parts) if f == "\\X" => parts.iter().any(|p| self.lazy_set(p, env)),
             _ => false,
         }
     }
