@@ -1349,6 +1349,39 @@ impl<'a> Gen<'a> {
                  let __dy: Vec<usize> = (0..__y.len()).filter(|&i| __y[i] > 0).collect(); \
                  __dx.len().cmp(&__dy.len()).then_with(|| __dx.iter().zip(__dy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| __x[__i].cmp(&__y[__j]))).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
             ),
+            // Records of different fields, as TLC compares records: by the number of fields, then
+            // name and value field by field (the fields are in TLC's order of names)
+            Ty::Rec(fs) if !is_tuple_fields(fs) && fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => {
+                if t.tlc_perm().is_some() {
+                    let id = self.ty_id(t)?;
+                    return Ok(format!("enc_{id}(*{a}).cmp(&enc_{id}(*{b}))"));
+                }
+                let mut present = vec![];
+                let mut arms = vec![];
+                for (i, (_, ft)) in fs.iter().enumerate() {
+                    let fp = rec_field(fs.len(), i);
+                    match ft {
+                        Ty::Opt(inner) => {
+                            present.push(format!("__x{fp}.0"));
+                            let c = self.tlc_cmp(inner, &format!("(&__x{fp}.1)"), &format!("(&__y{fp}.1)"))?;
+                            arms.push(format!("{i} => {c}"));
+                        }
+                        ft => {
+                            present.push("true".into());
+                            let c = self.tlc_cmp(ft, &format!("(&__x{fp})"), &format!("(&__y{fp})"))?;
+                            arms.push(format!("{i} => {c}"));
+                        }
+                    }
+                }
+                let px = present.join(", ");
+                let py = px.replace("__x", "__y");
+                format!(
+                    "{{ let (__x, __y) = ({a}, {b}); let __fx: Vec<usize> = [{px}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
+                     let __fy: Vec<usize> = [{py}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
+                     __fx.len().cmp(&__fy.len()).then_with(|| __fx.iter().zip(__fy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| if __i != __j {{ std::cmp::Ordering::Equal }} else {{ match __i {{ {}, _ => unreachable!() }} }})).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}",
+                    arms.join(", ")
+                )
+            }
             Ty::Rec(fs) if needs_tlc_order(t) => {
                 let mut parts = vec![];
                 for (i, (_, ft)) in fs.iter().enumerate() {
@@ -4871,6 +4904,24 @@ impl<'a> Gen<'a> {
                     }
                     _ => unreachable!(),
                 };
+                // Records of different fields: numbered in TLC's order (see Ty::tlc_perm)
+                let (enc_body, dec_body) = match t.tlc_perm() {
+                    Some(perm) => {
+                        let mut inv = vec![0u32; perm.len()];
+                        for (k, &r) in perm.iter().enumerate() {
+                            inv[r as usize] = k as u32;
+                        }
+                        let list = |v: &[u32]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                        (
+                            format!(
+                                "const P: [u32; {n}] = [{}]; let m = (|| -> u64 {{ {enc_body} }})(); if m == u64::MAX {{ m }} else {{ P[m as usize] as u64 }}",
+                                list(&perm)
+                            ),
+                            format!("const Q: [u32; {n}] = [{}]; let i = Q[i as usize] as u64; {dec_body}", list(&inv)),
+                        )
+                    }
+                    None => (enc_body, dec_body),
+                };
                 writeln!(s, "#[inline] fn enc_{i}(v: {r}) -> u64 {{ {enc_body} }}").unwrap();
                 writeln!(s, "#[inline] fn dec_{i}(i: u64) -> {r} {{ {dec_body} }}").unwrap();
                 writeln!(
@@ -5672,6 +5723,8 @@ fn needs_tlc_order(t: &Ty) -> bool {
     match t {
         Ty::Bag(_) | Ty::PFun(..) => true,
         Ty::Set(_) => !is_sparse(t),
+        // Records of different fields: TLC compares the number of fields first
+        Ty::Rec(fs) if !is_tuple_fields(fs) && fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => true,
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
         Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),
         _ => false,

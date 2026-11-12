@@ -6,7 +6,12 @@ use crate::lexer::R;
 use crate::value::Value;
 use std::collections::{BTreeSet, HashMap};
 
+/// The largest record type with optional fields whose values are numbered in TLC's order (see
+/// `Ty::tlc_perm`; the generated checker holds the permutation as a table)
+pub const PERM_MAX: u64 = 4096;
+
 thread_local! {
+    static PERMS: std::cell::RefCell<HashMap<Ty, std::rc::Rc<Vec<u32>>>> = std::cell::RefCell::new(HashMap::new());
     /// The order in which TLC creates each name (see `compile::tlc_string_ranks`)
     static FIELD_RANKS: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
 }
@@ -267,7 +272,48 @@ impl Ty {
     }
 
     /// Values in enumeration order (the inverse of enc)
+    /// For a record type with optional fields (records of different fields) of at most
+    /// `PERM_MAX` values: the rank in TLC's order of each value by its mixed-radix index (first
+    /// field slowest, an absent field first). TLC compares records by their number of fields
+    /// first, so that index is not its order; `enumerate` and `enc` follow TLC's order instead
+    pub fn tlc_perm(&self) -> Option<std::rc::Rc<Vec<u32>>> {
+        let Ty::Rec(fs) = self else { return None };
+        if is_tuple_fields(fs) || !fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) || self.size()? > PERM_MAX {
+            return None;
+        }
+        PERMS.with(|m| {
+            if let Some(p) = m.borrow().get(self) {
+                return Some(p.clone());
+            }
+            let vals = self.enumerate_mixed();
+            let mut order: Vec<usize> = (0..vals.len()).collect();
+            order.sort_by(|&a, &b| vals[a].cmp(&vals[b]));
+            let mut perm = vec![0u32; vals.len()];
+            for (rank, &i) in order.iter().enumerate() {
+                perm[i] = rank as u32;
+            }
+            let p = std::rc::Rc::new(perm);
+            m.borrow_mut().insert(self.clone(), p.clone());
+            Some(p)
+        })
+    }
+
     pub fn enumerate(&self) -> Vec<Value> {
+        let vals = self.enumerate_mixed();
+        match self.tlc_perm() {
+            Some(perm) => {
+                let mut out = vals.clone();
+                for (i, v) in vals.into_iter().enumerate() {
+                    out[perm[i] as usize] = v;
+                }
+                out
+            }
+            None => vals,
+        }
+    }
+
+    /// The values of the type by their mixed-radix index (see `tlc_perm`)
+    fn enumerate_mixed(&self) -> Vec<Value> {
         match self {
             Ty::Bool => vec![Value::Bool(false), Value::Bool(true)],
             Ty::Int(lo, hi) => (*lo..=*hi).map(Value::Int).collect(),
@@ -309,6 +355,15 @@ impl Ty {
     }
 
     pub fn enc(&self, v: &Value) -> Option<u64> {
+        let i = self.enc_mixed(v)?;
+        match self.tlc_perm() {
+            Some(perm) => Some(perm[i as usize] as u64),
+            None => Some(i),
+        }
+    }
+
+    /// The mixed-radix index of a value (see `tlc_perm`)
+    fn enc_mixed(&self, v: &Value) -> Option<u64> {
         match (self, v) {
             (Ty::Bool, Value::Bool(b)) => Some(*b as u64),
             (Ty::Int(lo, hi), Value::Int(i)) if lo <= i && i <= hi => Some((i - lo) as u64),

@@ -185,11 +185,11 @@ skip specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # manifest ru
 skip specifications/braf/BufferedRandomAccessFile.tla specifications/braf/BufferedRandomAccessFile.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg # needs module Relation, not in tla2tools.jar
 gap specifications/btree/kvstore.tla specifications/btree/kvstore.cfg # Init: type mismatch, a model value where a sequence is expected
-gap specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
-gap specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
+check specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg
+check specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg
 check specifications/byihive/VoucherLifeCycle.tla specifications/byihive/VoucherLifeCycle.cfg
-gap specifications/byihive/VoucherRedeem.tla specifications/byihive/VoucherRedeem.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
-gap specifications/byihive/VoucherTransfer.tla specifications/byihive/VoucherTransfer.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", vi |-> v]
+check specifications/byihive/VoucherRedeem.tla specifications/byihive/VoucherRedeem.cfg
+check specifications/byihive/VoucherTransfer.tla specifications/byihive/VoucherTransfer.cfg
 skip specifications/byzpaxos/BPConProof.tla specifications/byzpaxos/BPConProof.cfg # needs module FiniteSetTheorems, not in tla2tools.jar
 skip specifications/byzpaxos/Consensus.tla specifications/byzpaxos/Consensus.cfg # needs module FiniteSetTheorems, not in tla2tools.jar
 skip specifications/byzpaxos/PConProof.tla specifications/byzpaxos/PConProof.cfg # manifest runtime 00:06:00: beyond the 60 s budget
@@ -253,4 +253,4 @@ gap specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_
 skip specifications/transaction_commit/APTCommit.tla specifications/transaction_commit/APTCommit.cfg # symbolic mode: checked with Apalache
 skip specifications/transaction_commit/PaxosCommit.tla specifications/transaction_commit/PaxosCommit.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/transaction_commit/TCommit.tla specifications/transaction_commit/TCommit.cfg
-gap specifications/transaction_commit/TwoPhase.tla specifications/transaction_commit/TwoPhase.cfg # sets of records of different fields print in another order: TLC lists [type |-> "Abort"] before [type |-> "Prepared", rm |-> r]
+check specifications/transaction_commit/TwoPhase.tla specifications/transaction_commit/TwoPhase.cfg
