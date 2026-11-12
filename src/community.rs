@@ -24,6 +24,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "SequencesExt" => SEQUENCES_EXT,
         "UndirectedGraphs" => UNDIRECTED_GRAPHS,
         "Bitwise" => BITWISE,
+        "Relation" => RELATION,
         _ => return None,
     })
 }
@@ -225,5 +226,46 @@ LOCAL NotR(x, bit, rest) ==
 Not(a) == NotR(a, 1, a)
 RECURSIVE shiftR(_, _)
 shiftR(n, pos) == IF pos = 0 THEN n ELSE shiftR(n \div 2, pos - 1)
+====
+"#;
+
+/// Properties of a relation given as a function from pairs to booleans (`R[a, b]`), or as an
+/// operator (`...Under`). A value used more than once is bound by `\E x \in {e}` or `{... : x \in {e}}`, so
+/// that it is computed once: LET definitions are expanded at each use
+const RELATION: &str = r#"
+---- MODULE Relation ----
+EXTENDS Naturals, FiniteSets
+IsReflexive(R, S) == \A a \in S : R[a, a]
+IsReflexiveUnder(op(_, _), S) == \A a \in S : op(a, a)
+IsIrreflexive(R, S) == \A a \in S : ~R[a, a]
+IsIrreflexiveUnder(op(_, _), S) == \A a \in S : ~op(a, a)
+IsSymmetric(R, S) == \A a, b \in S : R[a, b] = R[b, a]
+IsSymmetricUnder(op(_, _), S) == \A a, b \in S : op(a, b) = op(b, a)
+IsAntiSymmetric(R, S) == \A a, b \in S : a # b => ~(R[a, b] /\ R[b, a])
+IsAntiSymmetricUnder(op(_, _), S) == \A a, b \in S : a # b => ~(op(a, b) /\ op(b, a))
+IsAsymmetric(R, S) == \A a, b \in S : ~R[a, b] \/ ~R[b, a]
+IsAsymmetricUnder(op(_, _), S) == \A a, b \in S : ~op(a, b) \/ ~op(b, a)
+IsTransitive(R, S) == \A a, b, c \in S : (R[a, b] /\ R[b, c]) => R[a, c]
+IsTransitiveUnder(op(_, _), S) == \A a, b, c \in S : (op(a, b) /\ op(b, c)) => op(a, c)
+IsStrictlyPartiallyOrdered(R, S) == IsIrreflexive(R, S) /\ IsAntiSymmetric(R, S) /\ IsTransitive(R, S)
+IsStrictlyPartiallyOrderedUnder(op(_, _), S) ==
+  IsIrreflexiveUnder(op, S) /\ IsAntiSymmetricUnder(op, S) /\ IsTransitiveUnder(op, S)
+IsPartiallyOrdered(R, S) == IsReflexive(R, S) /\ IsAntiSymmetric(R, S) /\ IsTransitive(R, S)
+IsPartiallyOrderedUnder(op(_, _), S) ==
+  IsReflexiveUnder(op, S) /\ IsAntiSymmetricUnder(op, S) /\ IsTransitiveUnder(op, S)
+IsStrictlyTotallyOrdered(R, S) ==
+  IsStrictlyPartiallyOrdered(R, S) /\ \A a, b \in S : a = b \/ R[a, b] \/ R[b, a]
+IsStrictlyTotallyOrderedUnder(op(_, _), S) ==
+  IsStrictlyPartiallyOrderedUnder(op, S) /\ \A a, b \in S : a = b \/ op(a, b) \/ op(b, a)
+IsTotallyOrdered(R, S) == IsPartiallyOrdered(R, S) /\ \A a, b \in S : R[a, b] \/ R[b, a]
+IsTotallyOrderedUnder(op(_, _), S) == IsPartiallyOrderedUnder(op, S) /\ \A a, b \in S : op(a, b) \/ op(b, a)
+TransitiveClosure(R, S) ==
+  LET pairs[k \in 0..Cardinality(S)] ==
+        IF k = 0 THEN {p \in S \X S : R[p[1], p[2]]}
+        ELSE UNION {P \cup {p \in S \X S : \E c \in S : <<p[1], c>> \in P /\ <<c, p[2]>> \in P} : P \in {pairs[k - 1]}}
+  IN CHOOSE f \in {[p \in S \X S |-> p \in P] : P \in {pairs[Cardinality(S)]}} : TRUE
+ReflexiveTransitiveClosure(R, S) ==
+  CHOOSE f \in {[p \in S \X S |-> p[1] = p[2] \/ T[p]] : T \in {TransitiveClosure(R, S)}} : TRUE
+IsConnected(R, S) == \E T \in {ReflexiveTransitiveClosure(R, S)} : \A a, b \in S : T[a, b]
 ====
 "#;
