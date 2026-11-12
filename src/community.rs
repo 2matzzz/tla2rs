@@ -23,6 +23,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "FiniteSetsExt" => FINITE_SETS_EXT,
         "SequencesExt" => SEQUENCES_EXT,
         "UndirectedGraphs" => UNDIRECTED_GRAPHS,
+        "Bitwise" => BITWISE,
         _ => return None,
     })
 }
@@ -182,5 +183,36 @@ AreConnectedIn(m, n, G) == FALSE
 ConnectedComponents(G) == FALSE
 IsStronglyConnected(G) == FALSE
 UndirectedGraphs(S) == [node : {S}, edge : SUBSET {{a, b} : <<a, b>> \in S \X S}]
+====
+"#;
+
+/// Bitwise operations on natural numbers, bit by bit from the lowest: `bit` is the value of the
+/// bit looked at and `rest` what is left of the larger argument
+const BITWISE: &str = r#"
+---- MODULE Bitwise ----
+LOCAL INSTANCE Integers
+RECURSIVE And(_, _, _, _)
+LOCAL And(x, y, bit, rest) ==
+  IF rest = 0 THEN 0
+  ELSE bit * ((x \div bit) % 2) * ((y \div bit) % 2) + And(x, y, 2 * bit, rest \div 2)
+x & y == IF x >= y THEN And(x, y, 1, x) ELSE And(y, x, 1, y)
+RECURSIVE Or(_, _, _, _)
+LOCAL Or(x, y, bit, rest) ==
+  IF rest = 0 THEN 0
+  ELSE LET a == (x \div bit) % 2
+           b == (y \div bit) % 2
+       IN bit * ((a + b + a * b) % 2) + Or(x, y, 2 * bit, rest \div 2)
+x | y == IF x >= y THEN Or(x, y, 1, x) ELSE Or(y, x, 1, y)
+RECURSIVE Xor(_, _, _, _)
+LOCAL Xor(x, y, bit, rest) ==
+  IF rest = 0 THEN 0
+  ELSE bit * (((x \div bit) + (y \div bit)) % 2) + Xor(x, y, 2 * bit, rest \div 2)
+x ^^ y == IF x >= y THEN Xor(x, y, 1, x) ELSE Xor(y, x, 1, y)
+RECURSIVE NotR(_, _, _)
+LOCAL NotR(x, bit, rest) ==
+  IF rest = 0 THEN 0 ELSE bit * ((((x \div bit) % 2) + 1) % 2) + NotR(x, 2 * bit, rest \div 2)
+Not(a) == NotR(a, 1, a)
+RECURSIVE shiftR(_, _)
+shiftR(n, pos) == IF pos = 0 THEN n ELSE shiftR(n \div 2, pos - 1)
 ====
 "#;
