@@ -760,8 +760,13 @@ pub fn compile(
             fairs.push(format!("({}, fen_{i} as fn(&State) -> bool, fstep_{i} as fn(&State, &State) -> bool)", f.weak));
         }
     }
-    if atoms.state.len() > 64 || atoms.action.len() > 64 || fairs.len() > 64 {
-        return Err("liveness checking supports up to 64 state predicates, 64 action predicates and 64 fairness conditions".into());
+    if atoms.state.len() > 64 || atoms.action.len() > 64 || fairs.len() > 128 {
+        return Err(format!(
+            "liveness checking supports up to 64 state predicates, 64 action predicates and 128 fairness conditions (here {}, {} and {})",
+            atoms.state.len(),
+            atoms.action.len(),
+            fairs.len()
+        ));
     }
     let mut sl = vec![];
     for (i, (_, c)) in atoms.state.iter().enumerate() {
@@ -776,6 +781,9 @@ pub fn compile(
     writeln!(src, "static SATOMS: &[fn(&State) -> bool] = &[{}];", sl.join(", ")).unwrap();
     writeln!(src, "static AATOMS: &[fn(&State, &State) -> bool] = &[{}];", al.join(", ")).unwrap();
     writeln!(src, "static FAIRS: &[(bool, fn(&State) -> bool, fn(&State, &State) -> bool)] = &[{}];", fairs.join(", ")).unwrap();
+    // The fairness conditions of a state or step, as a bit mask (wider only when needed: the
+    // liveness graph keeps one per state and per edge)
+    writeln!(src, "type FMask = {};", if fairs.len() > 64 { "u128" } else { "u64" }).unwrap();
     writeln!(src, "static LPROPS: &[LProp] = &[{}];", props.join(", ")).unwrap();
     writeln!(src, "const LIVENESS: bool = {};", !parts.is_empty()).unwrap();
     // The state atoms TLC evaluates when a state is generated (those of the tableau); it evaluates

@@ -843,10 +843,10 @@ struct LiveChunk {
     /// (source, target fingerprint, label, action atoms that hold on the step, fairness conditions
     /// whose <<A>>_v the step is). Self-loops are left out: the stuttering step every state has
     /// covers them.
-    edges: Vec<(u32, Fp, u32, u64, u64)>,
+    edges: Vec<(u32, Fp, u32, u64, FMask)>,
     /// (state, fairness conditions whose <<A>>_v is enabled there, action atoms that hold on its
     /// stuttering step, state atoms evaluated when it is expanded)
-    en: Vec<(u32, u64, u64, u64)>,
+    en: Vec<(u32, FMask, u64, u64)>,
     /// Working storage: the successors of the state being expanded that became edges, and those
     /// that are new
     pend: Vec<usize>,
@@ -954,7 +954,7 @@ fn expand_one(
             Err(m) => return Some(Found::Live(m)),
         };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut en = 0u64;
+            let mut en: FMask = 0;
             for (i, (_, enabled, _)) in FAIRS.iter().enumerate() {
                 if enabled(&s) {
                     en |= 1 << i;
@@ -998,7 +998,7 @@ fn state_bits(s: &State, mask: u64) -> Result<u64, SMsg> {
 }
 
 /// The action atoms that hold on the step s -> t, and the fairness conditions whose <<A>>_v it is
-fn step_bits(s: &State, t: &State) -> Result<(u64, u64), SMsg> {
+fn step_bits(s: &State, t: &State) -> Result<(u64, FMask), SMsg> {
     let r = std::panic::catch_unwind(|| {
         let mut a = 0u64;
         for (i, f) in AATOMS.iter().enumerate() {
@@ -1006,7 +1006,7 @@ fn step_bits(s: &State, t: &State) -> Result<(u64, u64), SMsg> {
                 a |= 1 << i;
             }
         }
-        let mut st = 0u64;
+        let mut st: FMask = 0;
         for (i, (_, _, step)) in FAIRS.iter().enumerate() {
             if step(s, t) {
                 st |= 1 << i;
@@ -2973,15 +2973,15 @@ struct Steps {
     dst: Vec<u32>,
     label: Vec<u32>,
     abits: Vec<u64>,
-    fbits: Vec<u64>,
+    fbits: Vec<FMask>,
     sbits: Vec<u64>,
-    fen: Vec<u64>,
+    fen: Vec<FMask>,
     stut: Vec<u64>,
 }
 
 impl Steps {
     /// (target, label, action atoms, fairness steps) of each step from s, stuttering last
-    fn of(&self, s: u32) -> impl Iterator<Item = (u32, u32, u64, u64)> + '_ {
+    fn of(&self, s: u32) -> impl Iterator<Item = (u32, u32, u64, FMask)> + '_ {
         let r = self.off[s as usize]..self.off[s as usize + 1];
         r.map(move |e| (self.dst[e], self.label[e], self.abits[e], self.fbits[e]))
             .chain(std::iter::once((s, STUTTER, self.stut[s as usize], 0)))
@@ -3002,7 +3002,7 @@ impl Product<'_> {
     }
 
     /// Successors of product node p: (node, label, fairness steps)
-    fn succ(&self, p: usize, out: &mut Vec<(usize, u32, u64)>) {
+    fn succ(&self, p: usize, out: &mut Vec<(usize, u32, FMask)>) {
         out.clear();
         let (s, q) = ((p / self.q) as u32, p % self.q);
         let n = &self.nodes[q];
@@ -3112,7 +3112,7 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
     if acc & all != all {
         return Verdict::Reject;
     }
-    let mut taken = 0u64;
+    let mut taken: FMask = 0;
     let mut buf = vec![];
     for &p in c {
         pr.succ(p, &mut buf);
@@ -3122,8 +3122,8 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
             }
         }
     }
-    let mut some_off = 0u64;
-    let mut all_off = u64::MAX;
+    let mut some_off: FMask = 0;
+    let mut all_off = FMask::MAX;
     for &p in c {
         let en = pr.st.fen[pr.state(p) as usize];
         some_off |= !en;
@@ -3131,9 +3131,9 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
     }
     let mut steps = vec![];
     let mut off = vec![];
-    let mut strong_bad = 0u64;
+    let mut strong_bad: FMask = 0;
     for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
-        let b = 1u64 << i;
+        let b: FMask = 1 << i;
         if taken & b != 0 {
             steps.push(i);
         } else if *weak {
@@ -3179,9 +3179,9 @@ fn path_to(
     set: &std::collections::HashSet<usize>,
     from: usize,
     goal: &dyn Fn(usize) -> bool,
-    edge: &dyn Fn(u64) -> bool,
-) -> Vec<(usize, u32, u64)> {
-    let mut prev: std::collections::HashMap<usize, (usize, u32, u64)> = std::collections::HashMap::new();
+    edge: &dyn Fn(FMask) -> bool,
+) -> Vec<(usize, u32, FMask)> {
+    let mut prev: std::collections::HashMap<usize, (usize, u32, FMask)> = std::collections::HashMap::new();
     let mut q = std::collections::VecDeque::from([from]);
     let mut buf = vec![];
     while let Some(u) = q.pop_front() {
@@ -3318,16 +3318,16 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
             // on the cycle, one of its steps; then return to the entry
             let _ = &off;
             let fen = |p: usize| st.fen[pr.state(p) as usize];
-            let mut cyc: Vec<(usize, u32, u64)> = vec![];
+            let mut cyc: Vec<(usize, u32, FMask)> = vec![];
             let mut cur = entry;
-            let go = |cyc: &mut Vec<(usize, u32, u64)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(u64) -> bool| {
+            let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
                 let p = path_to(&pr, &set, *cur, goal, edge);
                 if let Some(&(l, _, _)) = p.last() {
                     *cur = l;
                 }
                 cyc.extend(p);
             };
-            let visited = |cyc: &[(usize, u32, u64)], f: &dyn Fn(usize) -> bool| f(entry) || cyc.iter().any(|&(p, _, _)| f(p));
+            let visited = |cyc: &[(usize, u32, FMask)], f: &dyn Fn(usize) -> bool| f(entry) || cyc.iter().any(|&(p, _, _)| f(p));
             for j in 0..prop.nacc {
                 let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
                 if !visited(&cyc, &here) {
@@ -3352,7 +3352,7 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
                 }
                 let mut added = false;
                 for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
-                    let b = 1u64 << i;
+                    let b: FMask = 1 << i;
                     let on = |p: usize| fen(p) & b != 0;
                     if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
                         continue;

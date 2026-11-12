@@ -169,7 +169,7 @@ check specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg
 check specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg
 check specifications/acp/ACP_SB_TLC.tla specifications/acp/ACP_SB_TLC.cfg
 skip specifications/acp/APACP_SB.tla specifications/acp/APACP_SB.cfg # symbolic mode: checked with Apalache
-gap specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg rsargs=-seqcap,6 # liveness: the properties need more than 64 state predicates, action predicates or fairness conditions, the most tla2rs supports
+check specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg rsargs=-seqcap,6
 check specifications/allocator/AllocatorRefinement.tla specifications/allocator/AllocatorRefinement.cfg rsargs=-seqcap,6
 check specifications/allocator/SchedulingAllocator.tla specifications/allocator/SchedulingAllocator.cfg rsargs=-seqcap,3
 check specifications/allocator/SimpleAllocator.tla specifications/allocator/SimpleAllocator.cfg
