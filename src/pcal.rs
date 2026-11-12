@@ -705,8 +705,7 @@ impl Parser {
         let mut depth = 0i32;
         let mut quant = false;
         let mut prev = " ".to_string();
-        loop {
-            let Some(t) = self.lx.peek(0)? else { break };
+        while let Some(t) = self.lx.peek(0)? {
             let t = t.clone();
             if !t.string {
                 let ident = t.s.starts_with(is_letter);
@@ -1298,7 +1297,7 @@ fn update_pc(next: &str) -> Stmt {
 }
 
 /// Expands the last statement of `stmts`; whether control still has to go to `next`
-fn explode_last(stmts: &mut Vec<Stmt>, next: &str, own: bool, omit_pc: bool) -> bool {
+fn explode_last(stmts: &mut [Stmt], next: &str, own: bool, omit_pc: bool) -> bool {
     let mut needs = true;
     if let Some(last) = stmts.last_mut() {
         let mut replace = None;
