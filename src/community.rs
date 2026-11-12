@@ -30,11 +30,6 @@ pub fn source(name: &str) -> Option<&'static str> {
 
 /// The operators of each module that are refused when used, with the reason
 pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
-    ("SequencesExt", "Interleave", "not written yet"),
-    ("SequencesExt", "AllSubSeqs", "not written yet"),
-    ("SequencesExt", "IndexFirstSubSeq", "not written yet"),
-    ("SequencesExt", "ReplaceFirstSubSeq", "not written yet"),
-    ("SequencesExt", "ReplaceAllSubSeqs", "not written yet"),
     ("UndirectedGraphs", "Path", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
     ("UndirectedGraphs", "SimplePath", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
     ("UndirectedGraphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
@@ -156,13 +151,29 @@ FoldRightDomain(op(_, _), seq, base) == FoldRight(op, [i \in DOMAIN seq |-> i], 
 FlattenSeq(seqs) == IF Len(seqs) = 0 THEN seqs ELSE FoldLeft(LAMBDA a, b : a \o b, <<>>, seqs)
 Zip(s, t) ==
   LET n == IF Len(s) <= Len(t) THEN Len(s) ELSE Len(t) IN [i \in 1..n |-> <<s[i], t[i]>>]
-Interleave(s, t) == FALSE
+Interleave(s, t) ==
+  CASE Len(s) = Len(t) -> [k \in 1..2 * Len(s) |-> IF k % 2 = 1 THEN <<s[(k + 1) \div 2]>> ELSE <<t[k \div 2]>>]
 SubSeqs(s) == {SubSeq(s, i + 1, j) : i, j \in 0..Len(s)}
-AllSubSeqs(s) == FALSE
-IndexFirstSubSeq(s, t) == FALSE
+AllSubSeqs(s) ==
+  {[k \in 1..Cardinality(D) |-> s[CHOOSE i \in D : Cardinality({j \in D : j > i}) = k - 1]] : D \in SUBSET DOMAIN s}
+LOCAL Starts(s, t) == {k \in 1..Len(t) - Len(s) + 1 : SubSeq(t, k, k + Len(s) - 1) = s}
+IndexFirstSubSeq(s, t) == CHOOSE k \in Starts(s, t) : \A j \in Starts(s, t) : k <= j
 ReplaceSubSeqAt(i, r, s, t) == SubSeq(t, 1, i - 1) \o r \o SubSeq(t, i + Len(s), Len(t))
-ReplaceFirstSubSeq(r, s, t) == FALSE
-ReplaceAllSubSeqs(r, s, t) == FALSE
+ReplaceFirstSubSeq(r, s, t) ==
+  IF Starts(s, t) # {} THEN ReplaceSubSeqAt(IndexFirstSubSeq(s, t), r, s, t) ELSE t
+ReplaceAllSubSeqs(r, s, t) ==
+  CASE s = t -> r
+    [] r = s -> t
+    [] Len(s) = 0 ->
+         LET upto[k \in 0..Len(t)] == IF k = 0 THEN <<>> ELSE upto[k - 1] \o r \o <<t[k]>>
+         IN upto[Len(t)]
+    [] Starts(s, t) # {} ->
+         LET from[k \in 1..Len(t) + 1] ==
+               IF k > Len(t) - Len(s) + 1 THEN SubSeq(t, k, Len(t))
+               ELSE IF SubSeq(t, k, k + Len(s) - 1) = s THEN r \o from[k + Len(s)]
+               ELSE <<t[k]>> \o from[k + 1]
+         IN from[1]
+    [] OTHER -> t
 ====
 "#;
 
