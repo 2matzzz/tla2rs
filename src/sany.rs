@@ -188,7 +188,10 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                     return Err(clash(n));
                 }
                 pending_rec.push(n.clone());
+                // Exported even when the definition is LOCAL (measured: a module that extends
+                // one with `RECURSIVE F(_)` and `LOCAL F(n) == ...` may not define F)
                 scope.push(own(n, false));
+                out.push(own(n, false));
             }
             Unit::Assume(i) => Walker::new(&scope, known, &m.recursive).expr(&m.assumes[*i].expr)?,
             Unit::Def(i, fun) => {
@@ -241,7 +244,7 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                 if !scope.syms.contains(&s) {
                     scope.push(s.clone());
                 }
-                if !m.local_defs.contains(&d.name) {
+                if !m.local_defs.contains(&d.name) && !out.contains(&s) {
                     out.push(s);
                 }
             }

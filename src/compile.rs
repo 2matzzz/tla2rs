@@ -419,6 +419,11 @@ fn hide_locals(mut m: Module) -> Module {
             *e = rn(e, &locals, &prefix);
         }
     }
+    for r in &mut m.recursive {
+        if locals.contains(r) {
+            *r = format!("{prefix}{r}");
+        }
+    }
     m.local_defs = m.local_defs.iter().map(|n| format!("{prefix}{n}")).collect();
     m
 }
