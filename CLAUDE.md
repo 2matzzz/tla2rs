@@ -277,6 +277,14 @@ the set of its elements (written out, from the state or a definition, such a set
 unites with B by copying A's elements and adding B's (`SetEnumValue.cup`). So `s \in TS \cup {}` is TRUE where `s \in
 TS` fails. When A is empty the union is B itself, and `s \in {} \cup TS` fails as `s \in TS` does.
 
+A set of strings compared with a set of integers (`{x} = {5}`, x a string) cannot be held as one type, so `Gen::str_int_eq`
+compares them as TLC does, measured on TLC 2.19 (`tests/tlc/StrIntSet*`): sets of different sizes are unequal;
+otherwise TLC compares the elements in its order pair by pair and stops at the first unequal pair, where a model
+value is unequal to anything but itself and a string meeting an integer is an error worded by the left one
+(`Attempted to check equality of string "a" with non-string:` or `... of integer 5 with non-integer:`). A set written
+out on the left adds TLC's `TLC was unable to fingerprint.` (see "Messages and printed lines"). Tuples of such sets
+compare element by element; other values holding them are still refused.
+
 ### `\div` in Naturals
 
 TLC evaluates `\div` with a Java method of the module it loaded. Integers' is the floor of the

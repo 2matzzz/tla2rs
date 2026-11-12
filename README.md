@@ -174,7 +174,8 @@ memory.
   while it rebuilds a counterexample (see CLAUDE.md, "Messages and printed lines"). Such specs are searched without
   `-batched`
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
-  reason), sets that may hold both strings and integers, `Name <- [Module] Def` for a CONSTANT (TLC rejects it too),
+  reason), sets that may hold both strings and integers (a set of strings compared with a set of integers is
+  supported: unequal when the sizes differ, an evaluation error otherwise, as in TLC), `Name <- [Module] Def` for a CONSTANT (TLC rejects it too),
   `Op!@`, and a recursive operator that assigns variables called in Init with arguments that are not constant. `\A`
   over a set from the state whose body assigns a variable for some elements only needs the set's element type to have
   at most 16 values

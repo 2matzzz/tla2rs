@@ -260,6 +260,55 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Whether t has a set that may hold both strings and integers, which tla2rs cannot represent
+    fn mixed_set(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Set(e) if matches!(e.as_ref(), Ty::IntAtom(..)) && self.has_str(e) => true,
+            Ty::Set(e) | Ty::Seq(e) | Ty::Opt(e) | Ty::Bag(e) | Ty::Fun(_, e) | Ty::PFun(_, e) => self.mixed_set(e),
+            Ty::Rec(fs) => fs.iter().any(|(_, t)| self.mixed_set(t)),
+            _ => false,
+        }
+    }
+
+    /// `a = b` as TLC evaluates it (`a.equals(b)`) where a and b hold strings and integers in
+    /// places where the other holds the other kind (`{x} = {5}` with x a string; measured on TLC
+    /// 2.19, `tests/tlc/StrIntSet*`). Sets of different sizes are unequal; otherwise TLC compares
+    /// their elements in its order, pair by pair, and stops at the first pair that is unequal. A
+    /// model value is unequal to anything but itself, and a string compared with an integer stops
+    /// TLC with an error worded by the value on the left. Tuples compare element by element
+    fn str_int_eq(&mut self, ac: &str, at: &Ty, bc: &str, bt: &Ty) -> R<String> {
+        let leaf = |t: &Ty| matches!(t, Ty::Enum(_) | Ty::IntAtom(..) | Ty::Int(..));
+        match (at, bt) {
+            (Ty::Set(ea), Ty::Set(eb)) => {
+                let (x, y, p, q) = (self.fresh("x"), self.fresh("y"), self.fresh("p"), self.fresh("q"));
+                let (nx, ny) = (self.s_card(&x, at), self.s_card(&y, bt));
+                let (ix, iy) = (self.s_iter(&x, at)?, self.s_iter(&y, bt)?);
+                let inner = self.str_int_eq(&p, ea, &q, eb)?;
+                Ok(format!("{{ let ({x}, {y}) = ({ac}, {bc}); {nx} == {ny} && {{ let __all = {ix}.zip({iy}).all(|({p}, {q})| {inner}); __all }} }}"))
+            }
+            (Ty::Rec(fa), Ty::Rec(fb)) if tuple_elems(at).is_some() && tuple_elems(bt).is_some() => {
+                if fa.len() != fb.len() {
+                    return Ok(format!("{{ let _ = {ac}; let _ = {bc}; false }}"));
+                }
+                let (x, y) = (self.fresh("x"), self.fresh("y"));
+                let mut parts = vec![];
+                for (i, ((_, ta), (_, tb))) in fa.iter().zip(fb).enumerate() {
+                    let f = rec_field(fa.len(), i);
+                    parts.push(self.str_int_eq(&format!("{x}{f}"), ta, &format!("{y}{f}"), tb)?);
+                }
+                Ok(format!("{{ let ({x}, {y}) = ({ac}, {bc}); {} }}", parts.join(" && ")))
+            }
+            (a, b) if leaf(a) && leaf(b) => {
+                let as_i64 = |c: &str, t: &Ty| match t {
+                    Ty::Enum(_) => format!("(i64::MIN + ({c}) as i64)"),
+                    _ => format!("(({c}) as i64)"),
+                };
+                Ok(format!("str_int_eq({}, {})", as_i64(ac, a), as_i64(bc, b)))
+            }
+            _ => Err("comparing values that hold strings where the other holds integers is supported only for sets and tuples".into()),
+        }
+    }
+
     /// Whether comparing values of types `a` and `b` may compare a string with an integer, which TLC
     /// stops on (a model value compares unequal with anything)
     fn str_meets_int(&self, a: &Ty, b: &Ty) -> bool {
@@ -3507,6 +3556,15 @@ impl<'a> Gen<'a> {
                     }
                 }
                 let t = join(&at, &bt)?;
+                // Sets of strings compared with sets of integers, which tla2rs cannot hold as one
+                // type: compared as TLC compares them, without joining the types
+                if self.mixed_set(&t) && !self.mixed_set(&at) && !self.mixed_set(&bt) {
+                    let mut c = self.str_int_eq(&ac, &at, &bc, &bt)?;
+                    if self.built(a, env) {
+                        c = format!("{{ let __fp = FpSource::enter(); {c} }}");
+                    }
+                    return Ok((if op == Eq { c } else { format!("!{c}") }, Ty::Bool));
+                }
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
                 if matches!(t, Ty::IntAtom(..)) && self.has_str(&t) && self.str_meets_int(&at, &bt) {
@@ -5976,7 +6034,11 @@ impl<'a> Gen<'a> {
              // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\
              fn mixed_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
              if ai != bi {{ let at = if ai {{ b }} else {{ a }}; let n = if ai {{ a }} else {{ b }}; if IS_STR[(at - i64::MIN) as usize] {{ \
-             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
+             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n\
+             // The same, worded by the value on the left (`Gen::str_int_eq`)\n\
+             fn str_int_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
+             if ai && !bi && IS_STR[(b - i64::MIN) as usize] {{ eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", a, ATOMS[(b - i64::MIN) as usize])) }} \
+             if bi && !ai && IS_STR[(a - i64::MIN) as usize] {{ eval_error(format!(\"Attempted to check equality of string {{}} with non-string:\\n{{}}\", ATOMS[(a - i64::MIN) as usize], b)) }} a == b }}\n",
             names.len(),
             names.join(", "),
             strs.len(),
