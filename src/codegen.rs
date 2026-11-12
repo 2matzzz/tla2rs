@@ -72,6 +72,9 @@ pub struct Gen<'a> {
     /// The operator whose argument `gen_int` generates next: its Java method's name, and whether
     /// it takes one argument and gives an interval
     int_op: Option<(&'static str, bool, bool)>,
+    /// The comparison whose argument `gen_int` generates next: its symbol as TLC names it, and
+    /// whether this is the first argument
+    int_cmp: Option<(&'static str, bool)>,
     /// Whether the checker follows TLC's order of printed lines: each successor (and initial
     /// state) and the start of each action are marked as they are computed (PRINT_ORDER)
     pub print_order: bool,
@@ -133,6 +136,7 @@ impl<'a> Gen<'a> {
             actions: 0,
             int_module: "Naturals",
             int_op: None,
+            int_cmp: None,
             print_order: false,
             tmp: 0,
             scap: 8,
@@ -1491,15 +1495,37 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// TLC's message when it compares a value of type xt with a value it cannot compare it with
+    /// (`compareTo`, as in a search of a sorted set), for a tuple or a string (measured)
+    fn compare_fails_msg(&self, xt: &Ty) -> Option<&'static str> {
+        if tuple_elems(xt).is_some() {
+            Some("Attempted to compare the function {} with the value:\n{}")
+        } else if matches!(xt, Ty::Enum(v) if !v.is_empty() && v.iter().all(|&a| !self.atoms.is_model(a))) {
+            Some("Attempted to compare string {} with non-string:\n{}")
+        } else {
+            None
+        }
+    }
+
     /// Whether x (of type xt) is a member of set c (of type st)
     fn s_has(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<String> {
         let et = Self::elem_of(st);
         match self.tuple_cmp(xt, &et)? {
             Cmp::Normal => {}
             Cmp::Unequal => return Ok("false".into()),
-            // TLC compares only against the elements present, so an empty set is no error
+            // TLC compares only against the elements present, so an empty set is no error. The set
+            // is sorted: TLC searches it, comparing x first with the element in the middle
             Cmp::Fails(m) => {
                 let empty = if is_sparse(st) { format!("(({c}).len == 0)") } else { format!("({c} == 0)") };
+                if let Some(f) = self.compare_fails_msg(xt) {
+                    let it = self.s_iter(c, st)?;
+                    let n = self.s_card(c, st);
+                    let (xid, eid) = (self.ty_id(xt)?, self.ty_id(&et)?);
+                    let fail = format!(
+                        "{{ let __e = {it}.nth(({n} / 2) as usize).unwrap(); let __b: bool = eval_error(format!({f:?}, ppr(&fmt_{xid}(&{x})), ppr(&fmt_{eid}(&__e)))); __b }}"
+                    );
+                    return Ok(format!("(if {empty} {{ false }} else {fail})"));
+                }
                 return Ok(format!("(if {empty} {{ false }} else {{ {} }})", eval_error_bool(&m)));
             }
         }
@@ -3445,7 +3471,17 @@ impl<'a> Gen<'a> {
                 (format!("({ac} {} {bc})", if op == Eq { "==" } else { "!=" }), Ty::Bool)
             }
             Lt | Le | Gt | Ge => {
+                // As TLC names them in its errors (Naturals names >= as >)
+                let sym = match op {
+                    Lt => "<",
+                    Le => "<=",
+                    Gt => ">",
+                    _ if self.int_module == "Naturals" => ">",
+                    _ => ">=",
+                };
+                self.int_cmp = Some((sym, true));
                 let (ac, _) = self.gen_int(a, env)?;
+                self.int_cmp = Some((sym, false));
                 let (bc, _) = self.gen_int(b, env)?;
                 let o = match op {
                     Lt => "<",
@@ -3563,6 +3599,7 @@ impl<'a> Gen<'a> {
 
     fn gen_int(&mut self, e: &Expr, env: &Env) -> R<(String, (i64, i64))> {
         let op = self.int_op.take();
+        let cmp = self.int_cmp.take();
         let (c, t) = self.gen(e, env, None)?;
         match t {
             Ty::Int(lo, hi) => Ok((c, (lo, hi))),
@@ -3570,8 +3607,15 @@ impl<'a> Gen<'a> {
             // arithmetic or a comparison is an evaluation error, as in TLC. TLC evaluates
             // arithmetic with Java methods and names the one that failed to cast the model value
             Ty::IntAtom(lo, hi, _) => {
-                let fail = match op {
-                    Some((method, neg, interval)) => {
+                let fail = match (op, cmp) {
+                    // A comparison is TLC's own evaluation error (exit 255)
+                    (_, Some((sym, first))) => {
+                        let which = if first { "first" } else { "second" };
+                        format!(
+                            "arith_error(format!(\"The {which} argument of {sym} should be an integer, but instead it is:\\n{{}}\", ATOMS[(__n - i64::MIN) as usize]))"
+                        )
+                    }
+                    (Some((method, neg, interval)), None) => {
                         let v = "tlc2.value.impl.";
                         let args = if neg { format!("{v}IntValue") } else { format!("{v}IntValue,{v}IntValue") };
                         let ret = if interval { "IntervalValue" } else { "IntValue" };
@@ -3581,7 +3625,7 @@ impl<'a> Gen<'a> {
                         );
                         format!("eval_error({m:?}.to_string())")
                     }
-                    None => "eval_error(format!(\"Attempted to use the model value {} as an integer\", ATOMS[(__n - i64::MIN) as usize]))".into(),
+                    (None, None) => "eval_error(format!(\"Attempted to use the model value {} as an integer\", ATOMS[(__n - i64::MIN) as usize]))".into(),
                 };
                 Ok((format!("{{ let __n: i64 = {c}; if __n < i64::MIN + 65536 {{ {fail} }} __n }}"), (lo, hi)))
             }
@@ -3735,6 +3779,8 @@ impl<'a> Gen<'a> {
                 return Ok(format!("({})", parts.join(" || ")));
             }
         }
+        // Whether TLC builds the set here as written, or has it sorted (see the clash below)
+        let written = self.built(s, env);
         let s = s.strip();
         // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
         // treats it as a function in [S -> T]; none of these is compiled
@@ -4013,6 +4059,16 @@ impl<'a> Gen<'a> {
                 // elements might match first, whether it stops depends on its order: reject
                 if !fits.is_empty() {
                     return Err(format!("{m}: {}", short(s)));
+                }
+                // A set from a definition is sorted: TLC searches it, comparing x first with the
+                // element in the middle
+                if !written {
+                    if let Some(f) = self.compare_fails_msg(xt) {
+                        let e = set.iter().nth(set.len() / 2).unwrap();
+                        let et = crate::ppr::ppr(&crate::compile::show_value(self.atoms, e));
+                        let xid = self.ty_id(xt)?;
+                        return Ok(format!("{{ let __b: bool = eval_error(format!({f:?}, ppr(&fmt_{xid}(&{x})), {et:?})); __b }}"));
+                    }
                 }
                 return Ok(eval_error_bool(&m));
             }

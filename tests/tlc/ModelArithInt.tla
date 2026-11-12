@@ -12,4 +12,10 @@ NextNeg ==
 NextPlus ==
         /\ x' = IF x = 1 THEN None ELSE 1
         /\ x = 0 \/ x + 1 > 0
+NextLess ==
+        /\ x' = IF x = 1 THEN None ELSE 1
+        /\ x = 0 \/ x < 2
+NextAtLeast ==
+        /\ x' = IF x = 1 THEN None ELSE 1
+        /\ x = 0 \/ 2 >= x
 ====
