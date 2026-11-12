@@ -122,6 +122,10 @@ pub struct Module {
     pub instances: Vec<Instance>,
     /// Definitions declared LOCAL (not visible to a module that instantiates this one)
     pub local_defs: Vec<String>,
+    /// For each INSTANCE: the prefix of the hidden names of its definitions (`M#iK#`), the
+    /// prefix TLC names them with (`N!` or nothing), and the number of constants and variables
+    /// substituted
+    pub inst_prefixes: Vec<(String, String, usize)>,
 }
 
 /// `[LOCAL] INSTANCE M WITH x <- e, ...` (no name) or `N(p, ...) == INSTANCE M WITH ...`
@@ -133,6 +137,8 @@ pub struct Instance {
     pub arity: Vec<usize>,
     pub module: String,
     pub subs: Vec<(String, Expr)>,
+    /// The position of the statement as TLC prints it (see POS)
+    pub at: String,
 }
 
 /// An ASSUME expression and the position TLC reports on failure (1-based line and column; the end
@@ -142,6 +148,31 @@ pub struct Assume {
     pub module: String,
     pub expr: Expr,
     pub span: (usize, usize, usize, usize),
+}
+
+/// The name of the label that records where an expression is written: `#pos` followed by the
+/// position as TLC prints it (`line 3, col 9 to line 4, col 20 of module M`). The parser puts one
+/// around the subexpressions TLC can name an action by (see `Gen::gen_split`): definition bodies,
+/// disjuncts, the bodies of `\E`, LET and labels, and the action of `[A]_v`. Expansion drops them
+/// except while expanding the next-state relation (`Expander::keep_pos`).
+pub const POS: &str = "#pos ";
+
+/// `e` wrapped in a POS label for the position `at`
+pub fn at_pos(at: &str, e: Expr) -> Expr {
+    Expr::Label(format!("{POS}{at}"), vec![], e.b())
+}
+
+/// The position recorded by a POS label named `n`
+pub fn pos_of(n: &str) -> Option<&str> {
+    n.strip_prefix(POS)
+}
+
+/// `e` without POS labels
+pub fn strip_pos(e: &Expr) -> Expr {
+    match e {
+        Expr::Label(n, _, b) if pos_of(n).is_some() => strip_pos(b),
+        _ => crate::codegen::map_children(e, &strip_pos),
+    }
 }
 
 impl Expr {
@@ -226,6 +257,14 @@ impl Expr {
     /// Whether this is a label written in the spec (`l :: e`), as opposed to a call site
     pub fn is_user_label(&self) -> bool {
         matches!(self, Expr::Label(n, ..) if n.ends_with("::"))
+    }
+
+    /// Strips POS labels (see POS)
+    pub fn unpos(&self) -> &Expr {
+        match self {
+            Expr::Label(n, _, b) if pos_of(n).is_some() => b.unpos(),
+            e => e,
+        }
     }
 
     /// Strips Label wrappers

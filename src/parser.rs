@@ -18,6 +18,8 @@ pub struct Parser {
     tuple_binders: usize,
     /// Instances defined inside LET, made module-level (see `let_instance`)
     let_instances: Vec<Instance>,
+    /// The name of the module being parsed (for POS labels)
+    module: String,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -48,7 +50,7 @@ pub fn parse_module(src: &str) -> R<Module> {
     // reads them: binary and left-associative. Only then are they kept so (see INFIX_JUNCTION)
     let positional = toks.windows(2).any(|w| matches!(&w[0].tok, Tok::Sym(b) if b == "!") && is_selector(&w[1].tok));
     NEST_JUNCTIONS.with(|n| n.set(positional));
-    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![] };
+    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new() };
     let r = p.module();
     NEST_JUNCTIONS.with(|n| n.set(false));
     let m = r?;
@@ -432,6 +434,43 @@ fn fun_cons(bs: Vec<(String, Expr)>, body: Expr) -> Expr {
 }
 
 impl Parser {
+    /// The position of the tokens a..=b as TLC prints it: 1-based, the end column inclusive. SANY
+    /// gives a parenthesized expression the position of what is inside the parentheses
+    fn span_text(&self, mut a: usize, mut b: usize) -> String {
+        let sym = |t: &Token, c: &str| matches!(&t.tok, Tok::Sym(x) if x == c);
+        while a < b && sym(&self.toks[a], "(") && sym(&self.toks[b], ")") {
+            // Only if these two parentheses match each other
+            let mut depth = 0i32;
+            let mut matched = true;
+            for t in &self.toks[a..b] {
+                if sym(t, "(") {
+                    depth += 1;
+                } else if sym(t, ")") {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
+                break;
+            }
+            a += 1;
+            b -= 1;
+        }
+        let (s, e) = (&self.toks[a], &self.toks[b]);
+        format!("line {}, col {} to line {}, col {} of module {}", s.line, s.col + 1, e.line, e.end, self.module)
+    }
+
+    /// `e`, parsed from the token at `start` to the last one consumed, in a POS label
+    fn at(&self, start: usize, e: Expr) -> Expr {
+        if self.pos <= start {
+            return e;
+        }
+        at_pos(&self.span_text(start, self.pos - 1), e)
+    }
+
     fn raw(&self) -> &Token {
         &self.toks[self.pos]
     }
@@ -501,6 +540,7 @@ impl Parser {
         }
         self.pos += 1;
         m.name = self.ident()?;
+        let outer = std::mem::replace(&mut self.module, m.name.clone());
         loop {
             match self.raw().tok.clone() {
                 Tok::Eof => break,
@@ -569,8 +609,10 @@ impl Parser {
                     self.skip_proof_unit()
                 }
                 Tok::Ident(k) if k == "INSTANCE" => {
+                    let start = self.pos;
                     self.pos += 1;
-                    let inst = self.instance(None, vec![], vec![])?;
+                    let mut inst = self.instance(None, vec![], vec![])?;
+                    inst.at = self.span_text(start, self.pos - 1);
                     m.instances.push(inst);
                 }
                 Tok::Ident(k) if k == "LOCAL" => {
@@ -596,6 +638,7 @@ impl Parser {
         }
         m.recursive = std::mem::take(&mut self.recursive);
         m.instances.append(&mut self.let_instances);
+        self.module = outer;
         Ok(m)
     }
 
@@ -726,7 +769,7 @@ impl Parser {
                 }
             }
         }
-        Ok(Instance { name, params, arity, module, subs })
+        Ok(Instance { name, params, arity, module, subs, at: String::new() })
     }
 
     /// An instance defined inside LET becomes a module-level instance with a unique name that
@@ -744,18 +787,21 @@ impl Parser {
         params.extend(inst.params.iter().cloned());
         let mut arity = vec![0; names.len()];
         arity.extend(inst.arity.iter().copied());
-        self.let_instances.push(Instance { name: Some(unique.clone()), params, arity, module: inst.module, subs: inst.subs });
+        self.let_instances.push(Instance { name: Some(unique.clone()), params, arity, module: inst.module, subs: inst.subs, at: inst.at });
         (local, unique, names)
     }
 
     /// A definition, or (as Err) a definition of an instance `N(p) == INSTANCE M ...`
     fn def(&mut self) -> R<Result<Vec<Def>, Instance>> {
+        let def_start = self.pos;
         let name = self.ident()?;
         // A postfix operator definition `a ^+ == e`
         if let Some(op) = ["^+", "^*", "^#"].iter().find(|o| self.is(o)) {
             self.pos += 1;
             self.expect("==")?;
+            let start = self.pos;
             let body = self.expr(0)?;
+            let body = self.at(start, body);
             return Ok(Ok(vec![Def { name: op.to_string(), params: vec![name], arity: vec![0], body }]));
         }
         // An infix operator definition `a ++ b == e`
@@ -763,7 +809,9 @@ impl Parser {
             self.pos += 1;
             let b = self.ident()?;
             self.expect("==")?;
+            let start = self.pos;
             let body = self.expr(0)?;
+            let body = self.at(start, body);
             return Ok(Ok(vec![Def { name: op.to_string(), params: vec![name, b], arity: vec![0, 0], body }]));
         }
         let mut params = vec![];
@@ -817,9 +865,13 @@ impl Parser {
         self.expect("==")?;
         if self.is_kw("INSTANCE") {
             self.pos += 1;
-            return Ok(Err(self.instance(Some(name), params, arity)?));
+            let mut inst = self.instance(Some(name), params, arity)?;
+            inst.at = self.span_text(def_start, self.pos - 1);
+            return Ok(Err(inst));
         }
+        let start = self.pos;
         let body = self.expr(0)?;
+        let body = self.at(start, body);
         Ok(Ok(vec![Def { name, params, arity, body }]))
     }
 
@@ -856,8 +908,11 @@ impl Parser {
     /// An expression whose operators bind at least as tightly as `min`; `parent` is the infix
     /// operator it is the right operand of
     fn expr_in(&mut self, min: u8, parent: Option<&'static str>) -> R<Expr> {
+        let lhs_start = self.pos;
         let mut lhs = self.prefix()?;
         let mut prev: Option<&'static str> = None;
+        // Whether lhs is a disjunction built in this loop (its operands are in POS labels)
+        let mut chain_or = false;
         loop {
             let Some((prec, right, op)) = infix(self.peek()) else { break };
             if prec < min {
@@ -878,7 +933,16 @@ impl Parser {
                 lhs = Expr::Call("\\X".into(), parts);
                 continue;
             }
+            if op == "\\/" && !chain_or {
+                let end = self.pos - 1;
+                let at = std::mem::replace(&mut self.pos, end);
+                lhs = self.at(lhs_start, lhs);
+                self.pos = at;
+            }
+            let rhs_start = self.pos;
             let rhs = self.expr_in(if right { prec } else { prec + 1 }, Some(op))?;
+            let rhs = if op == "\\/" { self.at(rhs_start, rhs) } else { rhs };
+            chain_or = op == "\\/";
             lhs = bin(op, lhs, rhs);
         }
         Ok(lhs)
@@ -890,9 +954,11 @@ impl Parser {
         loop {
             self.pos += 1; // the bullet symbol
             self.limits.push(Some(col));
+            let start = self.pos;
             let e = self.expr(0);
             self.limits.pop();
-            items.push(e?);
+            let e = e?;
+            items.push(if sym == "\\/" { self.at(start, e) } else { e });
             let t = self.raw();
             let same = matches!(&t.tok, Tok::Sym(s) if s == sym) && t.col == col && !self.hidden(t);
             if !same {
@@ -1048,7 +1114,9 @@ impl Parser {
                 }
                 let (bs, lets) = self.binders_pat()?;
                 self.expect(":")?;
+                let start = self.pos;
                 let body = self.expr(0)?;
+                let body = if ex { self.at(start, body) } else { body };
                 let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
                 Ok(Expr::Quant(ex, bs, body.b()))
             }
@@ -1117,7 +1185,9 @@ impl Parser {
                         }
                     }
                     self.pos += 1;
-                    let mut body = self.expr(0)?;
+                    let start = self.pos;
+                    let body = self.expr(0)?;
+                    let mut body = self.at(start, body);
                     for r in &renames {
                         body = rename_instance(&body, r);
                         for d in defs.iter_mut() {
@@ -1266,7 +1336,9 @@ impl Parser {
                 // but liveness looks at (TLC cannot check a labeled temporal formula)
                 if self.is("::") {
                     self.pos += 1;
+                    let start = self.pos;
                     let body = self.expr(0)?;
+                    let body = self.at(start, body);
                     return Ok(Expr::Label(format!("{s}::"), vec![], body.b()));
                 }
                 if self.is("(") {
@@ -1287,7 +1359,9 @@ impl Parser {
                             })
                             .collect();
                         self.pos = j + 1;
+                        let start = self.pos;
                         let body = self.expr(0)?;
+                        let body = self.at(start, body);
                         return Ok(Expr::Label(format!("{s}({})::", ps.join(",")), vec![], body.b()));
                     }
                 }
@@ -1462,6 +1536,7 @@ impl Parser {
         }
         let start = self.pos;
         let e = self.expr(0)?;
+        let e_end = self.pos;
         if self.is(",") && matches!(&e, Expr::Ident(_) | Expr::Bin(BOp::In, ..)) {
             // [x \in S, y \in T |-> e] or [x, y \in S |-> e]
             self.pos = start;
@@ -1539,6 +1614,7 @@ impl Parser {
                 let v = v.to_string();
                 self.pos += 1;
                 let sub = if v.is_empty() { self.primary()? } else { Expr::Ident(v) };
+                let e = at_pos(&self.span_text(start, e_end - 1), e);
                 return Ok(Expr::BoxAction(e.b(), sub.b()));
             }
         }

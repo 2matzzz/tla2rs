@@ -19,10 +19,14 @@ pub struct Env {
     /// Primed variables that have already been assigned
     primed: HashMap<String, (String, Ty)>,
     init: bool,
+    /// The action the successors are labelled with in traces (an index into `labels`)
     label: Option<u32>,
-    /// Whether the label is settled (for a dispatching definition such as Next, the label is
-    /// overwritten by the inner definition's name)
-    label_final: bool,
+    /// Still splitting the next-state relation into actions as TLC does (see `gen_split`)
+    split: bool,
+    /// While splitting: the definition the action is named after, and the position of the
+    /// innermost part with a POS label
+    aname: Option<String>,
+    apos: Option<String>,
     /// Bound variables whose index within their type is known.
     /// Used as a function argument, they skip the conversion from atom value to index.
     idx: HashMap<String, (Ty, String)>,
@@ -74,6 +78,13 @@ pub struct Gen<'a> {
     /// these are settled
     ract: HashMap<String, (String, BTreeSet<u64>, bool)>,
     ract_progress: Vec<String>,
+    /// The position of each definition's body (from its POS label), for a recursive operator
+    /// unrolled while splitting the next-state relation
+    pub def_pos: HashMap<String, String>,
+    /// The definitions of each INSTANCE: the prefix of their hidden names (`M#iK#`), the prefix
+    /// TLC names them with (`N!` or nothing), and the number of constants and variables
+    /// substituted
+    pub inst_prefixes: Vec<(String, String, usize)>,
 }
 
 fn rid(n: &str) -> String {
@@ -104,6 +115,8 @@ impl<'a> Gen<'a> {
             rec_code: std::collections::BTreeMap::new(),
             ract: HashMap::new(),
             ract_progress: vec![],
+            def_pos: HashMap::new(),
+            inst_prefixes: vec![],
         }
     }
 
@@ -2352,6 +2365,7 @@ impl<'a> Gen<'a> {
             }
             Un(UOp::Enabled, x) => {
                 let mut inner = env.clone();
+                inner.split = false;
                 inner.primed.clear();
                 inner.work = None;
                 inner.init = false;
@@ -3710,6 +3724,9 @@ impl<'a> Gen<'a> {
             return self.emit_state(env, out);
         };
         let with = |x: Vec<Expr>| -> Vec<Expr> { x.into_iter().chain(rest.iter().cloned()).collect() };
+        if env.split && !env.init && self.gen_split(h, rest, env, out)? {
+            return Ok(());
+        }
         match h.strip() {
             // [A]_v is A \/ UNCHANGED v (TLC follows both)
             BoxAction(a, v) => {
@@ -3741,15 +3758,7 @@ impl<'a> Gen<'a> {
             return Err(format!("unsupported action form: {}", short(h)));
         }
         match h {
-            Label(name, _, body) => {
-                let mut env2 = env.clone();
-                if !env.label_final && action && !env.init && !h.is_user_label() {
-                    env2.label = Some(self.label_id(name));
-                    env2.label_final = !matches!(body.strip(), Or(_) | Quant(..));
-                }
-
-                return self.gen_action(&with(vec![body.as_ref().clone()]), &env2, out);
-            }
+            Label(_, _, body) => return self.gen_action(&with(vec![body.as_ref().clone()]), env, out),
             And(xs) => return self.gen_action(&with(xs.clone()), env, out),
             Or(xs) if open => {
                 for x in xs {
@@ -3851,6 +3860,11 @@ impl<'a> Gen<'a> {
                     env2.bind(&y, code, t);
                     env2.vals.insert(y.clone(), v.clone());
                     b = rename_ident(&b, p, &y);
+                }
+                if env.split {
+                    if let Some(p) = self.def_pos.get(&rd.name) {
+                        b = at_pos(p, b);
+                    }
                 }
                 self.unroll += 1;
                 let r = self.gen_action(&with(vec![Label(rd.name.clone(), args.clone(), b.b())]), &env2, out);
@@ -4507,7 +4521,92 @@ impl<'a> Gen<'a> {
     }
 
     pub fn env_next() -> Env {
-        Env::default()
+        Env { split: true, ..Default::default() }
+    }
+
+    /// The next-state relation split into actions as TLC splits it (`Tool.getActions`, measured
+    /// on TLC 2.19): through `\/`, `\E` over sets that do not depend on the state, labels, and
+    /// calls of definitions whose arguments do not depend on the state, except a definition of an
+    /// INSTANCE with substitutions, which stays whole. Where splitting stops is an action, named
+    /// in a trace by the innermost definition called (`Action` if none) and the position of the
+    /// innermost part with a POS label, as `Name line L, col C to line L2, col C2 of module M`.
+    /// Returns false for `\/`, `\E` and recursive calls that gen_action goes on splitting.
+    fn gen_split(&mut self, h: &Expr, rest: &[Expr], env: &Env, out: &mut String) -> R<bool> {
+        use Expr::*;
+        let with = |x: &Expr| -> Vec<Expr> { std::iter::once(x.clone()).chain(rest.iter().cloned()).collect() };
+        let open = env.primed.len() < self.vars.len();
+        let mut env2 = env.clone();
+        match h {
+            Label(n, _, b) if pos_of(n).is_some() => {
+                env2.apos = pos_of(n).map(|p| p.to_string());
+                self.gen_action(&with(b), &env2, out)?;
+                return Ok(true);
+            }
+            Label(_, _, b) if h.is_user_label() => {
+                self.gen_action(&with(b), env, out)?;
+                return Ok(true);
+            }
+            Label(n, args, b) if !n.starts_with('#') && n != "<<>>_" && !self.whole_instance(n) => {
+                env2.aname = Some(self.action_name(n));
+                // Called with an argument from the state: the call is the action (named by the
+                // definition called, at the position of the call)
+                if !args.iter().any(|a| self.mentions_state(a)) {
+                    self.gen_action(&with(b), &env2, out)?;
+                    return Ok(true);
+                }
+            }
+            Or(_) if open => return Ok(false),
+            Quant(true, bs, _) if open && !bs.iter().any(|(_, s)| self.mentions_state(s)) => return Ok(false),
+            RecCall(i, args) => {
+                let state = args.iter().any(|a| self.mentions_state(a));
+                if !state && open && self.rec_assigns(*i, env) && args.iter().all(|a| self.try_const(a, env).is_some()) {
+                    return Ok(false);
+                }
+                let rd = crate::expand::rec_def(*i);
+                env2.aname = Some(self.action_name(&rd.name));
+                // Arguments bound by a split \E are constants to TLC but not here: TLC would
+                // split the body further, which is not followed
+                if !state {
+                    if let Some(p) = self.def_pos.get(&rd.name) {
+                        env2.apos = Some(p.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        let name = env2.aname.as_deref().unwrap_or("Action");
+        let label = match &env2.apos {
+            Some(p) => format!("{name} {p}"),
+            None => name.to_string(),
+        };
+        env2.label = Some(self.label_id(&label));
+        env2.split = false;
+        self.gen_action(&with(&strip_pos(h)), &env2, out)?;
+        Ok(true)
+    }
+
+    /// Whether `e` depends on the state (has level 1 or more for SANY)
+    fn mentions_state(&self, e: &Expr) -> bool {
+        e.any(&|x| {
+            matches!(x, Expr::Ident(n) if self.is_var(n))
+                || matches!(x, Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled, _) | Expr::BoxAction(..))
+        })
+    }
+
+    /// Whether `n` is the hidden definition of an INSTANCE with substitutions, which TLC does not
+    /// split (a SubstInNode)
+    fn whole_instance(&self, n: &str) -> bool {
+        self.inst_prefixes.iter().any(|(p, _, subs)| *subs > 0 && n.starts_with(p.as_str()))
+    }
+
+    /// The name TLC gives the definition called `n`
+    fn action_name(&self, n: &str) -> String {
+        for (p, shown, _) in &self.inst_prefixes {
+            if let Some(op) = n.strip_prefix(p.as_str()) {
+                return format!("{shown}{op}");
+            }
+        }
+        n.to_string()
     }
 
     // ---------------------------------------------------------------- Helpers

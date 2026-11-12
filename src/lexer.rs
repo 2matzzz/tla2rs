@@ -23,6 +23,8 @@ pub struct Token {
     pub col: usize,
     /// Whether this is the first token on its line
     pub first: bool,
+    /// The column just after the token (tokens do not span lines)
+    pub end: usize,
 }
 
 const SYMS: &[&str] = &[
@@ -231,7 +233,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                 for _ in 0..4 {
                     adv!();
                 }
-                out.push(Token { tok: Tok::Sym("-+->".into()), line: tl, col: tc, first });
+                out.push(Token { tok: Tok::Sym("-+->".into()), line: tl, col: tc, first, end: col });
                 line_has_tok = true;
                 continue;
             }
@@ -242,7 +244,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                     adv!();
                 }
                 let name = if rest == "(+)" { "\\oplus" } else { "\\ominus" };
-                out.push(Token { tok: Tok::Sym(name.into()), line: tl, col: tc, first });
+                out.push(Token { tok: Tok::Sym(name.into()), line: tl, col: tc, first, end: col });
                 line_has_tok = true;
                 continue;
             }
@@ -262,13 +264,13 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
             depth -= 1;
         }
         let end = module && tok == Tok::Sym("====".into()) && depth <= 0;
-        out.push(Token { tok, line: tl, col: tc, first });
+        out.push(Token { tok, line: tl, col: tc, first, end: col });
         line_has_tok = true;
         if end {
             break;
         }
     }
-    out.push(Token { tok: Tok::Eof, line, col: 0, first: true });
+    out.push(Token { tok: Tok::Eof, line, col: 0, first: true, end: 0 });
     Ok(out)
 }
 
