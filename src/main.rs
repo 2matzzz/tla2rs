@@ -26,6 +26,7 @@ mod live;
 mod ltl;
 mod metal;
 mod parser;
+mod ppr;
 mod runtime;
 mod seqlen;
 mod trace;

@@ -14,7 +14,7 @@ commit 334c3983a2f44ac78fce89d1d20aa79ceb3e6987
 skip specifications/Bakery-Boulangerie/MCBakery.tla specifications/Bakery-Boulangerie/MCBakery.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Bakery-Boulangerie/MCBoulanger.tla specifications/Bakery-Boulangerie/MCBoulanger.cfg # needs module TLAPS, not in tla2tools.jar
 check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg
-gap specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg # TLC breaks a value wider than 80 columns that PrintT prints over several lines; tla2rs prints it on one line
+check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg
 skip specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/Chameneos/Chameneos.tla specifications/Chameneos/Chameneos.cfg
 skip specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordination.cfg # TLC 2.19 did not finish in 150 s with one worker
@@ -127,7 +127,7 @@ skip specifications/SpecifyingSystems/AsynchronousInterface/APAsynchInterface.tl
 skip specifications/SpecifyingSystems/AsynchronousInterface/APChannel.tla specifications/SpecifyingSystems/AsynchronousInterface/APChannel.cfg # symbolic mode: checked with Apalache
 check specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg
 check specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg
-gap specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.tla specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.cfg # TLC breaks a value wider than 80 columns that PrintT prints over several lines; tla2rs prints it on one line
+check specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.tla specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.cfg
 gap specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.tla specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.cfg # a variable holds records and model values in one function; tla2rs has no type for that
 gap specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
 skip specifications/SpecifyingSystems/Composing/APChannel.tla specifications/SpecifyingSystems/Composing/APChannel.cfg # symbolic mode: checked with Apalache

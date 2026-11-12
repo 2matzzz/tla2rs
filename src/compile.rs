@@ -795,7 +795,8 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
     let r = ce.eval(e, &HashMap::new());
     let lines = PRINTED.with(|p| p.borrow_mut().take()).unwrap_or_default();
     for l in lines {
-        out.push(l.iter().map(|v| show_value(ce.atoms, v)).collect::<Vec<_>>().join("  "));
+        // TLC pretty-prints each value printed (80 columns)
+        out.push(l.iter().map(|v| crate::ppr::ppr(&show_value(ce.atoms, v))).collect::<Vec<_>>().join("  "));
     }
     r
 }
@@ -1332,6 +1333,7 @@ fn compile_inner(
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
     src += &crate::lasso::template(&m, &cfg, &written);
     src += crate::runtime::RUNTIME;
+    src += crate::runtime::PPR;
     src += crate::runtime::LIVENESS_RT;
     Ok(Output { rust: src, warnings, rejected: None })
 }

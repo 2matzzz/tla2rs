@@ -2114,7 +2114,7 @@ impl<'a> Gen<'a> {
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;
-                    (format!("{{ println!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
+                    (format!("{{ println!(\"{{}}\", ppr(&fmt_{id}(&{c}))); true }}"), Ty::Bool)
                 }
                 // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
@@ -2122,7 +2122,7 @@ impl<'a> Gen<'a> {
                     let id = self.ty_id(&t)?;
                     let (vc, vt) = self.gen(v, env, want)?;
                     let vid = self.ty_id(&vt)?;
-                    (format!("{{ let __x = {c}; let __v = {vc}; println!(\"{{}}  {{}}\", fmt_{id}(&__x), fmt_{vid}(&__v)); __v }}"), vt)
+                    (format!("{{ let __x = {c}; let __v = {vc}; println!(\"{{}}  {{}}\", ppr(&fmt_{id}(&__x)), ppr(&fmt_{vid}(&__v))); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int(a, env)?;
