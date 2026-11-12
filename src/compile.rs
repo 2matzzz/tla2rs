@@ -1093,9 +1093,10 @@ fn compile_inner(
                     // leaves the variable's type to inference, which stops the search where a value
                     // leaves the type inferred
                     if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
+                        // Packing checks the element type of a bounded sequence, not its length,
+                        // nor which records and model values a mixed set lists
+                        taken = bounded_seq(s).is_none() && !crate::types::mixes_atoms(&t);
                         decl.insert(v.clone(), t);
-                        // Packing checks the element type of a bounded sequence, not its length
-                        taken = bounded_seq(s).is_none();
                     }
                 }
                 if !taken {
@@ -1111,8 +1112,8 @@ fn compile_inner(
                 let mut taken = false;
                 if let Expr::Ident(v) = v.strip() {
                     if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
+                        taken = !crate::types::mixes_atoms(&t);
                         decl.insert(v.clone(), Ty::Set(t.into()));
-                        taken = true;
                     }
                 }
                 if !taken {

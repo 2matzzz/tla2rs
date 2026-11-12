@@ -1535,6 +1535,11 @@ impl<'a> Gen<'a> {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
+            // A model value among records (see types::ATOM_FIELD)
+            (Value::Atom(a), Ty::Rec(fs)) if crate::types::has_atoms(fs) => {
+                let m = [(crate::types::ATOM_FIELD.to_string(), Value::Atom(*a))].into_iter().collect();
+                return self.lit(&Value::Rec(m), t);
+            }
             (Value::Atom(a), _) => format!("{a}u16"),
             (v, Ty::PFun(..) | Ty::Bag(_)) if is_sparse_fun(t) && crate::value::as_fun(v).is_some() => {
                 self.ty_id(t)?;
@@ -1674,6 +1679,17 @@ impl<'a> Gen<'a> {
             return Ok(format!("{{ let __u: {} = {{ let _ = {code}; unreachable!() }}; __u }}", to.repr()));
         }
         match (from, to) {
+            // A model value as a value that is a record or a model value (see types::ATOM_FIELD)
+            (Ty::Enum(_), Ty::Rec(fs)) if crate::types::has_atoms(fs) => {
+                let mut parts = vec![];
+                for (n, ft) in fs {
+                    parts.push(match ft {
+                        Ty::Opt(inner) if n == crate::types::ATOM_FIELD => format!("(true, {})", self.coerce(code.clone(), from, inner)?),
+                        ft => Self::default_code(ft),
+                    });
+                }
+                Ok(rec_build(&parts))
+            }
             // The function over the empty set, built as the empty record (its domain has no
             // element, so the record of no fields is the same value)
             (Ty::Rec(a), Ty::Fun(d, _) | Ty::PFun(d, _)) if a.is_empty() && d.size() == Some(0) => {
@@ -3773,16 +3789,18 @@ impl<'a> Gen<'a> {
             if fits.is_empty() {
                 return Ok("false".into());
             }
-            if fits.len() <= 8 || !xt.is_scalar() {
-                let parts: Vec<String> =
-                    fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
-                return Ok(format!("({})", parts.join(" || ")));
-            }
             let Ty::Set(mut et) = ty_of_value(&v)? else { unreachable!() };
             if narrows(xt, &et) {
                 et = join(xt, &et)?.into();
             }
             let st = Ty::Set(et.clone());
+            // Element by element, also for a set of more than 128 possible elements (records of
+            // different fields), which would be an array of limited capacity
+            if fits.len() <= 8 || !xt.is_scalar() || is_sparse(&st) {
+                let parts: Vec<String> =
+                    fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
+                return Ok(format!("({})", parts.join(" || ")));
+            }
             let mask = self.lit(&v, &st)?;
             let eid = self.ty_id(&et)?;
             let xc = self.coerce(x.to_string(), xt, &et)?;
@@ -5048,6 +5066,13 @@ impl<'a> Gen<'a> {
                     let mut b = String::from("let mut ps: Vec<String> = vec![]; ");
                     for (k, (name, ft)) in fs.iter().enumerate() {
                         let fp = rec_field(fs.len(), k);
+                        if name == crate::types::ATOM_FIELD {
+                            // A model value (see types::ATOM_FIELD)
+                            let Ty::Opt(inner) = ft else { unreachable!() };
+                            let fid = self.ty_id(inner)?;
+                            write!(b, "if v{fp}.0 {{ return fmt_{fid}(&v{fp}.1); }} ").unwrap();
+                            continue;
+                        }
                         match ft {
                             Ty::Opt(inner) => {
                                 let fid = self.ty_id(inner)?;

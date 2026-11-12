@@ -128,7 +128,7 @@ skip specifications/SpecifyingSystems/AsynchronousInterface/APChannel.tla specif
 check specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg
 check specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg
 check specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.tla specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.cfg
-gap specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.tla specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+check specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.tla specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.cfg
 gap specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
 skip specifications/SpecifyingSystems/Composing/APChannel.tla specifications/SpecifyingSystems/Composing/APChannel.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/Composing/APHourClock.tla specifications/SpecifyingSystems/Composing/APHourClock.cfg # symbolic mode: checked with Apalache
@@ -144,7 +144,7 @@ check specifications/SpecifyingSystems/HourClock/HourClock2.tla specifications/S
 skip specifications/SpecifyingSystems/Liveness/APHourClock.tla specifications/SpecifyingSystems/Liveness/APHourClock.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/Liveness/APLiveHourClock.tla specifications/SpecifyingSystems/Liveness/APLiveHourClock.cfg # symbolic mode: checked with Apalache
 check specifications/SpecifyingSystems/Liveness/LiveHourClock.tla specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg
-gap specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+check specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg
 gap specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
 check specifications/SpecifyingSystems/RealTime/MCRealTimeHourClock.tla specifications/SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg
 check specifications/SpecifyingSystems/SimpleMath/SimpleMath.tla specifications/SpecifyingSystems/SimpleMath/SimpleMath.cfg
