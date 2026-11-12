@@ -20,6 +20,9 @@ pub struct Parser {
     let_instances: Vec<Instance>,
     /// The name of the module being parsed (for POS labels)
     module: String,
+    /// A prefix operator (`[]`, `<>`, ENABLED, UNCHANGED) whose operand is being parsed: SANY
+    /// refuses a postfix operator on that operand (`[]x'`)
+    postfix_guard: Option<&'static str>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -50,88 +53,10 @@ pub fn parse_module(src: &str) -> R<Module> {
     // reads them: binary and left-associative. Only then are they kept so (see INFIX_JUNCTION)
     let positional = toks.windows(2).any(|w| matches!(&w[0].tok, Tok::Sym(b) if b == "!") && is_selector(&w[1].tok));
     NEST_JUNCTIONS.with(|n| n.set(positional));
-    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new() };
+    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new(), postfix_guard: None };
     let r = p.module();
     NEST_JUNCTIONS.with(|n| n.set(false));
-    let m = r?;
-    check_bound_names(&m)?;
-    Ok(m)
-}
-
-/// SANY refuses a bound variable, operator parameter or LET definition named like a symbol in
-/// scope: a CONSTANT or VARIABLE of the module, a definition before it, Nat or Int from the
-/// standard modules extended, or an enclosing bound variable (also one in the same quantifier).
-/// Names from other modules the spec extends are not checked.
-fn check_bound_names(m: &Module) -> R<()> {
-    fn bind(x: &str, scope: &mut Vec<String>) -> R<()> {
-        if !x.contains('#') && scope.iter().any(|y| y == x) {
-            return Err(format!("{SANY}Multiply-defined symbol '{x}': this definition or declaration conflicts with another one in scope."));
-        }
-        scope.push(x.to_string());
-        Ok(())
-    }
-    fn walk(e: &Expr, scope: &[String]) -> R<()> {
-        use Expr::*;
-        let mut inner = scope.to_vec();
-        match e {
-            Quant(_, bs, body) | SetMap(body, bs) => {
-                for (_, s) in bs {
-                    walk(s, scope)?;
-                }
-                for (x, _) in bs {
-                    bind(x, &mut inner)?;
-                }
-                walk(body, &inner)
-            }
-            Choose(x, s, p) | SetFilter(x, s, p) | FunCons(x, s, p) => {
-                walk(s, scope)?;
-                bind(x, &mut inner)?;
-                walk(p, &inner)
-            }
-            Let(defs, body) => {
-                // A LET definition is in scope after its own body (`LET i == CHOOSE i \in S : P`)
-                for d in defs {
-                    let mut ps = inner.clone();
-                    for p in &d.params {
-                        bind(p, &mut ps)?;
-                    }
-                    walk(&d.body, &ps)?;
-                    bind(&d.name, &mut inner)?;
-                }
-                walk(body, &inner)
-            }
-            Lambda(ps, body) => {
-                for p in ps {
-                    bind(p, &mut inner)?;
-                }
-                walk(body, &inner)
-            }
-            e => e.children().into_iter().try_for_each(|c| walk(c, scope)),
-        }
-    }
-    let mut scope: Vec<String> = m.constants.iter().chain(&m.variables).cloned().collect();
-    scope.extend(m.op_constants.iter().map(|(n, _)| n.clone()));
-    let ext = |n: &[&str]| m.extends.iter().any(|e| n.contains(&e.as_str()));
-    if ext(&["Naturals", "Integers", "Reals"]) {
-        scope.push("Nat".into());
-    }
-    if ext(&["Integers", "Reals"]) {
-        scope.push("Int".into());
-    }
-    for d in &m.defs {
-        let mut ps = scope.clone();
-        for p in &d.params {
-            bind(p, &mut ps)?;
-        }
-        walk(&d.body, &ps)?;
-        if !scope.contains(&d.name) {
-            scope.push(d.name.clone());
-        }
-    }
-    for a in &m.assumes {
-        walk(&a.expr, &scope)?;
-    }
-    m.nested.iter().try_for_each(check_bound_names)
+    r
 }
 
 /// Whether a token after `!` starts a positional subexpression selector
@@ -239,6 +164,13 @@ fn sany_range(op: &str) -> Option<(u8, u8, bool)> {
         "*" | "**" | "\\o" | "&&" | "&" | "\\otimes" | "\\odot" | "\\star" | "\\bullet" | "\\bigcirc" => (13, 13, true),
         "\\div" | "//" | "\\oslash" => (13, 13, false),
         "^" | "^^" => (14, 14, false),
+        // Prefix operators, as SANY treats them (measured on SANY 2.19): unary minus, and the
+        // temporal ones, ENABLED and UNCHANGED, as in the TLA+ table; SUBSET, UNION and DOMAIN
+        // as if their range were 10-13 (`SUBSET a + b` is refused, `SUBSET 1..2` is
+        // `(SUBSET 1)..2`, `SUBSET a \cup b` is `(SUBSET a) \cup b`)
+        "-." => (12, 12, false),
+        "[]" | "<>" | "ENABLED" | "UNCHANGED" => (4, 15, false),
+        "SUBSET" | "UNION" | "DOMAIN" => (10, 13, false),
         _ => return None,
     })
 }
@@ -552,6 +484,7 @@ impl Parser {
                 Tok::Sym(s) if s == "----" => self.pos += 1,
                 Tok::Ident(k) if k == "MODULE" => {
                     let inner = self.module()?;
+                    m.units.push(Unit::Nested(m.nested.len()));
                     m.nested.push(inner);
                 }
                 Tok::Ident(k) if k == "EXTENDS" => {
@@ -564,12 +497,15 @@ impl Parser {
                         if n > 0 {
                             m.op_constants.push((c.clone(), n));
                         }
+                        m.units.push(Unit::Decl(c.clone()));
                         m.constants.push(c);
                     }
                 }
                 Tok::Ident(k) if k == "VARIABLE" || k == "VARIABLES" => {
                     self.pos += 1;
-                    m.variables.extend(self.ident_list()?);
+                    let vs = self.ident_list()?;
+                    m.units.extend(vs.iter().map(|v| Unit::Decl(v.clone())));
+                    m.variables.extend(vs);
                 }
                 // TLC checks ASSUME and ASSUMPTION, and skips THEOREM and AXIOM
                 Tok::Ident(k) if k == "ASSUME" || k == "ASSUMPTION" => {
@@ -587,7 +523,10 @@ impl Parser {
                     let (a, b) = (&self.toks[start], &self.toks[self.pos - 1]);
                     let span = (a.line, a.col + 1, b.line, b.col + tok_width(&b.tok));
                     if let Some(name) = named {
+                        m.units.push(Unit::Def(m.defs.len(), false));
                         m.defs.push(Def { name, params: vec![], arity: vec![], body: expr.clone() });
+                    } else {
+                        m.units.push(Unit::Assume(m.assumes.len()));
                     }
                     m.assumes.push(Assume { module: m.name.clone(), expr, span });
                 }
@@ -597,6 +536,7 @@ impl Parser {
                         let at = |p: &Self, k: usize| p.toks[(p.pos + k).min(p.toks.len() - 1)].tok.clone();
                         if let (Tok::Ident(n), Tok::Sym(eq)) = (at(self, 1), at(self, 2)) {
                             if eq == "==" {
+                                m.units.push(Unit::Theorem(n.clone()));
                                 let save = self.pos;
                                 self.pos += 3;
                                 if let Ok(e) = self.expr(0) {
@@ -613,6 +553,8 @@ impl Parser {
                     self.pos += 1;
                     let mut inst = self.instance(None, vec![], vec![])?;
                     inst.at = self.span_text(start, self.pos - 1);
+                    let local = start > 0 && matches!(&self.toks[start - 1].tok, Tok::Ident(l) if l == "LOCAL");
+                    m.units.push(Unit::Inst(m.instances.len(), local));
                     m.instances.push(inst);
                 }
                 Tok::Ident(k) if k == "LOCAL" => {
@@ -626,13 +568,26 @@ impl Parser {
                 Tok::Ident(k) if k == "RECURSIVE" => {
                     self.pos += 1;
                     for (n, _) in self.ident_list_arity()? {
+                        m.units.push(Unit::Recursive(n.clone()));
                         self.recursive.push(n);
                     }
                 }
-                Tok::Ident(_) => match self.def()? {
-                    Ok(d) => m.defs.extend(d),
-                    Err(inst) => m.instances.push(inst),
-                },
+                Tok::Ident(_) => {
+                    let fun = matches!(self.peek2(), Tok::Sym(b) if b == "[");
+                    let local = self.pos > 0 && matches!(&self.toks[self.pos - 1].tok, Tok::Ident(l) if l == "LOCAL");
+                    match self.def()? {
+                        Ok(d) => {
+                            for d in d {
+                                m.units.push(Unit::Def(m.defs.len(), fun));
+                                m.defs.push(d);
+                            }
+                        }
+                        Err(inst) => {
+                            m.units.push(Unit::Inst(m.instances.len(), local));
+                            m.instances.push(inst);
+                        }
+                    }
+                }
                 _ => return self.err("unexpected token at module level"),
             }
         }
@@ -909,7 +864,7 @@ impl Parser {
     /// operator it is the right operand of
     fn expr_in(&mut self, min: u8, parent: Option<&'static str>) -> R<Expr> {
         let lhs_start = self.pos;
-        let mut lhs = self.prefix()?;
+        let mut lhs = self.prefix(parent)?;
         let mut prev: Option<&'static str> = None;
         // Whether lhs is a disjunction built in this loop (its operands are in POS labels)
         let mut chain_or = false;
@@ -1075,7 +1030,22 @@ impl Parser {
         Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind} {at}"), vec![])))
     }
 
-    fn prefix(&mut self) -> R<Expr> {
+    /// The operand of the prefix operator `op` (by its name in `sany_range`), parsed at
+    /// precedence `min`. SANY refuses an infix operator whose range overlaps op's right after it,
+    /// inside the operand (`[]x = 1`, `ENABLED x' = 1`) or after it (`-a \X b`)
+    fn prefix_operand(&mut self, op: &'static str, min: u8) -> R<Expr> {
+        let e = self.expr_in(min, Some(op))?;
+        if let Some((_, _, next)) = infix(self.peek()) {
+            if precedence_conflict(op, next) {
+                return self.err(&format!("{SANY}Precedence conflict between ops {op} and {next}."));
+            }
+        }
+        Ok(e)
+    }
+
+    /// `parent` is the infix operator whose right operand this is
+    fn prefix(&mut self, parent: Option<&'static str>) -> R<Expr> {
+        let guard = self.postfix_guard.take();
         let t = self.peek().clone();
         match &t {
             Tok::Sym(s) if s == "/\\" || s == "\\/" => self.bullets(&s.clone()),
@@ -1084,20 +1054,27 @@ impl Parser {
                 Ok(Expr::Un(UOp::Not, self.expr(4)?.b()))
             }
             Tok::Sym(s) if s == "-" => {
+                // SANY refuses unary minus as the operand of an operator that binds tighter
+                // (`a * -b`, `a ^ -b`)
+                if let Some(p) = parent.filter(|p| sany_range(p).is_some_and(|(lo, _, _)| lo > 12)) {
+                    return self.err(&format!("{SANY}Precedence conflict between ops {p} and -."));
+                }
                 self.pos += 1;
-                Ok(Expr::Un(UOp::Neg, self.expr(12)?.b()))
+                Ok(Expr::Un(UOp::Neg, self.prefix_operand("-.", 12)?.b()))
             }
             // In an AT label: TLC names a part of a property, such as `[]P` checked as an
             // invariant, by its position
             Tok::Sym(s) if s == "[]" => {
                 let start = self.pos;
                 self.pos += 1;
-                let e = Expr::Un(UOp::Always, self.expr(4)?.b());
+                self.postfix_guard = Some("[]");
+                let e = Expr::Un(UOp::Always, self.prefix_operand("[]", 4)?.b());
                 Ok(at_err(&self.span_text(start, self.pos - 1), e))
             }
             Tok::Sym(s) if s == "<>" => {
                 self.pos += 1;
-                Ok(Expr::Un(UOp::Eventually, self.expr(4)?.b()))
+                self.postfix_guard = Some("<>");
+                Ok(Expr::Un(UOp::Eventually, self.prefix_operand("<>", 4)?.b()))
             }
             // \EE x : e and \AA x : e (temporal quantifiers)
             Tok::Sym(s) if s == "\\EE" || s == "\\AA" => {
@@ -1130,17 +1107,18 @@ impl Parser {
             Tok::Ident(k) => match k.as_str() {
                 "SUBSET" | "UNION" | "DOMAIN" => {
                     self.pos += 1;
-                    let op = match k.as_str() {
-                        "SUBSET" => UOp::Subset,
-                        "UNION" => UOp::Union,
-                        _ => UOp::Domain,
+                    let (op, name) = match k.as_str() {
+                        "SUBSET" => (UOp::Subset, "SUBSET"),
+                        "UNION" => (UOp::Union, "UNION"),
+                        _ => (UOp::Domain, "DOMAIN"),
                     };
-                    Ok(Expr::Un(op, self.expr(9)?.b()))
+                    Ok(Expr::Un(op, self.prefix_operand(name, 14)?.b()))
                 }
                 "UNCHANGED" | "ENABLED" => {
                     self.pos += 1;
-                    let op = if k == "UNCHANGED" { UOp::Unchanged } else { UOp::Enabled };
-                    Ok(Expr::Un(op, self.expr(15)?.b()))
+                    let (op, name) = if k == "UNCHANGED" { (UOp::Unchanged, "UNCHANGED") } else { (UOp::Enabled, "ENABLED") };
+                    self.postfix_guard = Some(name);
+                    Ok(Expr::Un(op, self.prefix_operand(name, 15)?.b()))
                 }
                 "IF" => {
                     self.pos += 1;
@@ -1243,15 +1221,25 @@ impl Parser {
                     };
                     Ok(at_err(&self.span_text(start, self.pos - 1), Expr::Choose(x, s.b(), p.b())))
                 }
-                _ => self.postfix(),
+                _ => {
+                    self.postfix_guard = guard;
+                    self.postfix()
+                }
             },
-            _ => self.postfix(),
+            _ => {
+                self.postfix_guard = guard;
+                self.postfix()
+            }
         }
     }
 
     fn postfix(&mut self) -> R<Expr> {
+        let guard = self.postfix_guard.take();
         let mut e = self.primary()?;
         loop {
+            if let (Some(p), Some(op)) = (guard, ["'", "^+", "^*", "^#"].iter().find(|o| self.is(o))) {
+                return self.err(&format!("{SANY}Precedence conflict between ops {p} and {op}."));
+            }
             // The postfix operators a spec may define (a ^+ == ...)
             if let Some(op) = ["^+", "^*", "^#"].iter().find(|o| self.is(o)) {
                 self.pos += 1;

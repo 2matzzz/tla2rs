@@ -329,6 +329,11 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     if depth > 16 {
         return Err("EXTENDS nests too deeply".into());
     }
+    // A nested module is checked with the module it is nested in, where it sees the names
+    // defined before it (see `sany.rs`)
+    let nested = NESTED.with(|n| n.borrow().contains_key(&m.name));
+    let to_check = (!nested).then(|| m.clone());
+    let m = if depth > 0 { hide_locals(m) } else { m };
     NESTED.with(|n| {
         for inner in &m.nested {
             n.borrow_mut().insert(inner.name.clone(), inner.clone());
@@ -364,7 +369,6 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
             }
         }
     }
-    missing_std_ops(&m, &out)?;
     out.op_constants.extend(m.op_constants);
     out.recursive.extend(m.recursive);
     out.constants.extend(m.constants);
@@ -375,37 +379,53 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     for inst in &m.instances {
         instantiate(&mut out, inst, dir, warnings, depth)?;
     }
+    if let Some(m) = to_check {
+        crate::sany::check(&m)?;
+    }
     Ok(out)
 }
 
-/// SANY refuses an operator of a standard module that the module does not extend (directly or
-/// through the modules it extends, whose standard modules are in `ext.extends`): unary minus
-/// without Integers, `:>` and `@@` without TLC (unless the spec defines them). The standard
-/// modules other than Integers, Reals and Bags instantiate theirs LOCALly, which exports nothing.
-fn missing_std_ops(m: &Module, ext: &Module) -> R<()> {
-    let has = |n: &str| ext.extends.iter().any(|e| e == n);
-    let defined = |n: &str| m.defs.iter().chain(&ext.defs).any(|d| d.name == n);
-    let mut missing = vec![];
-    if !has("Integers") && !has("Reals") {
-        missing.push(("-.", Expr::Un(UOp::Neg, Expr::Bool(true).b())));
+/// A module read for EXTENDS or INSTANCE with its LOCAL definitions renamed, so that they do not
+/// meet definitions of the same name in the module that reads it, where they are not in scope
+/// (SANY accepts such a name there)
+fn hide_locals(mut m: Module) -> Module {
+    if m.local_defs.is_empty() {
+        return m;
     }
-    for op in [":>", "@@"] {
-        // Bags extends TLC
-        if !has("TLC") && !has("Bags") && !defined(op) {
-            missing.push((op, Expr::Call(op.into(), vec![])));
+    let locals: HashSet<String> = m.local_defs.iter().cloned().collect();
+    let prefix = format!("{}#local#", m.name);
+    fn rn(e: &Expr, locals: &HashSet<String>, prefix: &str) -> Expr {
+        match e {
+            Expr::Ident(n) if locals.contains(n) => Expr::Ident(format!("{prefix}{n}")),
+            Expr::Call(n, a) if locals.contains(n) => Expr::Call(format!("{prefix}{n}"), a.iter().map(|x| rn(x, locals, prefix)).collect()),
+            Expr::Let(ds, b) => Expr::Let(
+                ds.iter().map(|d| Def { body: rn(&d.body, locals, prefix), ..d.clone() }).collect(),
+                rn(b, locals, prefix).b(),
+            ),
+            _ => crate::codegen::map_children(e, &|c| rn(c, locals, prefix)),
         }
     }
-    let same = |x: &Expr, pat: &Expr| match (x, pat) {
-        (Expr::Un(UOp::Neg, _), Expr::Un(UOp::Neg, _)) => true,
-        (Expr::Call(a, args), Expr::Call(b, _)) => a == b && args.len() == 2,
-        _ => false,
-    };
-    for e in m.defs.iter().map(|d| &d.body).chain(m.assumes.iter().map(|a| &a.expr)) {
-        if let Some((op, _)) = missing.iter().find(|(_, pat)| e.any(&|x| same(x, pat))) {
-            return Err(format!("{}Could not find declaration or definition of symbol '{op}' in module {}.", crate::lexer::SANY, m.name));
+    for d in &mut m.defs {
+        if locals.contains(&d.name) {
+            d.name = format!("{prefix}{}", d.name);
+        }
+        d.body = rn(&d.body, &locals, &prefix);
+    }
+    for a in &mut m.assumes {
+        a.expr = rn(&a.expr, &locals, &prefix);
+    }
+    for i in &mut m.instances {
+        for (_, e) in &mut i.subs {
+            *e = rn(e, &locals, &prefix);
         }
     }
-    Ok(())
+    for r in &mut m.recursive {
+        if locals.contains(r) {
+            *r = format!("{prefix}{r}");
+        }
+    }
+    m.local_defs = m.local_defs.iter().map(|n| format!("{prefix}{n}")).collect();
+    m
 }
 
 /// Whether `name` is a standard module that tla2rs provides itself (an error for the standard
@@ -763,7 +783,12 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
             }
         };
         if out.defs.iter().any(|x| x.name == name) {
-            return Err(format!("INSTANCE {mname}: `{name}` is defined both here and in {mname}"));
+            // The module's own definition when the module has no constants or variables (it is
+            // also extended, or instantiated twice): SANY accepts that (see `sany.rs`)
+            if params.is_empty() && inst.name.is_none() {
+                continue;
+            }
+            return Err(format!("{}Multiple declarations or definitions for symbol {name}.", crate::lexer::SANY));
         }
         out.defs.push(Def { name, params, arity, body });
     }
@@ -948,6 +973,11 @@ fn compile_inner(
             return Err(last_err);
         }
         pending = left;
+    }
+
+    // SANY checks the subexpression names in every definition, used or not
+    for e in m.defs.iter().map(|d| &d.body).chain(m.assumes.iter().map(|a| &a.expr)) {
+        ex.check_subexprs(e)?;
     }
 
     // SANY checks the level rules of temporal formulas in every definition, used or not (a

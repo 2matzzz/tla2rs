@@ -29,6 +29,7 @@ mod parser;
 mod pcal;
 mod ppr;
 mod runtime;
+mod sany;
 mod seqlen;
 mod trace;
 mod types;
