@@ -7,6 +7,8 @@ It has no crate dependencies.
 
 - `cargo build --release` builds the compiler (`target/release/tla2rs`)
 - `target/release/tla2rs Spec.tla [-config X.cfg] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR] [--emit-only] [-o DIR]`
+  - `-setcap` / `-seqcap` only set where the capacities of sets held as arrays and of sequences start; a value that
+    outgrows one makes tla2rs build the checker again with twice the room (see "Capacities")
   - The generated crate goes to `<spec dir>/.tla2rs/<cfg name>/` by default; it is built with
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, `-dumpgraph`, `-lassocheck` and
@@ -21,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 583 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 585 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -56,7 +58,7 @@ It has no crate dependencies.
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
 | `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first) |
-| `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A value that is a record or a model value (`[op : S] \cup {NoVal}`) is a record type whose fields are all optional, with the model values in a field of its own (`ATOM_FIELD`); a type invariant giving such a type is checked on every state, since packing does not check which records it lists. A value that is a model value or a value of another kind (a sequence, tuple, set, function, bag or boolean: `Seq(S) \cup {NoVal}`, `SUBSET P \cup P`) is such a record type too, with that value in a field of its own (`VAL_FIELD`, named to sort before `ATOM_FIELD`, so model values come first as in TLC); an operation that takes the value apart (application, DOMAIN, iteration, set operations, Cardinality, the sequence operators) takes it out of that field (`Gen::gen_val`), and fails on a model value. A record type with optional fields of at most 4096 values is numbered in TLC's order of records (`tlc_perm`: the number of fields first), so sets of such records print, CHOOSE and enumerate as in TLC. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element); functions over different domains (other than 1..n, which are sequences) join into one. Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
+| `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A value that is a record or a model value (`[op : S] \cup {NoVal}`) is a record type whose fields are all optional, with the model values in a field of its own (`ATOM_FIELD`); a type invariant giving such a type is checked on every state, since packing does not check which records it lists. A value that is a model value or a value of another kind (a sequence, tuple, set, function, bag or boolean: `Seq(S) \cup {NoVal}`, `SUBSET P \cup P`) is such a record type too, with that value in a field of its own (`VAL_FIELD`, named to sort before `ATOM_FIELD`, so model values come first as in TLC); an operation that takes the value apart (application, DOMAIN, iteration, set operations, Cardinality, the sequence operators) takes it out of that field (`Gen::gen_val`), and fails on a model value. A record type with optional fields of at most 4096 values is numbered in TLC's order of records (`tlc_perm`: the number of fields first), so sets of such records print, CHOOSE and enumerate as in TLC. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). An `SSet` holds at most SCAP elements, and never more than its element type has values (`set_cap`); both capacities grow at run time (see "Capacities"). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element); functions over different domains (other than 1..n, which are sequences) join into one. Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
 | `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). When the types from TypeOK fail in Init or Next (a module that extends another and adds a record field its type invariant lacks), the spec is compiled again with every type inferred (`INFER_ALL`). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
@@ -86,6 +88,43 @@ memory.
 The parts of a level beyond `-memlimit` spill to a temp file. The file is unlinked as soon as it is opened, so nothing is
 left behind even when the checker is killed. A failed read of the spilled queue is a fatal error: skipping it could turn
 an incomplete search into "no error".
+
+### Capacities
+
+A set held as an array (`SSet`, also the (key, value) pairs of a sparse function or bag) and a sequence (`Sq`) are
+fixed-size arrays, so that states stay `Copy` and pack at known widths; TLC has no such bound. Where they start:
+
+| | Starts at |
+|---|---|
+| SCAP (sets) | `-setcap N`, else 8; raised to `Cardinality(x) <= K` in TypeOK and to the size of the largest constant set Init assigns to a variable of such a set type (`set_cap_start`). A set type never gets more than its element type has values (`types::set_cap`, emitted as `set_cap(n)` in the checker) |
+| QCAP (sequences) | `-seqcap N` (at least the longest tuple literal), else one more than `Len(x) <= N` in TypeOK or a CONSTRAINT, else the longest length Init and Next reach when they settle (`seqlen.rs`), else the longest tuple literal if nothing grows sequences, else a length test anywhere in the spec plus 2, else 8 (`seq_cap`) |
+
+When a value outgrows its capacity (`capacity_exceeded` in the runtime, from `SSet::insert`, `SSet::put` and
+`seq_too_long`) and tla2rs runs the checker, the checker exits at once with 70 (sets) or 71 (sequences); tla2rs
+(`main.rs`) prints `tla2rs: a set grew beyond N elements; checking again from the start with room for 2N`, compiles
+with that capacity doubled, builds (the build cache applies) and runs again from the start. `TLA2RS_GROW` tells the
+checker which kinds may still grow (both stop at 65535, `types::MAX_CAP`); run directly, or at the maximum, the
+checker reports an evaluation error as before. Output before the line is repeated by the next run, so
+`crosscheck.sh` compares only what follows the last such line, and says how many rebuilds there were. A spec that
+stays within its capacities builds and runs exactly as before.
+
+Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
+
+| Model | Needed | Now |
+|---|---|---|
+| `MCCheckpointCoordinationFailure`, `ReadersWriters` `MC`, `AllocatorImplementation`, `AllocatorRefinement`, `SchedulingAllocator` | `-seqcap` 8, 6, 6, 6, 3 | No rebuild: sequences start at 8 |
+| `MCDisruptor_MPMC`, `-liveliness`, `MCDisruptor_SPMC` | `-seqcap 10` | 1 rebuild (16) |
+| `SlidingPuzzles` | `-setcap 64` | No rebuild: Init assigns a constant set of 10 |
+| `SimplifiedFastPaxos` `Paxos` | `-setcap 1024` | 5 rebuilds (256; its message set holds more than 128): about 30 s in all, but the search takes 0.5 s instead of 2.1 s with 1024 |
+| `tests/tlc/SubBags` | `-setcap 32` | 1 rebuild (16) |
+| `tests/tlc/LongSeq` | `-seqcap 140 -setcap 140` | Sequences settle at 140 (`seqlen.rs`); `DOMAIN q` takes 5 rebuilds (sets of `1..140`, capped at 140) |
+| `tests/tlc/SeqCap` | `-seqcap 3` | No rebuild: lengths settle |
+
+Not done, measured: starting SCAP at |T| for `x \subseteq T` in TypeOK with T constant would have raised it for 15
+configurations of `tests/tlc/` and 2 corpus models that run at 8 (to 36 to 5002; `RecMix` 5002, `SetsOfSets` 512)
+and widened every set held as an array there, and for `SlidingPuzzles` to 2^20. The bounds a spec implies by its logic (a queue that holds
+each process at most twice, the messages a protocol can send) are not derived: the Init/Next analysis of `seqlen.rs`
+covers sequence lengths only.
 
 ### TLC counts generated states per `\/` branch
 
@@ -462,14 +501,13 @@ modules, TLAPS), 35 that take longer (from the manifest's runtime, or measured),
 `ALIAS` section), and 2 where TLC picks values at random (two TLC runs differed). That leaves 98 selected.
 
 The cfgs of the corpus are not edited, so a line of the list gives what a `\* crosscheck:` line would: `rules=`
-(narrowing rules, passed as `CROSSCHECK_RULES`) and `rsargs=` (arguments for tla2rs only, `CROSSCHECK_RSARGS`; here
-`-seqcap` and `-setcap` where the spec bounds a sequence or set only by its logic). A selected model tla2rs does not
+(narrowing rules, passed as `CROSSCHECK_RULES`) and `rsargs=` (arguments for tla2rs only, `CROSSCHECK_RSARGS`; no
+model needs one now that capacities grow, see "Capacities"). A selected model tla2rs does not
 match is listed as `gap` with the reason measured; `corpus.sh` still runs it and says when it starts to match, and
 fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
 below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 95 match, of which 6 with `distinct-only` and 10
-with a bound for tla2rs. Only the generated count differs in those 6: TLC generates the same successor of a state
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 95 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
 more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
 with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
 states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
