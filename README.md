@@ -213,6 +213,9 @@ memory.
   compiles, other than a value, a set a quantifier ranges over or a set tested for membership (the condition of an
   IF, say), and the characters of a string taken apart into a tuple (`SelectSeq`, `SortSeq`, a string compared with a
   tuple) keep the order tla2rs meets them in
+- A set that TLC holds as an interval (`x = 1..3`) prints as `{1, 2, 3}`, where TLC prints `1..3` until an
+  operation enumerates it. Which form TLC prints depends on how the value was built (see CLAUDE.md, "State graphs"),
+  so the comparison with TLC reads an interval as the set it denotes
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
   it instead (`-lassocheck`)

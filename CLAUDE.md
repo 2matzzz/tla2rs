@@ -440,7 +440,15 @@ not the graphs. Reducing to it:
   variable assigned `1..3` prints as `1..3` until an operation turns it into an enumerated set, while tla2rs prints
   `{1, 2, 3}` (measured on the corpus's `DiningPhilosophers`). This applies to a variable printed on one line whose
   value fits in 80 columns once expanded, where TLC's pretty printer would also keep it on one line; a longer one is
-  kept as printed and then differs (no configuration has one)
+  kept as printed and then differs (no configuration has one). tla2rs does not print intervals as TLC does, because
+  the form depends on how the value was built, not on the value. Measured on TLC 2.19 (`tests/tlc/IntervalShow`):
+  `s = 1..3` prints `1..3` and, after `s' = {1, 2, 3}`, the same value prints `{1, 2, 3}`; a function built as `[i \in
+  1..2 |-> 1..i]` prints `<<1..1, 1..2>>`, and keeps `1..2` through an EXCEPT of the other entry; `s \cup {4}`
+  enumerates; an empty interval prints `{}`. A state graph labels each state by the first way it was reached. To
+  follow this, a checker would have to carry, for every set inside a state, whether TLC holds it as an interval,
+  outside the fingerprint and through every operation, while states are packed to fixed widths by type and sets of
+  integers are bit masks. Of the 671 configurations, only `IntervalShow` prints an interval (TLC's graphs and outputs
+  of all of them, searched), and of the corpus `DiningPhilosophers`
 
 Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
 are for the 483 configurations at the time of writing):
