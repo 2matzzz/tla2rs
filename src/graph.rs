@@ -59,8 +59,87 @@ pub fn canon_state_text(text: &str) -> String {
             _ => parts.push(line.to_string()),
         }
     }
+    let mut parts: Vec<String> = parts.iter().map(|p| intervals(p)).collect();
     parts.sort();
     empty_seqs(&parts.join("\n")).replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// TLC prints a set in the form it holds it, so a set built as `1..3` prints as `1..3` until an
+/// operation enumerates it, while a checker prints `{1, 2, 3}`. Both are the same value, so an
+/// interval outside strings becomes the set it denotes, in a conjunct printed on one line whose
+/// value still fits in TLC's 80 columns after that (TLC's pretty printer would leave it on one
+/// line). A conjunct that does not qualify is kept as printed, and then differs.
+fn intervals(part: &str) -> String {
+    if part.contains('\n') || !part.contains("..") {
+        return part.to_string();
+    }
+    let c: Vec<char> = part.chars().collect();
+    let mut o = String::with_capacity(part.len());
+    let (mut i, mut in_str) = (0, false);
+    let num = |j: usize| -> Option<(i64, usize)> {
+        let mut k = j;
+        if k < c.len() && c[k] == '-' {
+            k += 1;
+        }
+        let d = k;
+        while k < c.len() && c[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k == d {
+            return None;
+        }
+        c[j..k].iter().collect::<String>().parse().ok().map(|v| (v, k))
+    };
+    while i < c.len() {
+        if in_str {
+            if c[i] == '\\' && i + 1 < c.len() {
+                o.push(c[i]);
+                i += 1;
+            } else if c[i] == '"' {
+                in_str = false;
+            }
+            o.push(c[i]);
+            i += 1;
+            continue;
+        }
+        if c[i] == '"' {
+            in_str = true;
+            o.push(c[i]);
+            i += 1;
+            continue;
+        }
+        let starts = i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.');
+        if starts {
+            if let Some((a, j)) = num(i) {
+                if c[j..].starts_with(&['.', '.']) {
+                    if let Some((b, k)) = num(j + 2) {
+                        if k == c.len() || !(c[k].is_alphanumeric() || c[k] == '_' || c[k] == '.') {
+                            if b.saturating_sub(a) > 40 {
+                                return part.to_string();
+                            }
+                            let elems: Vec<String> = (a..=b).map(|v| v.to_string()).collect();
+                            o.push('{');
+                            o.push_str(&elems.join(", "));
+                            o.push('}');
+                            i = k;
+                            continue;
+                        }
+                    }
+                }
+                // A number that does not start an interval: copy it whole
+                o.extend(&c[i..j]);
+                i = j;
+                continue;
+            }
+        }
+        o.push(c[i]);
+        i += 1;
+    }
+    let value = |t: &str| t.split_once(" = ").map(|(_, v)| v.chars().count()).unwrap_or(0);
+    if value(&o) > 80 {
+        return part.to_string();
+    }
+    o
 }
 
 /// TLC prints the empty function as `<<>>` when it is held as a function and `<< >>` when it is
