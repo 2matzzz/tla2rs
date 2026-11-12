@@ -1,0 +1,6 @@
+key 719b0a940d47b9297b55d064c627b0e452dca8352ca548a98b767241f44170c9
+tlc Version 2.19
+rc 12
+Invariant Low is violated
+2 states generated 2 distinct states found
+trace=2

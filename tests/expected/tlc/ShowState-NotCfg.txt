@@ -1,0 +1,6 @@
+key 7891f896fe97bee089e22144447cbd9d62c662a169a85d0e46ff6b6225435ca4
+tlc Version 2.19
+rc 12
+Invariant NotCfg is violated
+7 states generated 7 distinct states found
+trace=3

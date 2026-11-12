@@ -1,0 +1,6 @@
+key 823221d9d06841927c9a0d39d9ece7f3cecde0de2dd41c31891b4f6dad7a4388
+tlc Version 2.19
+rc 76
+Evaluating invariant InvA failed
+2 states generated 2 distinct states found
+trace=2

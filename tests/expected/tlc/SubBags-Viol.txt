@@ -1,0 +1,6 @@
+key 4f829ca6cc62e55dec15e25fa00c5a17ba1ea29786a9447f1edbec151d6b4e97
+tlc Version 2.19
+rc 12
+Invariant NotTwos is violated
+10 states generated 10 distinct states found
+trace=3

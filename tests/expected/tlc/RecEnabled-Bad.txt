@@ -1,0 +1,6 @@
+key 89b06d14cd2ef6ba53c6ef3c659eddcc0bff582ed7b804b5102faf12fea2310c
+tlc Version 2.19
+rc 12
+Invariant InvBad is violated
+24 states generated 14 distinct states found
+trace=5

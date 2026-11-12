@@ -1,0 +1,6 @@
+key 07567c992df22df19e3afdc0f1f39e31e5d14abcb9f3c7d3aac88b47e4013c68
+tlc Version 2.19
+rc 12
+Invariant Few is violated
+11 states generated 10 distinct states found
+trace=4

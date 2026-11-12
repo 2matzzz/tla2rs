@@ -1,0 +1,6 @@
+key 2a07dbfe2a378320cce414b7fef6ded7b1e2f5e9cccc5aec4b796f0d7db02f2d
+tlc Version 2.19
+rc 12
+Invariant NotPair is violated
+30 states generated 27 distinct states found
+trace=3

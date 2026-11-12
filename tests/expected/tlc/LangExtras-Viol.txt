@@ -1,0 +1,6 @@
+key 52e68dbdffa5122a408893b713da812e5e3ae14c1a99dffefff3f28e7a5aaa36
+tlc Version 2.19
+rc 12
+Invariant Bound is violated
+218 states generated 111 distinct states found
+trace=5

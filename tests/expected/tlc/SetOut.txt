@@ -1,0 +1,6 @@
+key 86d11f99a473936903aedd0ee70e9be7bac15596815991ecab309bd8287c287f
+tlc Version 2.19
+rc 12
+Invariant TypeOK is violated
+5 states generated 5 distinct states found
+trace=5

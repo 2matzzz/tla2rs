@@ -1,0 +1,6 @@
+key 2e97a6b29aa9bd620c6cbf4d06a24396352a2e99a913c4f02102a5a761168be4
+tlc Version 2.19
+rc 12
+Invariant NotSeven is violated
+11 states generated 8 distinct states found
+trace=4

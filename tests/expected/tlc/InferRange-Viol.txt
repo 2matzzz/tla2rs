@@ -1,0 +1,6 @@
+key 851a6d955f4c6ac8ebd482dad393c4efd246c089e40f556647c2080f5f3b4c61
+tlc Version 2.19
+rc 12
+Invariant NotFull is violated
+886 states generated 188 distinct states found
+trace=6

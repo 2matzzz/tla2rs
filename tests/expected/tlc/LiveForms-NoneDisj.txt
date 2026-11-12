@@ -1,0 +1,6 @@
+key b272894bbbd9ba85aea5815892969f67b6c5c435ae80618c1330d0b3885b5ac8
+tlc Version 2.19
+rc 13
+Temporal property violated
+13 states generated 6 distinct states found
+trace=lasso

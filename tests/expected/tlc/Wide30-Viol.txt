@@ -1,0 +1,6 @@
+key e9e4928cb5d423251b1107054a13934bf89024c98bd9a23529a4d10d628e0ddc
+tlc Version 2.19
+rc 12
+Invariant Both is violated
+61 states generated 27 distinct states found
+trace=4

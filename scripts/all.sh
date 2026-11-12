@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Cross-check every configuration in examples/ and tests/tlc/ against TLC.
+# Cross-check every configuration in examples/ and tests/tlc/ against TLC's results in
+# tests/expected/ (written by scripts/expected.sh; this script does not run TLC).
 # Extra arguments (e.g. -batched, -metal) are passed on to every crosscheck.sh run.
-# JOBS=N runs N configurations at a time (default 4; JOBS=1 runs them one by one). TLC and each
-# checker use one worker, so the results do not depend on JOBS.
+# JOBS=N runs N configurations at a time (default 4; JOBS=1 runs them one by one). Each checker
+# uses one worker, so the results do not depend on JOBS.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 cargo build --release --quiet

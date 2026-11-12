@@ -17,9 +17,13 @@ It has no crate dependencies.
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
   one worker, and it compares the verdict, generated and distinct state counts, counterexample length, and exit code.
   If TLC produces no verdict, the check fails
-- TLC results and built checkers are cached under `target/crosscheck/` (keys: jar, cfg, arguments and the modules
-  the spec reads; generated code and rustc version). A cached TLC result that does not match is rechecked with a
-  fresh TLC run. `CROSSCHECK_NO_CACHE=1` disables both; `JOBS=N` sets how many configurations `all.sh` runs at once
+- TLC's summary for each configuration (verdict, counts, trace length, exit code, and a hash of the jar, cfg,
+  arguments and the modules the spec reads) is committed in `tests/expected/`. `crosscheck.sh` and `all.sh` compare
+  against these files only and fail on a missing or stale one. After adding or changing a test, run
+  `scripts/expected.sh` (it runs TLC for missing and stale files only) and commit the files with the test.
+  `expected.sh -check` reruns TLC and reports differences without writing. Built checkers are cached in
+  `target/crosscheck/build` (key: generated code and rustc version; `CROSSCHECK_NO_CACHE=1` rebuilds); `JOBS=N`
+  sets how many configurations `all.sh` and `expected.sh` run at once
 - The TLC jar comes from `TLA_TOOLS` (default `~/.tla/tla2tools.jar`)
 
 ## Layout

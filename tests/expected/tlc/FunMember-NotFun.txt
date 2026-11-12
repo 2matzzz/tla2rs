@@ -1,0 +1,6 @@
+key bfca553258b57562029d2a9841d4e7a59e05f6d3835d959faf7ee6281687a077
+tlc Version 2.19
+rc 76
+Evaluating invariant NotFun failed
+4 states generated 4 distinct states found
+trace=2
