@@ -1,0 +1,6 @@
+key 6b75cd166c136462bf362d9911e62b955c0de1c232622c31dab1a23bd33f7572
+tlc Version 2.19
+rc 12
+Invariant PLt3 is violated
+4 states generated 4 distinct states found
+trace=4

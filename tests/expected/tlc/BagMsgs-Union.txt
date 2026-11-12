@@ -1,0 +1,6 @@
+key 2d1309cdc22cea5c431b35dfc62c8d710c96e837ae4bc0234c2710b5a107a950
+tlc Version 2.19
+rc 12
+Invariant UnionOk is violated
+10 states generated 9 distinct states found
+trace=4

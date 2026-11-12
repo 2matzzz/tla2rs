@@ -1,0 +1,6 @@
+key a1258260ca71d5c4c928d0a8925fa300db50085eb5615c3bb178cfdebf148503
+tlc Version 2.19
+rc 12
+Invariant NoTriple is violated
+22 states generated 16 distinct states found
+trace=4

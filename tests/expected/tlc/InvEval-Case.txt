@@ -1,0 +1,6 @@
+key 1a3dec72e234dadb0d3e9d4f06c0edede5720465c0d0b70d499851ea777b71a7
+tlc Version 2.19
+rc 76
+Evaluating invariant InvCase failed
+3 states generated 3 distinct states found
+trace=3

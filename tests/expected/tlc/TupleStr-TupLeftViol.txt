@@ -1,0 +1,6 @@
+key 3c0dfcc59bdd3221f72f654fd9decd6974caa289849ba05a130a846fa74d9104
+tlc Version 2.19
+rc 12
+Invariant TupLeftViol is violated
+3 states generated 3 distinct states found
+trace=3

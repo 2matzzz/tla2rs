@@ -1,0 +1,6 @@
+key 0fa7c2de2e444d67a84533feae57190101e44f429264c98fcd5cebf513faad16
+tlc Version 2.19
+rc 12
+Invariant SomeoneHolds3 is violated
+67 states generated 39 distinct states found
+trace=4

@@ -1,0 +1,6 @@
+key 1a6067008e53f861d7ad1d78084f12d158071c6de13363b65681ac7b25d6b99a
+tlc Version 2.19
+rc 0
+No error has been found
+4 states generated 3 distinct states found
+trace=0

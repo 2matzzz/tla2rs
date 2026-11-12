@@ -1,0 +1,6 @@
+key d064dbb53dec431a470c5c6c2759d3fa5315d110d38e2eafa83e33c1559bd9d7
+tlc Version 2.19
+rc 76
+Evaluating invariant StrLeft failed
+4 states generated 4 distinct states found
+trace=2

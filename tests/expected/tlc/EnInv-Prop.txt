@@ -1,0 +1,6 @@
+key 16d088716b6ae71c6281f565ae33bea0751ec77e03db2cc0f43e5613c8d338aa
+tlc Version 2.19
+rc 12
+Invariant Prop is violated
+4 states generated 4 distinct states found
+trace=3

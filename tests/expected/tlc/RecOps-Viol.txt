@@ -1,0 +1,6 @@
+key 2076b67fe22b070b3ad3d96f3be8ff353a9e220df2ce4e55b48e39f22a9e03f0
+tlc Version 2.19
+rc 12
+Invariant Small is violated
+31 states generated 31 distinct states found
+trace=4

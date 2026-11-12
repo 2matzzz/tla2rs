@@ -1,0 +1,6 @@
+key 08127bf26d9cc11f3b17977f6962bab8fcf6e1a99bc258bc98514c74497df59c
+tlc Version 2.19
+rc 12
+Invariant Light is violated
+8 states generated 6 distinct states found
+trace=3

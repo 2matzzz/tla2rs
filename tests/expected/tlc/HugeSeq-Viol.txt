@@ -1,0 +1,6 @@
+key 0d40ee4c3f9697288bd5dc74bb3239d69b9d389cbe3549fd148ae288c1e6a957
+tlc Version 2.19
+rc 12
+Invariant Short is violated
+3000 states generated 3000 distinct states found
+trace=3000

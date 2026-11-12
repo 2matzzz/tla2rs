@@ -1,0 +1,6 @@
+key 675b7d138db6335e7a0f30a94897b59469d37645323d6ca76749a8f3007e9838
+tlc Version 2.19
+rc 12
+Invariant NotBoth is violated
+14 states generated 13 distinct states found
+trace=3
