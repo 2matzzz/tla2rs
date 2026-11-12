@@ -25,6 +25,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "UndirectedGraphs" => UNDIRECTED_GRAPHS,
         "Bitwise" => BITWISE,
         "Relation" => RELATION,
+        "BagsExt" => BAGS_EXT,
         _ => return None,
     })
 }
@@ -267,5 +268,26 @@ TransitiveClosure(R, S) ==
 ReflexiveTransitiveClosure(R, S) ==
   CHOOSE f \in {[p \in S \X S |-> p[1] = p[2] \/ T[p]] : T \in {TransitiveClosure(R, S)}} : TRUE
 IsConnected(R, S) == \E T \in {ReflexiveTransitiveClosure(R, S)} : \A a, b \in S : T[a, b]
+====
+"#;
+
+/// Bags: a fold applies `op` to `base` and f(x) once per copy of x for each element, the elements
+/// taken as `MapThenFoldSet` takes them
+const BAGS_EXT: &str = r#"
+---- MODULE BagsExt ----
+LOCAL INSTANCE Bags
+LOCAL INSTANCE Integers
+LOCAL INSTANCE Folds
+BagAdd(B, x) == B (+) SetToBag({x})
+BagRemove(B, x) == B (-) SetToBag({x})
+BagRemoveAll(B, x) ==
+  IF x \in DOMAIN B THEN LET less[n \in 0..B[x]] == IF n = 0 THEN B ELSE less[n - 1] (-) SetToBag({x}) IN less[B[x]]
+  ELSE B
+MapThenFoldBag(op(_, _), base, f(_), choose(_), B) ==
+  LET Copies(x) == LET acc[n \in 1..B[x]] == op(IF n > 1 THEN acc[n - 1] ELSE base, f(x)) IN acc[B[x]]
+  IN MapThenFoldSet(op, base, Copies, LAMBDA T : CHOOSE a \in T : TRUE, DOMAIN B)
+FoldBag(op(_, _), base, B) == MapThenFoldBag(op, base, LAMBDA a : a, LAMBDA T : CHOOSE a \in T : TRUE, B)
+SumBag(B) == FoldBag(LAMBDA a, b : a + b, 0, B)
+ProductBag(B) == FoldBag(LAMBDA a, b : a * b, 1, B)
 ====
 "#;
