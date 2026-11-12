@@ -609,7 +609,8 @@ fn fp_note(e: &EvalErr) {
 // each, and prints them in that order; it then expands in order without -batched, and rebuilds a
 // behavior as TLC does.
 
-/// Lines held while computing states (see above)
+/// Lines held while computing states (see above), and the strings made meanwhile (see "the
+/// order of strings made")
 #[derive(Default)]
 struct Capture {
     pushes: u32,
@@ -618,6 +619,8 @@ struct Capture {
     push_acts: Vec<u32>,
     /// (states pushed before, actions started before, line)
     lines: Vec<(u32, u32, String)>,
+    /// (states pushed before, string)
+    made: Vec<(u32, u16)>,
 }
 
 thread_local! {
@@ -632,8 +635,12 @@ fn tlc_print(line: String) {
     })
 }
 
-/// A state pushed by `init` or `next` (PRINT_ORDER only)
+/// A state pushed by `init` or `next`
+#[inline]
 fn mark_push() {
+    if !PRINT_ORDER && !STR_ORDER {
+        return;
+    }
     CAPTURE.with(|c| {
         if let Some(c) = &mut *c.borrow_mut() {
             c.push_acts.push(c.acts);
@@ -642,8 +649,12 @@ fn mark_push() {
     })
 }
 
-/// The start of an action of the next-state relation (PRINT_ORDER only)
+/// The start of an action of the next-state relation
+#[inline]
 fn mark_action() {
+    if !PRINT_ORDER && !STR_ORDER {
+        return;
+    }
     CAPTURE.with(|c| {
         if let Some(c) = &mut *c.borrow_mut() {
             c.acts += 1;
@@ -651,49 +662,55 @@ fn mark_action() {
     })
 }
 
-/// Holds the lines printed until `finish` (or until dropped, when they are discarded, also
-/// while unwinding). Does nothing unless PRINT_ORDER
-struct Capturing(Option<Capture>);
+/// Holds the lines printed (and the strings made) until `finish` (or until dropped, when they are
+/// discarded, also while unwinding). Does nothing unless PRINT_ORDER, or strings made are noted
+struct Capturing {
+    active: bool,
+    outer: Option<Capture>,
+}
 
 impl Capturing {
     fn start() -> Self {
-        if PRINT_ORDER {
-            Capturing(CAPTURE.with(|c| c.borrow_mut().replace(Capture::default())))
+        if PRINT_ORDER || str_on() {
+            Capturing { active: true, outer: CAPTURE.with(|c| c.borrow_mut().replace(Capture::default())) }
         } else {
-            Capturing(None)
+            Capturing { active: false, outer: None }
         }
     }
     fn finish(self) -> Held {
-        if !PRINT_ORDER {
+        if !self.active {
             return Held::default();
         }
         let cap = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
-        Held { cap, next: 0 }
+        Held { cap, next: 0, next_made: 0 }
     }
 }
 
 impl Drop for Capturing {
     fn drop(&mut self) {
-        if PRINT_ORDER {
+        if self.active {
             // Back to what was there before (nothing, or an outer capture)
-            let outer = self.0.take();
+            let outer = self.outer.take();
             CAPTURE.with(|c| *c.borrow_mut() = outer);
         }
     }
 }
 
-/// Lines held, printed in order as the states they come before are handled
+/// Lines held, printed in order as the states they come before are handled (and strings made,
+/// noted then)
 #[derive(Default)]
 struct Held {
     cap: Capture,
     next: usize,
+    next_made: usize,
 }
 
 impl Held {
-    /// Prints the lines printed before the `n`th state was pushed (all with u32::MAX)
+    /// Prints the lines printed before the `n`th state was pushed (all with u32::MAX), and notes
+    /// the strings made before it
     #[inline]
     fn flush(&mut self, n: u32) {
-        if !PRINT_ORDER {
+        if !PRINT_ORDER && !STR_ORDER {
             return;
         }
         while let Some((p, _, l)) = self.cap.lines.get(self.next) {
@@ -703,7 +720,114 @@ impl Held {
             println!("{l}");
             self.next += 1;
         }
+        while let Some(&(p, a)) = self.cap.made.get(self.next_made) {
+            if p >= n {
+                break;
+            }
+            str_note(a);
+            self.next_made += 1;
+        }
     }
+}
+
+// ---------------------------------------------------------------- the order of strings made
+//
+// TLC orders strings by when it first creates them, so a string an operation makes while
+// exploring (`\o`, Append, Head, Tail, SubSeq, ToString, or a constant expression TLC evaluates
+// there) comes after every string made before it (measured on TLC 2.19, `tests/tlc/StrMade*`). The
+// compiler numbers the strings the checker may make (from TRACK_FROM) in the order a checker built
+// before made them, and the others after them as it meets them. When tla2rs runs the checker with
+// one worker, it names a file in TLA2RS_ORDER, and the checker notes each such string the first
+// time it makes one, where TLC would make it: what it makes while computing a successor counts
+// after the invariants of the successors pushed before (as the lines printed above). A string made
+// after one numbered later, or one TLC created when it parsed the spec (a name or number of a
+// module, RANKED_LATE), means the order differs from TLC's: the checker still explores to the end,
+// then writes the numbers of the strings in the order made to the file and exits with ORDER_EXIT,
+// and tla2rs compiles the checker again with that order and checks from the start. With several
+// workers the order TLC makes strings in depends on its threads, and nothing is noted.
+
+/// The exit code that tells tla2rs to number the strings made in the order written to the file
+const ORDER_EXIT: i32 = 72;
+
+static STR_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct Made {
+    seen: Vec<bool>,
+    order: Vec<u16>,
+    /// One more than the largest string made so far
+    top: usize,
+    differs: bool,
+}
+
+static MADE: std::sync::Mutex<Option<Made>> = std::sync::Mutex::new(None);
+
+#[inline]
+fn str_on() -> bool {
+    STR_ORDER && STR_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Notes the strings made from here on, when tla2rs asks for it and there is one worker
+fn str_order_start(workers: usize) {
+    if STR_ORDER && workers == 1 && std::env::var_os("TLA2RS_ORDER").is_some() {
+        *MADE.lock().unwrap() = Some(Made { seen: vec![false; ATOMS.len()], order: vec![], top: 0, differs: false });
+        STR_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A string made by an operation
+#[inline]
+fn str_made(a: u16) {
+    if (a as usize) >= TRACK_FROM && str_on() {
+        str_made_now(a);
+    }
+}
+
+#[inline(never)]
+fn str_made_now(a: u16) {
+    let held = CAPTURE.with(|c| match &mut *c.borrow_mut() {
+        Some(c) => {
+            c.made.push((c.pushes, a));
+            true
+        }
+        None => false,
+    });
+    if !held {
+        str_note(a);
+    }
+}
+
+/// A string made, at the point TLC makes it
+fn str_note(a: u16) {
+    let mut g = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_mut() else { return };
+    let i = a as usize;
+    if m.seen[i] {
+        return;
+    }
+    m.seen[i] = true;
+    m.order.push(a);
+    if RANKED_LATE.get(i - TRACK_FROM).copied().unwrap_or(false) || i < m.top {
+        m.differs = true;
+    }
+    m.top = m.top.max(i + 1);
+}
+
+/// When the strings were made in an order other than their numbers: tells tla2rs the order
+fn str_order_finish() {
+    if !str_on() {
+        return;
+    }
+    let g = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref().filter(|m| m.differs) else { return };
+    let text: String = m.order.iter().map(|a| format!("{a}\n")).collect();
+    let path = std::env::var_os("TLA2RS_ORDER").unwrap();
+    if let Err(e) = std::fs::write(&path, text) {
+        eprintln!("cannot write {}: {e}", std::path::Path::new(&path).display());
+        return;
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(ORDER_EXIT);
 }
 
 /// The step s -> t evaluated again as TLC does while showing a behavior: the actions in order up
@@ -1464,6 +1588,7 @@ fn dump_finish() {
 /// Exits the checker, completing the state graph first
 fn exit(code: i32) -> ! {
     dump_finish();
+    str_order_finish();
     std::process::exit(code)
 }
 
@@ -1605,6 +1730,7 @@ fn main() {
     for l in STARTUP_PRINTS {
         println!("{l}");
     }
+    str_order_start(opt.workers);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // A spec without [][Next]_v: TLC computes and checks the initial states, then stops
         if NO_NEXT {
@@ -1615,7 +1741,7 @@ fn main() {
         }
         if LIVENESS {
             run_liveness(&opt);
-        } else if opt.batched && !PRINT_ORDER {
+        } else if opt.batched && !PRINT_ORDER && !str_on() {
             run_safety_batched(&opt);
         } else {
             run_safety(&opt);
@@ -1627,6 +1753,7 @@ fn main() {
         exit(eval_code(&e));
     }
     dump_finish();
+    str_order_finish();
 }
 
 struct Opt {

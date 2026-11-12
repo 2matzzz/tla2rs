@@ -21,6 +21,8 @@ pub struct Output {
     /// The capacity of sets held as arrays and the longest sequence the checker was built with
     /// (SCAP and QCAP)
     pub caps: (usize, usize),
+    /// The name of each string and model value, by its number in the checker
+    pub atoms: Vec<String>,
 }
 
 /// What TLC prints when it starts, in its order: its warnings that a PlusCal algorithm or its
@@ -32,6 +34,10 @@ pub struct Startup {
     pub consts: Vec<String>,
     pub warnings: Vec<String>,
     pub assumes: Vec<String>,
+    /// The strings that operations made while TLC evaluated the constants, the definitions of
+    /// constant level, the constant invariants and properties and the ASSUMEs, in the order made
+    /// (strings written in the spec left out)
+    pub made: Vec<String>,
 }
 
 /// TLC's note after the first warning it prints
@@ -74,6 +80,9 @@ thread_local! {
     /// Set while compiling again with every variable's type inferred, after the types from TypeOK
     /// failed in Init or Next (see `compile`)
     static INFER_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The strings made by operations, in the order TLC makes them as far as it is known (see
+    /// `compile`): those made when TLC starts, then those the checker made while exploring
+    static MADE_ORDER: std::cell::RefCell<(Vec<String>, Vec<String>)> = const { std::cell::RefCell::new((vec![], vec![])) };
 }
 
 /// The bounded sequences `UNION {[1..n -> S] : n \in R}`: (R, S)
@@ -462,13 +471,13 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
     }
 }
 
-/// The order in which TLC creates the strings it knows before it starts exploring: TLC orders
+/// The order in which TLC creates the strings it knows before it evaluates anything: TLC orders
 /// strings by when it first creates them. Measured on TLC 2.19: the strings and model values of
 /// the cfg; SANY's built-in names; the identifiers, keywords and numbers (as written: `007`,
-/// `\b101`) of each module as it parses them, root module first and then the modules it extends or instantiates, breadth first; a few more
-/// built-in names; then the string literals of each module, dependencies before the modules that
-/// use them. Strings created later (by \o, ToString, ...) follow, in the order TLC happens to
-/// create them, which tla2rs does not reproduce (see CLAUDE.md).
+/// `\b101`) of each module as it parses them, root module first and then the modules it extends
+/// or instantiates, breadth first; a few more built-in names; then the string literals of each
+/// module, dependencies before the modules that use them. Strings made later (by \o, ToString,
+/// ...) follow, in the order TLC makes them (see `compile`).
 fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<String, usize> {
     let mut order: Vec<String> = vec![];
     fn cfg_values(e: &Expr, order: &mut Vec<String>) {
@@ -821,8 +830,32 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     Ok(())
 }
 
+/// Compiles the spec. `made` lists the strings made by operations while a checker built earlier
+/// explored, in the order it made them (see "The order of strings" in CLAUDE.md): they are
+/// numbered in that order after the strings TLC knows when it starts. Those, in turn, are
+/// numbered after the strings TLC creates when it parses the spec, in the order the evaluation of
+/// the constants, definitions and ASSUMEs makes them, which is known only once they are evaluated:
+/// when it differs from the order they were numbered in, the spec is compiled again with it
 #[allow(clippy::too_many_arguments)]
-pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
+pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool, made: &[String]) -> R<Output> {
+    let mut at_start: Vec<String> = vec![];
+    // Each round numbers the strings made at the start in the order the round before made them;
+    // that order changes only when the numbering changes the order of a set they are made from
+    for _ in 0..4 {
+        MADE_ORDER.with(|o| *o.borrow_mut() = (at_start.clone(), made.to_vec()));
+        let (out, now) = compile_once(tla, cfg_src, dir, setcap, seqcap, fp128, metal)?;
+        if now == at_start {
+            return Ok(out);
+        }
+        at_start = now;
+    }
+    Ok(compile_once(tla, cfg_src, dir, setcap, seqcap, fp128, metal)?.0)
+}
+
+/// Compiles the spec once, with the strings numbered as MADE_ORDER says, and returns the strings
+/// made when TLC starts as well
+#[allow(clippy::too_many_arguments)]
+fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<(Output, Vec<String>)> {
     let (pcal, notes) = crate::pcal::warnings(tla, dir);
     let mut startup = Startup { pcal: pcal.clone(), ..Default::default() };
     let mut first = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup);
@@ -854,7 +887,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
             }
-            return Ok(Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), caps: (0, 0) });
+            return Ok((Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), caps: (0, 0), atoms: vec![] }, vec![]));
         }
         r => r?,
     };
@@ -866,7 +899,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
             *msg = format!("{}\n{msg}", lines.join("\n"));
         }
     }
-    Ok(out)
+    Ok((out, startup.made))
 }
 
 /// e with Print and PrintT removed (as TLC uses the value it computed when it started)
@@ -894,6 +927,31 @@ fn constant_level(e: &Expr, m: &Module) -> bool {
         Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) => true,
         x => x.is_unchecked_temporal(),
     })
+}
+
+/// Whether evaluating e can make a string: ToString, or a sequence operator (`\o`, Append, Head,
+/// Tail, SubSeq) where e has a string, or a constant whose value has one
+fn makes_strings(e: &Expr, constants: &HashMap<String, Value>, atoms: &Atoms) -> bool {
+    fn has_str(v: &Value, atoms: &Atoms) -> bool {
+        match v {
+            Value::Atom(a) => !atoms.is_model(*a),
+            Value::Set(s) => s.iter().any(|x| has_str(x, atoms)),
+            Value::Fun(m) => m.iter().any(|(k, x)| has_str(k, atoms) || has_str(x, atoms)),
+            Value::Rec(m) => m.values().any(|x| has_str(x, atoms)),
+            Value::Tuple(xs) => xs.iter().any(|x| has_str(x, atoms)),
+            Value::Bool(_) | Value::Int(_) => false,
+        }
+    }
+    let op = |name: &str| e.any(&|x| matches!(x, Expr::Call(n, _) if n == name));
+    if op("ToString") {
+        return true;
+    }
+    ["\\o", "Append", "Head", "Tail", "SubSeq"].iter().any(|n| op(n))
+        && e.any(&|x| match x {
+            Expr::Str(_) => true,
+            Expr::Ident(n) => constants.get(n).is_some_and(|v| has_str(v, atoms)),
+            _ => false,
+        })
 }
 
 fn has_prints(e: &Expr) -> bool {
@@ -952,6 +1010,15 @@ fn compile_inner(
         crate::types::note_written_fields(&a.expr);
     }
     let mut strings: Vec<String> = (0..seen.len() as u32).filter(|&a| !seen.is_model(a)).map(|a| seen.name(a)).collect();
+    let literals: HashSet<String> = strings.iter().cloned().collect();
+    // A string made by an operation that is also a name or number of a module was created by TLC
+    // when it parsed that, and takes its place (see `compile` for the order of the others)
+    let (made_at_start, made_later) = MADE_ORDER.with(|o| o.borrow().clone());
+    for x in made_at_start.iter().chain(&made_later) {
+        if ranks.contains_key(x) && !strings.contains(x) {
+            strings.push(x.clone());
+        }
+    }
     strings.sort_by_key(|x| ranks.get(x).copied().unwrap_or(usize::MAX));
     // TLC orders a model value before any string (measured: {"zz", m1} prints as {m1, "zz"} and
     // CHOOSE picks m1), and atoms are ordered by their number
@@ -961,13 +1028,23 @@ fn compile_inner(
             atoms.intern(true, &seen.name(a));
         }
     }
-    for x in &strings {
+    for x in strings.iter().chain(&made_at_start) {
         atoms.intern(false, x);
     }
+    // The strings numbered from here on are those the checker may make while exploring: it notes
+    // the order it makes them in (see "the order of strings made" in the runtime)
+    let track_from = atoms.len();
+    for x in &made_later {
+        atoms.intern(false, x);
+    }
+    // The strings made when TLC starts: by the constants, the definitions of constant level, the
+    // constant invariants and properties, and the ASSUMEs, which TLC evaluates in that order
+    let mut made_now: Vec<u32> = vec![];
 
     // Constants
     let empty = HashMap::new();
     let mut constants = HashMap::new();
+    atoms.log_start();
     {
         let ce = ConstEval { atoms: &atoms, constants: &empty };
         for c in &m.constants {
@@ -1009,6 +1086,7 @@ fn compile_inner(
         }
         pending = left;
     }
+    made_now.extend(atoms.log_end());
 
     // SANY checks the subexpression names in every definition, used or not
     for e in m.defs.iter().map(|d| &d.body).chain(m.assumes.iter().map(|a| &a.expr)) {
@@ -1030,7 +1108,7 @@ fn compile_inner(
                 .and_then(|m| m.strip_prefix(crate::ast::SPAN).and_then(|m| m.split_once('\n')).map(|(at, m)| (at.to_string(), m.to_string())));
             let (at, msg) = at.unwrap_or_else(|| (format!("in definition {}", d.name), msg));
             let msg = format!("Semantic errors:\n\n*** Errors: 1\n\n{at}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.");
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), caps: (0, 0) });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), caps: (0, 0), atoms: vec![] });
         }
     }
 
@@ -1041,16 +1119,23 @@ fn compile_inner(
     {
         let ce = ConstEval { atoms: &atoms, constants: &constants };
         let names: Vec<String> = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
+        atoms.log_start();
         for n in names {
             let Ok(e) = ex.expand_def(&n) else { continue };
-            if !constant_level(&e, &m) || !has_prints(&e) {
+            if !constant_level(&e, &m) {
                 continue;
             }
-            // TLC ignores a definition it fails to evaluate here
-            if eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.consts).is_ok() {
-                cached.insert(n);
+            if has_prints(&e) {
+                // TLC ignores a definition it fails to evaluate here
+                if eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.consts).is_ok() {
+                    cached.insert(n);
+                }
+            } else if makes_strings(&e, &constants, &atoms) {
+                // For the strings it makes; its value is computed again where it is used
+                let _ = ce.eval(&e, &HashMap::new());
             }
         }
+        made_now.extend(atoms.log_end());
     }
 
     // TLC evaluates an invariant or property of constant level once, before exploring, and
@@ -1063,11 +1148,14 @@ fn compile_inner(
             if !constant_level(&e, &m) {
                 continue;
             }
-            match ce.eval(&e, &HashMap::new()) {
+            atoms.log_start();
+            let r = ce.eval(&e, &HashMap::new());
+            made_now.extend(atoms.log_end());
+            match r {
                 Ok(Value::Bool(true)) | Err(_) => {}
                 Ok(v) => {
                     let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), caps: (0, 0) });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), caps: (0, 0), atoms: vec![] });
                 }
             }
         }
@@ -1081,7 +1169,7 @@ fn compile_inner(
     } else {
         match resolve_spec(&m, &cfg, &mut ex)? {
             Ok(p) => p,
-            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), caps: (0, 0) }),
+            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), caps: (0, 0), atoms: vec![] }),
         }
     };
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
@@ -1092,7 +1180,10 @@ fn compile_inner(
             let (l1, c1, l2, c2) = a.span;
             let at = format!("line {l1}, col {c1} to line {l2}, col {c2} of module {}", a.module);
             let e = ex.expand_top(&a.expr).map_err(|e| format!("ASSUME at {at}: {e}"))?;
-            match eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.assumes) {
+            atoms.log_start();
+            let r = eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.assumes);
+            made_now.extend(atoms.log_end());
+            match r {
                 Ok(Value::Bool(true)) => {}
                 Ok(Value::Bool(false)) => {
                     return Ok(Output {
@@ -1100,20 +1191,28 @@ fn compile_inner(
                         warnings,
                         rejected: Some((format!("Error: Assumption {at} is false."), 10)),
                         caps: (0, 0),
+                        atoms: vec![],
                     })
                 }
                 Ok(v) => return Err(format!("ASSUME at {at} is not a boolean: {v:?}")),
                 Err(e) if crate::value::is_eval_failure(&e) => {
                     let msg = format!("Error: Evaluating assumption {at} failed.\n{e}");
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), caps: (0, 0) });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), caps: (0, 0), atoms: vec![] });
                 }
                 Err(e) => return Err(format!("cannot evaluate the ASSUME at {at}: {e}")),
             }
         }
     }
 
+    // Each once, in the order first made; a string written in the spec was created when TLC parsed it
+    for a in made_now {
+        let n = atoms.name(a);
+        if !atoms.is_model(a) && !literals.contains(&n) && !startup.made.contains(&n) {
+            startup.made.push(n);
+        }
+    }
     if no_behavior {
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), caps: (0, 0) });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), caps: (0, 0), atoms: vec![] });
     }
     if uses_real_time(&init) || next.as_ref().is_some_and(uses_real_time) {
         return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
@@ -1127,6 +1226,7 @@ fn compile_inner(
     let next = strip_pos(&next_pos);
 
     let mut g = Gen::new(&atoms, &constants);
+    g.track_from = track_from as u32;
     g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
     g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
     g.def_pos = m.defs.iter().filter_map(|d| match &d.body {
@@ -1238,7 +1338,6 @@ fn compile_inner(
     let print_order = has_prints(&init)
         || has_prints(&next_pos)
         || cfg.invariants.iter().any(|n| ex.expand_def(n).is_ok_and(|e| has_prints(&e)));
-    g.print_order = print_order;
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
@@ -1274,7 +1373,7 @@ fn compile_inner(
         if uses_real_time(&e) {
             startup.liveness_warnings(&cfg, true);
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0) });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0), atoms: vec![] });
         }
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, None, &mut parts)?;
@@ -1317,20 +1416,20 @@ fn compile_inner(
     }
     if no_next && (!inv_list.is_empty() || !cfg.invariants.is_empty() || !action_props.is_empty() || !live_parts.is_empty()) {
         let msg = "Error: The configuration file did not specify the next state predicate.";
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), caps: (0, 0) });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), caps: (0, 0), atoms: vec![] });
     }
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0) });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0), atoms: vec![] });
         }
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
     let live_code = match crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts)? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0) })
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0), atoms: vec![] })
         }
     };
     let mut prop_code = String::new();
@@ -1455,6 +1554,12 @@ fn compile_inner(
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
     writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
+    // The strings the checker may make while exploring, and which of them TLC created when it
+    // parsed the spec (a name or number of a module), whose place is known
+    writeln!(src, "const STR_ORDER: bool = {};", g.str_notes).unwrap();
+    writeln!(src, "const TRACK_FROM: usize = {track_from};").unwrap();
+    let ranked: Vec<String> = (track_from..atoms.len()).map(|a| ranks.contains_key(&atoms.name(a as u32)).to_string()).collect();
+    writeln!(src, "static RANKED_LATE: &[bool] = &[{}];", if g.str_notes { ranked.join(", ") } else { String::new() }).unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a
@@ -1493,7 +1598,8 @@ fn compile_inner(
     src += crate::runtime::RUNTIME;
     src += crate::runtime::PPR;
     src += crate::runtime::LIVENESS_RT;
-    Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap) })
+    let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
+    Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap), atoms: names })
 }
 
 /// Whether VIEW(perm(s)) = perm(VIEW(s)) for every permutation, so the view can be computed once
