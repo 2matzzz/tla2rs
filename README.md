@@ -253,3 +253,8 @@ and their reasons are in `tests/corpus.txt` and CLAUDE.md.
 
 - Sequences (`Sequences`) and sets of sets
 - Take constants as run-time arguments, so changing the configuration does not need a rebuild
+
+## License notices
+
+Parts of tla2rs are derived from TLC and from the TLA+ Examples, both under the MIT License; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

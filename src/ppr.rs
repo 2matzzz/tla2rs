@@ -1,3 +1,4 @@
+// Ported from TLC (https://github.com/tlaplus/tlaplus, MIT License; see THIRD_PARTY_NOTICES.md).
 // TLC's pretty printer for values, used by the compiler (Print and PrintT evaluated when TLC
 // starts) and pasted into every generated checker (`runtime::PPR`). No inner doc comments here:
 // the text is also part of the generated main.rs.
