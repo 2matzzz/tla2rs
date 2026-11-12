@@ -1,4 +1,4 @@
-key 9ddf5ce425d8bba48536bc4e60bda291af5338946bebaed3941de5b9cef776a8
+key 93331921d40fd2e6051fb7ae325bd08d6bc5a2deb17dad8effc49b76671b8e65
 tlc Version 2.19
 rc 76
 Evaluating invariant InvA failed
@@ -6,3 +6,5 @@ Evaluating invariant InvA failed
 trace 2 269e3c25ea838ffbe034527249d198c9dc6a17b71abf9f09cd25a850fff36dec
 states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 5 f431162ebf8a52d48b3fbca404f4808af3c65774ddcd4b7e98a54a0fa7c48683
+errors 2 87b467c8da6731e3bd569da155f6a9b8c881124eb32738bc44f632367e3b83d7

@@ -1,4 +1,4 @@
-key f77e7023aa4eda9311beb3d55b9902e8a59e000b9b9e04db2a22b6b0e73507ec
+key 302876b4b1e8ca23346e49fddb42db1d1ffb30d585f944b0d00f3576b06f849e
 tlc Version 2.19
 rc 13
 Temporal property violated
@@ -6,3 +6,5 @@ Temporal property violated
 trace lasso
 states 8 a1f41ceb9ad214fa5d2c85a2bb791befd669f4e58f02983ad530ec611462a2a1
 edges 16 b49b349b1ca7390e48b01328b0a7e503b382531c7fe302f6400a2d06f789492e
+messages 2 6be04df69bad15fab236950a575fcd0eb79db1c87abb9f8463f5b6d04807d609
+errors 2 6be04df69bad15fab236950a575fcd0eb79db1c87abb9f8463f5b6d04807d609

@@ -1,4 +1,4 @@
-key feece2b9f15bffd0cad106eef25eb746b7123df5a5d7e2c4ccff3eec732a3f60
+key f9869e6c72ecf02a2959c11d4773b749d2ffd33df6b38b6c818a8a35f3cbe58b
 tlc Version 2.19
 rc 12
 Invariant NeverBoth is violated
@@ -6,3 +6,5 @@ Invariant NeverBoth is violated
 trace 4 c79f73547bf96094859ffcfdaaa81d492a41e30829240cacdc0bc7eccc6ed9e1
 states 10 1931e66dcd9cfc4e7de0c14fbb560bf6329fc567968f639a9400fee94ea7c800
 edges 9 3be03bc0905f89380ff14185a449681ae2303254b7641be5b3ddbef007d25777
+messages 2 fc75673e32b5c24877cf732dbb71badf2055efc984b0cdfc070969ae408d3ea9
+errors 2 fc75673e32b5c24877cf732dbb71badf2055efc984b0cdfc070969ae408d3ea9

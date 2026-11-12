@@ -1,4 +1,4 @@
-key 5cf8553b733f4b8f0052086470885541c6f7384f05d74db9b14f8aaffb8cf2e4
+key 39e46cd1f11df80dcf5d74bd932701d48e7a87187aa966cd2f4d329ef563fefc
 tlc Version 2.19
 rc 12
 Invariant Small is violated
@@ -6,3 +6,5 @@ Invariant Small is violated
 trace 4 a5d2aeeb5d2c0c2fe2c58741182f8bcff1f00d7bd8cafcad4f19dfac9f4900d3
 states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
 edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29
+messages 2 c9858f6ba45bc6f4eb96652ead3dea7d7b221bf582e1031caf0d49248b80d0d9
+errors 2 c9858f6ba45bc6f4eb96652ead3dea7d7b221bf582e1031caf0d49248b80d0d9
