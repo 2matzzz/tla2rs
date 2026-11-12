@@ -854,6 +854,11 @@ impl ConstEval<'_> {
                         let i = x.as_int()?;
                         t.get((i - 1) as usize).cloned().ok_or("tuple index out of range")?
                     }
+                    // r[d] with d a string, as for a function over the field names
+                    Value::Rec(m) => match x {
+                        Value::Atom(a) => m.iter().find(|(k, _)| self.atoms.intern(false, k) == a).map(|(_, v)| v.clone()).ok_or("function applied outside its domain")?,
+                        _ => return Err("function applied outside its domain".into()),
+                    },
                     _ => return Err("application of a non-function".into()),
                 }
             }
