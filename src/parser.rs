@@ -66,6 +66,24 @@ fn is_selector(t: &Tok) -> bool {
 
 thread_local! {
     static NEST_JUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `parse_module` with SPAN labels (see `ast::SPAN`) around `[]`, `<>` and the infix operators
+/// `/\`, `\/`, `=>`, `<=>` and `~>`, which then nest as SANY reads them (binary, to the left). Only
+/// for the position of a level error, since the labels change the tree
+pub fn parse_module_spans(src: &str) -> R<Module> {
+    SPANS.with(|s| s.set(true));
+    let r = parse_module(src);
+    SPANS.with(|s| s.set(false));
+    r
+}
+
+/// The label inside a SPAN label around a bulleted `/\` or `\/` list
+pub const LIST: &str = "#list";
+
+fn spans() -> bool {
+    SPANS.with(|s| s.get())
 }
 
 /// The label around `a /\ b` (and `a \/ b`) written infix, in a module that names
@@ -409,6 +427,11 @@ impl Parser {
         }
         let (s, e) = (&self.toks[a], &self.toks[b]);
         format!("line {}, col {} to line {}, col {} of module {}", s.line, s.col + 1, e.line, e.end, self.module)
+    }
+
+    /// `e`, parsed from the token at `start` to the last one consumed, in a SPAN label
+    fn span(&self, start: usize, e: Expr) -> Expr {
+        Expr::Label(format!("{}{}", crate::ast::SPAN, self.span_text(start, self.pos - 1)), vec![], e.b())
     }
 
     /// `e`, parsed from the token at `start` to the last one consumed, in a POS label
@@ -915,12 +938,16 @@ impl Parser {
             let rhs = if op == "\\/" { self.at(rhs_start, rhs) } else { rhs };
             chain_or = op == "\\/";
             lhs = bin(op, lhs, rhs);
+            if spans() && ["/\\", "\\/", "=>", "<=>", "~>"].contains(&op) {
+                lhs = self.span(lhs_start, lhs);
+            }
         }
         Ok(lhs)
     }
 
     fn bullets(&mut self, sym: &str) -> R<Expr> {
         let col = self.raw().col;
+        let first = self.pos;
         let mut items = vec![];
         loop {
             self.pos += 1; // the bullet symbol
@@ -936,13 +963,16 @@ impl Parser {
                 break;
             }
         }
-        Ok(if items.len() == 1 {
+        let list = items.len() > 1;
+        let e = if items.len() == 1 {
             items.pop().unwrap()
         } else if sym == "/\\" {
             Expr::And(items)
         } else {
             Expr::Or(items)
-        })
+        };
+        // SANY names a bulleted list differently from an infix junction (see `live::sany_level`)
+        Ok(if spans() && list { self.span(first, Expr::Label(LIST.into(), vec![], e.b())) } else { e })
     }
 
     /// At `<<x, y>> \in`, the names (consuming the pattern up to `\in` inclusive); otherwise None
@@ -1103,12 +1133,15 @@ impl Parser {
                 self.pos += 1;
                 self.postfix_guard = Some("[]");
                 let e = Expr::Un(UOp::Always, self.prefix_operand("[]", 4)?.b());
-                Ok(at_err(&self.span_text(start, self.pos - 1), e))
+                let e = at_err(&self.span_text(start, self.pos - 1), e);
+                Ok(if spans() { self.span(start, e) } else { e })
             }
             Tok::Sym(s) if s == "<>" => {
+                let start = self.pos;
                 self.pos += 1;
                 self.postfix_guard = Some("<>");
-                Ok(Expr::Un(UOp::Eventually, self.prefix_operand("<>", 4)?.b()))
+                let e = Expr::Un(UOp::Eventually, self.prefix_operand("<>", 4)?.b());
+                Ok(if spans() { self.span(start, e) } else { e })
             }
             // \EE x : e and \AA x : e (temporal quantifiers)
             Tok::Sym(s) if s == "\\EE" || s == "\\AA" => {

@@ -1001,8 +1001,16 @@ fn compile_inner(
     for d in &m.defs {
         let e = if d.params.is_empty() { ex.expand_def(&d.name).ok() } else { Some(d.body.clone()) };
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
-            // As SANY reports it, with the definition where SANY gives the position of the formula
-            let msg = format!("Semantic errors:\n\n*** Errors: 1\n\nin definition {}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.", d.name);
+            // As SANY reports it, with the position of the formula it refuses: the root module is
+            // parsed again with the positions of temporal formulas (see `parse_module_spans`), and
+            // the definition as written checked again. Otherwise the definition is named
+            let at = crate::parser::parse_module_spans(tla)
+                .ok()
+                .and_then(|m| m.defs.into_iter().find(|x| x.name == d.name))
+                .and_then(|x| crate::live::sany_level(&x.body).err())
+                .and_then(|m| m.strip_prefix(crate::ast::SPAN).and_then(|m| m.split_once('\n')).map(|(at, m)| (at.to_string(), m.to_string())));
+            let (at, msg) = at.unwrap_or_else(|| (format!("in definition {}", d.name), msg));
+            let msg = format!("Semantic errors:\n\n*** Errors: 1\n\n{at}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.");
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), caps: (0, 0) });
         }
     }
