@@ -1426,6 +1426,13 @@ impl<'a> Gen<'a> {
     fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
         Ok(match t {
             Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            // A sorted array whose elements Rust orders otherwise than TLC: by size, then the
+            // elements in TLC's order
+            Ty::Set(e) if needs_tlc_order(e) => {
+                let (ix, iy) = (self.s_iter(&format!("(*{a})"), t)?, self.s_iter(&format!("(*{b})"), t)?);
+                let inner = self.tlc_cmp(e, "__fa", "__fb")?;
+                format!("{a}.len.cmp(&{b}.len).then_with(|| {ix}.zip({iy}).map(|(__fa, __fb)| {{ let (__fa, __fb) = (&__fa, &__fb); {inner} }}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal))")
+            }
             // A sparse function or bag: its pairs sort by key, so the Rust order of the set of pairs
             // is TLC's (by the size of the domain, then key and value pair by pair) when it is so
             // for keys and values
@@ -5668,106 +5675,6 @@ impl<'a> Gen<'a> {
         })
     }
 
-    /// Same layout as `pack_value`, but writes perm(c) (`pm`, inverse `pi`) without building the
-    /// permuted value. A function's entry j is read from the argument that `pm` maps to j, and a
-    /// sparse set's elements are written in the order of their permuted values.
-    fn pack_perm(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
-        if is_sparse_fun(t) {
-            return self.pack_perm(c, &fun_pairs(t), out, at);
-        }
-        if let Ty::Bag(e) = t {
-            return self.pack_perm(c, &bag_fun(e), out, at);
-        }
-        if let Ty::PFun(d, cd) = t {
-            return self.pack_perm(c, &pfun_repr(d, cd), out, at);
-        }
-        let inv_key = |d: &Ty, k: &str| match d {
-            Ty::Enum(_) => Some(format!("pi[({k}) as usize]")),
-            Ty::Bool | Ty::Int(..) => Some(k.to_string()),
-            _ => None,
-        };
-        match t {
-            _ if t.size().is_some() => {
-                let pc = self.perm_code(c, t)?;
-                self.pack_value(&format!("({pc})"), t, out, at)
-            }
-            Ty::Rec(fs) => {
-                let mut total = 0;
-                for (i, (_, ft)) in fs.iter().enumerate() {
-                    total += self.pack_perm(&format!("{c}{}", rec_field(fs.len(), i)), ft, out, at)?;
-                }
-                Ok(total)
-            }
-            Ty::Opt(inner) => {
-                match at {
-                    Some(o) => {
-                        out.push_str(&Self::put_at(&format!("({c}).0 as u128"), 1, *o));
-                        *o += 1;
-                    }
-                    None => write!(out, "put(&mut w, &mut p, ({c}).0 as u128, 1); ").unwrap(),
-                }
-                Ok(1 + self.pack_perm(&format!("({c}).1"), inner, out, at)?)
-            }
-            Ty::Set(e) if is_sparse(t) => {
-                let cap = crate::types::set_cap(t, self.scap);
-                let lb = Self::bits_for(cap as u64 + 1);
-                let (n, ord, a, b, k) = (self.fresh("n"), self.fresh("ord"), self.fresh("a"), self.fresh("b"), self.fresh("k"));
-                let lhs = self.perm_code(&format!("({c}).items[{ord}[{b} - 1] as usize]"), e)?;
-                let rhs = self.perm_code(&format!("({c}).items[{ord}[{b}] as usize]"), e)?;
-                // Sorting is the costly part, so give up first if the words written so far
-                // already exceed the best key
-                match at {
-                    Some(o) => write!(out, "if prune(&w, __best, {}, &mut __cw) {{ return Some(None); }} let mut p = {o}u32; ", *o / 64).unwrap(),
-                    None => out.push_str("if prune(&w, __best, (p / 64) as usize, &mut __cw) { return Some(None); } "),
-                }
-                *at = None;
-                write!(
-                    out,
-                    "let {n} = ({c}).len as usize; let mut {ord} = [0u16; {}]; for {k} in 0..{n} {{ {ord}[{k}] = {k} as u16; }} \
-                     for {a} in 1..{n} {{ let mut {b} = {a}; while {b} > 0 && {lhs} > {rhs} {{ {ord}.swap({b} - 1, {b}); {b} -= 1; }} }} \
-                     put(&mut w, &mut p, {n} as u128, {lb}); for {k} in 0..{n} {{ ",
-                    cap
-                )
-                .unwrap();
-                let eb = self.pack_perm(&format!("({c}).items[{ord}[{k}] as usize]"), e, out, &mut None)?;
-                out.push_str("} ");
-                Ok(lb + eb * cap as u32)
-            }
-            Ty::Fun(d, cod) if inv_key(d, "").is_some() => {
-                let n = d.size().unwrap();
-                let did = self.ty_id(d)?;
-                if at.is_some() {
-                    let mut total = 0;
-                    for k in 0..n {
-                        let src = inv_key(d, &format!("dec_{did}({k}u64)")).unwrap();
-                        let words = at.map(|o| o / 64);
-                        total += self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, at)?;
-                        // The permutation decides which entry lands here, so a key often loses
-                        // to the best one within the first entries
-                        if let (Some(before), Some(o)) = (words, *at) {
-                            if o / 64 > before {
-                                write!(out, "if prune(&w, __best, {}, &mut __cw) {{ return Some(None); }} ", o / 64).unwrap();
-                            }
-                        }
-                    }
-                    return Ok(total);
-                }
-                let k = self.fresh("k");
-                let src = inv_key(d, &format!("dec_{did}({k} as u64)")).unwrap();
-                write!(out, "for {k} in 0..{n} {{ ").unwrap();
-                let b = self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, &mut None)?;
-                out.push_str("} ");
-                Ok(b * n as u32)
-            }
-            _ => {
-                let pv = self.fresh("pv");
-                let pc = self.perm_code(c, t)?;
-                write!(out, "let {pv} = {pc}; ").unwrap();
-                self.pack_value(&pv, t, out, at)
-            }
-        }
-    }
-
     fn unpack_value(&mut self, t: &Ty, at: &mut Option<u32>) -> R<String> {
         if is_sparse_fun(t) {
             return self.unpack_value(&fun_pairs(t), at);
@@ -5896,14 +5803,9 @@ impl<'a> Gen<'a> {
 
     /// Function that packs the deduplication key (the VIEW value if there is one, otherwise the
     /// state) into a bit string
-    /// state) into a bit string. With `equiv` (see `view_is_equivariant`), also emits `view_perm`,
-    /// which permutes an already computed view value.
-    pub fn gen_key(&mut self, view: Option<&Expr>, equiv: bool) -> R<String> {
+    pub fn gen_key(&mut self, view: Option<&Expr>) -> R<String> {
         let Some(view) = view else {
-            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\n\
-                       const VIEW_EQUIV: bool = false;\ntype View = ();\nfn view_val(_: &State) -> View {}\n\
-                       fn view_perm_pack(_: &View, _: &[u16], _: &[u16], _: Option<&Key>) -> Option<Option<Key>> { unreachable!() }\nfn view_pack_v(_: &View) -> Option<Key> { unreachable!() }\n"
-                .into());
+            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\n".into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
         let mut body = String::new();
@@ -5911,19 +5813,9 @@ impl<'a> Gen<'a> {
         let bits = self.pack_value("(*__v)", &vt, &mut body, &mut at)?;
         let vp = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let words = bits.div_ceil(64).max(1);
-        let mut pbody = String::new();
-        let mut pat = Some(0u32);
-        if equiv {
-            self.pack_perm("(*__v)", &vt, &mut pbody, &mut pat)?;
-        }
-        let pvp = if pat.is_some() { "" } else { "let mut p = 0u32; " };
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
-             const VIEW_EQUIV: bool = {equiv};\ntype View = {};\n\
-             fn view_val(s: &State) -> View {{ {vc} }}\n\
-             fn view_pack_v(__v: &View) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn view_perm_pack(__v: &View, pm: &[u16], pi: &[u16], __best: Option<&Key>) -> Option<Option<Key>> {{ let mut w: Key = [0; VWORDS]; let mut __cw = 0usize; {pvp}{pbody}Some(Some(w)) }}\n\
-             fn key_of(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n",
+             fn key_of(s: &State) -> Option<Key> {{ let __v: &{} = &{{ {vc} }}; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n",
             vt.repr()
         ))
     }
@@ -6006,6 +5898,15 @@ impl<'a> Gen<'a> {
             fields.push(format!("v_{v}: {}", self.perm_code(&format!("s.v_{v}"), &t)?));
         }
         writeln!(s, "fn perm_state(s: &State, pm: &[u16]) -> State {{ State {{ {} }} }}", fields.join(", ")).unwrap();
+        // TLC's order of states: the variables in the order it prints them, each in its order of
+        // values (with a VIEW, the smallest permuted state is the one whose view is taken)
+        let mut cmp = String::from("std::cmp::Ordering::Equal");
+        for v in self.print_order.clone().iter().rev() {
+            let t = self.vars.iter().find(|(n, _)| n == v).map(|(_, t)| t.clone()).ok_or("a variable without a type")?;
+            let c = self.tlc_cmp(&t, &format!("(&a.v_{v})"), &format!("(&b.v_{v})"))?;
+            cmp = format!("{c}.then_with(|| {cmp})");
+        }
+        writeln!(s, "fn tlc_state_cmp(a: &State, b: &State) -> std::cmp::Ordering {{ {cmp} }}").unwrap();
         Ok(s)
     }
 
@@ -6171,7 +6072,7 @@ fn bag_fun(e: &Ty) -> Ty {
 fn needs_tlc_order(t: &Ty) -> bool {
     match t {
         Ty::Bag(_) | Ty::PFun(..) => true,
-        Ty::Set(_) => !is_sparse(t),
+        Ty::Set(e) => !is_sparse(t) || needs_tlc_order(e),
         // Records of different fields: TLC compares the number of fields first
         Ty::Rec(fs) if !is_tuple_fields(fs) && fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => true,
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),

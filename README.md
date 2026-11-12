@@ -216,9 +216,9 @@ memory.
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
   it instead (`-lassocheck`)
-- With `VIEW` and `SYMMETRY` together, the distinct count can be lower than TLC's. TLC sometimes keeps states with
-  identical views as separate states (its choice of representative depends on the state itself), while tla2rs folds
-  by orbits of the view. With only one of the two, counts match TLC exactly
+- With `VIEW` and `SYMMETRY` together, a state is reduced as TLC reduces it: the smallest of its permutations (values
+  compared as TLC compares them, variables in the order TLC prints them), and then the view of that state. This
+  compares whole permuted states, which costs more than comparing views did
 
 ## Cross-checking against TLC
 

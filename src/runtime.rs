@@ -238,27 +238,32 @@ fn canon_fp(s: &State) -> Option<Fp> {
 
 /// `canon_fp`, or Some(None) if `mine` shows that this thread has fingerprinted the state before.
 fn fresh_fp(s: &State, mut mine: Option<&mut Seen>) -> Option<Option<Fp>> {
-    // The key under the first permutation decides the smallest one, so a repeat is caught before
-    // trying the others. A VIEW that does not commute with the permutations breaks this: states
-    // with equal VIEW values can then have different smallest keys.
-    let by_first = mine.is_some() && (!HAS_VIEW || VIEW_EQUIV);
+    // Without a VIEW, the key under the first permutation decides the smallest one, so a repeat is
+    // caught before trying the others
+    let by_first = mine.is_some() && !HAS_VIEW;
     let mut fresh = |fp| mine.as_mut().is_none_or(|m| m.fresh(fp));
     if PERMS.is_empty() {
         let fp = fingerprint(&key_of(s)?);
         return Some(fresh(fp).then_some(fp));
     }
-    let v = if VIEW_EQUIV { Some(view_val(s)) } else { None };
+    if HAS_VIEW {
+        // As TLC does (`TLCStateMut.fingerPrint`): the smallest of the permuted states, comparing
+        // values in TLC's order and the variables in the order TLC prints them, and then the VIEW
+        // of that state. Two states with equal views can have smallest states whose views differ,
+        // and TLC keeps both
+        let mut best = *s;
+        for p in PERMS.iter() {
+            let t = perm_state(s, p);
+            if tlc_state_cmp(&t, &best).is_lt() {
+                best = t;
+            }
+        }
+        let fp = fingerprint(&key_of(&best)?);
+        return Some(fresh(fp).then_some(fp));
+    }
     let mut best: Option<Key> = None;
     for (i, p) in PERMS.iter().enumerate() {
-        let k = match &v {
-            Some(v) if i == 0 && PERM0_IS_ID => view_pack_v(v)?,
-            Some(v) => match view_perm_pack(v, p, PERMS_INV[i], best.as_ref())? {
-                Some(k) => k,
-                None => continue,
-            },
-            None if i == 0 && PERM0_IS_ID => key_of(s)?,
-            None => key_of(&perm_state(s, p))?,
-        };
+        let k = if i == 0 && PERM0_IS_ID { key_of(s)? } else { key_of(&perm_state(s, p))? };
         if i == 0 && by_first && !fresh(fingerprint(&k)) {
             return Some(None);
         }
@@ -278,26 +283,6 @@ fn fresh_state_fp(s: &State, w: &Packed, mine: &mut Seen) -> Option<Fp> {
         return mine.fresh(fp).then_some(fp);
     }
     fresh_fp(s, Some(mine)).unwrap_or_else(|| type_error("VIEW value", ""))
-}
-
-/// Compares the fully written words `*cw..done` of a key being packed with `best`. Returns true
-/// once the key is known to be greater than `best`; once it is known to be smaller, moves `*cw`
-/// past the end so later calls return false at once.
-#[inline]
-fn prune(w: &[u64], best: Option<&Key>, done: usize, cw: &mut usize) -> bool {
-    let Some(b) = best else { return false };
-    while *cw < done {
-        let i = *cw;
-        if w[i] != b[i] {
-            if w[i] > b[i] {
-                return true;
-            }
-            *cw = usize::MAX;
-            return false;
-        }
-        *cw += 1;
-    }
-    false
 }
 
 #[inline]
