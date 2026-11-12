@@ -1035,8 +1035,11 @@ fn compile_inner(
             Expr::Bin(BOp::In, v, s) => {
                 let mut taken = false;
                 if let Expr::Ident(v) = v.strip() {
-                    if m.variables.contains(v) {
-                        decl.insert(v.clone(), ty_of_set(&g, s).map_err(|e| format!("{tname}: type of `{v}`: {e}"))?);
+                    // A set that gives no type (one with Int inside, records mixed with other values)
+                    // leaves the variable's type to inference, which stops the search where a value
+                    // leaves the type inferred
+                    if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
+                        decl.insert(v.clone(), t);
                         // Packing checks the element type of a bounded sequence, not its length
                         taken = bounded_seq(s).is_none();
                     }
@@ -1053,8 +1056,7 @@ fn compile_inner(
             Expr::Bin(BOp::Subseteq, v, s) => {
                 let mut taken = false;
                 if let Expr::Ident(v) = v.strip() {
-                    if m.variables.contains(v) {
-                        let t = ty_of_set(&g, s).map_err(|e| format!("{tname}: type of `{v}`: {e}"))?;
+                    if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
                         decl.insert(v.clone(), Ty::Set(t.into()));
                         taken = true;
                     }
