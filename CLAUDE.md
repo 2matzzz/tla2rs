@@ -366,7 +366,10 @@ state and of each successor as soon as it generates it, and evaluates the initia
 actions again while rebuilding a counterexample. tla2rs computes all initial states, or all
 successors of a state, before checking them, and replays a counterexample its own way, so lines
 printed in Init, an action or an invariant come in another order (and number) when a state has more
-than one initial state or successor (`PrintNext`).
+than one initial state or successor (`PrintNext`). With `-batched` / `-metal`, phase 1 checks the
+invariants of every candidate this thread has not seen, before the lookup; when an invariant prints,
+it first skips a candidate already visited or collected in the level (`INV_PRINTS`), since TLC checks
+new states only (`PrintConst` printed the invariant of a revisited state twice otherwise).
 
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is

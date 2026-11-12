@@ -1075,11 +1075,14 @@ fn compile_inner(
     let type_inv_subsumed = leftover == 0 && ex.has_def(tname) && cfg.invariants.iter().any(|n| n == tname);
     let mut inv_code = String::new();
     let mut inv_list = vec![];
+    // Whether an invariant prints (Print, PrintT): see INV_PRINTS in the runtime
+    let mut inv_prints = false;
     for (i, name) in cfg.invariants.iter().enumerate() {
         if type_inv_subsumed && name == tname {
             continue;
         }
         let e = ex.expand_def(name)?;
+        inv_prints |= has_prints(&e);
         let c = g.gen_as(&e, &Gen::env_next(), &Ty::Bool).map_err(|m| format!("invariant {name}: {m}"))?;
         writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {c} }}").unwrap();
         inv_list.push(format!("({name:?}, inv_{i} as fn(&State) -> bool)"));
@@ -1116,6 +1119,7 @@ fn compile_inner(
             if kind == 4 || kind == 6 {
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 if kind == 4 {
+                    inv_prints |= has_prints(&p);
                     let i = inv_list.len() + 1000;
                     writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {pc} }}").unwrap();
                     inv_list.push(format!("({part_name:?}, inv_{i} as fn(&State) -> bool)"));
@@ -1272,6 +1276,7 @@ fn compile_inner(
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
+    writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a

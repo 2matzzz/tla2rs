@@ -2689,7 +2689,14 @@ fn collect_phase(
                     };
                     (fp, Some(tw))
                 };
-                let inv = if tw.is_some() { eval_invariants(&t) } else { Ok(None) };
+                // Phase 1 checks the invariants of every candidate not seen by this thread, also one
+                // visited before, which only matters when they print: TLC evaluates them on new
+                // states only, so then a candidate already visited or collected is not checked
+                let known = INV_PRINTS && {
+                    let has = |v: &Vec<Cand>| v.iter().any(|c| c.fp == tfp);
+                    tbl.contains(tfp) || prev.iter().flatten().any(has) || out.parts.iter().any(has)
+                };
+                let inv = if tw.is_some() && !known { eval_invariants(&t) } else { Ok(None) };
                 // TLC checks only new states. With a VIEW or a SYMMETRY, a state already visited
                 // under the same fingerprint can be a different one, so before stopping, look the
                 // candidate up among the states visited or collected so far.
