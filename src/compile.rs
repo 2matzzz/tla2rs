@@ -908,6 +908,37 @@ fn compile_inner(
         }
     }
 
+    // TLC evaluates an invariant or property of constant level once, before exploring, and
+    // refuses one that is not TRUE (one it fails to evaluate is evaluated again on each state)
+    {
+        let ce = ConstEval { atoms: &atoms, constants: &constants };
+        let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
+        for (what, name) in named {
+            let e = ex.expand_def(name)?;
+            if !constant_level(&e, &m) {
+                continue;
+            }
+            match ce.eval(&e, &HashMap::new()) {
+                Ok(Value::Bool(true)) | Err(_) => {}
+                Ok(v) => {
+                    let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)) });
+                }
+            }
+        }
+    }
+    // A module without variables and a cfg without SPECIFICATION, INIT and NEXT (one that only checks
+    // its ASSUMEs): TLC checks the constant-level invariants and properties, then finishes with no
+    // states (measured on TLC 2.19, `tests/tlc/NoBehavior*`)
+    let no_behavior = cfg.specification.is_none() && cfg.init.is_none() && cfg.next.is_none() && m.variables.is_empty();
+    let SpecParts { init, next, temporal, written } = if no_behavior {
+        SpecParts { init: Expr::Bool(false), next: None, temporal: vec![], written: Err(String::new()) }
+    } else {
+        match resolve_spec(&m, &cfg, &mut ex)? {
+            Ok(p) => p,
+            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r) }),
+        }
+    };
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
     // is false. An expression that cannot be evaluated is an error rather than silently passing.
     {
@@ -935,28 +966,8 @@ fn compile_inner(
         }
     }
 
-    let SpecParts { init, next, temporal, written } = match resolve_spec(&m, &cfg, &mut ex)? {
-        Ok(p) => p,
-        Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r) }),
-    };
-    // TLC evaluates an invariant or property of constant level once, before exploring, and
-    // refuses one that is not TRUE (one it fails to evaluate is evaluated again on each state)
-    {
-        let ce = ConstEval { atoms: &atoms, constants: &constants };
-        let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
-        for (what, name) in named {
-            let e = ex.expand_def(name)?;
-            if !constant_level(&e, &m) {
-                continue;
-            }
-            match ce.eval(&e, &HashMap::new()) {
-                Ok(Value::Bool(true)) | Err(_) => {}
-                Ok(v) => {
-                    let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)) });
-                }
-            }
-        }
+    if no_behavior {
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)) });
     }
     if uses_real_time(&init) || next.as_ref().is_some_and(uses_real_time) {
         return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
@@ -1476,6 +1487,10 @@ pub struct SpecParts {
     pub written: Result<crate::lasso::Written, String>,
 }
 
+/// What TLC prints when there is nothing to explore (see `no_behavior`); `main` writes the empty state
+/// graph TLC writes
+pub const NO_BEHAVIOR: &str = "Computing initial states...\nModel checking completed. No error has been found.\n0 states generated, 0 distinct states found, 0 states left on queue.\nThe depth of the complete state graph search is 1.";
+
 const NO_INIT: &str = "Error: The configuration file did not specify the initial state predicate.\nCan also be caused by trying to run TLC on a specification from\na module imported with a parameterized INSTANCE statement.";
 
 /// The spec's parts, or why TLC refuses it (message and exit code)
@@ -1501,7 +1516,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
         });
         return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![], written }));
     }
-    let spec = cfg.specification.as_ref().ok_or("cfg needs SPECIFICATION or INIT/NEXT")?;
+    let Some(spec) = cfg.specification.as_ref() else { return Ok(Err((NO_INIT.into(), 151))) };
     let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false, written: Ok(Default::default()) };
     if !ex.has_def(spec) {
         return Err(format!("no definition `{spec}`"));
