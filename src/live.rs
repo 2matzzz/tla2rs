@@ -545,7 +545,12 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
         // WF_v(A) is []<>(~ENABLED <<A>>_v \/ <<A>>_v); SF_v(A) is <>[]~ENABLED <<A>>_v \/ []<><<A>>_v
         Fair(weak, v, a) => {
             let step = And(vec![a.as_ref().clone(), changed(v)]);
-            let en = TExpr::Neg(TExpr::State(atoms.state(g, &Un(UOp::Enabled, step.clone().b()), env)?).into());
+            // Written in an instantiated module (see ast::SUBVAR), subscript included
+            let en_step = match a.as_ref() {
+                Label(n, ..) if n == crate::ast::ENINST => Label(n.clone(), vec![], step.clone().b()),
+                _ => step.clone(),
+            };
+            let en = TExpr::Neg(TExpr::State(atoms.state(g, &Un(UOp::Enabled, en_step.b()), env)?).into());
             let act = TExpr::Action(atoms.action(g, &step, env)?);
             if *weak {
                 TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
@@ -741,13 +746,15 @@ pub fn compile(
             let what = if f.weak { "WF" } else { "SF" };
             let chg = g.gen_as(&changed(&f.sub), &step_env, &Ty::Bool).map_err(|m| format!("{what} subscript: {m}"))?;
             let act = g.gen_as(&f.action, &step_env, &Ty::Bool).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
+            // Whether <<A>>_v is enabled, as for WF in a property: v changes in a successor of A
             let mut succ = String::new();
-            g.gen_action(&[f.action.clone()], &g.env_fair(genv.clone(), &f.sub), &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
+            let step = Expr::And(vec![f.action.clone(), changed(&f.sub)]);
+            g.gen_action(&[step], &Gen::env_fair(genv.clone(), &f.action), &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
             writeln!(src, "#[allow(unused_variables)]\nfn fchg_{i}(s: &State, t: &State) -> bool {{ {chg} }}").unwrap();
             writeln!(src, "#[allow(unused_variables)]\nfn fstep_{i}(s: &State, t: &State) -> bool {{ ({act}) && fchg_{i}(s, t) }}").unwrap();
             writeln!(
                 src,
-                "fn fen_{i}(s: &State) -> bool {{ let mut buf: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf; {succ} }} buf.iter().any(|(t, _)| fchg_{i}(s, t)) }}"
+                "fn fen_{i}(s: &State) -> bool {{ let mut buf: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf; {succ} }} !buf.is_empty() }}"
             )
             .unwrap();
             fairs.push(format!("({}, fen_{i} as fn(&State) -> bool, fstep_{i} as fn(&State, &State) -> bool)", f.weak));

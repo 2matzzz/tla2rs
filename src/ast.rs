@@ -180,6 +180,30 @@ pub fn at_pos(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{POS}{at}"), vec![], e.b())
 }
 
+/// The name of the label around what a variable of an instantiated module stands for, when an
+/// INSTANCE substitutes another expression for it: `#var ` followed by the variable's name. It
+/// changes nothing, except where TLC computes whether an action is enabled in an ENABLED or a
+/// WF / SF written in the instantiated module (marked with ENINST): there TLC binds a primed
+/// variable by its name and does not read the substitution (`Gen::gen_phantom`, measured on TLC
+/// 2.19, `tests/tlc/EnSubst*`)
+pub const SUBVAR: &str = "#var ";
+
+/// The name of the label around the action of an ENABLED, WF or SF written in an instantiated
+/// module (see SUBVAR). An ENABLED written in the instantiating module reads the substitutions
+pub const ENINST: &str = "#en_inst";
+
+/// For an expression that is a substituted variable of an instantiated module (inside other
+/// labels): the variable's name and what it stands for
+pub fn subvar_of(e: &Expr) -> Option<(&str, &Expr)> {
+    match e {
+        Expr::Label(n, _, b) => match n.strip_prefix(SUBVAR) {
+            Some(v) => Some((v, b)),
+            None => subvar_of(b),
+        },
+        _ => None,
+    }
+}
+
 /// The position recorded by a POS label named `n`
 pub fn pos_of(n: &str) -> Option<&str> {
     n.strip_prefix(POS)

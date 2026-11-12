@@ -68,7 +68,7 @@ skip specifications/LoopInvariance/MCBinarySearch.tla specifications/LoopInvaria
 skip specifications/LoopInvariance/MCQuicksort.tla specifications/LoopInvariance/MCQuicksort.cfg # needs module TLAPS, not in tla2tools.jar
 check specifications/Majority/MCMajority.tla specifications/Majority/MCMajority.cfg
 skip specifications/MisraReachability/APParReach.tla specifications/MisraReachability/APParReach.cfg # symbolic mode: checked with Apalache
-gap specifications/MisraReachability/MCParReach.tla specifications/MisraReachability/MCParReach.cfg # tla2rs reports a variable as undefined while evaluating Next (3 states in); TLC does not
+check specifications/MisraReachability/MCParReach.tla specifications/MisraReachability/MCParReach.cfg
 skip specifications/MisraReachability/MCReachabilityTest.tla specifications/MisraReachability/MCReachabilityTestAllGraphs.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/MisraReachability/MCReachabilityTest.tla specifications/MisraReachability/MCReachabilityTestRandomGraphs.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/MisraReachability/MCReachable.tla specifications/MisraReachability/MCReachable.cfg # TLC 2.19 took 81 s with one worker
@@ -232,7 +232,7 @@ skip specifications/ewd998/SmokeEWD998_SC.tla specifications/ewd998/SmokeEWD998_
 skip specifications/glowingRaccoon/APclean.tla specifications/glowingRaccoon/APclean.cfg # symbolic mode: checked with Apalache
 skip specifications/glowingRaccoon/APstages.tla specifications/glowingRaccoon/APstages.cfg # symbolic mode: checked with Apalache
 check specifications/glowingRaccoon/clean.tla specifications/glowingRaccoon/clean.cfg
-gap specifications/glowingRaccoon/product.tla specifications/glowingRaccoon/product.cfg # tla2rs reports a variable as undefined while evaluating Next (2 states in); TLC does not
+check specifications/glowingRaccoon/product.tla specifications/glowingRaccoon/product.cfg
 check specifications/glowingRaccoon/stages.tla specifications/glowingRaccoon/stages.cfg
 skip specifications/lamport_mutex/APLamportMutex.tla specifications/lamport_mutex/APLamportMutex.cfg # symbolic mode: checked with Apalache
 check specifications/lamport_mutex/MCLamportMutex.tla specifications/lamport_mutex/MCLamportMutex.cfg

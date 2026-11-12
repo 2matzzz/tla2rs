@@ -658,6 +658,15 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
                 a.extend(args.iter().map(|x| rename(x, names, raw, pargs)));
                 Expr::Call(raw(n), a)
             }
+            // See ast::SUBVAR
+            Expr::Un(UOp::Enabled, x) => {
+                Expr::Un(UOp::Enabled, Expr::Label(crate::ast::ENINST.into(), vec![], rename(x, names, raw, pargs).b()).b())
+            }
+            Expr::Fair(w, v, a) => Expr::Fair(
+                *w,
+                rename(v, names, raw, pargs).b(),
+                Expr::Label(crate::ast::ENINST.into(), vec![], rename(a, names, raw, pargs).b()).b(),
+            ),
             _ => crate::codegen::map_children(e, &|c| rename(c, names, raw, pargs)),
         }
     }
@@ -682,6 +691,10 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     let mut args = vec![];
     for (p, _) in &params {
         match inst.subs.iter().find(|(x, _)| x == p) {
+            // A variable substituted by anything but itself is marked (see ast::SUBVAR)
+            Some((_, e)) if mm.variables.contains(p) && !matches!(e, Expr::Ident(n) if n == p) => {
+                args.push(Expr::Label(format!("{}{p}", crate::ast::SUBVAR), vec![], e.clone().b()))
+            }
             Some((_, e)) => args.push(e.clone()),
             None if known(p) || inst.params.contains(p) => args.push(Expr::Ident(p.clone())),
             None => return Err(format!("INSTANCE {mname}: {p} has no WITH substitution and is not declared or defined here")),

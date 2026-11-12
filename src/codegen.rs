@@ -35,9 +35,9 @@ pub struct Env {
     work: Option<String>,
     /// Inside ENABLED: a successor need not determine every variable (as in TLC)
     partial: bool,
-    /// With `partial`, the variables a successor must still determine: those the subscript of a
-    /// fairness condition reads (TLC fails evaluating it on a successor that leaves one out)
-    need: Vec<String>,
+    /// Inside an ENABLED written in an instantiated module: a substituted variable is bound by its
+    /// name (see gen_phantom)
+    phantom: bool,
     /// Computing whether an action is enabled (ENABLED, or for fairness), which TLC's error
     /// messages name
     enabled: bool,
@@ -93,6 +93,12 @@ pub struct Gen<'a> {
     /// TLC names them with (`N!` or nothing), and the number of constants and variables
     /// substituted
     pub inst_prefixes: Vec<(String, String, usize)>,
+}
+
+/// The local holding the value bound to the substituted variable `n` of an instance while
+/// computing whether an action is enabled (see `Gen::gen_phantom`)
+fn phantom(n: &str) -> String {
+    format!("'{n}")
 }
 
 fn rid(n: &str) -> String {
@@ -967,6 +973,7 @@ impl<'a> Gen<'a> {
         match e {
             Expr::Ident(n) if self.is_var(n) => Expr::Prime(e.clone().b()),
             Expr::Prime(_) => e.clone(),
+            Expr::Label(n, ..) if n.starts_with(crate::ast::SUBVAR) => Expr::Prime(e.clone().b()),
             _ => map_children(e, &|c| self.prime_vars(c)),
         }
     }
@@ -1881,6 +1888,22 @@ impl<'a> Gen<'a> {
                 }
             }
             At => env.locals.get("@").cloned().ok_or("`@` outside EXCEPT")?,
+            // A substituted variable of an instance: what it stands for, primed; while computing
+            // whether an action is enabled, the value bound to its name (see gen_action)
+            Prime(x) if crate::ast::subvar_of(x).is_some() => {
+                let (n, b) = crate::ast::subvar_of(x).unwrap();
+                if !env.phantom {
+                    return self.gen(&Prime(b.clone().b()), env, want);
+                }
+                match env.locals.get(&phantom(n)) {
+                    Some(x) => x.clone(),
+                    // Not bound yet: TLC fails on evaluation, naming the variable
+                    None => {
+                        let (_, t) = self.gen(b, env, want)?;
+                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
+                    }
+                }
+            }
             Prime(x) => match x.strip() {
                 Ident(n) if self.is_var(n) => match env.primed.get(n) {
                     Some(x) => x.clone(),
@@ -2406,6 +2429,7 @@ impl<'a> Gen<'a> {
                 inner.init = false;
                 inner.partial = true;
                 inner.enabled = true;
+                inner.phantom = matches!(x.as_ref(), Label(n, ..) if n == crate::ast::ENINST);
                 let mut code = String::new();
                 self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
                 (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
@@ -3765,6 +3789,11 @@ impl<'a> Gen<'a> {
         if env.split && !env.init && self.gen_split(h, rest, env, out)? {
             return Ok(());
         }
+        if env.phantom && !env.init {
+            if let Some(r) = self.gen_phantom(h, rest, env, out) {
+                return r;
+            }
+        }
         match h.strip() {
             // [A]_v is A \/ UNCHANGED v (TLC follows both)
             BoxAction(a, v) => {
@@ -4133,6 +4162,71 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// While computing whether an action is enabled, TLC binds a primed variable by its name in a
+    /// partial state (`TLCStateFun`) and reads it from there. A variable of an instantiated module
+    /// that the INSTANCE substitutes (see ast::SUBVAR) is bound the same way, as if it were a
+    /// variable of its own: `x' = e` and `x' \in S` bind it when it is not bound yet, UNCHANGED x
+    /// binds it to what x stands for, and `x'` elsewhere reads it (failing when it is not bound),
+    /// never the substitution (measured on TLC 2.19, `tests/tlc/EnSubst*`). The binding does not
+    /// assign any variable of the state. Returns None for a conjunct that binds nothing.
+    fn gen_phantom(&mut self, h: &Expr, rest: &[Expr], env: &Env, out: &mut String) -> Option<R<()>> {
+        use Expr::*;
+        let unbound = |e: &Expr| match e.strip() {
+            Prime(x) => crate::ast::subvar_of(x).map(|(n, _)| n.to_string()).filter(|n| !env.locals.contains_key(&phantom(n))),
+            _ => None,
+        };
+        match h.strip() {
+            Bin(BOp::Eq, lhs, rhs) => {
+                let n = unbound(lhs)?;
+                Some((|| {
+                    let (c, t) = self.gen(rhs, env, None)?;
+                    let x = self.fresh("ph");
+                    writeln!(out, "{{ let {x} = {c};").unwrap();
+                    let mut env2 = env.clone();
+                    env2.bind(&phantom(&n), x, t);
+                    self.gen_action(rest, &env2, out)?;
+                    out.push_str("}\n");
+                    Ok(())
+                })())
+            }
+            Bin(BOp::In, lhs, s) => {
+                let n = unbound(lhs)?;
+                Some((|| {
+                    let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                    let x = self.fresh("ph");
+                    let val = match ix {
+                        Some(_) => format!("dec_{}({x})", self.ty_id(&et)?),
+                        None => x.clone(),
+                    };
+                    let y = self.fresh("ph");
+                    writeln!(out, "for {x} in {it} {{ let {y} = {val};").unwrap();
+                    let mut env2 = self.renew_work(env, out);
+                    env2.bind(&phantom(&n), y, et);
+                    self.gen_action(rest, &env2, out)?;
+                    out.push_str("}\n");
+                    Ok(())
+                })())
+            }
+            Un(UOp::Unchanged, x) => {
+                let mut leaves = vec![];
+                Self::unchanged_leaves(x, &mut leaves);
+                if !leaves.iter().any(|l| crate::ast::subvar_of(l).is_some()) {
+                    return None;
+                }
+                let parts: Vec<Expr> = leaves
+                    .into_iter()
+                    .map(|l| match l.strip() {
+                        Ident(n) if self.is_var(n) && crate::ast::subvar_of(&l).is_none() => Un(UOp::Unchanged, l.clone().b()),
+                        _ => Bin(BOp::Eq, Prime(l.clone().b()).b(), l.b()),
+                    })
+                    .collect();
+                let work: Vec<Expr> = parts.into_iter().chain(rest.iter().cloned()).collect();
+                Some(self.gen_action(&work, env, out))
+            }
+            _ => None,
+        }
+    }
+
     /// `\A x \in S : B` that assigns variables, with S from the state. TLC evaluates it as the
     /// conjunction of B over the elements of S in order: an element can assign the variables not
     /// assigned yet, and once B only reads what is assigned, it is a test for the remaining
@@ -4290,6 +4384,8 @@ impl<'a> Gen<'a> {
     /// The assignment target (x' in Next, x in Init), if it is not yet assigned
     fn target(&self, e: &Expr, env: &Env) -> Option<String> {
         let n = match (e.strip(), env.init) {
+            // Bound by its name while computing ENABLED (see gen_phantom)
+            (Expr::Prime(x), false) if env.phantom && crate::ast::subvar_of(x).is_some() => return None,
             (Expr::Prime(x), false) => match x.strip() {
                 Expr::Ident(n) => n.clone(),
                 _ => return None,
@@ -4532,7 +4628,7 @@ impl<'a> Gen<'a> {
             return Ok(());
         }
         for (v, _) in &self.vars {
-            if env.primed.contains_key(v) || (env.partial && !env.need.contains(v)) {
+            if env.primed.contains_key(v) || env.partial {
                 continue;
             }
             // Fail only if this branch is reached (TLC: Successor state is not completely specified)
@@ -4574,13 +4670,12 @@ impl<'a> Gen<'a> {
         env
     }
 
-    /// Environment for whether the action of WF_sub / SF_sub is enabled: as TLC computes ENABLED,
-    /// a successor may leave variables undetermined, except those `sub` reads (measured on TLC
-    /// 2.19, `tests/tlc/FairPartial*`)
-    pub fn env_fair(&self, env: Env, sub: &Expr) -> Env {
+    /// Environment for whether `<<A>>_v` is enabled, for WF_v(A) / SF_v(A): as TLC computes
+    /// ENABLED, a successor may leave variables undetermined (reading one fails)
+    pub fn env_fair(env: Env, action: &Expr) -> Env {
         let mut env = Self::env_enabled(env);
         env.partial = true;
-        env.need = self.vars.iter().map(|(v, _)| v.clone()).filter(|v| sub.any(&|x| matches!(x, Expr::Ident(n) if n == v))).collect();
+        env.phantom = matches!(action, Expr::Label(n, ..) if n == crate::ast::ENINST);
         env
     }
 
