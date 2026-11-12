@@ -36,9 +36,9 @@ skip specifications/DiningPhilosophers/DiningPhilosophers_anim.tla specification
 skip specifications/DiningPhilosophers/DiningPhilosophers_stats.tla specifications/DiningPhilosophers/DiningPhilosophers_stats.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/Disruptor/APDisruptor_MPMC.tla specifications/Disruptor/APDisruptor_MPMC.cfg # symbolic mode: checked with Apalache
 skip specifications/Disruptor/APDisruptor_SPMC.tla specifications/Disruptor/APDisruptor_SPMC.cfg # symbolic mode: checked with Apalache
-gap specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC.cfg rsargs=-seqcap,10 # TypeOk, checked as an invariant, tests membership in [S -> Int], which tla2rs cannot test on a state
-gap specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC_liveliness.cfg rsargs=-seqcap,10 # TypeOk, checked as an invariant, tests membership in [S -> Int], which tla2rs cannot test on a state
-gap specifications/Disruptor/MCDisruptor_SPMC.tla specifications/Disruptor/MCDisruptor_SPMC.cfg rsargs=-seqcap,10 # TypeOk, checked as an invariant, tests membership in [S -> Int], which tla2rs cannot test on a state
+check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC.cfg rsargs=-seqcap,10
+check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC_liveliness.cfg rsargs=-seqcap,10
+check specifications/Disruptor/MCDisruptor_SPMC.tla specifications/Disruptor/MCDisruptor_SPMC.cfg rsargs=-seqcap,10
 skip specifications/EinsteinRiddle/Einstein.tla specifications/EinsteinRiddle/Einstein.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APCRDT.tla specifications/FiniteMonotonic/APCRDT.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APReplicatedLog.tla specifications/FiniteMonotonic/APReplicatedLog.cfg # symbolic mode: checked with Apalache

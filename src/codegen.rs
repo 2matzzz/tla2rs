@@ -3705,6 +3705,12 @@ impl<'a> Gen<'a> {
                     _ => format!("({l} && !{r})"),
                 });
             }
+            // x \in UNION {S}: x \in S, without enumerating S. With more sets TLC compares them to
+            // build the set of sets, which fails for a set it cannot enumerate (measured)
+            Un(UOp::Union, ss) if matches!(ss.strip(), SetLit(v) if v.len() == 1) && self.try_const(s, env).is_none() => {
+                let SetLit(ss) = ss.strip() else { unreachable!() };
+                return self.gen_member(x, xt, &ss[0], env);
+            }
             SetFilter(y, t, p) if self.try_const(s, env).is_none() => {
                 let m = self.gen_member(x, xt, t, env)?;
                 let mut env2 = env.clone();
