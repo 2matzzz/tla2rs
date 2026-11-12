@@ -228,7 +228,11 @@ impl ConstEval<'_> {
                     return Err(format!("`{n}` is not a constant"));
                 }
             }
-            Label(_, _, b) => self.eval(b, env)?,
+            // TLC gives the position of a CASE or CHOOSE that fails (see ast::AT)
+            Label(n, _, b) => match (crate::ast::err_pos_of(n), self.eval(b, env)) {
+                (Some(p), Err(m)) if m == CASE_NONE || m == CHOOSE_NONE => return Err(format!("{m}\n{p}")),
+                (_, r) => r?,
+            },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 (f, []) if crate::parser::unbounded_error(f).is_some() => return Err(crate::parser::unbounded_error(f).unwrap()),
                 ("Cardinality", [s]) => Value::Int(self.eval(s, env)?.as_set()?.len() as i64),

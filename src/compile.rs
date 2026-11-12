@@ -510,6 +510,22 @@ fn uses_real_time(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Label(n, ..) if n == "RTBound" || n == "RTnow"))
 }
 
+/// How TLC names the first RTnow or RTBound in e when it refuses it: by its position (see
+/// ast::AT), or as written
+fn real_time_at(e: &Expr) -> String {
+    fn find(e: &Expr) -> Option<&str> {
+        if let Expr::Label(n, _, b) = e {
+            if let Some(p) = err_pos_of(n) {
+                if uses_real_time(b) && matches!(b.as_ref(), Expr::Label(r, ..) if r == "RTBound" || r == "RTnow") {
+                    return Some(p);
+                }
+            }
+        }
+        e.children().into_iter().find_map(find)
+    }
+    find(e).map(|p| p.to_string()).unwrap_or_else(|| format!("{} (RTBound / RTnow of RealTime)", short(e)))
+}
+
 /// The operators of the standard modules and their numbers of arguments, for a named instance
 /// (`S == INSTANCE Sequences` used as `S!Len(s)`)
 fn std_ops(m: &str) -> &'static [(&'static str, usize)] {
@@ -1035,13 +1051,13 @@ fn compile_inner(
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
         if uses_real_time(&e) {
-            let msg = format!("Error: TLC cannot handle the temporal formula {name} (RTBound / RTnow of RealTime)");
+            let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
         }
         let mut parts = vec![];
-        split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
+        split_property(&g, &e, &HashMap::new(), name, None, &mut parts)?;
         let whole = parts.len() == 1;
-        for (disp, kind, p, q, venv) in parts {
+        for (disp, kind, p, q, venv, at) in parts {
             if kind == 7 {
                 live_parts.push((disp, p, venv));
                 continue;
@@ -1049,8 +1065,12 @@ fn compile_inner(
             let env = crate::live::bind_env(&mut g, &venv).map_err(|m| format!("property {name}: {m}"))?;
             // As TLC does, []P for a state predicate P is checked as an invariant while exploring,
             // and a state predicate on its own only on the initial states. TLC names a part of a
-            // property by its position in the source, which tla2rs does not keep.
-            let part_name = if whole && disp == *name { disp.clone() } else { format!("{disp} (a part)") };
+            // property by its position, kept for `[]` (see ast::AT)
+            let part_name = match at {
+                _ if whole && disp == *name => disp.clone(),
+                Some(p) if disp == *name => p,
+                _ => format!("{disp} (a part)"),
+            };
             if kind == 4 || kind == 6 {
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 if kind == 4 {
@@ -1078,7 +1098,7 @@ fn compile_inner(
     }
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
-            let msg = format!("Error: TLC cannot handle the temporal formula {} (RTBound / RTnow of RealTime)", short(f));
+            let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
         }
     }
@@ -1470,7 +1490,11 @@ impl SpecWalk {
     /// Walks a conjunct as written
     fn walk(&mut self, e: &Expr, m: &Module, ex: &mut Expander) -> R<()> {
         match e {
-            Expr::Label(n, _, b) if pos_of(n).is_some() => self.walk(b, m, ex)?,
+            // The AT label of `[]` (see ast::AT); the others stay with the conjunct, which TLC names
+            // by them when it refuses it
+            Expr::Label(n, _, b) if pos_of(n).is_some() || (err_pos_of(n).is_some() && matches!(b.as_ref(), Expr::Un(UOp::Always, _))) => {
+                self.walk(b, m, ex)?
+            }
             Expr::And(xs) => {
                 for x in xs {
                     self.walk(x, m, ex)?;
@@ -1581,7 +1605,9 @@ pub fn show_value(atoms: &Atoms, v: &Value) -> String {
     }
 }
 
-type PropPart = (String, u8, Expr, Option<Expr>, HashMap<String, Value>);
+/// (name, kind, formula, the condition of a step that leaves v unchanged, constant bindings, the
+/// position of the part as written)
+type PropPart = (String, u8, Expr, Option<Expr>, HashMap<String, Value>, Option<String>);
 
 /// Splits a property into checkable forms: 0: <>P, 1: []<>P, 2: <>[]P, 3: P ~> Q, 4: []P (state
 /// predicate), 5: [][A]_v.
@@ -1598,7 +1624,8 @@ fn action_level(e: &Expr) -> bool {
     }
 }
 
-fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, out: &mut Vec<PropPart>) -> R<()> {
+/// `at` is the position of the innermost `[]` around e (see ast::AT), by which TLC names a part
+fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, at: Option<&str>, out: &mut Vec<PropPart>) -> R<()> {
     use Expr::*;
     let temporal = |x: &Expr| {
         x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..) | BoxAction(..) | Fair(..)) || y.is_unchecked_temporal())
@@ -1614,12 +1641,12 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
     }
     let disp = if tag.is_empty() { name.to_string() } else { format!("{name} [{tag}]") };
     match e {
-        Label(_, _, b) if !e.is_user_label() => split_property(g, b, env, name, out),
-        And(xs) => xs.iter().try_for_each(|x| split_property(g, x, env, name, out)),
+        Label(n, _, b) if !e.is_user_label() => split_property(g, b, env, name, err_pos_of(n).or(at), out),
+        And(xs) => xs.iter().try_for_each(|x| split_property(g, x, env, name, None, out)),
         Quant(false, bs, body) if temporal(body) => {
             let mut err = Ok(());
             let r = g.ce.each_binding(bs, env, &mut |env2| {
-                if let Err(m) = split_property(g, body, env2, name, out) {
+                if let Err(m) = split_property(g, body, env2, name, None, out) {
                     err = Err(m);
                     return Ok(false);
                 }
@@ -1628,23 +1655,26 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
             match r {
                 // A bound that depends on the state: left whole, for the liveness checks to refuse
                 // as TLC does
-                Err(m) if m.contains("is not a constant") => Ok(out.push((disp, 7, e.clone(), None, env.clone()))),
+                Err(m) if m.contains("is not a constant") => Ok(out.push((disp, 7, e.clone(), None, env.clone(), None))),
                 r => r.and(err),
             }
         }
-        Un(UOp::Always, p) => match p.strip() {
-            p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone()))),
-            // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since v
-            // need not be a tuple of variables, e.g. under a refinement mapping)
-            BoxAction(a, v) if !temporal(a) => {
-                let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
-                Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), env.clone())))
+        Un(UOp::Always, p) => {
+            let at = at.map(|a| a.to_string());
+            match p.strip() {
+                p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone(), at))),
+                // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since
+                // v need not be a tuple of variables, e.g. under a refinement mapping)
+                BoxAction(a, v) if !temporal(a) => {
+                    let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
+                    Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), env.clone(), at)))
+                }
+                _ => Ok(out.push((disp, 7, e.clone(), None, env.clone(), None))),
             }
-            _ => Ok(out.push((disp, 7, e.clone(), None, env.clone()))),
-        },
+        }
         // A state predicate: TLC checks it on the initial states
-        p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 6, p.clone(), None, env.clone()))),
-        p if temporal(p) => Ok(out.push((disp, 7, p.clone(), None, env.clone()))),
+        p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 6, p.clone(), None, env.clone(), None))),
+        p if temporal(p) => Ok(out.push((disp, 7, p.clone(), None, env.clone(), None))),
         _ => Err(format!("property {name}: an action formula must be under [] as [][A]_v ({})", short(e))),
     }
 }

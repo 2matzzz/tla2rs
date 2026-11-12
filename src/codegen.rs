@@ -35,6 +35,9 @@ pub struct Env {
     work: Option<String>,
     /// Inside ENABLED: a successor need not determine every variable (as in TLC)
     partial: bool,
+    /// Computing whether an action is enabled (ENABLED, or for fairness), which TLC's error
+    /// messages name
+    enabled: bool,
     /// Bound variables whose value is known at compile time (an unrolled \\A or recursive call)
     vals: HashMap<String, Value>,
     /// Inside the function of a recursive operator that assigns variables (`rec_action_fn`, by
@@ -43,6 +46,8 @@ pub struct Env {
 }
 
 pub struct Gen<'a> {
+    /// The position of the action-level CASE about to be generated (see `gen_action`)
+    case_at: Option<String>,
     /// The module's definitions without arguments (TLC keeps the value of those of constant level)
     pub zero_defs: HashSet<String>,
     /// How deep recursive operators are being unrolled in an action
@@ -94,6 +99,7 @@ fn rid(n: &str) -> String {
 impl<'a> Gen<'a> {
     pub fn new(atoms: &'a Atoms, constants: &'a HashMap<String, Value>) -> Self {
         Gen {
+            case_at: None,
             zero_defs: HashSet::new(),
             unroll: 0,
             atoms,
@@ -1819,6 +1825,8 @@ impl<'a> Gen<'a> {
                 return self.lit_auto(&v, want);
             }
         }
+        // Where a CASE or CHOOSE is written, for TLC's error message (see ast::AT)
+        let at = err_at(e);
         let e = e.strip();
         // A constant bag is built by SetToBag below, which gives it the type of a bag (its value
         // alone is a function, over part of a type when its elements are records with different
@@ -1876,7 +1884,7 @@ impl<'a> Gen<'a> {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
                 // An unbounded quantifier or CHOOSE: TLC stops when it evaluates one
                 (f, []) if crate::parser::unbounded_error(f).is_some() => {
-                    let t = want.cloned().unwrap_or(if f.ends_with("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
+                    let t = want.cloned().unwrap_or(if f.contains("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
                     let msg = crate::parser::unbounded_error(f).unwrap();
                     (format!("{{ let __v: {} = eval_error({msg:?}.to_string()); __v }}", t.repr()), t)
                 }
@@ -2370,6 +2378,7 @@ impl<'a> Gen<'a> {
                 inner.work = None;
                 inner.init = false;
                 inner.partial = true;
+                inner.enabled = true;
                 let mut code = String::new();
                 self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
                 (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
@@ -2563,7 +2572,7 @@ impl<'a> Gen<'a> {
                 }
                 match oth {
                     Some((oc, ot)) => s += &format!("{{ {} }})", self.coerce(oc, &ot, &t)?),
-                    None => s += "{ eval_error(\"Attempted to evaluate a CASE with no conditions true.\".into()) })",
+                    None => s += &format!("{{ eval_error({:?}.into()) }})", with_at(crate::value::CASE_NONE, &at)),
                 }
                 (s, t)
             }
@@ -2998,8 +3007,9 @@ impl<'a> Gen<'a> {
                 (
                     format!(
                         "{{ let mut {r}: Option<{}> = None; for {lx} in {it} {{ if {pc} {{ {r} = Some({val}); break; }} }} \
-                         match {r} {{ Some(v) => v, None => eval_error(\"Attempted to compute the value of an expression of form CHOOSE x \\\\in S: P, but no element of S satisfied P.\".into()) }} }}",
-                        et.repr()
+                         match {r} {{ Some(v) => v, None => eval_error({:?}.into()) }} }}",
+                        et.repr(),
+                        with_at(crate::value::CHOOSE_NONE, &at)
                     ),
                     et,
                 )
@@ -3757,6 +3767,13 @@ impl<'a> Gen<'a> {
         if !open && h.is_action() && !self.only_reads_assigned(h, env) {
             return Err(format!("unsupported action form: {}", short(h)));
         }
+        // Where an action-level CASE is written (see ast::AT): kept from its label to the CASE
+        if let Label(n, _, b) = h {
+            if let Some(p) = err_pos_of(n).filter(|_| matches!(b.strip(), Case(..))) {
+                self.case_at = Some(p.to_string());
+            }
+        }
+        let case_at = if matches!(h, Label(..)) { None } else { self.case_at.take() };
         match h {
             Label(_, _, body) => return self.gen_action(&with(vec![body.as_ref().clone()]), env, out),
             And(xs) => return self.gen_action(&with(xs.clone()), env, out),
@@ -3933,7 +3950,9 @@ impl<'a> Gen<'a> {
                 out.push_str("}\n");
                 return Ok(());
             }
-            Case(arms, other) if action => {
+            // TLC computes successors through a CASE among the conjuncts of an action, also one that
+            // assigns nothing (which matters for its error message)
+            Case(arms, other) => {
                 for (i, (p, v)) in arms.iter().enumerate() {
                     let pc = match self.gen_as(p, env, &Ty::Bool) {
                         Err(_) if self.infer.is_some() => "true".into(),
@@ -3948,7 +3967,12 @@ impl<'a> Gen<'a> {
                 let eo = self.renew_work(env, out);
                 match other {
                     Some(o) => self.gen_action(&with(vec![o.as_ref().clone()]), &eo, out)?,
-                    None => out.push_str("eval_error(\"Attempted to evaluate a CASE with no conditions true.\".into());\n"),
+                    None => {
+                        // TLC's message names what it was computing
+                        let when = if env.enabled { "ENABLED" } else if env.init { "initial states" } else { "next states" };
+                        let msg = with_at(&format!("In computing {when}, TLC encountered a CASE with no conditions true."), &case_at);
+                        writeln!(out, "eval_error({msg:?}.into());").unwrap();
+                    }
                 }
                 out.push_str("}\n");
                 return Ok(());
@@ -4516,6 +4540,12 @@ impl<'a> Gen<'a> {
         env
     }
 
+    /// Environment for computing whether an action is enabled (for fairness)
+    pub fn env_enabled(mut env: Env) -> Env {
+        env.enabled = true;
+        env
+    }
+
     pub fn env_init() -> Env {
         Env { init: true, ..Default::default() }
     }
@@ -4543,6 +4573,14 @@ impl<'a> Gen<'a> {
                 return Ok(true);
             }
             Label(_, _, b) if h.is_user_label() => {
+                self.gen_action(&with(b), env, out)?;
+                return Ok(true);
+            }
+            // An AT label (see ast::AT) changes nothing in how TLC splits
+            Label(n, _, b) if err_pos_of(n).is_some() => {
+                if matches!(b.strip(), Case(..)) {
+                    self.case_at = err_pos_of(n).map(|p| p.to_string());
+                }
                 self.gen_action(&with(b), env, out)?;
                 return Ok(true);
             }
@@ -5523,6 +5561,26 @@ const FORALL_REST: &str = "#forall-rest";
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)
+/// The position of the AT label among the labels around e, if any (see ast::AT)
+fn err_at(e: &Expr) -> Option<String> {
+    let mut x = e;
+    while let Expr::Label(n, _, b) = x {
+        if let Some(p) = err_pos_of(n) {
+            return Some(p.to_string());
+        }
+        x = b;
+    }
+    None
+}
+
+/// TLC's message followed by the position it gives, when known
+pub fn with_at(msg: &str, at: &Option<String>) -> String {
+    match at {
+        Some(p) => format!("{msg}\n{p}"),
+        None => msg.to_string(),
+    }
+}
+
 fn eval_error_bool(msg: &str) -> String {
     // TLC's own evaluation errors (for a failed arithmetic operation) are raised as such
     let f = if msg.starts_with(crate::value::DIV_ZERO) || msg.starts_with(crate::value::MOD_NONPOS) { "arith_error" } else { "eval_error" };

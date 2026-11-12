@@ -157,6 +157,24 @@ pub struct Assume {
 /// except while expanding the next-state relation (`Expander::keep_pos`).
 pub const POS: &str = "#pos ";
 
+/// The name of the label that records where an expression whose evaluation can fail is written,
+/// for TLC's messages: `#at ` followed by the position as TLC prints it. The parser puts one
+/// around CASE and CHOOSE (whose errors TLC reports with their position), around labels, RTnow and
+/// RTBound (temporal formulas TLC refuses by position) and around `[]` (TLC names a part of a
+/// property by position). Expansion keeps it; code generation, constant evaluation and the
+/// liveness compiler read it (`codegen::err_at`, `live::refused`, `split_property`).
+pub const AT: &str = "#at ";
+
+/// `e` wrapped in an AT label for the position `at`
+pub fn at_err(at: &str, e: Expr) -> Expr {
+    Expr::Label(format!("{AT}{at}"), vec![], e.b())
+}
+
+/// The position recorded by an AT label named `n`
+pub fn err_pos_of(n: &str) -> Option<&str> {
+    n.strip_prefix(AT)
+}
+
 /// `e` wrapped in a POS label for the position `at`
 pub fn at_pos(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{POS}{at}"), vec![], e.b())

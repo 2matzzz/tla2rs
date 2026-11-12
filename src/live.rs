@@ -473,16 +473,33 @@ impl TExpr {
 }
 
 /// Turns a property into TLC's form, as tlc2.tool.liveness.Liveness.astToLive does
-fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Atoms) -> R<Result<TExpr, Rejected>> {
+/// TLC's refusal of the temporal formula e, which it names by position: that of a label or
+/// RealTime operator around e (see ast::AT), of the definition e is the body of, or `at`
+fn refused(g: &Gen, e: &Expr, at: Option<&str>) -> Rejected {
+    let mut x = e;
+    let mut pos = None;
+    while let Expr::Label(n, args, b) = x {
+        if pos.is_none() {
+            pos = err_pos_of(n).or_else(|| if args.is_empty() { g.def_pos.get(n).map(|p| p.as_str()) } else { None });
+        }
+        x = b;
+    }
+    let what = pos.or(at).map(|p| p.to_string()).unwrap_or_else(|| short(e));
+    Rejected(format!("TLC cannot handle the temporal formula {what}"), 255)
+}
+
+/// `at` is the position of e as written, if known (see `refused`)
+fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Atoms, at: Option<&str>) -> R<Result<TExpr, Rejected>> {
     use Expr::*;
     // TLC cannot handle a temporal formula under a label written in the spec
     let mut x = e;
     while let Label(_, _, b) = x {
         if x.is_user_label() && temporal(b) {
-            return Ok(Err(Rejected(format!("TLC cannot handle the temporal formula {}", short(e)), 255)));
+            return Ok(Err(refused(g, e, at)));
         }
         x = b;
     }
+    let e0 = e;
     let e = e.strip();
     if !temporal(e) {
         if let Bool(b) = e {
@@ -496,7 +513,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
     }
     macro_rules! sub {
         ($x:expr) => {
-            match to_texpr(g, $x, env, atoms)? {
+            match to_texpr(g, $x, env, atoms, None)? {
                 Ok(t) => t,
                 Err(r) => return Ok(Err(r)),
             }
@@ -541,7 +558,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             let mut err: R<Option<Rejected>> = Ok(None);
             let ce = g.ce.clone();
             let r = ce.each_binding(bs, env, &mut |env2| {
-                match to_texpr(g, body, env2, atoms) {
+                match to_texpr(g, body, env2, atoms, None) {
                     Ok(Ok(t)) => parts.push(t),
                     Ok(Err(r)) => {
                         err = Ok(Some(r));
@@ -557,7 +574,12 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             if let Err(m) = r {
                 // The bound is not a constant (it depends on the state, or is infinite)
                 if m.contains("is not a constant") {
-                    return Ok(Err(Rejected(format!("TLC cannot handle the temporal formula {}", short(e)), 255)));
+                    let mut r = refused(g, e0, at);
+                    // A bound that reads a variable: TLC adds the error it got evaluating it
+                    if let Some(v) = m.strip_prefix('`').and_then(|x| x.strip_suffix("` is not a constant")).filter(|v| g.vars.iter().any(|(n, _)| n == v)) {
+                        r.0 += &format!(":\nIn evaluation, the identifier {v} is either undefined or not an operator.");
+                    }
+                    return Ok(Err(r));
                 }
                 return Err(m);
             }
@@ -574,7 +596,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             let c = sub!(c);
             TExpr::Disj(vec![TExpr::Conj(vec![c.clone(), sub!(a)]), TExpr::Conj(vec![TExpr::Neg(c.into()), sub!(b)])])
         }
-        _ => return Ok(Err(Rejected(format!("TLC cannot handle the temporal formula {}", short(e)), 255))),
+        _ => return Ok(Err(refused(g, e0, at))),
     }))
 }
 
@@ -664,14 +686,15 @@ pub fn compile(
     }
     let mut texprs = vec![];
     for (name, e, env) in parts {
-        match to_texpr(g, e, env, &mut atoms).map_err(|m| format!("property {name}: {m}"))? {
+        let at = g.def_pos.get(name).cloned();
+        match to_texpr(g, e, env, &mut atoms, at.as_deref()).map_err(|m| format!("property {name}: {m}"))? {
             Ok(t) => texprs.push(t),
             Err(r) => return Ok(Err(r)),
         }
     }
     let mut atexprs = vec![];
     for (e, env) in assumed {
-        match to_texpr(g, e, env, &mut atoms).map_err(|m| format!("spec: {m}"))? {
+        match to_texpr(g, e, env, &mut atoms, None).map_err(|m| format!("spec: {m}"))? {
             Ok(t) => atexprs.push(t),
             Err(r) => return Ok(Err(r)),
         }
@@ -719,7 +742,7 @@ pub fn compile(
             let chg = g.gen_as(&changed(&f.sub), &step_env, &Ty::Bool).map_err(|m| format!("{what} subscript: {m}"))?;
             let act = g.gen_as(&f.action, &step_env, &Ty::Bool).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
             let mut succ = String::new();
-            g.gen_action(&[f.action.clone()], &genv, &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
+            g.gen_action(&[f.action.clone()], &Gen::env_enabled(genv.clone()), &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
             writeln!(src, "#[allow(unused_variables)]\nfn fchg_{i}(s: &State, t: &State) -> bool {{ {chg} }}").unwrap();
             writeln!(src, "#[allow(unused_variables)]\nfn fstep_{i}(s: &State, t: &State) -> bool {{ ({act}) && fchg_{i}(s, t) }}").unwrap();
             writeln!(
