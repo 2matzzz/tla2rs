@@ -6,24 +6,30 @@ It has no crate dependencies.
 ## Common commands
 
 - `cargo build --release` builds the compiler (`target/release/tla2rs`)
-- `target/release/tla2rs Spec.tla [-config X.cfg] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [--emit-only] [-o DIR]`
+- `target/release/tla2rs Spec.tla [-config X.cfg] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [--emit-only] [-o DIR]`
   - The generated crate goes to `<spec dir>/.tla2rs/<cfg name>/` by default; it is built with
     `cargo build --release --offline` and then run
-  - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, and `-deadlock` are passed on to the
-    generated checker, which also accepts them directly
+  - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, `-dumpgraph`, and `-deadlock` are passed
+    on to the generated checker, which also accepts them directly
+- `target/release/tla2rs --graph FILE` reduces a state graph (TLC's `-dump dot FILE` or a checker's `-dumpgraph
+  FILE`) to `states N <sha256>` and `edges M <sha256>`; `--graph-text FILE` prints the canonical form itself, for
+  diffing two graphs (see "State graphs")
 - `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 469 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
-  one worker, and it compares the verdict, generated and distinct state counts, counterexample length, and exit code.
-  If TLC produces no verdict, the check fails
-- TLC's summary for each configuration (verdict, counts, trace length, exit code, and a hash of the jar, cfg,
-  arguments and the modules the spec reads) is committed in `tests/expected/`. `crosscheck.sh` and `all.sh` compare
+  one worker, and it compares the verdict, generated and distinct state counts, counterexample length, exit code,
+  and the state graph (the set of states and the set of transitions; see "State graphs"). If TLC produces no
+  verdict, the check fails. `all.sh` prints, after `ok`, the rule that narrowed a comparison, if any
+- TLC's summary for each configuration (verdict, counts, trace length, exit code, the hashes of its state graph, and
+  a key hashing the jar, cfg, arguments, the modules the spec reads and `src/graph.rs`) is committed in
+  `tests/expected/`. `crosscheck.sh` and `all.sh` compare
   against these files only and fail on a missing or stale one. After adding or changing a test, run
   `scripts/expected.sh` (it runs TLC for missing and stale files only) and commit the files with the test.
   `expected.sh -check` reruns TLC and reports differences without writing. Built checkers are cached in
   `target/crosscheck/build` (key: generated code and rustc version; `CROSSCHECK_NO_CACHE=1` rebuilds); `JOBS=N`
-  sets how many configurations `all.sh` and `expected.sh` run at once
+  sets how many configurations `all.sh` and `expected.sh` run at once. `CROSSCHECK_GRAPH_DIR=DIR` keeps the graphs
+  of a run as `DIR/<cfg>.tlc.dot` (with `expected.sh`) and `DIR/<cfg>.rs.dot`
 - The TLC jar comes from `TLA_TOOLS` (default `~/.tla/tla2tools.jar`)
 
 ## Layout
@@ -40,7 +46,8 @@ It has no crate dependencies.
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
-| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos) |
+| `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
+| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos). Also TLC's pretty printer for values (`ppr`, used for every state printed) and the `-dumpgraph` output |
 
 ### Memory use (`runtime.rs`)
 
@@ -203,6 +210,59 @@ fixed polynomial, its hash-set order, and a port of its tableau, normal form, SC
 What is checked instead: the verdict and exit code of every liveness configuration, including the formulas TLC refuses
 (`tests/tlc/RejTemp*.cfg`), and the counts at which liveness checks stop on an evaluation error.
 
+### State graphs
+
+Matching counts does not show that tla2rs reached the same states or took the same transitions, so the cross-check
+also compares the state graph. TLC writes it with `-dump dot FILE`, and a generated checker with `-dumpgraph FILE` in
+the same form (`runtime.rs`, "state graph dump"; without the option nothing is written and the search is unchanged).
+What TLC 2.19 writes, measured (`tlc2.util.DotStateWriter`, called from `Worker`):
+
+- A node per state, labelled with the state as TLC prints it in a trace; the initial states are filled. Ids are
+  fingerprints, so they mean nothing outside the file. With SYMMETRY or VIEW the id is the fingerprint of the
+  canonical form or the view, and the label is the first state of that class reached
+- An edge for each successor that satisfies the CONSTRAINT and ACTION_CONSTRAINT, written when it is generated:
+  self-loops included, and once per time it is generated (so twice when two `\/` branches give it). A successor
+  outside the model gets no edge
+- When the search stops at a violation or deadlock, the graph ends at the successor that stopped it (its edge and
+  label are there). With one worker this point is deterministic, and every such configuration is compared
+- After an error in evaluating an invariant on a new state, TLC evaluates the state it was expanding again to show
+  where the error is, and that pass writes too: an edge to every successor of that state, adding those not yet seen,
+  until a new successor fails an invariant or any fails an action property. `dump_replay` repeats this
+  (`tests/tlc/BagOps-Lit.cfg`, `FunMember-NotFun.cfg`, `StrSeqOps-StrLeft.cfg` need it)
+- For liveness checking, TLC also writes a dashed stuttering edge from each state it expands to itself
+- The values are pretty-printed to 80 columns (`tlc2.pprint`, ported as `ppr` and checked against TLC's on 25,000
+  random values). A spec with a single variable prints `x = 1`, without `/\`
+- When TLC stops while computing the initial states or before (an ASSUME, a constant-level invariant, a refused
+  formula, a violation in an initial state), it never ends the file, and what it had buffered (the initial states)
+  is lost
+
+The canonical form (`src/graph.rs`) is the sorted set of state texts, each marked initial or not, and the sorted
+set of edges as pairs of those texts; the expected file keeps `states N <sha256>` and `edges M <sha256>` of them,
+not the graphs. Reducing to it:
+
+- The `/\ var = value` lines of a state are sorted. TLC lists the variables in the order of a Java `Hashtable` of
+  SANY's symbols (`Context.getVariableDecls`, reversed by `ModuleNode`), which depends on the hash of every symbol
+  of the module and its extensions, not on the state
+- `<<>>` is read as `<< >>`. TLC prints the empty function as `<<>>` when it is held as a function and as `<< >>`
+  when it is held as a tuple, depending on the expression that built it (`DynDomain`, `NatDom`, `PartFuns`,
+  `SparseFun`, ...)
+- Duplicate edges collapse, and dashed stuttering edges are dropped (they are not transitions of the next-state
+  relation)
+
+Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
+are for the 469 configurations at the time of writing):
+
+| Rule | Applies to | Compared |
+|---|---|---|
+| TLC did not end the file (automatic: no closing `}`) | 56 (stops in or before the initial states, and SANY or temporal refusals) | Not the graph; verdict, counts and exit code as before |
+| tla2rs stopped at a successor that left its declared type while `next` built it (automatic: "a successor that tla2rs cannot represent" in its output) | 1 (`SetOut`) | The numbers of states and edges (tla2rs writes a placeholder node for the successor TLC adds) |
+| VIEW and SYMMETRY together (automatic), see below | 1 (`ViewSym-Both`) | The verdict only. `ViewSymSet-Both` has `\* crosscheck: exact`: TLC was measured to keep no two states with equal views there, and everything matches |
+
+`distinct-only` (three configurations) leaves the graph compared: duplicate edges collapse anyway.
+
+Known gap, not hit by any configuration: TLC prints a value in the form it holds it, so a variable assigned `1..3`
+prints as `1..3` until an operation turns it into an enumerated set, while tla2rs prints `{1, 2, 3}`.
+
 ### VIEW and SYMMETRY together
 
 TLC sometimes keeps states whose views are identical as separate states (its choice of representative depends on the
@@ -211,7 +271,8 @@ most TLC's. VIEW alone and SYMMETRY alone both match TLC exactly (`tests/tlc/Vie
 `ViewSym-SymOnly.cfg`).
 
 So when a cfg has both VIEW and SYMMETRY, `scripts/crosscheck.sh` compares only the verdict and prints
-`MATCH(verdict only; VIEW+SYMMETRY)`. To compare counts, run a cfg without SYMMETRY.
+`MATCH(verdict only; VIEW+SYMMETRY)`, unless the cfg has a line `\* crosscheck: exact` (for one where TLC was
+measured to keep no such duplicates; everything is compared then). To compare counts, run a cfg without SYMMETRY.
 
 With VIEW (in particular together with CONSTRAINT) and several workers, the distinct count can vary slightly from run
 to run, for TLC as well as tla2rs, because which state becomes the representative depends on search order. With one

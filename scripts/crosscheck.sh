@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the same spec with TLC and tla2rs and compare state counts, violated invariants, and
-# counterexample lengths.
+# Run the same spec with TLC and tla2rs and compare state counts, violated invariants,
+# counterexample lengths, exit codes and state graphs (see "State graphs" in CLAUDE.md).
 #   scripts/crosscheck.sh examples/DieHard.tla [examples/DieHard.cfg] [-deadlock]
 #   scripts/crosscheck.sh examples/DieHard.cfg            (the spec is the cfg name up to the first -)
 # For a configuration in examples/ or tests/tlc/, TLC's side is the static result in tests/expected/,
@@ -84,12 +84,13 @@ summarize() {
 # TLC's result depends only on the jar, the cfg, the arguments and the modules the spec reads
 # (followed through EXTENDS and INSTANCE within the spec's directory; standard modules come from the
 # jar). For a configuration in examples/ or tests/tlc/, the summary TLC gives (verdict, counts, trace
-# length, exit code) is kept in tests/expected/ with a hash of those inputs (the key). The parts of
+# length, exit code, and hashes of its state graph) is kept in tests/expected/ with a hash of those
+# inputs and of src/graph.rs, which reduces the graph to its hashes (the key). The parts of
 # TLC's output that vary from run to run (times, the fingerprint seed, the shape of a liveness
 # counterexample) are not part of the summary, so the file is the same for every TLC run.
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  { echo "v1 -workers 1 ${extra[*]-}"; shasum -a 256 "$jar" | cut -d' ' -f1; cat "$cfg_abs"
+  { echo "v2 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" | cut -d' ' -f1; cat "$cfg_abs"
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
 expected=""
@@ -104,8 +105,18 @@ run_tlc() {
   rc_tlc=0
   # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
   mkdir -p "$work/jtmp"
-  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
-  a=$(summarize tlc.out)
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -dump dot tlc.dot -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  a="$(summarize tlc.out)
+$(graph tlc.dot)"
+}
+# The state graph reduced to hashes of its states and its edges (see src/graph.rs).
+# CROSSCHECK_GRAPH_DIR=DIR keeps the graphs as DIR/<cfg name>.{tlc,rs}.dot (`tla2rs --graph-text`
+# prints them in canonical form, for diffing).
+graph() { "$bin" --graph "$1" || echo "graph unreadable"; }
+keep_graph() {
+  if [[ -n "${CROSSCHECK_GRAPH_DIR:-}" && -f "$1" ]]; then
+    mkdir -p "$CROSSCHECK_GRAPH_DIR" && cp "$1" "$CROSSCHECK_GRAPH_DIR/$(basename "$c" .cfg).$2.dot"
+  fi
 }
 expected_text() { echo "key $key"; echo "tlc $(grep -m1 -oE 'Version [0-9.]+' tlc.out || true)"; echo "rc $rc_tlc"; echo "$a"; }
 fresh=0
@@ -127,6 +138,7 @@ if [[ $mode != compare ]]; then
     echo "ERROR $cfg_rel: no verdict from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
     exit 1
   fi
+  keep_graph tlc.dot tlc
   if [[ $mode == expected-check ]]; then
     if [[ -f "$expected" ]] && diff -q <(expected_text | sed 1,2d) <(sed 1,2d "$expected") > /dev/null && [[ $fresh == 1 ]]; then
       echo "same $cfg_rel"
@@ -154,7 +166,7 @@ else
   run_tlc
 fi
 s1=$(date +%s.%N)
-"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
+"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 s2=$(date +%s.%N)
 
 # With both VIEW and SYMMETRY, TLC may keep states with equal views as distinct (its choice of
@@ -164,6 +176,11 @@ verdict_only=0
 if grep -qE '^[[:space:]]*VIEW[[:space:]]' "$c" && grep -qE '^[[:space:]]*SYMMETRY[[:space:]]' "$c"; then
   verdict_only=1
 fi
+# `\* crosscheck: exact` in such a cfg compares everything after all: TLC has been measured to keep
+# no two states with equal views there, so the counts and the state graph agree
+if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*exact' "$c"; then
+  verdict_only=0
+fi
 # If the cfg says `\* crosscheck: distinct-only`, don't compare generated-state counts.
 # TLC counts successors per \/ branch, so in specs where both branches can hold it counts the
 # same successor more than once (distinct counts and verdicts still match).
@@ -172,7 +189,9 @@ if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*distinct-only' 
   distinct_only=1
 fi
 
-b=$(summarize rs.out)
+keep_graph rs.dot rs
+b="$(summarize rs.out)
+$(graph rs.dot)"
 # If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
 if [[ -z "$(echo "$a" | head -1)" ]]; then
   echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out 2>/dev/null | grep -vE 'Parsing|Semantic' | head -10
@@ -192,6 +211,19 @@ exit=$(norm $rc_rs)"
 if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*ignore-exit' "$c"; then
   a=$(echo "$a" | grep -v '^exit='); b=$(echo "$b" | grep -v '^exit=')
 fi
+# The state graph is compared as a whole (states and edges, see "State graphs" in CLAUDE.md), except:
+# - TLC did not end its graph file: it stopped while computing the initial states or before, and
+#   what it had buffered is lost. The graph is not compared
+# - tla2rs stopped at a successor that left its declared type while being built: TLC adds that
+#   state, but tla2rs cannot print it. Only the numbers of states and edges are compared
+graph_note=""
+if grep -q '^states incomplete' <<< "$a"; then
+  a=$(grep -vE '^(states|edges) ' <<< "$a"); b=$(grep -vE '^(states|edges) ' <<< "$b")
+  graph_note="; graph not compared: TLC stopped before ending it"
+elif grep -q '<a successor that tla2rs cannot represent>' rs.out; then
+  a=$(sed -E 's/^(states|edges) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$a"); b=$(sed -E 's/^(states|edges) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$b")
+  graph_note="; graph sizes only: a successor tla2rs cannot represent"
+fi
 if [[ $verdict_only == 1 ]]; then
   a=$(echo "$a" | head -1); b=$(echo "$b" | head -1)
 elif [[ $distinct_only == 1 ]]; then
@@ -203,7 +235,9 @@ if [[ "$a" == "$b" ]]; then
   if [[ $verdict_only == 1 ]]; then
     echo "  MATCH(verdict only; VIEW+SYMMETRY): $(echo "$a" | tr '\n' ' ')"
   elif [[ $distinct_only == 1 ]]; then
-    echo "  MATCH(distinct only; TLC counts \\/-duplicates): $(echo "$a" | tr '\n' ' ')"
+    echo "  MATCH(distinct only; TLC counts \\/-duplicates$graph_note): $(echo "$a" | tr '\n' ' ')"
+  elif [[ -n $graph_note ]]; then
+    echo "  MATCH(${graph_note#; }): $(echo "$a" | tr '\n' ' ')"
   else
     echo "  MATCH: $(echo "$a" | tr '\n' ' ')"
   fi

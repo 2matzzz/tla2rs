@@ -15,7 +15,8 @@ one() {
   local out
   out=$(scripts/crosscheck.sh "$tla" "$cfg" "$@" 2>&1)
   if tail -n +2 <<< "$out" | grep -q '  MATCH'; then
-    echo "ok    $cfg"
+    # A comparison narrowed by a rule says which, as in MATCH(verdict only; ...)
+    echo "ok    $cfg$(grep -oE '  MATCH\([^)]*\)' <<< "$out" | sed 's/  MATCH/  /')"
   else
     # Keep the details of a failure, since the summary line alone does not say what differed
     mkdir -p target/crosscheck/fail && echo "$out" > "target/crosscheck/fail/$(basename "$cfg" .cfg).log"

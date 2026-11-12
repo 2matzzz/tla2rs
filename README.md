@@ -42,7 +42,11 @@ cargo build --release
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
   the CPU
-- Output (state counts, counterexample format) follows TLC, and so do exit codes: 10 = assumption (false or failing to
+- `-dumpgraph FILE` writes the states and transitions explored to FILE in the form of TLC's `-dump dot FILE` (a node
+  per state, labelled with the state as TLC prints it, and an edge per successor). `tla2rs --graph FILE` reduces
+  either file to hashes of its states and its edges that do not depend on node ids or order, and `--graph-text FILE`
+  prints that canonical form
+- Output (state counts, counterexample format, values wider than 80 columns broken over lines) follows TLC, and so do exit codes: 10 = assumption (false or failing to
   evaluate), 11 = deadlock, 12 = invariant, 13 = temporal or action property. An evaluation error exits with 76 in an
   invariant, 75 in the initial states, and otherwise 255 for a failed arithmetic operation (such as `\div` by zero) and
   75 for the rest
@@ -166,12 +170,16 @@ memory.
 ## Cross-checking against TLC
 
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
-generated and distinct state counts, counterexample length, and exit code. `scripts/all.sh` does this for every
+generated and distinct state counts, counterexample length, exit code, and the state graph: the set of states
+reached and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a
+SHA-256 hash (with the variables of each state sorted, since TLC's order comes from a hash table). Where the graph
+cannot be compared as a whole (TLC stops before ending its graph file when it stops in the initial states; a
+successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied; CLAUDE.md lists them. `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
 `TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). `all.sh` runs four configurations at a time
 (`JOBS=N` to change). TLC's result for each configuration is committed in `tests/expected/`: the verdict, the
-state counts, the trace length and the exit code, with a hash of the jar, the cfg, the arguments and the modules the
-spec reads. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
+state counts, the trace length, the exit code and the hashes of the state graph, with a hash of the jar, the cfg, the
+arguments, the modules the spec reads and `src/graph.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
 recorded, so the files are the same for every TLC run. `crosscheck.sh` and `all.sh` only compare against these
 files and never run TLC for them; a missing or stale file fails the check. `scripts/expected.sh [cfg ...]` is what
 runs TLC: it writes missing and stale files and leaves the others alone, so a second run changes nothing.
@@ -184,6 +192,8 @@ $ scripts/all.sh
 ok    examples/DieHard.cfg
 ok    examples/Peterson-Live.cfg
 ok    examples/TwoPhase.cfg
+...
+ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending it)
 ...
 ```
 

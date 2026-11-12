@@ -9,6 +9,8 @@
 # and reports any file whose content differs, without writing. JOBS=N runs N at a time (default 4).
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# tla2rs --graph reduces TLC's state graph to the hashes kept in the files
+cargo build --release --quiet || exit 1
 mode=--expected
 case "${1:-}" in
   -force) mode=--expected-force; shift ;;
