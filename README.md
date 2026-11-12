@@ -145,7 +145,9 @@ memory.
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
   characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`, and, giving tuples as in TLC, `SelectSeq`,
   `SortSeq` and a tuple followed by a string in `\o`), `Bags`, `STRING`, and from `TLC` `Print`, `PrintT`, `Assert`,
-  `ToString`, `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`
+  `ToString`, `TLCEval`, `Any`, `:>`, `@@`, `Permutations`, `SortSeq`. `\div` of a negative number follows the module
+  the spec loads, as in TLC: the floor of the quotient with Integers, and with Naturals only, rounded toward zero
+  and then down when that is negative (`(0 - 1) \div 3` is 0)
 - Records are ordered as TLC orders them (by their number of fields first), model values come before strings, and
   `Print` / `PrintT` break a value wider than 80 columns over lines, as TLC does
 - Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),

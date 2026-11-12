@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 630 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 639 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -239,6 +239,15 @@ is TRUE for s = "ab"), a string asked about a tuple stops with an error, and a m
 TRUE), while a set from a definition or the state has been sorted, and comparing a string with a tuple then fails.
 `Gen::tuple_str_eq` follows this. One case is not matched: TLC finds `s \in TS \cup {}` TRUE where TS is such a sorted
 set (`s \in TS` fails); tla2rs fails on both.
+
+### `\div` in Naturals
+
+TLC evaluates `\div` with a Java method of the module it loaded. Integers' is the floor of the
+quotient; Naturals' rounds toward zero and then down only when that is negative and the division is
+not exact, so `(0 - 1) \div 3` and `10 \div (0 - 11)` are 0 under Naturals and -1 under Integers,
+while `(0 - 7) \div 2` is -4 under both (measured on TLC 2.19, `tests/tlc/NatDiv`, `IntDiv`). When
+the spec does not load Integers (or Reals), tla2rs follows Naturals: `tla_div_nat` in the checker,
+`value::nat_div` in constant evaluation (`value::NAT_DIV`).
 
 ### What SANY refuses
 
@@ -515,6 +524,11 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
   tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
   set of tuples:` and the product (`tests/tlc/TupleVals*`)
+- A tuple or a string in a set it cannot be compared with, when the set is sorted (from the state or
+  a definition): TLC searches the set and fails on its first comparison, with the element at index
+  n/2 in its order: `Attempted to compare the function <<1, 3>> with the value:` or `Attempted to
+  compare string "x" with non-string:`, then that element (`tests/tlc/SortedCmp*`). A set written
+  out where it is used is compared with element by element instead
 - A value that is not an integer in an interval: `Attempted to check if the value:`, the value, `is
   in the integer interval 5..6`
 - A model value in `+`, `-`, `*`, `\div`, `%`, `^`, unary minus or `..`: TLC evaluates these with Java
@@ -522,9 +536,9 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   tlc2.module.Naturals.Plus(tlc2.value.impl.IntValue,tlc2.value.impl.IntValue)` (`Minus`, `Times`,
   `Divide`, `Mod`, `Expt`, `Neg` with one argument, `DotDot` giving an `IntervalValue`), in `Integers`
   when the spec loads Integers or Reals, then `Cannot cast tlc2.value.impl.ModelValue to
-  tlc2.value.impl.IntValue` (`tests/tlc/ModelArith*`, `Gen::gen_int_of`). The comparisons (`<` ...)
-  are worded otherwise (`The first argument of < should be an integer`, with `>` for `>=` under
-  Naturals), which tla2rs does not follow yet
+  tlc2.value.impl.IntValue` (`tests/tlc/ModelArith*`, `Gen::gen_int_of`). In a comparison it is TLC's
+  own error (exit 255): `The first argument of < should be an integer, but instead it is:` (or
+  `second`) and the value, with `>` for `>=` under Naturals (`Gen::int_cmp`)
 - SANY's reports. A precedence conflict, a bad string escape and LAMBDA outside an operator's argument
   stop SANY while it parses (`***Parse Error***` or `Lexical error at line L, column C.`, then
   `Fatal errors while parsing TLA+ spec in file M`, `*** Abort messages: 1`, `In module M`, `Could
@@ -540,15 +554,14 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
 
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
-compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 41
+compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 39
 configurations, by reason:
 
 | Reason | Configurations |
 |---|---|
 | SANY's semantic errors give the position of each name involved (also of the declaration it clashes with, in a standard module, or `--TLA+ BUILTINS--`) and add follow-on errors (an operator's arity, an infix symbol it cannot resolve) and warnings; tla2rs's syntax tree keeps no positions of names | 20: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-LocalRec`, `-Minus`, `-OwnParam`, `-QuantSet`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `-Unknown`, `SubexprBad` |
 | TLC gives the position of an identifier it fails to evaluate (also a substituted variable in ENABLED, and a variable a fair action leaves unspecified, which tla2rs reports in its own words) or of an `x' \in S` it cannot enumerate; tla2rs keeps no positions of identifiers | 11: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `EnSubst-EEarly`, `-Outer`, `FairPartial`, `RealSet-NextE` |
-| TLC warns, with the position of the function, about an EXCEPT outside the domain on some of the evaluations that do one (3 of many in `SparseFun`), by a rule not found; `LazyFun*` also print a lazy function with the position of its body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
-| TLC compares the value with the element its binary search of a sorted set reaches first (`x \in S` for S from the state: the element at index n/2) and words the error by that element; tla2rs decides the failure from the types | 2: `RejTupleIn`, `TupleStr-InDef` |
+| TLC warns, with the position of the function, about an EXCEPT outside the domain only on its first evaluations: twice whether 3 or about 100 evaluations do one (measured), once when only one does, by a rule not found; `LazyFun*` also print a lazy function with the position of its body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
 | TLC reports the error from ENABLED of the fair action, tla2rs from the step of that action, which it evaluates first; why TLC does not is not found | 1: `LiveErr-Fair` |
 
 ### The corpus
