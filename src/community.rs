@@ -20,6 +20,7 @@ pub fn source(name: &str) -> Option<&'static str> {
     Some(match name {
         "Folds" => FOLDS,
         "Functions" => FUNCTIONS,
+        "FiniteSetsExt" => FINITE_SETS_EXT,
         _ => return None,
     })
 }
@@ -64,5 +65,24 @@ FoldFunctionOnSet(op(_, _), base, fun, indices) ==
 FoldFunction(op(_, _), base, fun) == FoldFunctionOnSet(op, base, fun, DOMAIN fun)
 SumFunctionOnSet(fun, indices) == FoldFunctionOnSet(LAMBDA a, b : a + b, 0, fun, indices)
 SumFunction(fun) == SumFunctionOnSet(fun, DOMAIN fun)
+====
+"#;
+
+const FINITE_SETS_EXT: &str = r#"
+---- MODULE FiniteSetsExt ----
+EXTENDS Integers, FiniteSets, Folds, Functions
+FoldSet(op(_, _), base, set) == MapThenFoldSet(op, base, LAMBDA a : a, LAMBDA T : CHOOSE a \in T : TRUE, set)
+SumSet(set) == FoldSet(LAMBDA a, b : a + b, 0, set)
+ProductSet(set) == FoldSet(LAMBDA a, b : a * b, 1, set)
+ReduceSet(op(_, _), set, acc) == FoldSet(op, acc, set)
+MapThenSumSet(op(_), set) == MapThenFoldSet(LAMBDA a, b : a + b, 0, op, LAMBDA T : CHOOSE a \in T : TRUE, set)
+FlattenSet(S) == UNION S
+SymDiff(A, B) == (A \ B) \cup (B \ A)
+Quantify(S, P(_)) == Cardinality({a \in S : P(a)})
+kSubset(k, S) == {T \in SUBSET S : Cardinality(T) = k}
+Max(S) == CHOOSE a \in S : \A b \in S : a >= b
+Min(S) == CHOOSE a \in S : \A b \in S : a =< b
+Choices(Sets) == {Range(g) : g \in {g \in [Sets -> UNION Sets] : \A T \in Sets : g[T] \in T}}
+ChooseUnique(S, P(_)) == CHOOSE a \in S : P(a) /\ \A b \in S : P(b) => b = a
 ====
 "#;
