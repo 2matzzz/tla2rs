@@ -437,13 +437,23 @@ fn hide_locals(mut m: Module) -> Module {
     m
 }
 
+thread_local! {
+    /// Whether the spec loads Integers (or Reals), whose Java methods TLC then evaluates
+    /// arithmetic with (see `Gen::int_module`)
+    static INTEGERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Whether `name` is a standard module that tla2rs provides itself (an error for the standard
 /// modules it does not support)
 fn standard_module(name: &str, how: &str) -> R<bool> {
     match name {
         // Reals in TLC is Integers plus operators it cannot evaluate. Toolbox only has definitions
         // for the Toolbox's trace explorer.
-        "Naturals" | "Integers" | "FiniteSets" | "TLC" | "Sequences" | "Reals" | "Toolbox" | "Bags" => Ok(true),
+        "Integers" | "Reals" => {
+            INTEGERS.with(|i| i.set(true));
+            Ok(true)
+        }
+        "Naturals" | "FiniteSets" | "TLC" | "Sequences" | "Toolbox" | "Bags" => Ok(true),
         // Handled by `real_time` (EXTENDS only)
         "RealTime" => Err(format!("{how} {name}: only EXTENDS RealTime is supported")),
         // TLC picks the subsets at random, so its results cannot be reproduced
@@ -907,6 +917,7 @@ fn compile_inner(
     startup: &mut Startup,
 ) -> R<Output> {
     let mut warnings = vec![];
+    INTEGERS.with(|i| i.set(false));
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
     let cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
@@ -1108,6 +1119,7 @@ fn compile_inner(
     let next = strip_pos(&next_pos);
 
     let mut g = Gen::new(&atoms, &constants);
+    g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
     g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
     g.def_pos = m.defs.iter().filter_map(|d| match &d.body {
         Expr::Label(n, _, _) => pos_of(n).map(|p| (d.name.clone(), p.to_string())),

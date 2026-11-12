@@ -66,6 +66,12 @@ pub struct Gen<'a> {
     pub labels: Vec<String>,
     /// The number of actions the next-state relation splits into (see `gen_split`)
     pub actions: usize,
+    /// The module whose Java methods TLC evaluates arithmetic with: Integers when the spec loads
+    /// it (or Reals), else Naturals (see `gen_int`)
+    pub int_module: &'static str,
+    /// The operator whose argument `gen_int` generates next: its Java method's name, and whether
+    /// it takes one argument and gives an interval
+    int_op: Option<(&'static str, bool, bool)>,
     /// Whether the checker follows TLC's order of printed lines: each successor (and initial
     /// state) and the start of each action are marked as they are computed (PRINT_ORDER)
     pub print_order: bool,
@@ -125,6 +131,8 @@ impl<'a> Gen<'a> {
             need_subsets: false,
             labels: vec!["Init".into(), "Next".into()],
             actions: 0,
+            int_module: "Naturals",
+            int_op: None,
             print_order: false,
             tmp: 0,
             scap: 8,
@@ -2309,8 +2317,8 @@ impl<'a> Gen<'a> {
                     (format!("{{ let __x = {c}; let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr(&fmt_{id}(&__x)), ppr(&fmt_{vid}(&__v)))); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
-                    let (ac, (alo, ahi)) = self.gen_int(a, env)?;
-                    let (bc, (blo, bhi)) = self.gen_int(b, env)?;
+                    let (ac, (alo, ahi)) = self.gen_int_of("Expt", false, false, a, env)?;
+                    let (bc, (blo, bhi)) = self.gen_int_of("Expt", false, false, b, env)?;
                     // Monotone in both arguments when both are natural numbers
                     let t = match (alo >= 0, int_pow(alo, blo.max(0)), int_pow(ahi, bhi)) {
                         (true, Some(lo), Some(hi)) if hi <= BIG => Ty::Int(if alo == 0 { 0 } else { lo }, hi.max(1)),
@@ -2659,7 +2667,7 @@ impl<'a> Gen<'a> {
                 (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
             }
             Un(UOp::Neg, x) => {
-                let (c, (lo, hi)) = self.gen_int(x, env).map_err(|_| "negation of a non-integer".to_string())?;
+                let (c, (lo, hi)) = self.gen_int_of("Neg", true, false, x, env).map_err(|_| "negation of a non-integer".to_string())?;
                 (format!("(-{c})"), Ty::Int(-hi, -lo))
             }
             Un(UOp::Domain, f) => {
@@ -3504,8 +3512,8 @@ impl<'a> Gen<'a> {
             LeadsTo => return Err("~> in a state expression".into()),
             // a..b with bounds from the state, as a value: a set over the integers both bounds can be
             Range => {
-                let (ac, (alo, _)) = self.gen_int(a, env)?;
-                let (bc, (_, bhi)) = self.gen_int(b, env)?;
+                let (ac, (alo, _)) = self.gen_int_of("DotDot", false, true, a, env)?;
+                let (bc, (_, bhi)) = self.gen_int_of("DotDot", false, true, b, env)?;
                 let st = Ty::Set(Ty::Int(alo, bhi.max(alo)).into());
                 let acc = self.fresh("acc");
                 let add = self.s_add(&acc, "__k", &st)?;
@@ -3513,8 +3521,15 @@ impl<'a> Gen<'a> {
                 (format!("{{ let mut {acc} = {empty}; for __k in ({ac})..=({bc}) {{ {add} }} {acc} }}"), st)
             }
             Add | Sub | Mul | Div | Mod => {
-                let (ac, (alo, ahi)) = self.gen_int(a, env)?;
-                let (bc, (blo, bhi)) = self.gen_int(b, env)?;
+                let method = match op {
+                    Add => "Plus",
+                    Sub => "Minus",
+                    Mul => "Times",
+                    Div => "Divide",
+                    _ => "Mod",
+                };
+                let (ac, (alo, ahi)) = self.gen_int_of(method, false, false, a, env)?;
+                let (bc, (blo, bhi)) = self.gen_int_of(method, false, false, b, env)?;
                 // Compute ranges in i128 and clamp to BIG. Otherwise an operation such as
                 // subtracting two unbounded integers (Nat / Int) overflows i64, corrupting the
                 // range into a type that admits only a single value
@@ -3538,16 +3553,37 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// `gen_int` of an argument of the arithmetic operator whose Java method in TLC is `method`
+    /// (`neg`: it takes one argument; `interval`: it gives an interval)
+    fn gen_int_of(&mut self, method: &'static str, neg: bool, interval: bool, e: &Expr, env: &Env) -> R<(String, (i64, i64))> {
+        self.int_op = Some((method, neg, interval));
+        self.gen_int(e, env)
+    }
+
     fn gen_int(&mut self, e: &Expr, env: &Env) -> R<(String, (i64, i64))> {
+        let op = self.int_op.take();
         let (c, t) = self.gen(e, env, None)?;
         match t {
             Ty::Int(lo, hi) => Ok((c, (lo, hi))),
             // An integer or a model value (`x # None => x + 1 > 0`): a model value reaching
-            // arithmetic or a comparison is an evaluation error, as in TLC
-            Ty::IntAtom(lo, hi, _) => Ok((
-                format!("{{ let __n: i64 = {c}; if __n < i64::MIN + 65536 {{ eval_error(format!(\"Attempted to use the model value {{}} as an integer\", ATOMS[(__n - i64::MIN) as usize])) }} __n }}"),
-                (lo, hi),
-            )),
+            // arithmetic or a comparison is an evaluation error, as in TLC. TLC evaluates
+            // arithmetic with Java methods and names the one that failed to cast the model value
+            Ty::IntAtom(lo, hi, _) => {
+                let fail = match op {
+                    Some((method, neg, interval)) => {
+                        let v = "tlc2.value.impl.";
+                        let args = if neg { format!("{v}IntValue") } else { format!("{v}IntValue,{v}IntValue") };
+                        let ret = if interval { "IntervalValue" } else { "IntValue" };
+                        let m = format!(
+                            "Attempted to apply the operator overridden by the Java method\npublic static {v}{ret} tlc2.module.{}.{method}({args}),\nbut it produced the following error:\nCannot cast {v}ModelValue to {v}IntValue",
+                            self.int_module
+                        );
+                        format!("eval_error({m:?}.to_string())")
+                    }
+                    None => "eval_error(format!(\"Attempted to use the model value {} as an integer\", ATOMS[(__n - i64::MIN) as usize]))".into(),
+                };
+                Ok((format!("{{ let __n: i64 = {c}; if __n < i64::MIN + 65536 {{ {fail} }} __n }}"), (lo, hi)))
+            }
             // No value has this type (an element of the empty tuple, say), so the code cannot
             // produce one: it stops, and still runs to report that
             Ty::Enum(v) if v.is_empty() => Ok((format!("{{ let __u: i64 = {{ let _ = {c}; unreachable!() }}; __u }}"), (0, 0))),
@@ -3904,9 +3940,25 @@ impl<'a> Gen<'a> {
                 })
             }
             Bin(BOp::Range, a, b) => {
-                let (ac, _) = self.gen_int(a, env)?;
-                let (bc, _) = self.gen_int(b, env)?;
-                return Ok(format!("({ac} <= {x} && {x} <= {bc})"));
+                let (ac, _) = self.gen_int_of("DotDot", false, true, a, env)?;
+                let (bc, _) = self.gen_int_of("DotDot", false, true, b, env)?;
+                // A value that is not an integer: TLC stops with an error
+                let fail = |id: usize| {
+                    format!(
+                        "{{ let (__a, __b) = ({ac}, {bc}); eval_error(format!(\"Attempted to check if the value:\\n{{}}\\nis in the integer interval {{}}..{{}}\", ppr(&fmt_{id}(&{x})), __a, __b)) }}"
+                    )
+                };
+                return Ok(match xt {
+                    Ty::Int(..) => format!("({ac} <= {x} && {x} <= {bc})"),
+                    Ty::IntAtom(..) => {
+                        let id = self.ty_id(xt)?;
+                        format!("(if {x} >= i64::MIN + 65536 {{ {ac} <= {x} && {x} <= {bc} }} else {} )", fail(id))
+                    }
+                    _ => {
+                        let id = self.ty_id(xt)?;
+                        fail(id)
+                    }
+                });
             }
             Bin(op @ (BOp::Cup | BOp::Cap | BOp::SetMinus), a, b) if self.try_const(s, env).is_none() => {
                 let l = self.gen_member(x, xt, a, env)?;
