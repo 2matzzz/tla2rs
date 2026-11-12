@@ -864,17 +864,32 @@ impl<'a> Gen<'a> {
         // function built from the one at a smaller argument) a function over the domain the body
         // builds its value on
         let mut seeds = vec![Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool, Ty::Set(Ty::Enum(vec![]).into())];
-        let mut value = &rd.body;
-        loop {
-            match value {
-                Expr::Label(_, _, b) | Expr::If(_, b, _) => value = b,
-                _ => break,
+        // The values the body can take, through IF: one without a recursive call (a base case)
+        // gives its type
+        let mut values = vec![];
+        let mut todo = vec![&rd.body];
+        while let Some(e) = todo.pop() {
+            match e {
+                Expr::Label(_, _, b) => todo.push(b),
+                Expr::If(_, a, b) => {
+                    todo.push(b);
+                    todo.push(a);
+                }
+                e => values.push(e),
             }
         }
-        if let Expr::FunCons(_, dom, _) = value {
-            if let Ok((_, Ty::Set(dt))) = self.gen(dom, &env, None) {
-                for c in [Ty::Bool, Ty::Int(0, 0), Ty::Enum(vec![])] {
-                    seeds.push(Ty::Fun(dt.clone(), c.into()));
+        for value in values {
+            if let Expr::FunCons(_, dom, _) = value {
+                if let Ok((_, Ty::Set(dt))) = self.gen(dom, &env, None) {
+                    for c in [Ty::Bool, Ty::Int(0, 0), Ty::Enum(vec![])] {
+                        seeds.push(Ty::Fun(dt.clone(), c.into()));
+                    }
+                }
+            } else if !value.any(&|x| matches!(x, Expr::RecCall(..))) {
+                if let Ok((_, t)) = self.gen(value, &env, None) {
+                    if !seeds.contains(&t) {
+                        seeds.push(t);
+                    }
                 }
             }
         }

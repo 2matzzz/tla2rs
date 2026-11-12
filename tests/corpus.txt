@@ -18,7 +18,7 @@ check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specific
 skip specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/Chameneos/Chameneos.tla specifications/Chameneos/Chameneos.cfg
 skip specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordination.cfg # TLC 2.19 did not finish in 150 s with one worker
-gap specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg rsargs=-seqcap,8 # compile error: field .counter of a non-record (Next)
+check specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg rules=distinct-only rsargs=-seqcap,8
 skip specifications/CigaretteSmokers/APCigaretteSmokers.tla specifications/CigaretteSmokers/APCigaretteSmokers.cfg # symbolic mode: checked with Apalache
 check specifications/CigaretteSmokers/CigaretteSmokers.tla specifications/CigaretteSmokers/CigaretteSmokers.cfg
 skip specifications/CoffeeCan/APCoffeeCan.tla specifications/CoffeeCan/APCoffeeCan.cfg # symbolic mode: checked with Apalache
@@ -88,7 +88,7 @@ check specifications/N-Queens/Queens.toolbox/FourQueens/MC.tla specifications/N-
 check specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.tla specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg
 skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoLarge.cfg # manifest runtime 00:20:00: beyond the 60 s budget
 skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoMedium.cfg # TLC 2.19 took 79 s with one worker
-gap specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+gap specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg # Next: an operator of the instantiated module (SignHash) is reported unknown; cause not identified
 skip specifications/Paxos/MCConsensus.tla specifications/Paxos/MCConsensus.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Paxos/MCPaxos.tla specifications/Paxos/MCPaxos.cfg # needs module TLAPS, not in tla2tools.jar
 skip specifications/Paxos/MCVoting.tla specifications/Paxos/MCVoting.cfg # needs module TLAPS, not in tla2tools.jar
@@ -129,7 +129,7 @@ check specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla
 check specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg
 check specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.tla specifications/SpecifyingSystems/AsynchronousInterface/PrintValues.cfg
 check specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.tla specifications/SpecifyingSystems/CachingMemory/MCInternalMemory.cfg
-gap specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+check specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla specifications/SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg
 skip specifications/SpecifyingSystems/Composing/APChannel.tla specifications/SpecifyingSystems/Composing/APChannel.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/Composing/APHourClock.tla specifications/SpecifyingSystems/Composing/APHourClock.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/FIFO/APChannel.tla specifications/SpecifyingSystems/FIFO/APChannel.cfg # symbolic mode: checked with Apalache
@@ -145,7 +145,7 @@ skip specifications/SpecifyingSystems/Liveness/APHourClock.tla specifications/Sp
 skip specifications/SpecifyingSystems/Liveness/APLiveHourClock.tla specifications/SpecifyingSystems/Liveness/APLiveHourClock.cfg # symbolic mode: checked with Apalache
 check specifications/SpecifyingSystems/Liveness/LiveHourClock.tla specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg
 check specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg
-gap specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg # a variable holds records and model values in one function; tla2rs has no type for that
+check specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla specifications/SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg
 check specifications/SpecifyingSystems/RealTime/MCRealTimeHourClock.tla specifications/SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg
 check specifications/SpecifyingSystems/SimpleMath/SimpleMath.tla specifications/SpecifyingSystems/SimpleMath/SimpleMath.cfg
 check specifications/SpecifyingSystems/TLC/ABCorrectness.tla specifications/SpecifyingSystems/TLC/ABCorrectness.cfg
@@ -203,7 +203,7 @@ gap specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/B
 gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs was killed by the system (memory) in a corpus run; not run until that is fixed
 skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
 skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget
-gap specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg # Next: type mismatch, a set where an element is expected
+gap specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg # a variable holds model values and sets of them in one function; tla2rs has no type for that
 skip specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg # TLC 2.19 took 62 s with one worker
 skip specifications/diskpaxos/MC_HDiskSynod.tla specifications/diskpaxos/MC_HDiskSynod.cfg # TLC 2.19 took 60 s with one worker
 check specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg
