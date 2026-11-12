@@ -19,7 +19,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --messages FILE` reduces the messages and printed lines in such an output to `messages N
   <sha256>` and its error lines to `errors M <sha256>`; `--messages-text FILE` prints the canonical form (see
   "Messages and printed lines")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 500 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 541 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -53,9 +53,9 @@ It has no crate dependencies.
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
 | `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first) |
-| `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element). Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
+| `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A value that is a record or a model value (`[op : S] \cup {NoVal}`) is a record type whose fields are all optional, with the model values in a field of its own (`ATOM_FIELD`); a type invariant giving such a type is checked on every state, since packing does not check which records it lists. A record type with optional fields of at most 4096 values is numbered in TLC's order of records (`tlc_perm`: the number of fields first), so sets of such records print, CHOOSE and enumerate as in TLC. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element). Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
 | `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
-| `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
+| `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). When the types from TypeOK fail in Init or Next (a module that extends another and adds a record field its type invariant lacks), the spec is compiled again with every type inferred (`INFER_ALL`). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
@@ -63,7 +63,8 @@ It has no crate dependencies.
 | `src/trace.rs` | `--trace`: reduces the counterexample in an output of TLC or of a checker to its canonical form and hashes it |
 | `src/messages.rs` | `--messages`: reduces the messages and printed lines in an output of TLC or of a checker to their canonical form and hashes it, and its error lines (see "Messages and printed lines") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
-| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos). Also TLC's pretty printer for values (`ppr`, used for every state printed) and the `-dumpgraph` output |
+| `src/ppr.rs` | TLC's pretty printer for values (`ppr`, ported from `tlc2.pprint` and checked against TLC's on 25,000 random values): used by the compiler for what Print and PrintT print when TLC starts, and pasted into every generated checker, which prints states and printed values with it |
+| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos). Also the `-dumpgraph` output |
 
 ### Memory use (`runtime.rs`)
 
@@ -105,7 +106,9 @@ it creates: the strings and model values of the cfg; SANY's built-in names; the 
 as it parses them (root module first, then the modules it extends or instantiates, breadth first; a string equal to an
 identifier such as an operator name, or to a name in a standard module, takes that identifier's place); a few more
 built-in names; the string literals of each module, dependencies first. `tlc_string_ranks` reproduces this, with the
-standard modules' names in `src/std_modules.rs` (generated from TLC's jar).
+standard modules' names in `src/std_modules.rs` (generated from TLC's jar). TLC orders every model value before every
+string (`{"zz", m1}` prints as `{m1, "zz"}`, a function over both lists the model values first, CHOOSE picks `m1`;
+`tests/tlc/ModelStr*`), so model values get the lower atom numbers.
 
 Strings created while exploring (by `\o`, `Append`, `ToString`, ...) are not ordered as in TLC: tla2rs computes them at
 compile time and numbers them after the others. Reproducing TLC is not possible in general (Refs #23):
@@ -143,6 +146,19 @@ Measured on TLC 2.19 (`tests/tlc/SpecConj*`, `SpecShape*`, `SpecInst*`, `RtSpec*
   151). TLC also evaluates every definition of constant level without arguments when it starts, then the ASSUMEs, and
   keeps the values: `Print` / `PrintT` in them print once, before anything else (`STARTUP_PRINTS`), and not when the
   definition is used later
+
+### ENABLED in an instantiated module
+
+While TLC computes whether an action is enabled, it binds each primed variable by its name in a partial state
+(`TLCStateFun`). For an ENABLED, WF or SF written in an instantiated module, a variable the INSTANCE substitutes
+(`total <- a + b`) is bound the same way, as if it were a variable of its own: `total' = e` and `total' \in S` bind
+it, UNCHANGED total binds it to what it stands for, and `total'` elsewhere reads the binding (an error when it is not
+bound), never the substitution, so an action that can never take a step can be enabled. An ENABLED written in the
+instantiating module reads the substitution. Measured on TLC 2.19 (`tests/tlc/EnSubst*`). Expansion marks a
+substituted variable with an `ast::SUBVAR` label and the action of such an ENABLED, WF or SF with `ast::ENINST`;
+`Gen::gen_phantom` binds them. Whether a fair action is enabled is computed with its subscript test as the last
+conjunct, as for WF in a property, so a successor may leave variables the subscript does not read undetermined
+(`tests/tlc/FairSub*`).
 
 ### Functions over sets that cannot be enumerated
 
@@ -418,26 +434,35 @@ The cfgs of the corpus are not edited, so a line of the list gives what a `\* cr
 (narrowing rules, passed as `CROSSCHECK_RULES`) and `rsargs=` (arguments for tla2rs only, `CROSSCHECK_RSARGS`; here
 `-seqcap` and `-setcap` where the spec bounds a sequence or set only by its logic). A selected model tla2rs does not
 match is listed as `gap` with the reason measured; `corpus.sh` still runs it and says when it starts to match, and
-fails only on a `check` that differs. A gap marked `norun` is not run: `GameOfLife` (6 MB of generated Rust that
-rustc did not finish building in 9 minutes) and `TLCSailfish1` (the system killed tla2rs for memory in one run).
+fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
+below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2, 50 s with built checkers cached): 59 match, of which 4 with `distinct-only`
-(`StaleViewShrink`: graphs, counterexamples and distinct counts match, only the generated counts differ, as TLC's
-counting per `\/` branch does; not confirmed by rewriting) and 3 with a bound for tla2rs. 39 are gaps (37 run, 2 `norun`), by how many
-models each blocks:
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 91 match, of which 6 with `distinct-only` and 10
+with a bound for tla2rs. Only the generated count differs in those 6, as TLC counts a successor once per `\/` branch
+that yields it: `StaleViewShrink` (4, not confirmed by rewriting), `MCCheckpointCoordinationFailure` (not confirmed)
+and `2PCwithBTM` (rewriting one guard whose two branches both hold as IF lowered TLC's count from 5841 to 5673; tla2rs
+gives 5291). 7 are gaps (4 run, 3 `norun`), each blocking one model:
 
-| Gap | Models |
+| Gap | Model |
 |---|---|
-| A set of records with different fields prints in another order (TLC lists `[type \|-> "Abort"]` first) | 5 |
-| A variable holds records and model values in one function: no type for it | 4 |
-| TypeOK, checked as an invariant, tests membership in `[S -> Int]` on a state | 3 |
-| A recursive operator iterates over a value typed Bool (compile error) | 3 |
-| tla2rs reports a variable undefined, or unassigned in a successor, where TLC does not | 4 |
-| PrintT of a value wider than 80 columns: TLC breaks it over lines | 2 |
-| An ASSUME tla2rs cannot evaluate at compile time (`Nat`) | 2 |
-| Types from TypeInv of the extended module, which lacks a field the extending module adds | 2 |
-| A function over the empty set typed as an empty record | 2 |
-| One each: the PlusCal checksum warning, a field read of a non-record, functions over domains of different sizes, `[Module]Value` in a cfg, a model value where a sequence is expected, a set where an element is expected, a recursive operator applied as a function, an infix `&` defined by the spec, an EXCEPT path, state texts that differ in a 1.2-million-edge graph (cause not identified), and the two `norun` | 12 |
+| TLC warns that the PlusCal algorithm changed since its last translation: it checksums the syntax tree of its PlusCal parser (`pcal.Validator`), which tla2rs does not have | `DiningPhilosophersPCal` |
+| A variable holds functions over domains of different sizes (type inference) | `MCLeastCircularSubstringSmall` |
+| A variable holds tuples of different lengths and a model value: no type for it | `kvstore` |
+| A variable holds model values and sets of them in one function: no type for it | `DijkstraMutex` (LSpec) |
+| `norun`: the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it | `GameOfLife` |
+| `norun`: evaluating its ASSUMEs at compile time took 1.5 GB in 2.5 minutes (LET definitions are expanded at each use, so recursion through them repeats work) | `BlockDagTest` |
+| `norun`: the system killed tla2rs for memory in a corpus run | `TLCSailfish1` |
+
+Forms the corpus showed, each with a test in `tests/tlc/`: records of different fields in TLC's
+order (`RecMix`), a value that is a record or a model value (`RecAtom`), primed substituted variables in ENABLED
+written in an instance (`EnSubst`), a fair action leaving variables its subscript does not read undetermined
+(`FairSub`), `x \in UNION {S}` without enumerating S (`UnionMem`), recursive functions typed from a set, function or
+base-case seed (`RecSetFn`, `RecFunApp`, `RecBase`), Print and PrintT pretty-printed (`PrintWide`), ASSUMEs over
+`Nat \X S` and `\subseteq Nat \ {0}` (`AssumeNatFn`), the function over an empty domain (`EmptyDomFn`), types
+inferred when TypeOK's fail (`ExtType`), an infix `&` (`AmpOp`), `name = [Module] value` in a cfg (`ModVal`), LET
+definitions of an instance renamed (`InstLet`), in-place EXCEPT on a function over part of a type (`PartExcept`), model
+values before strings (`ModelStr`), records compared field by field in an array (`RecNest`), and up to 128 fairness
+conditions (`ManyFair`).
 
 ### VIEW and SYMMETRY together
 
