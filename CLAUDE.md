@@ -6,25 +6,30 @@ It has no crate dependencies.
 ## Common commands
 
 - `cargo build --release` builds the compiler (`target/release/tla2rs`)
-- `target/release/tla2rs Spec.tla [-config X.cfg] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [--emit-only] [-o DIR]`
+- `target/release/tla2rs Spec.tla [-config X.cfg] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR] [--emit-only] [-o DIR]`
   - The generated crate goes to `<spec dir>/.tla2rs/<cfg name>/` by default; it is built with
     `cargo build --release --offline` and then run
-  - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, `-dumpgraph`, and `-deadlock` are passed
-    on to the generated checker, which also accepts them directly
+  - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, `-dumpgraph`, `-lassocheck` and
+    `-deadlock` are passed on to the generated checker, which also accepts them directly
 - `target/release/tla2rs --graph FILE` reduces a state graph (TLC's `-dump dot FILE` or a checker's `-dumpgraph
   FILE`) to `states N <sha256>` and `edges M <sha256>`; `--graph-text FILE` prints the canonical form itself, for
   diffing two graphs (see "State graphs")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 469 currently
+- `target/release/tla2rs --trace FILE` reduces the counterexample in an output of TLC or of a checker to `trace N
+  <sha256>`; `--trace-text FILE` prints its canonical form (see "Counterexamples")
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 483 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
-  one worker, and it compares the verdict, generated and distinct state counts, counterexample length, exit code,
-  and the state graph (the set of states and the set of transitions; see "State graphs"). If TLC produces no
-  verdict, the check fails. `all.sh` prints, after `ok`, the rule that narrowed a comparison, if any
-- TLC's summary for each configuration (verdict, counts, trace length, exit code, the hashes of its state graph, and
-  a key hashing the jar, cfg, arguments, the modules the spec reads and `src/graph.rs`) is committed in
+  one worker, and it compares the verdict, generated and distinct state counts, the counterexample (its states and
+  the action of each step; see "Counterexamples"), exit code, and the state graph (the set of states and the set of
+  transitions; see "State graphs"). A liveness counterexample is instead checked by TLC (it runs TLC on the
+  `-lassocheck` output). If TLC produces no verdict, the check fails. `all.sh` prints, after `ok`, the rule that
+  narrowed a comparison, if any
+- TLC's summary for each configuration (verdict, counts, the length and hash of its counterexample, exit code, the
+  hashes of its state graph, and a key hashing the jar, cfg, arguments, the modules the spec reads, `src/graph.rs`
+  and `src/trace.rs`) is committed in
   `tests/expected/`. `crosscheck.sh` and `all.sh` compare
-  against these files only and fail on a missing or stale one. After adding or changing a test, run
+  against these files only (they run TLC only on a lasso check not yet confirmed, cached in `target/crosscheck/lasso` by a hash of the check, its modules and the jar) and fail on a missing or stale one. After adding or changing a test, run
   `scripts/expected.sh` (it runs TLC for missing and stale files only) and commit the files with the test.
   `expected.sh -check` reruns TLC and reports differences without writing. Built checkers are cached in
   `target/crosscheck/build` (key: generated code and rustc version; `CROSSCHECK_NO_CACHE=1` rebuilds); `JOBS=N`
@@ -36,17 +41,19 @@ It has no crate dependencies.
 
 | File | Role |
 |---|---|
-| `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also the checks of SANY that tla2rs repeats (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150 |
+| `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also the checks of SANY that tla2rs repeats (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150. The positions TLC names actions by are kept in POS labels (`ast::POS`, see "Counterexamples") |
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
 | `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first) |
 | `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element). Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
-| `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
+| `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
 | `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
+| `src/trace.rs` | `--trace`: reduces the counterexample in an output of TLC or of a checker to its canonical form and hashes it |
+| `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS, bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components; counterexamples are lassos). Also TLC's pretty printer for values (`ppr`, used for every state printed) and the `-dumpgraph` output |
 
 ### Memory use (`runtime.rs`)
@@ -196,20 +203,6 @@ counts match TLC). Over a constant set or with constant arguments, tla2rs unroll
   state, once per mask. A call of the operator in its own body uses the masks found so far, and the body is generated
   again until they settle (`Gen::gen_rec_action`, `rec_action_fn`). In Init, arguments must still be constant
 
-### Liveness counterexamples are not compared
-
-For a violated temporal property, `scripts/crosscheck.sh` compares the verdict, the counts and the exit code, but not
-the lasso. TLC's lasso is not reproducible from the spec alone: the successors of a state in its liveness graph come
-out of a hash set keyed by fingerprint (`tlc2.util.SetOfStates`), and TLC picks the fingerprint polynomial at random on
-each run (`with fp N` in its banner). The same configuration then gives different lassos. For
-`tests/tlc/LiveForms-NoneImplies.cfg`, ten runs gave 5 states eight times and 4 states twice; with `-fp 1` it is 4
-states every time, with `-fp 50` 5 states every time. Matching TLC would take its FP64 fingerprint of every value for a
-fixed polynomial, its hash-set order, and a port of its tableau, normal form, SCC search and trace construction
-(`tlc2.tool.liveness.LiveWorker`), and would still hold only for that `-fp`.
-
-What is checked instead: the verdict and exit code of every liveness configuration, including the formulas TLC refuses
-(`tests/tlc/RejTemp*.cfg`), and the counts at which liveness checks stop on an evaluation error.
-
 ### State graphs
 
 Matching counts does not show that tla2rs reached the same states or took the same transitions, so the cross-check
@@ -250,18 +243,68 @@ not the graphs. Reducing to it:
   relation)
 
 Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
-are for the 469 configurations at the time of writing):
+are for the 483 configurations at the time of writing):
 
 | Rule | Applies to | Compared |
 |---|---|---|
 | TLC did not end the file (automatic: no closing `}`) | 56 (stops in or before the initial states, and SANY or temporal refusals) | Not the graph; verdict, counts and exit code as before |
-| tla2rs stopped at a successor that left its declared type while `next` built it (automatic: "a successor that tla2rs cannot represent" in its output) | 1 (`SetOut`) | The numbers of states and edges (tla2rs writes a placeholder node for the successor TLC adds) |
+| tla2rs stopped at a successor that left its declared type while `next` built it (automatic: "a successor that tla2rs cannot represent" in its output) | 1 (`SetOut`) | The numbers of states and edges and the length of the counterexample (tla2rs writes a placeholder node and state for the successor TLC adds) |
 | VIEW and SYMMETRY together (automatic), see below | 1 (`ViewSym-Both`) | The verdict only. `ViewSymSet-Both` has `\* crosscheck: exact`: TLC was measured to keep no two states with equal views there, and everything matches |
 
 `distinct-only` (three configurations) leaves the graph compared: duplicate edges collapse anyway.
 
 Known gap, not hit by any configuration: TLC prints a value in the form it holds it, so a variable assigned `1..3`
 prints as `1..3` until an operation turns it into an enumerated set, while tla2rs prints `{1, 2, 3}`.
+
+### Counterexamples
+
+A safety counterexample (invariant, action property, deadlock, an evaluation error with a behavior) is compared
+with TLC's as a whole: each step's first line, `State N: <Name line L, col C to line L2, col C2 of module M>`, and
+its state. `src/trace.rs` reduces both to that list, each state in the canonical form of the state graphs (its
+variables sorted, `<<>>` read as `<< >>`), and the expected file keeps `trace N <sha256>` of it.
+
+With one worker TLC's counterexample is deterministic: for all 186 configurations that have one, four runs (two with
+random fingerprint seeds, `-fp 1`, `-fp 50`) gave the same text. TLC rebuilds it from fingerprints, taking for each
+step the first action, in its order of actions, that yields the next state (`Tool.getState`); tla2rs replays `next`
+the same way (`replay`), and its successors come in TLC's order, so every counterexample matches. Only
+`tests/tlc/SetOut.cfg` compares the length alone: its last state is the successor tla2rs cannot represent.
+
+How TLC names actions, measured on TLC 2.19 (`tests/tlc/ActName*`, `Tool.getActions`), which `Gen::gen_split`
+follows:
+
+- It splits the next-state relation through `\/`, `\E` over a set that does not depend on the state (once per
+  element), LET, labels, and calls of definitions (also LET and recursive ones) whose arguments do not depend on the
+  state. What it reaches otherwise is one action: a conjunction, `IF`, `[A]_v`, `\E` over a set from the state, ...
+- An action is named by the innermost definition called on the way (`Action` if none, as for `[][x' = x + 1]_x`),
+  and for a call with an argument from the state, by the definition called. Its position is that of the part
+  where splitting stopped: a definition's body, a disjunct, the body of `\E`, LET or a label, or the call. SANY's
+  positions run from the first to the last token, without the parentheses around a whole expression
+- A definition of an INSTANCE with substitutions is not split: its actions are named `N!Op` (or `Op` for an unnamed
+  INSTANCE, or `Action` for the next-state relation of a SPECIFICATION inside the instance) at the position of the
+  INSTANCE statement
+
+The parser keeps these positions in POS labels; expansion drops them except while expanding the next-state relation
+(`Expander::keep_pos`). One case is not followed: a recursive operator called with an argument bound by a split
+`\E` is split further by TLC (the argument is a constant to it), while tla2rs names the call after the operator at
+the position of its body; no configuration has this.
+
+A liveness counterexample (lasso) cannot be compared with TLC's: TLC takes the successors of a state in its liveness
+graph out of a hash set keyed by fingerprint (`tlc2.util.SetOfStates`), and picks the fingerprint polynomial at
+random on each run. For `tests/tlc/LiveForms-NoneImplies.cfg`, ten runs gave 5 states eight times and 4 states
+twice. TLC checks tla2rs's lasso instead. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
+`.cfg` (`write_lasso_check` in the runtime, `src/lasso.rs`): a module that EXTENDS the spec with a variable for the
+position on the lasso, whose initial predicate is the first state and the spec's own, whose next-state relation
+moves to the next position's state (from the last back to where the lasso returns, or to itself when it ends
+stuttering) conjoined with the spec's `[Next]_vars`, and whose spec adds WF of that relation to the spec's temporal
+conjuncts. The only fair behavior is then the lasso, so TLC reports the properties violated, with one distinct state
+per position, exactly when the lasso starts in an initial state, every step is a step of Next (otherwise it
+deadlocks, or a state is missing), it satisfies the spec's fairness (otherwise no behavior is fair) and it violates a
+property. Fairness stays that of the spec: its actions do not mention the new variable. Altering a confirmed lasso
+gave the expected refusals (a wrong state: deadlock; a wrong first state: no initial state; a wrong return: deadlock;
+fairness for both processes in `Peterson-Unfair`: no error). VIEW and SYMMETRY are left out of the cfg, so the
+lasso is checked as a behavior of the spec itself (`LiveSym` passes). `crosscheck.sh` runs this for each of the 37
+liveness violations (about a second of TLC each) and fails if TLC does not confirm it, or if the spec's parts cannot
+be written out (`lasso::tla` refuses a SPECIFICATION split inside an INSTANCE, and LET or LAMBDA in its conjuncts).
 
 ### VIEW and SYMMETRY together
 

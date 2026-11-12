@@ -1,8 +1,8 @@
-key 0c3cf51fcd0fd8e71dfb691f65cdf181dc5aecf6a2c66ec5cca88b44bdb4ff71
+key 202bc85a33c81ccd2dcb8fca99bfc01668c571b4d5fb24e70bdc9b2f6543d9a7
 tlc Version 2.19
 rc 12
 Invariant NotTwos is violated
 10 states generated 10 distinct states found
-trace=3
+trace 3 69af7ece0e00b8271f92c90c24542f229b4b40641b06e19e0172cae0fde32354
 states 10 b5d6cc79d2ddbc070a63471264c431e49d2dc72cb495afcc2495c634d6f58693
 edges 9 2568a6efbf1229181c0d6bd14fff4d69e75784a8bb1e399a1b871aae7d0bb18f

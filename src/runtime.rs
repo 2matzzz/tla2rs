@@ -3568,8 +3568,12 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
         }
         shown.push((s, l));
     }
+    // The states shown, for -lassocheck
+    let mut texts: Vec<String> = vec![];
     for (i, &(s, l)) in shown.iter().enumerate() {
-        println!("State {}: <{}>\n{}\n", i + 1, name(l), show(&unpack(&g.states[s as usize])));
+        let t = show(&unpack(&g.states[s as usize]));
+        println!("State {}: <{}>\n{t}\n", i + 1, name(l));
+        texts.push(t);
     }
     let entry_no = shown.len();
     let entry = shown[entry_no - 1].0;
@@ -3584,15 +3588,65 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
     }
     if moves.is_empty() {
         println!("State {}: Stuttering", entry_no + 1);
+        write_lasso_check(&texts, None);
         return;
     }
     let last = moves.len() - 1;
+    let mut back = None;
     for (j, &(s, l)) in moves.iter().enumerate() {
         if j == last && s == entry {
             println!("Back to state {entry_no}: <{}>", name(l));
+            back = Some(entry_no);
         } else {
-            println!("State {}: <{}>\n{}\n", entry_no + j + 1, name(l), show(&unpack(&g.states[s as usize])));
+            let t = show(&unpack(&g.states[s as usize]));
+            println!("State {}: <{}>\n{t}\n", entry_no + j + 1, name(l));
+            texts.push(t);
         }
+    }
+    write_lasso_check(&texts, back);
+}
+
+/// With `-lassocheck DIR`, writes DIR/Tla2rsLasso.tla and .cfg: a spec whose only behavior is the
+/// lasso `states` (as printed), returning to state `back` (1-based) or ending stuttering, for TLC
+/// to confirm that it is a behavior of the spec that violates the properties (see lasso.rs in
+/// tla2rs)
+fn write_lasso_check(states: &[String], back: Option<usize>) {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(dir) = args.iter().position(|a| a == "-lassocheck").and_then(|i| args.get(i + 1)) else { return };
+    let [module, pre, post, cfg] = match LASSO_CHECK {
+        Ok(parts) => parts,
+        Err(why) => {
+            println!("The lasso check is not written: {why}.");
+            return;
+        }
+    };
+    let indent = |t: &str| t.lines().map(|l| format!("  {l}\n")).collect::<String>();
+    // The state with its variables primed: `/\ x = v` (or `x = v` for a single variable) starts
+    // each variable's lines
+    let primed = |t: &str| {
+        t.lines()
+            .enumerate()
+            .map(|(i, l)| if l.starts_with("/\\ ") || i == 0 { l.replacen(" = ", "' = ", 1) } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let tlc = states.iter().any(|t| t.contains(":>") || t.contains("@@"));
+    let mut o = format!("---- MODULE Tla2rsLasso ----\nEXTENDS {module}{}\n{pre}", if tlc { ", TLC" } else { "" });
+    for (i, t) in states.iter().enumerate() {
+        o += &format!("Tla2rsState{} ==\n{}Tla2rsGo{} ==\n{}", i + 1, indent(t), i + 1, indent(&primed(t)));
+    }
+    o += "Tla2rsStep ==\n";
+    let n = states.len();
+    for i in 1..=n {
+        let to = if i < n { i + 1 } else { back.unwrap_or(n) };
+        o += &format!("  \\/ tla2rsAt = {i} /\\ tla2rsAt' = {to} /\\ Tla2rsGo{to}\n");
+    }
+    o += post;
+    o += "====\n";
+    let dir = std::path::Path::new(dir);
+    let written = std::fs::write(dir.join("Tla2rsLasso.tla"), o).and_then(|_| std::fs::write(dir.join("Tla2rsLasso.cfg"), cfg));
+    if let Err(e) = written {
+        eprintln!("cannot write the lasso check to {}: {e}", dir.display());
     }
 }
 "##;

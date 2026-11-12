@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the same spec with TLC and tla2rs and compare state counts, violated invariants,
-# counterexample lengths, exit codes and state graphs (see "State graphs" in CLAUDE.md).
+# counterexamples, exit codes and state graphs (see "State graphs" and "Counterexamples" in
+# CLAUDE.md).
 #   scripts/crosscheck.sh examples/DieHard.tla [examples/DieHard.cfg] [-deadlock]
 #   scripts/crosscheck.sh examples/DieHard.cfg            (the spec is the cfg name up to the first -)
 # For a configuration in examples/ or tests/tlc/, TLC's side is the static result in tests/expected/,
@@ -57,7 +58,8 @@ done
 
 summarize() {
   # Line 1: verdict (ok / violated invariant / deadlock / failed invariant or assumption), line 2:
-  # state counts, line 3: trace length
+  # state counts, line 3: the counterexample (its length and a hash of its states and actions; see
+  # src/trace.rs)
   local f="$1"
   local res
   local span='line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+'
@@ -75,22 +77,24 @@ summarize() {
   local counts
   counts=$(grep -oE '[0-9,]+ states generated, [0-9,]+ distinct states found' "$f" | tail -1 | tr -d ',' || true)
   local trace
-  trace=$(grep -cE '^State [0-9]+:' "$f" || true)
-  # Don't compare lengths of liveness counterexamples (lassos); one property can have several
-  [[ $temporal == 1 ]] && trace=lasso
-  printf '%s\n%s\ntrace=%s\n' "$res" "$counts" "$trace"
+  trace=$("$bin" --trace "$f" || echo "trace unreadable")
+  # A liveness counterexample (lasso) depends on TLC's random fingerprint polynomial, so it is not
+  # compared with TLC's; check_lasso checks tla2rs's instead
+  [[ $temporal == 1 ]] && trace="trace lasso"
+  printf '%s\n%s\n%s\n' "$res" "$counts" "$trace"
 }
 
 # TLC's result depends only on the jar, the cfg, the arguments and the modules the spec reads
 # (followed through EXTENDS and INSTANCE within the spec's directory; standard modules come from the
-# jar). For a configuration in examples/ or tests/tlc/, the summary TLC gives (verdict, counts, trace
-# length, exit code, and hashes of its state graph) is kept in tests/expected/ with a hash of those
-# inputs and of src/graph.rs, which reduces the graph to its hashes (the key). The parts of
-# TLC's output that vary from run to run (times, the fingerprint seed, the shape of a liveness
-# counterexample) are not part of the summary, so the file is the same for every TLC run.
+# jar). For a configuration in examples/ or tests/tlc/, the summary TLC gives (verdict, counts, the
+# length and a hash of its counterexample, exit code, and hashes of its state graph) is kept in
+# tests/expected/ with a hash of those inputs and of src/graph.rs and src/trace.rs, which reduce the
+# graph and the counterexample to their hashes (the key). The parts of TLC's output that vary from
+# run to run (times, the fingerprint seed, the shape of a liveness counterexample) are not part of
+# the summary, so the file is the same for every TLC run.
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  { echo "v2 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" | cut -d' ' -f1; cat "$cfg_abs"
+  { echo "v3 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" | cut -d' ' -f1; cat "$cfg_abs"
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
 expected=""
@@ -166,7 +170,7 @@ else
   run_tlc
 fi
 s1=$(date +%s.%N)
-"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
+"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 s2=$(date +%s.%N)
 
 # With both VIEW and SYMMETRY, TLC may keep states with equal views as distinct (its choice of
@@ -215,19 +219,54 @@ fi
 # - TLC did not end its graph file: it stopped while computing the initial states or before, and
 #   what it had buffered is lost. The graph is not compared
 # - tla2rs stopped at a successor that left its declared type while being built: TLC adds that
-#   state, but tla2rs cannot print it. Only the numbers of states and edges are compared
+#   state, but tla2rs cannot print it. Only the numbers of states and edges and the length of the
+#   counterexample are compared
 graph_note=""
 if grep -q '^states incomplete' <<< "$a"; then
   a=$(grep -vE '^(states|edges) ' <<< "$a"); b=$(grep -vE '^(states|edges) ' <<< "$b")
   graph_note="; graph not compared: TLC stopped before ending it"
 elif grep -q '<a successor that tla2rs cannot represent>' rs.out; then
-  a=$(sed -E 's/^(states|edges) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$a"); b=$(sed -E 's/^(states|edges) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$b")
-  graph_note="; graph sizes only: a successor tla2rs cannot represent"
+  a=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$a"); b=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$b")
+  graph_note="; graph and counterexample sizes only: a successor tla2rs cannot represent"
 fi
 if [[ $verdict_only == 1 ]]; then
   a=$(echo "$a" | head -1); b=$(echo "$b" | head -1)
 elif [[ $distinct_only == 1 ]]; then
   a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
+fi
+# A liveness counterexample (lasso) is not compared with TLC's, which depends on TLC's random
+# fingerprint polynomial. TLC checks tla2rs's instead: the checker writes a spec whose only behavior
+# is the lasso (-lassocheck, see src/lasso.rs), and TLC must report that it violates the properties,
+# with one distinct state per state of the lasso. That holds only if the lasso starts in an initial
+# state, each step is a step of the spec, it satisfies the spec's fairness and violates a property
+lasso_note=""
+if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
+  if [[ ! -f Tla2rsLasso.tla ]]; then
+    echo "  LASSO NOT CHECKED: $(grep -m1 'lasso check is not written' rs.out || echo 'the checker wrote no lasso check')"
+    exit 1
+  fi
+  n_lasso=$(grep -cE '^State [0-9]+: <' rs.out || true)
+  # TLC's answer depends only on the jar, the generated check and the spec's modules, so a
+  # confirmation is kept in target/crosscheck/lasso under a hash of those, and TLC runs again only
+  # when tla2rs writes a different lasso (CROSSCHECK_NO_CACHE=1 always runs it)
+  lasso_key=$({ echo "lasso v1 $n_lasso"; shasum -a 256 "$jar" | cut -d' ' -f1
+    for f in Tla2rsLasso.tla Tla2rsLasso.cfg "${modules[@]/%/.tla}"; do echo "== $f"; cat "$f"; done; } | shasum -a 256 | cut -d' ' -f1)
+  lasso_ok="$root/target/crosscheck/lasso/$lasso_key"
+  if [[ -n "${CROSSCHECK_NO_CACHE:-}" || ! -f "$lasso_ok" ]]; then
+    rc_lasso=0
+    mkdir -p "$work/jtmp"
+    java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
+    found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
+    if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
+      echo "  LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
+      grep -E '^Error|distinct states found|No error' lasso.out | head -5 | sed 's/^/    tlc: /'
+      exit 1
+    fi
+    mkdir -p "$(dirname "$lasso_ok")" && touch "$lasso_ok"
+    lasso_note="  (lasso of $n_lasso states confirmed by TLC)"
+  else
+    lasso_note="  (lasso of $n_lasso states confirmed by TLC earlier; cached)"
+  fi
 fi
 note=""; [[ $tlc_cached == 1 ]] && note=" cached"
 printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)"
@@ -241,6 +280,7 @@ if [[ "$a" == "$b" ]]; then
   else
     echo "  MATCH: $(echo "$a" | tr '\n' ' ')"
   fi
+  [[ -z $lasso_note ]] || echo "$lasso_note"
 else
   echo "  MISMATCH"; echo "  TLC:    $(echo "$a" | tr '\n' ' ')"; echo "  tla2rs: $(echo "$b" | tr '\n' ' ')"
   sed 's/^/    rs.err: /' rs.err | head -20

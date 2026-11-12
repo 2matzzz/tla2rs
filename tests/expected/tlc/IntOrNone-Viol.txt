@@ -1,8 +1,8 @@
-key 6a19e14555cd444a8a4d29b229d42bd5a4c2bf59982f43eba4471ad8fd9dfa27
+key e8f9674dfd8446b8322c9228b9d7a875b99a0913436b55b377ab5f46561e2db1
 tlc Version 2.19
 rc 12
 Invariant SomeoneHolds3 is violated
 67 states generated 39 distinct states found
-trace=4
+trace 4 cf37e9cc5b45ca0803cf77265d2f010b2bd1a5bc91da70e4fc2e0723ad34b3d0
 states 39 62d8226acb250b71f381a6bb2b02e924b53889f4ee38cbc57c0473063cf00595
 edges 66 8165d1cf22f171ab291a318854eb87fff68606e78ab53a10c488657cf91ba387

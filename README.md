@@ -46,7 +46,13 @@ cargo build --release
   per state, labelled with the state as TLC prints it, and an edge per successor). `tla2rs --graph FILE` reduces
   either file to hashes of its states and its edges that do not depend on node ids or order, and `--graph-text FILE`
   prints that canonical form
-- Output (state counts, counterexample format, values wider than 80 columns broken over lines) follows TLC, and so do exit codes: 10 = assumption (false or failing to
+- `-lassocheck DIR` makes a checker that finds a liveness counterexample write `DIR/Tla2rsLasso.tla` and
+  `Tla2rsLasso.cfg`: a spec whose only behavior is that lasso, which TLC reports as violating the properties only if
+  the lasso is a fair behavior of the spec that violates them (see CLAUDE.md, "Counterexamples")
+- `tla2rs --trace FILE` reduces the counterexample in an output of TLC or of a checker to its length and a hash of its
+  states and actions; `--trace-text FILE` prints the canonical form
+- Output (state counts, counterexample format, including the name and position of each step's action, values wider
+  than 80 columns broken over lines) follows TLC, and so do exit codes: 10 = assumption (false or failing to
   evaluate), 11 = deadlock, 12 = invariant, 13 = temporal or action property. An evaluation error exits with 76 in an
   invariant, 75 in the initial states, and otherwise 255 for a failed arithmetic operation (such as `\div` by zero) and
   75 for the rest
@@ -161,8 +167,8 @@ memory.
   modules, or the cfg. Strings created during the search (by `\o`, `ToString`, ...) can be ordered differently: TLC's
   order for those depends on its evaluation order and, with several workers, on scheduling
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
-  depends on a fingerprint polynomial TLC picks at random), so cross-checks compare only the verdict, counts and exit
-  code
+  depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
+  it instead (`-lassocheck`)
 - With `VIEW` and `SYMMETRY` together, the distinct count can be lower than TLC's. TLC sometimes keeps states with
   identical views as separate states (its choice of representative depends on the state itself), while tla2rs folds
   by orbits of the view. With only one of the two, counts match TLC exactly
@@ -170,18 +176,23 @@ memory.
 ## Cross-checking against TLC
 
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
-generated and distinct state counts, counterexample length, exit code, and the state graph: the set of states
-reached and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a
-SHA-256 hash (with the variables of each state sorted, since TLC's order comes from a hash table). Where the graph
-cannot be compared as a whole (TLC stops before ending its graph file when it stops in the initial states; a
-successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied; CLAUDE.md lists them. `scripts/all.sh` does this for every
+generated and distinct state counts, the counterexample, exit code, and the state graph: the set of states reached
+and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a SHA-256
+hash (with the variables of each state sorted, since TLC's order comes from a hash table). A safety counterexample is
+compared step by step: each state and the action that led to it, as TLC names it (with one worker TLC's is the same
+on every run). A liveness counterexample depends on TLC's random fingerprint polynomial, so instead TLC is run on the
+spec `-lassocheck` writes, and must confirm that tla2rs's lasso is a fair behavior of the spec that violates the
+properties. Where the graph cannot be compared as a whole (TLC stops before ending its graph file when it stops in
+the initial states; a successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied;
+CLAUDE.md lists them. `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
 `TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). `all.sh` runs four configurations at a time
 (`JOBS=N` to change). TLC's result for each configuration is committed in `tests/expected/`: the verdict, the
-state counts, the trace length, the exit code and the hashes of the state graph, with a hash of the jar, the cfg, the
-arguments, the modules the spec reads and `src/graph.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
+state counts, the length and a hash of the counterexample, the exit code and the hashes of the state graph, with a
+hash of the jar, the cfg, the arguments, the modules the spec reads, `src/graph.rs` and `src/trace.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
 recorded, so the files are the same for every TLC run. `crosscheck.sh` and `all.sh` only compare against these
-files and never run TLC for them; a missing or stale file fails the check. `scripts/expected.sh [cfg ...]` is what
+files and never run TLC on the configurations themselves (only on a lasso check whose confirmation is not yet cached in `target/crosscheck/lasso`); a missing or stale file fails
+the check. `scripts/expected.sh [cfg ...]` is what
 runs TLC: it writes missing and stale files and leaves the others alone, so a second run changes nothing.
 `expected.sh -check` reruns TLC and reports any file that differs, without writing; `-force` rewrites them all.
 Built checkers are kept in `target/crosscheck/build` under a hash of the generated code and the rustc version

@@ -1,8 +1,8 @@
-key 8e8f7879f5e3ece502dabf4b46536a4e8279f2b8f669d5b114b99d8546282d3e
+key 732fe5c56d1f1caa69bf177249298379c8cd1ee1552bba30e880b8da347db044
 tlc Version 2.19
 rc 12
 Invariant TypeOK is violated
 5 states generated 5 distinct states found
-trace=5
+trace 5 42f6444f6ca070743499d7bb76ebd9e1eae4cfba8d8142b35f7e7de95dea1e7d
 states 5 e43f1bbd405221cc916b9942dd96aca727a8c06e9abaa5bb554ddaa1d584dced
 edges 4 723eee12f244bc1bd1e4648685d613233d8b31a2ee280f5d2837c79c28ca6842

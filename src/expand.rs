@@ -37,6 +37,9 @@ pub struct Expander<'a> {
     stack: Vec<String>,
     /// Unique name of a recursive definition -> its index in REC_DEFS
     rec_ids: HashMap<String, usize>,
+    /// Keep the POS labels (see `ast::POS`), for the next-state relation; otherwise they are
+    /// dropped
+    pub keep_pos: bool,
 }
 
 impl<'a> Expander<'a> {
@@ -49,6 +52,7 @@ impl<'a> Expander<'a> {
             recursive: m.recursive.clone(),
             stack: vec![],
             rec_ids: HashMap::new(),
+            keep_pos: false,
         }
     }
 
@@ -169,7 +173,10 @@ impl<'a> Expander<'a> {
             .map(|(_, p)| self.bind(p, &mut env))
             .collect();
         self.stack.push(d.name.clone());
+        // Shared by every use of the operator, so without positions
+        let keep = std::mem::replace(&mut self.keep_pos, false);
         let body = self.expand(&d.body, &env);
+        self.keep_pos = keep;
         self.stack.pop();
         let body = body?;
         REC_DEFS.with(|r| r.borrow_mut()[i] = RecDef { name: name.to_string(), params, body });
@@ -373,6 +380,13 @@ impl<'a> Expander<'a> {
                     (_, a) => Or(vec![a, c]),
                 }
             }
+            Label(n, _, b) if pos_of(n).is_some() => {
+                if self.keep_pos {
+                    Label(n.clone(), vec![], ex(self, b)?.b())
+                } else {
+                    ex(self, b)?
+                }
+            }
             Label(n, args, b) => Label(n.clone(), args.clone(), ex(self, b)?.b()),
         })
     }
@@ -521,10 +535,10 @@ impl<'a> Expander<'a> {
     }
 }
 
-/// e without the labels around it (written ones and those of infix /\ and \/)
+/// e without the labels around it (written ones and POS labels)
 fn strip_labels(e: &Expr) -> &Expr {
     match e {
-        Expr::Label(n, _, b) if n.ends_with("::") => strip_labels(b),
+        Expr::Label(n, _, b) if n.ends_with("::") || pos_of(n).is_some() => strip_labels(b),
         e => e,
     }
 }

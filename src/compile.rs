@@ -587,6 +587,7 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
         }
     }
     let raw = |d: &str| format!("{mname}#i{k}#{d}");
+    out.inst_prefixes.push((raw(""), inst.name.as_ref().map_or(String::new(), |n| format!("{n}!")), params.len()));
     let names: HashSet<&str> = mm.defs.iter().map(|d| d.name.as_str()).collect();
     let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone())).collect();
     fn rename(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]) -> Expr {
@@ -635,6 +636,8 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
         let mut call_args = args.clone();
         call_args.extend(d.params.iter().map(|p| Expr::Ident(p.clone())));
         let body = if call_args.is_empty() { Expr::Ident(raw(&d.name)) } else { Expr::Call(raw(&d.name), call_args) };
+        // TLC names an action inside it by the INSTANCE statement
+        let body = if inst.at.is_empty() { body } else { at_pos(&inst.at, body) };
         let (name, params, arity) = match &inst.name {
             None => (d.name.clone(), d.params.clone(), d.arity.clone()),
             Some(n) => {
@@ -875,7 +878,7 @@ fn compile_inner(
         }
     }
 
-    let SpecParts { init, next, temporal } = match resolve_spec(&m, &cfg, &mut ex)? {
+    let SpecParts { init, next, temporal, written } = match resolve_spec(&m, &cfg, &mut ex)? {
         Ok(p) => p,
         Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r) }),
     };
@@ -904,10 +907,18 @@ fn compile_inner(
     // Without a next-state action TLC computes the initial states and stops (or refuses the spec
     // when there is something to check on the steps, below)
     let no_next = next.is_none();
-    let next = next.unwrap_or(Expr::Bool(false));
+    // The next-state relation keeps the positions TLC names its actions by for code generation
+    // (see Gen::gen_split); everything else reads it without them
+    let next_pos = next.unwrap_or(Expr::Bool(false));
+    let next = strip_pos(&next_pos);
 
     let mut g = Gen::new(&atoms, &constants);
     g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
+    g.def_pos = m.defs.iter().filter_map(|d| match &d.body {
+        Expr::Label(n, _, _) => pos_of(n).map(|p| (d.name.clone(), p.to_string())),
+        _ => None,
+    }).collect();
+    g.inst_prefixes = m.inst_prefixes.clone();
     if setcap > 0 {
         g.scap = setcap;
     }
@@ -999,7 +1010,7 @@ fn compile_inner(
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
-    g.gen_action(&[next], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
+    g.gen_action(&[next_pos], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
@@ -1221,6 +1232,7 @@ fn compile_inner(
     let fp_bits = if fp128 { 128 } else { 64 };
     writeln!(src, "const FP_BITS: usize = {fp_bits};\ntype Fp = u{fp_bits};").unwrap();
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
+    src += &crate::lasso::template(&m, &cfg, &written);
     src += crate::runtime::RUNTIME;
     src += crate::runtime::LIVENESS_RT;
     Ok(Output { rust: src, warnings, rejected: None })
@@ -1391,6 +1403,8 @@ pub struct SpecParts {
     pub init: Expr,
     pub next: Option<Expr>,
     pub temporal: Vec<Expr>,
+    /// The same parts as written (for the lasso check), or why they cannot be written out
+    pub written: Result<crate::lasso::Written, String>,
 }
 
 const NO_INIT: &str = "Error: The configuration file did not specify the initial state predicate.\nCan also be caused by trying to run TLC on a specification from\na module imported with a parameterized INSTANCE statement.";
@@ -1400,17 +1414,32 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
     if cfg.specification.is_none() && (cfg.init.is_some() || cfg.next.is_some()) {
         let Some(i) = &cfg.init else { return Ok(Err((NO_INIT.into(), 151))) };
         let next = match &cfg.next {
-            Some(n) => Some(ex.expand_def(n)?),
+            Some(n) => {
+                ex.keep_pos = true;
+                let e = ex.expand_def(n);
+                ex.keep_pos = false;
+                Some(e?)
+            }
             None => None,
         };
-        return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![] }));
+        let written = Ok(crate::lasso::Written {
+            init: vec![Expr::Ident(i.clone())],
+            next: cfg.next.as_ref().map(|n| {
+                let vars = Expr::Tuple(m.variables.iter().map(|v| Expr::Ident(v.clone())).collect());
+                Expr::BoxAction(Expr::Ident(n.clone()).b(), vars.b())
+            }),
+            temporal: vec![],
+        });
+        return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![], written }));
     }
     let spec = cfg.specification.as_ref().ok_or("cfg needs SPECIFICATION or INIT/NEXT")?;
-    let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false };
+    let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false, written: Ok(Default::default()) };
     if !ex.has_def(spec) {
         return Err(format!("no definition `{spec}`"));
     }
     w.walk(&Expr::Ident(spec.clone()), m, ex)?;
+    w.init = w.init.iter().map(strip_pos).collect();
+    w.temporal = w.temporal.iter().map(strip_pos).collect();
     if w.init.is_empty() {
         return Ok(Err((NO_INIT.into(), 151)));
     }
@@ -1419,7 +1448,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
         return Ok(Err((msg.into(), 151)));
     }
     let init = if w.init.len() == 1 { w.init.pop().unwrap() } else { Expr::And(w.init) };
-    Ok(Ok(SpecParts { init, next: w.next, temporal: w.temporal }))
+    Ok(Ok(SpecParts { init, next: w.next, temporal: w.temporal, written: w.written }))
 }
 
 struct SpecWalk {
@@ -1427,6 +1456,7 @@ struct SpecWalk {
     next: Option<Expr>,
     temporal: Vec<Expr>,
     twice: bool,
+    written: Result<crate::lasso::Written, String>,
 }
 
 impl SpecWalk {
@@ -1440,6 +1470,7 @@ impl SpecWalk {
     /// Walks a conjunct as written
     fn walk(&mut self, e: &Expr, m: &Module, ex: &mut Expander) -> R<()> {
         match e {
+            Expr::Label(n, _, b) if pos_of(n).is_some() => self.walk(b, m, ex)?,
             Expr::And(xs) => {
                 for x in xs {
                     self.walk(x, m, ex)?;
@@ -1447,44 +1478,76 @@ impl SpecWalk {
             }
             Expr::Un(UOp::Always, x) => match x.as_ref() {
                 Expr::BoxAction(a, _) => {
-                    let a = ex.expand_top(a)?;
-                    self.set_next(a);
+                    ex.keep_pos = true;
+                    let a = ex.expand_top(a);
+                    ex.keep_pos = false;
+                    self.set_next(a?);
+                    if let Ok(w) = &mut self.written {
+                        w.next = Some(x.as_ref().clone());
+                    }
                 }
-                _ => self.temporal.push(ex.expand_top(e)?),
+                _ => {
+                    self.temporal.push(ex.expand_top(e)?);
+                    if let Ok(w) = &mut self.written {
+                        w.temporal.push(e.clone());
+                    }
+                }
             },
             Expr::Ident(n) if ex.def(n).is_some_and(|d| d.params.is_empty()) => {
                 let b = ex.def(n).unwrap().body.clone();
                 // A definition of an instance: its body calls the instantiated module's definition,
                 // which is split after substitution
-                let inst = matches!(&b, Expr::Ident(r) | Expr::Call(r, _) if r.contains("#i"));
+                let inst = matches!(b.unpos(), Expr::Ident(r) | Expr::Call(r, _) if r.contains("#i"));
                 if inst {
-                    let x = ex.expand_top(e)?;
-                    self.walk_expanded(&x);
+                    ex.keep_pos = true;
+                    let x = ex.expand_top(e);
+                    ex.keep_pos = false;
+                    self.walk_expanded(&x?, None, false);
+                    self.written = Err(format!("the spec is split inside the instance `{n}`"));
                 } else if is_temporal(e, m, &mut HashSet::new()) {
                     self.walk(&b, m, ex)?;
                 } else {
                     self.init.push(ex.expand_top(e)?);
+                    if let Ok(w) = &mut self.written {
+                        w.init.push(e.clone());
+                    }
                 }
             }
             // RTnow(v) and RTBound(..) of RealTime are temporal formulas
-            Expr::Call(n, _) if n == "RTnow" || n == "RTBound" => self.temporal.push(ex.expand_top(e)?),
-            e if is_temporal(e, m, &mut HashSet::new()) => self.temporal.push(ex.expand_top(e)?),
-            e => self.init.push(ex.expand_top(e)?),
+            e if matches!(e, Expr::Call(n, _) if n == "RTnow" || n == "RTBound") || is_temporal(e, m, &mut HashSet::new()) => {
+                self.temporal.push(ex.expand_top(e)?);
+                if let Ok(w) = &mut self.written {
+                    w.temporal.push(e.clone());
+                }
+            }
+            e => {
+                self.init.push(ex.expand_top(e)?);
+                if let Ok(w) = &mut self.written {
+                    w.init.push(e.clone());
+                }
+            }
         }
         Ok(())
     }
 
-    /// Walks an expanded conjunct, where a call of a definition is a Label
-    fn walk_expanded(&mut self, e: &Expr) {
+    /// Walks an expanded conjunct, where a call of a definition is a Label. `at` is the innermost
+    /// POS label around it, and `subst` whether it is inside an instance with substitutions: TLC
+    /// then takes the next-state relation as one action, named `Action` at the INSTANCE statement
+    fn walk_expanded(&mut self, e: &Expr, at: Option<&str>, subst: bool) {
         let temporal = |x: &Expr| {
             x.any(&|y| matches!(y, Expr::Un(UOp::Always | UOp::Eventually, _) | Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..)) || y.is_unchecked_temporal())
         };
         match e {
-            Expr::And(xs) => xs.iter().for_each(|x| self.walk_expanded(x)),
+            Expr::And(xs) => xs.iter().for_each(|x| self.walk_expanded(x, at, subst)),
+            Expr::Label(n, _, b) if pos_of(n).is_some() => self.walk_expanded(b, if subst { at } else { pos_of(n) }, subst),
             Expr::Label(n, args, b) if (args.is_empty() || n.contains("#i")) && n != "<<>>_" && !e.is_user_label() => {
-                self.walk_expanded(b)
+                self.walk_expanded(b, at, subst || (n.contains("#i") && !args.is_empty()))
             }
             Expr::Un(UOp::Always, x) => match x.as_ref() {
+                Expr::BoxAction(a, _) if subst => self.set_next(match at {
+                    Some(p) => at_pos(p, strip_pos(a)),
+                    None => strip_pos(a),
+                }),
                 Expr::BoxAction(a, _) => self.set_next(a.as_ref().clone()),
                 _ => self.temporal.push(e.clone()),
             },

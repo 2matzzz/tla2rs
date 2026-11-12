@@ -1,12 +1,14 @@
 //! tla2rs: compiles a TLA+ spec into an explicit-state model checker in Rust, specialized to that
 //! spec.
 //!
-//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE]
+//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]
 //!   tla2rs --graph FILE | --graph-text FILE
+//!   tla2rs --trace FILE | --trace-text FILE
 //!
 //! Builds the generated crate with `cargo build --release` and runs it. With --emit-only, it only
 //! writes the Rust code. `--graph` reduces a state graph written by `-dumpgraph` or by TLC's
-//! `-dump dot` to hashes (see graph.rs).
+//! `-dump dot` to hashes (see graph.rs); `--trace` reduces the counterexample in the output of TLC
+//! or of a checker to a hash (see trace.rs).
 
 mod ast;
 mod cfg;
@@ -14,6 +16,7 @@ mod codegen;
 mod compile;
 mod expand;
 mod graph;
+mod lasso;
 mod lexer;
 mod std_modules;
 mod live;
@@ -22,6 +25,7 @@ mod metal;
 mod parser;
 mod runtime;
 mod seqlen;
+mod trace;
 mod types;
 mod value;
 
@@ -49,8 +53,9 @@ fn build_key(dir: &Path) -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE]");
+    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]");
     eprintln!("       tla2rs --graph FILE | --graph-text FILE");
+    eprintln!("       tla2rs --trace FILE | --trace-text FILE");
     exit(2)
 }
 
@@ -59,6 +64,9 @@ fn main() {
     if let [mode, path] = args.as_slice() {
         if mode == "--graph" || mode == "--graph-text" {
             exit(graph::main(mode, path));
+        }
+        if mode == "--trace" || mode == "--trace-text" {
+            exit(trace::main(mode, path));
         }
     }
     let mut tla: Option<PathBuf> = None;
@@ -102,7 +110,7 @@ fn main() {
             }
             // Candidate budget (MB) the checker holds at once (smaller values split each level into
             // more chunks), the spill directory, and the file to write the state graph to
-            "-memlimit" | "-tmpdir" | "-dumpgraph" => {
+            "-memlimit" | "-tmpdir" | "-dumpgraph" | "-lassocheck" => {
                 pass.push(args[i].clone());
                 i += 1;
                 pass.push(args.get(i).unwrap_or_else(|| usage()).clone());

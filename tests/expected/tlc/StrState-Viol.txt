@@ -1,8 +1,8 @@
-key 89d9cfcfe2e368902a0571d8838f518a110f99ad4a32db8daf3b66d13dbab341
+key c6fcdbd9c3ba2a18c501c6204b0c9c39ad99a033e5482d2b916b9e252ab60e1a
 tlc Version 2.19
 rc 12
 Invariant Short is violated
 8 states generated 8 distinct states found
-trace=2
+trace 2 40e61fcec5f2d0075bce07c56946fb1f4c5b6f4bf2a4f663ef9c27c18477ebbf
 states 8 df0884496d187d7cc9929d190c5a8a295752d25c5463db3482623f17f96f98a0
 edges 2 f13631a93464cd3e9187c3b3eb5b9f1580dc26d3feb32dcb62114490adaaf4c8

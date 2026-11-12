@@ -1,8 +1,8 @@
-key f4a54b44abc4817a00fd03ad96815ca64be3d5b6c69e1eda8c2fd22f8ed4b866
+key 9ddf5ce425d8bba48536bc4e60bda291af5338946bebaed3941de5b9cef776a8
 tlc Version 2.19
 rc 76
 Evaluating invariant InvA failed
 2 states generated 2 distinct states found
-trace=2
+trace 2 269e3c25ea838ffbe034527249d198c9dc6a17b71abf9f09cd25a850fff36dec
 states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

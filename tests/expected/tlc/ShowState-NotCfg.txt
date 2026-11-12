@@ -1,8 +1,8 @@
-key 1bca17b1e05d4953a6e72fa926fc8e3ae8ae4295debff6e6598eca44776478aa
+key 6847b09b7cdcd2b3e32012d16cd936a20f9ec4be63eecf87fe1795dae279dd65
 tlc Version 2.19
 rc 12
 Invariant NotCfg is violated
 7 states generated 7 distinct states found
-trace=3
+trace 3 27321c54632ad34ac0d838933df06001e99486a89ab69800fe15e79353b229d0
 states 7 968099cdea63cd42bd90fb0659160005376c1908c98f69488df6ea2abc0724fd
 edges 6 ec2f11dda0d0d717f45689a00e5cb37100971701f4a650dc6c96505efcfff2d8
