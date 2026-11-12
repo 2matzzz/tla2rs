@@ -16,6 +16,13 @@ tla2tools.jar), the modules it reads, its identifiers, keywords and numbers in t
 strings, so that tla2rs orders strings as TLC does. It is generated from those module files; nothing else of their
 text is copied.
 
+Some rules of `src/sany.rs` (`var_order`: the names SANY's context of a module holds, which decide the order TLC
+prints variables in), `src/runtime.rs` (`fresh_fp`: the state whose VIEW TLC fingerprints under SYMMETRY) and
+`src/codegen.rs` (`member_unsorted`: how TLC unites sets; `lazy_fun_string`: how it prints a function it cannot
+enumerate) follow TLC 2.19's behaviour as measured and as read from its classes in tla2tools.jar
+(`ModuleNode.getVariableDecls`, `Context`, `TLCStateMut.fingerPrint`, `SetEnumValue.cup`,
+`FcnLambdaValue.toString`). They are written for tla2rs; no code of TLC is copied.
+
 ```
 MIT License
 
