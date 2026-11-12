@@ -29,7 +29,7 @@ It has no crate dependencies.
   hashes of its state graph, and a key hashing the jar, cfg, arguments, the modules the spec reads, `src/graph.rs`
   and `src/trace.rs`) is committed in
   `tests/expected/`. `crosscheck.sh` and `all.sh` compare
-  against these files only (they run TLC only on lasso checks) and fail on a missing or stale one. After adding or changing a test, run
+  against these files only (they run TLC only on a lasso check not yet confirmed, cached in `target/crosscheck/lasso` by a hash of the check, its modules and the jar) and fail on a missing or stale one. After adding or changing a test, run
   `scripts/expected.sh` (it runs TLC for missing and stale files only) and commit the files with the test.
   `expected.sh -check` reruns TLC and reports differences without writing. Built checkers are cached in
   `target/crosscheck/build` (key: generated code and rustc version; `CROSSCHECK_NO_CACHE=1` rebuilds); `JOBS=N`

@@ -191,7 +191,7 @@ configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `
 state counts, the length and a hash of the counterexample, the exit code and the hashes of the state graph, with a
 hash of the jar, the cfg, the arguments, the modules the spec reads, `src/graph.rs` and `src/trace.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
 recorded, so the files are the same for every TLC run. `crosscheck.sh` and `all.sh` only compare against these
-files and never run TLC on the configurations themselves (only on the lasso checks); a missing or stale file fails
+files and never run TLC on the configurations themselves (only on a lasso check whose confirmation is not yet cached in `target/crosscheck/lasso`); a missing or stale file fails
 the check. `scripts/expected.sh [cfg ...]` is what
 runs TLC: it writes missing and stale files and leaves the others alone, so a second run changes nothing.
 `expected.sh -check` reruns TLC and reports any file that differs, without writing; `-force` rewrites them all.

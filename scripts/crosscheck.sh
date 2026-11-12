@@ -246,16 +246,27 @@ if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
     exit 1
   fi
   n_lasso=$(grep -cE '^State [0-9]+: <' rs.out || true)
-  rc_lasso=0
-  mkdir -p "$work/jtmp"
-  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
-  found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
-  if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
-    echo "  LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
-    grep -E '^Error|distinct states found|No error' lasso.out | head -5 | sed 's/^/    tlc: /'
-    exit 1
+  # TLC's answer depends only on the jar, the generated check and the spec's modules, so a
+  # confirmation is kept in target/crosscheck/lasso under a hash of those, and TLC runs again only
+  # when tla2rs writes a different lasso (CROSSCHECK_NO_CACHE=1 always runs it)
+  lasso_key=$({ echo "lasso v1 $n_lasso"; shasum -a 256 "$jar" | cut -d' ' -f1
+    for f in Tla2rsLasso.tla Tla2rsLasso.cfg "${modules[@]/%/.tla}"; do echo "== $f"; cat "$f"; done; } | shasum -a 256 | cut -d' ' -f1)
+  lasso_ok="$root/target/crosscheck/lasso/$lasso_key"
+  if [[ -n "${CROSSCHECK_NO_CACHE:-}" || ! -f "$lasso_ok" ]]; then
+    rc_lasso=0
+    mkdir -p "$work/jtmp"
+    java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
+    found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
+    if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
+      echo "  LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
+      grep -E '^Error|distinct states found|No error' lasso.out | head -5 | sed 's/^/    tlc: /'
+      exit 1
+    fi
+    mkdir -p "$(dirname "$lasso_ok")" && touch "$lasso_ok"
+    lasso_note="  (lasso of $n_lasso states confirmed by TLC)"
+  else
+    lasso_note="  (lasso of $n_lasso states confirmed by TLC earlier; cached)"
   fi
-  lasso_note="  (lasso of $n_lasso states confirmed by TLC)"
 fi
 note=""; [[ $tlc_cached == 1 ]] && note=" cached"
 printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)"
