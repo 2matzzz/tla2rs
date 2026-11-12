@@ -251,7 +251,8 @@ the spec does not load Integers (or Reals), tla2rs follows Naturals: `tla_div_na
 
 ### What SANY refuses
 
-TLC stops with exit 150 before checking anything when SANY refuses a spec. tla2rs repeats these of SANY's checks
+TLC stops with exit 150 before checking anything when SANY refuses a spec (its report on a parse error
+or a level error is reproduced word for word, see "Messages and printed lines"). tla2rs repeats these of SANY's checks
 (measured on SANY 2.19 with small specs; `tests/tlc/RejSany*`, `SanyScope*`):
 
 - Scope (`sany.rs`). A name is in scope only after the statement that declares or defines it: an operator
