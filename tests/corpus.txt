@@ -31,7 +31,7 @@ check specifications/DieHard/MCDieHarder.tla specifications/DieHard/MCDieHarder.
 skip specifications/DieHard/MCDieHardest.tla specifications/DieHard/MCDieHardest.cfg # needs module Functions, not in tla2tools.jar
 skip specifications/DiningPhilosophers/APDiningPhilosophersPCal.tla specifications/DiningPhilosophers/APDiningPhilosophersPCal.cfg # symbolic mode: checked with Apalache
 check specifications/DiningPhilosophers/DiningPhilosophers.tla specifications/DiningPhilosophers/DiningPhilosophers.cfg
-gap specifications/DiningPhilosophers/DiningPhilosophersPCal.tla specifications/DiningPhilosophers/DiningPhilosophersPCal.cfg # TLC warns that the PlusCal algorithm changed since its last translation; tla2rs does not check the translation checksum
+gap specifications/DiningPhilosophers/DiningPhilosophersPCal.tla specifications/DiningPhilosophers/DiningPhilosophersPCal.cfg # TLC warns that the PlusCal algorithm changed since its last translation: it checksums the syntax tree of its PlusCal parser (pcal.Validator), which tla2rs does not have
 skip specifications/DiningPhilosophers/DiningPhilosophers_anim.tla specifications/DiningPhilosophers/DiningPhilosophers_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/DiningPhilosophers/DiningPhilosophers_stats.tla specifications/DiningPhilosophers/DiningPhilosophers_stats.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/Disruptor/APDisruptor_MPMC.tla specifications/Disruptor/APDisruptor_MPMC.cfg # symbolic mode: checked with Apalache
@@ -184,7 +184,7 @@ skip specifications/bosco/APbosco.tla specifications/bosco/APbosco.cfg # symboli
 skip specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # manifest runtime 00:03:00: beyond the 60 s budget
 skip specifications/braf/BufferedRandomAccessFile.tla specifications/braf/BufferedRandomAccessFile.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 skip specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg # needs module Relation, not in tla2tools.jar
-gap specifications/btree/kvstore.tla specifications/btree/kvstore.cfg # Init: type mismatch, a model value where a sequence is expected
+gap specifications/btree/kvstore.tla specifications/btree/kvstore.cfg # a variable holds tuples of different lengths and a model value; tla2rs has no type for that
 check specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg
 check specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg
 check specifications/byihive/VoucherLifeCycle.tla specifications/byihive/VoucherLifeCycle.cfg
