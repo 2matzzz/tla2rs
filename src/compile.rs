@@ -819,8 +819,11 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
             None => return Err(format!("INSTANCE {mname}: {p} has no WITH substitution and is not declared or defined here")),
         }
     }
+    // A module the instantiated one reaches along two paths of EXTENDS (Folds, through
+    // FiniteSetsExt and Functions) has its definitions in mm.defs twice: one definition to SANY
+    let mut seen: HashSet<&str> = HashSet::new();
     for d in &mm.defs {
-        if mm.local_defs.contains(&d.name) || d.name.contains('#') {
+        if mm.local_defs.contains(&d.name) || d.name.contains('#') || !seen.insert(d.name.as_str()) {
             continue;
         }
         let mut call_args = args.clone();
