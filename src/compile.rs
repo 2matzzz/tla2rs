@@ -359,12 +359,31 @@ fn community_module(name: &str, src: &str, dir: &std::path::Path, warnings: &mut
         let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
         d.body = Expr::Call(format!("{op} of the CommunityModules' {module}, which tla2rs does not support: {why}"), vec![]);
     }
+    for &(module, op, at) in crate::community::CASE_AT.iter().filter(|u| u.0 == name) {
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
+        let done = std::cell::Cell::new(false);
+        d.body = case_at(&d.body, at, &done);
+        if !done.get() {
+            return Err(format!("{op} of {module}: no CASE"));
+        }
+    }
     for &(module, op, why) in crate::community::CONST_ONLY.iter().filter(|u| u.0 == name) {
         let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
         let msg = format!("{op} of the CommunityModules' {module} is supported only on constant arguments: {why}");
         d.body = Expr::Label(format!("{}{msg}", crate::ast::CONST_ONLY), vec![], std::mem::replace(&mut d.body, Expr::Bool(true)).b());
     }
     Ok(m)
+}
+
+/// e with the position of its first CASE (see `community::CASE_AT`) set to `at`
+fn case_at(e: &Expr, at: &str, done: &std::cell::Cell<bool>) -> Expr {
+    match e {
+        Expr::Label(n, _, b) if !done.get() && crate::ast::err_pos_of(n).is_some() && matches!(b.strip(), Expr::Case(..)) => {
+            done.set(true);
+            crate::ast::at_err(at, b.as_ref().clone())
+        }
+        _ => crate::codegen::map_children(e, &|c| case_at(c, at, done)),
+    }
 }
 
 fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {

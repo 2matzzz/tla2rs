@@ -75,6 +75,11 @@ pub const CONST_ONLY: &[(&str, &str, &str)] = &[
     ("IOUtils", "zeroPadN", STRINGS_BY_RECURSION),
 ];
 
+/// Where TLC 2.19 says a CASE without OTHER of a module is written, when none of its conditions
+/// is true: SANY's span of the CASE in the release's module file, from CASE to the last character
+/// of its last arm (comments between arms included), as TLC prints a position (measured)
+pub const CASE_AT: &[(&str, &str, &str)] = &[("SequencesExt", "Interleave", "line 445, col 3 to line 455, col 45 of module SequencesExt")];
+
 const STRINGS_BY_RECURSION: &str = "it builds a string by recursion, which the checker cannot do at run time";
 
 /// Folding a set: `op(f(x1), op(f(x2), ... op(f(xn), base)))` where x1 is `choose(S)`, x2 is
