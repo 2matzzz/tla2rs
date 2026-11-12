@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 680 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 687 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -510,7 +510,20 @@ deadlocks, or a state is missing), it satisfies the spec's fairness (otherwise n
 property. Fairness stays that of the spec: its actions do not mention the new variable. Altering a confirmed lasso
 gave the expected refusals (a wrong state: deadlock; a wrong first state: no initial state; a wrong return: deadlock;
 fairness for both processes in `Peterson-Unfair`: no error). VIEW and SYMMETRY are left out of the cfg, so the
-lasso is checked as a behavior of the spec itself (`LiveSym` passes). `crosscheck.sh` runs this for each of the 37
+lasso is checked as a behavior of the spec itself (`LiveSym` passes).
+
+The liveness graph keeps the first state reached of each fingerprint, which under a VIEW or a SYMMETRY need not be a
+successor of the state before it on the lasso. So the checker replays the lasso on actual states, as TLC rebuilds a
+behavior from fingerprints (`lasso_states` in the runtime): from the initial state, each step takes the successor
+whose fingerprint is the next node's, by the same action if one is. Under a SYMMETRY the cycle can come back to
+another member of the entry's class; it is followed again until it repeats an actual state, which takes at most one
+round per permutation (`tests/tlc/LiveSymTurn`: two rounds). Under a VIEW the actual states need not repeat at all:
+in `tests/tlc/LiveView` and the corpus's `MCDistributedReplicatedLog` a value the view leaves out only grows. The
+lasso then returns to its entry under the VIEW only. Its last step goes to the actual successor (`Tla2rsGoBack`), and
+the cfg gets the spec's VIEW with the position added (`Tla2rsView == <<tla2rsAt, V>>`, and the spec's SYMMETRY if it
+has one), so TLC folds that successor into the entry as its own search does. A step with no successor of the right
+fingerprint (TLC cannot rebuild such a behavior either, tlaplus/tlaplus#1045) leaves the states the graph keeps,
+which TLC then refuses. `crosscheck.sh` runs this for each of the 44
 liveness violations (about a second of TLC each) and fails if TLC does not confirm it, or if the spec's parts cannot
 be written out (`lasso::tla` refuses a SPECIFICATION split inside an INSTANCE, and LET or LAMBDA in its conjuncts).
 
@@ -674,24 +687,23 @@ match is listed as `gap` with the reason measured; `corpus.sh` still runs it and
 fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
 below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 101 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 102 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
 more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
 with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
 states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
 4682 distinct edges; `MCCheckpointCoordinationFailure` has 1297994 and 1297595 edges, and the same 611225 distinct
 edges. The graph hashes compare the distinct edges, so the state space and transitions match. `StaleViewShrink` (4) is
-not measured this way. 4 are gaps, 3 of them `norun`:
+not measured this way. 3 are gaps, all `norun`:
 
 | Gap | Model |
 |---|---|
-| A liveness counterexample under a VIEW: verdict, counts and state graph match, but tla2rs's lasso goes through the first state reached of each view, which is not always a successor of the state before it, so TLC deadlocks on the lasso check | `MCDistributedReplicatedLog` |
 | `norun`: the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it | `GameOfLife` |
 | `norun`: evaluating its ASSUMEs at compile time took 1.5 GB in 2.5 minutes (LET definitions are expanded at each use, so recursion through them repeats work) | `BlockDagTest` |
 | `norun`: the system killed tla2rs for memory in a corpus run | `TLCSailfish1` |
 
 Forms the corpus showed, each with a test in `tests/tlc/`: the CommunityModules (`CmFun`, `CmSet`, `CmSeq`,
-`CmGraph`, `CmBits`; see "CommunityModules"), `[1..n -> S]` with n from the state as a set of sequences
-(`SeqFunSet`), a definition of an instantiated module passed as an operator argument (`InstOpArg`), a recursive
+`CmGraph`, `CmBits`, and since then `CmSeqSub`, `CmRel`, `CmDigraph`, `CmBag`, `CmMisc`; see "CommunityModules"),
+`[1..n -> S]` with n from the state as a set of sequences (`SeqFunSet`), a definition of an instantiated module passed as an operator argument (`InstOpArg`), a recursive
 operator called inside the operator passed to it (`RecNestOp`), the field of an element of a set that starts empty
 (`EmptyField`), records of different fields in TLC's
 order (`RecMix`), a value that is a record or a model value (`RecAtom`), primed substituted variables in ENABLED
@@ -717,16 +729,33 @@ modules only, extracted into
 in `crosscheck.sh` (202611060952, the one current at the corpus's commit); a spec that uses it has the hash in the
 key of its expected file.
 
-tla2rs provides `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`, `UndirectedGraphs` and `Bitwise` itself
+tla2rs provides `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`, `UndirectedGraphs`, `Bitwise`, `Relation`,
+`BagsExt`, `Graphs`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals` and `VectorClocks` itself
 (`src/community.rs`), as TLA+ source written for tla2rs, read when no module of that name is next to the spec.
 Since TLC evaluates the modules' own definitions, these give the same values: CHOOSE over the same set with the
-same predicate (`SetToSeq`, `Max`, `LongestCommonPrefix`, `Inverse`), and folds that take the elements in the same
-order (`MapThenFoldSet` applies `op(f(x), rest)` with x chosen first, so `FoldFunction` takes the smallest index
-first, `FoldLeft` the largest). Each module exports the same names in the same order as the release's, with what it
-extends (`SequencesExt` extends Bags and TLC, for example), since SANY's context, and the order TLC prints variables
-in, depend on them (see "The order of variables"). Operators listed in `community::UNSUPPORTED` are refused where
-they are used: five of SequencesExt not written yet, and UndirectedGraphs' operators over paths, which quantify over
-`Seq(S)`, so TLC 2.19 stops on them too ("non-enumerable quantifier bound").
+same predicate (`SetToSeq`, `Max`, `LongestCommonPrefix`, `Inverse`, `CausalOrder`), and folds that take the elements
+in the same order (`MapThenFoldSet` applies `op(f(x), rest)` with x chosen first, so `FoldFunction` takes the
+smallest index first, `FoldLeft` the largest; `MapThenFoldBag` applies op once per copy of each element). Where the
+definition gives a value its documentation does not, the definition wins: `AllSubSeqs` lists each subsequence
+backwards (it folds with `Snoc` from the smallest index), `ReplaceAllSubSeqs` replaces the leftmost occurrences
+(measured on every sequence over {1, 2} up to length 3, and over {1} up to 4, against the module's definition, which
+enumerates sequences of sequences), `ChiSquare` and `DotDiGraph` are TRUE, and `DyadicRationals` fails on a
+numerator of 0 or less when it reduces (`Half(Zero)`), as the definition's divisors of 0 are none. Each module
+exports the same names in the same order as the release's, with what it extends (`SequencesExt` extends Bags and
+TLC, for example), since SANY's context, and the order TLC prints variables in, depend on them (see "The order of
+variables"). Operators listed in `community::UNSUPPORTED` are refused where they are used: the operators over paths
+of UndirectedGraphs and Graphs (and Graphs' `IsTreeWithRoot`, which uses one), which quantify over `Seq(S)`, so TLC
+2.19 stops on them too ("non-enumerable quantifier bound").
+
+The other modules of the release are not provided, so a spec that names one is refused. Measured on TLC 2.19 with the
+release's modules only:
+
+| Module | Why |
+|---|---|
+| `IOUtils`, `CSV`, `CBOR`, and `Json`'s `JsonDeserialize` / `ndJsonDeserialize` | They read or write files, run commands or read the environment. Their definitions stop TLC 2.19: CHOOSE without a set (`JsonDeserialize`, `CSVRecords`), CHOOSE over a set it cannot enumerate (`atoi`, `IOEnv`), `Assert(FALSE, ...)` (`ToCBOR`) |
+| `ShiViz` | `Host` and `Clock` read `TLCGet` and the Toolbox module; TLC 2.19 stops on `Host` ("Attempted to enumerate S \ T when S: Nat is not enumerable") |
+| `DifferentialEquations` | `Integrate` is a CHOOSE without a set over functions of reals; TLC 2.19 stops ("TLC attempted to evaluate an unbounded CHOOSE") |
+| `Json`'s `ToJson`, `ToJsonArray`, `ToJsonObject`, `JsonSerialize` (TRUE), `HTML`, `SVG`, `IOUtils`' `zeroPadN` | TLC 2.19 evaluates them (strings built for animations and output); not written yet |
 
 Not followed: the identifiers and strings of these modules are not in `tlc_string_ranks` (TLC creates them when it
 parses the modules), so a string literal of the spec equal to one of their identifiers, and not to one of the spec's,

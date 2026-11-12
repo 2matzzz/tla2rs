@@ -1,0 +1,10 @@
+key 4c52b8b61425914dbb5b30bcadb3aa9fe8b68451aae4a748d69ca8e4b478e524
+tlc Version 2.19
+rc 13
+Temporal property violated
+6 states generated 4 distinct states found 0 states left on queue
+trace lasso
+states 4 1ab06f52004ce63a3a3c01cccdc4bbf5f354a3dcba4f1a1b6658cda15f5c3a87
+edges 5 076ab05d6ea46a28f2a489aad68f592626bf6bdffc32c4d9756421f78dae0e60
+messages 2 6be04df69bad15fab236950a575fcd0eb79db1c87abb9f8463f5b6d04807d609
+errors 2 6be04df69bad15fab236950a575fcd0eb79db1c87abb9f8463f5b6d04807d609

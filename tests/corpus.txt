@@ -44,7 +44,7 @@ skip specifications/EinsteinRiddle/Einstein.tla specifications/EinsteinRiddle/Ei
 skip specifications/FiniteMonotonic/APCRDT.tla specifications/FiniteMonotonic/APCRDT.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APReplicatedLog.tla specifications/FiniteMonotonic/APReplicatedLog.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/MCCRDT.tla specifications/FiniteMonotonic/MCCRDT.cfg # needs a TLC flag outside a normal run (-Dtlc2.tool.impl.Tool.cdot=true, action composition)
-gap specifications/FiniteMonotonic/MCDistributedReplicatedLog.tla specifications/FiniteMonotonic/MCDistributedReplicatedLog.cfg # verdict, counts and state graph match; the liveness counterexample does not: with a VIEW, tla2rs's lasso goes through the first state reached of each view, which is not always a successor of the state before it, and TLC deadlocks on the lasso check
+check specifications/FiniteMonotonic/MCDistributedReplicatedLog.tla specifications/FiniteMonotonic/MCDistributedReplicatedLog.cfg
 skip specifications/FiniteMonotonic/MCReplicatedLog.tla specifications/FiniteMonotonic/MCReplicatedLog.cfg # needs a TLC flag outside a normal run (-Dtlc2.tool.impl.Tool.cdot=true, action composition)
 skip specifications/FlashProtocol/APFlashWithMutex.tla specifications/FlashProtocol/APFlashWithMutex.cfg # symbolic mode: checked with Apalache
 check specifications/FlashProtocol/MCFlashWithMutex.tla specifications/FlashProtocol/MCFlashWithMutex.cfg

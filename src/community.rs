@@ -13,7 +13,8 @@
 //! its definitions and RECURSIVE declarations), since SANY's context, and with it the order TLC
 //! prints variables in, depends on them (see `sany::var_order`). The operators listed in
 //! `UNSUPPORTED` are refused when used: TLC 2.19 cannot evaluate them without their Java overrides
-//! (they enumerate `Seq(S)`), or they are not written yet.
+//! (they enumerate `Seq(S)`). The modules not here (files, commands, reals, animation) are listed
+//! with the reason in CLAUDE.md, "CommunityModules".
 
 /// The source of each module, by name
 pub fn source(name: &str) -> Option<&'static str> {
@@ -24,22 +25,30 @@ pub fn source(name: &str) -> Option<&'static str> {
         "SequencesExt" => SEQUENCES_EXT,
         "UndirectedGraphs" => UNDIRECTED_GRAPHS,
         "Bitwise" => BITWISE,
+        "Relation" => RELATION,
+        "BagsExt" => BAGS_EXT,
+        "Graphs" => GRAPHS,
+        "Combinatorics" => COMBINATORICS,
+        "Statistics" => STATISTICS,
+        "GraphViz" => GRAPH_VIZ,
+        "DyadicRationals" => DYADIC_RATIONALS,
+        "VectorClocks" => VECTOR_CLOCKS,
         _ => return None,
     })
 }
 
 /// The operators of each module that are refused when used, with the reason
 pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
-    ("SequencesExt", "Interleave", "not written yet"),
-    ("SequencesExt", "AllSubSeqs", "not written yet"),
-    ("SequencesExt", "IndexFirstSubSeq", "not written yet"),
-    ("SequencesExt", "ReplaceFirstSubSeq", "not written yet"),
-    ("SequencesExt", "ReplaceAllSubSeqs", "not written yet"),
     ("UndirectedGraphs", "Path", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
     ("UndirectedGraphs", "SimplePath", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
     ("UndirectedGraphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
     ("UndirectedGraphs", "ConnectedComponents", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
     ("UndirectedGraphs", "IsStronglyConnected", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("Graphs", "Path", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
+    ("Graphs", "SimplePath", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
+    ("Graphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("Graphs", "IsStronglyConnected", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("Graphs", "IsTreeWithRoot", "TLC 2.19 cannot evaluate it without its Java override (AreConnectedIn, \\E over Seq(S))"),
 ];
 
 /// Folding a set: `op(f(x1), op(f(x2), ... op(f(xn), base)))` where x1 is `choose(S)`, x2 is
@@ -156,13 +165,29 @@ FoldRightDomain(op(_, _), seq, base) == FoldRight(op, [i \in DOMAIN seq |-> i], 
 FlattenSeq(seqs) == IF Len(seqs) = 0 THEN seqs ELSE FoldLeft(LAMBDA a, b : a \o b, <<>>, seqs)
 Zip(s, t) ==
   LET n == IF Len(s) <= Len(t) THEN Len(s) ELSE Len(t) IN [i \in 1..n |-> <<s[i], t[i]>>]
-Interleave(s, t) == FALSE
+Interleave(s, t) ==
+  CASE Len(s) = Len(t) -> [k \in 1..2 * Len(s) |-> IF k % 2 = 1 THEN <<s[(k + 1) \div 2]>> ELSE <<t[k \div 2]>>]
 SubSeqs(s) == {SubSeq(s, i + 1, j) : i, j \in 0..Len(s)}
-AllSubSeqs(s) == FALSE
-IndexFirstSubSeq(s, t) == FALSE
+AllSubSeqs(s) ==
+  {[k \in 1..Cardinality(D) |-> s[CHOOSE i \in D : Cardinality({j \in D : j > i}) = k - 1]] : D \in SUBSET DOMAIN s}
+LOCAL Starts(s, t) == {k \in 1..Len(t) - Len(s) + 1 : SubSeq(t, k, k + Len(s) - 1) = s}
+IndexFirstSubSeq(s, t) == CHOOSE k \in Starts(s, t) : \A j \in Starts(s, t) : k <= j
 ReplaceSubSeqAt(i, r, s, t) == SubSeq(t, 1, i - 1) \o r \o SubSeq(t, i + Len(s), Len(t))
-ReplaceFirstSubSeq(r, s, t) == FALSE
-ReplaceAllSubSeqs(r, s, t) == FALSE
+ReplaceFirstSubSeq(r, s, t) ==
+  IF Starts(s, t) # {} THEN ReplaceSubSeqAt(IndexFirstSubSeq(s, t), r, s, t) ELSE t
+ReplaceAllSubSeqs(r, s, t) ==
+  CASE s = t -> r
+    [] r = s -> t
+    [] Len(s) = 0 ->
+         LET upto[k \in 0..Len(t)] == IF k = 0 THEN <<>> ELSE upto[k - 1] \o r \o <<t[k]>>
+         IN upto[Len(t)]
+    [] Starts(s, t) # {} ->
+         LET from[k \in 1..Len(t) + 1] ==
+               IF k > Len(t) - Len(s) + 1 THEN SubSeq(t, k, Len(t))
+               ELSE IF SubSeq(t, k, k + Len(s) - 1) = s THEN r \o from[k + Len(s)]
+               ELSE <<t[k]>> \o from[k + 1]
+         IN from[1]
+    [] OTHER -> t
 ====
 "#;
 
@@ -214,5 +239,169 @@ LOCAL NotR(x, bit, rest) ==
 Not(a) == NotR(a, 1, a)
 RECURSIVE shiftR(_, _)
 shiftR(n, pos) == IF pos = 0 THEN n ELSE shiftR(n \div 2, pos - 1)
+====
+"#;
+
+/// Properties of a relation given as a function from pairs to booleans (`R[a, b]`), or as an
+/// operator (`...Under`). A value used more than once is bound by `\E x \in {e}` or `{... : x \in {e}}`, so
+/// that it is computed once: LET definitions are expanded at each use
+const RELATION: &str = r#"
+---- MODULE Relation ----
+EXTENDS Naturals, FiniteSets
+IsReflexive(R, S) == \A a \in S : R[a, a]
+IsReflexiveUnder(op(_, _), S) == \A a \in S : op(a, a)
+IsIrreflexive(R, S) == \A a \in S : ~R[a, a]
+IsIrreflexiveUnder(op(_, _), S) == \A a \in S : ~op(a, a)
+IsSymmetric(R, S) == \A a, b \in S : R[a, b] = R[b, a]
+IsSymmetricUnder(op(_, _), S) == \A a, b \in S : op(a, b) = op(b, a)
+IsAntiSymmetric(R, S) == \A a, b \in S : a # b => ~(R[a, b] /\ R[b, a])
+IsAntiSymmetricUnder(op(_, _), S) == \A a, b \in S : a # b => ~(op(a, b) /\ op(b, a))
+IsAsymmetric(R, S) == \A a, b \in S : ~R[a, b] \/ ~R[b, a]
+IsAsymmetricUnder(op(_, _), S) == \A a, b \in S : ~op(a, b) \/ ~op(b, a)
+IsTransitive(R, S) == \A a, b, c \in S : (R[a, b] /\ R[b, c]) => R[a, c]
+IsTransitiveUnder(op(_, _), S) == \A a, b, c \in S : (op(a, b) /\ op(b, c)) => op(a, c)
+IsStrictlyPartiallyOrdered(R, S) == IsIrreflexive(R, S) /\ IsAntiSymmetric(R, S) /\ IsTransitive(R, S)
+IsStrictlyPartiallyOrderedUnder(op(_, _), S) ==
+  IsIrreflexiveUnder(op, S) /\ IsAntiSymmetricUnder(op, S) /\ IsTransitiveUnder(op, S)
+IsPartiallyOrdered(R, S) == IsReflexive(R, S) /\ IsAntiSymmetric(R, S) /\ IsTransitive(R, S)
+IsPartiallyOrderedUnder(op(_, _), S) ==
+  IsReflexiveUnder(op, S) /\ IsAntiSymmetricUnder(op, S) /\ IsTransitiveUnder(op, S)
+IsStrictlyTotallyOrdered(R, S) ==
+  IsStrictlyPartiallyOrdered(R, S) /\ \A a, b \in S : a = b \/ R[a, b] \/ R[b, a]
+IsStrictlyTotallyOrderedUnder(op(_, _), S) ==
+  IsStrictlyPartiallyOrderedUnder(op, S) /\ \A a, b \in S : a = b \/ op(a, b) \/ op(b, a)
+IsTotallyOrdered(R, S) == IsPartiallyOrdered(R, S) /\ \A a, b \in S : R[a, b] \/ R[b, a]
+IsTotallyOrderedUnder(op(_, _), S) == IsPartiallyOrderedUnder(op, S) /\ \A a, b \in S : op(a, b) \/ op(b, a)
+TransitiveClosure(R, S) ==
+  LET pairs[k \in 0..Cardinality(S)] ==
+        IF k = 0 THEN {p \in S \X S : R[p[1], p[2]]}
+        ELSE UNION {P \cup {p \in S \X S : \E c \in S : <<p[1], c>> \in P /\ <<c, p[2]>> \in P} : P \in {pairs[k - 1]}}
+  IN CHOOSE f \in {[p \in S \X S |-> p \in P] : P \in {pairs[Cardinality(S)]}} : TRUE
+ReflexiveTransitiveClosure(R, S) ==
+  CHOOSE f \in {[p \in S \X S |-> p[1] = p[2] \/ T[p]] : T \in {TransitiveClosure(R, S)}} : TRUE
+IsConnected(R, S) == \E T \in {ReflexiveTransitiveClosure(R, S)} : \A a, b \in S : T[a, b]
+====
+"#;
+
+/// Bags: a fold applies `op` to `base` and f(x) once per copy of x for each element, the elements
+/// taken as `MapThenFoldSet` takes them
+const BAGS_EXT: &str = r#"
+---- MODULE BagsExt ----
+LOCAL INSTANCE Bags
+LOCAL INSTANCE Integers
+LOCAL INSTANCE Folds
+BagAdd(B, x) == B (+) SetToBag({x})
+BagRemove(B, x) == B (-) SetToBag({x})
+BagRemoveAll(B, x) ==
+  IF x \in DOMAIN B THEN LET less[n \in 0..B[x]] == IF n = 0 THEN B ELSE less[n - 1] (-) SetToBag({x}) IN less[B[x]]
+  ELSE B
+MapThenFoldBag(op(_, _), base, f(_), choose(_), B) ==
+  LET Copies(x) == LET acc[n \in 1..B[x]] == op(IF n > 1 THEN acc[n - 1] ELSE base, f(x)) IN acc[B[x]]
+  IN MapThenFoldSet(op, base, Copies, LAMBDA T : CHOOSE a \in T : TRUE, DOMAIN B)
+FoldBag(op(_, _), base, B) == MapThenFoldBag(op, base, LAMBDA a : a, LAMBDA T : CHOOSE a \in T : TRUE, B)
+SumBag(B) == FoldBag(LAMBDA a, b : a + b, 0, B)
+ProductBag(B) == FoldBag(LAMBDA a, b : a * b, 1, B)
+====
+"#;
+
+/// Directed graphs as records `[node |-> N, edge |-> E]` with E a set of pairs (values used more
+/// than once are bound as in Relation)
+const GRAPHS: &str = r#"
+---- MODULE Graphs ----
+EXTENDS Naturals, Sequences, FiniteSets, SequencesExt, Relation
+IsDirectedGraph(G) == G = [node |-> G.node, edge |-> G.edge] /\ G.edge \subseteq G.node \X G.node
+DirectedSubgraph(G) == {H \in [node : SUBSET G.node, edge : SUBSET G.edge] : H.edge \subseteq H.node \X H.node}
+Transpose(G) == [node |-> G.node, edge |-> {<<e[2], e[1]>> : e \in G.edge}]
+IsUndirectedGraph(G) == IsDirectedGraph(G) /\ \A e \in G.edge : <<e[2], e[1]>> \in G.edge
+UndirectedSubgraph(G) == {H \in DirectedSubgraph(G) : IsUndirectedGraph(H)}
+Path(G) == FALSE
+SimplePath(G) == FALSE
+AreConnectedIn(m, n, G) == FALSE
+IsStronglyConnected(G) == FALSE
+ConnectionsIn(G) == ReflexiveTransitiveClosure([p \in G.node \X G.node |-> p \in G.edge], G.node)
+IsTreeWithRoot(G, r) == FALSE
+GraphUnion(G, H) == [node |-> G.node \cup H.node, edge |-> G.edge \cup H.edge]
+IsBipartiteWithPartitions(G, U, V) ==
+  /\ U \cap V = {}
+  /\ G.node \subseteq U \cup V
+  /\ \A e \in G.edge : {e[1], e[2]} \cap U # {} /\ {e[1], e[2]} \cap V # {}
+HasCycle(G) == \E C \in {ConnectionsIn(G)} : \E e \in G.edge : e[1] \in G.node /\ e[2] \in G.node /\ C[e[2], e[1]]
+IsDag(G) == IsDirectedGraph(G) /\ ~HasCycle(G)
+Successors(G, n) == {m \in G.node : <<n, m>> \in G.edge}
+AllSuccessors(G, S) == UNION {Successors(G, n) : n \in S}
+Predecessors(G, n) == {m \in G.node : <<m, n>> \in G.edge}
+AllPredecessors(G, S) == UNION {Predecessors(G, n) : n \in S}
+Ancestors(G, n) == UNION {{m \in G.node : \E k \in Successors(G, m) : C[k, n]} : C \in {ConnectionsIn(G)}}
+Descendants(G, n) == UNION {{m \in G.node : \E k \in Successors(G, n) : C[k, m]} : C \in {ConnectionsIn(G)}}
+InDegree(G, n) == Cardinality(Predecessors(G, n))
+OutDegree(G, n) == Cardinality(Successors(G, n))
+Roots(G) == {n \in G.node : \A m \in G.node : <<m, n>> \notin G.edge}
+Leaves(G) == {n \in G.node : \A m \in G.node : <<n, m>> \notin G.edge}
+EmptyGraph == [node |-> {}, edge |-> {}]
+Graphs(S) == [node : {S}, edge : SUBSET (S \X S)]
+====
+"#;
+
+/// `factorial` is a function over Nat, applied where it is used
+const COMBINATORICS: &str = r#"
+---- MODULE Combinatorics ----
+EXTENDS Naturals
+factorial[n \in Nat] == IF n > 0 THEN n * factorial[n - 1] ELSE 1
+choose(n, k) == factorial[n] \div (factorial[n - k] * factorial[k])
+====
+"#;
+
+/// The module's definition is TRUE (the test is its Java override, which TLC 2.19 does not load)
+const STATISTICS: &str = r#"
+---- MODULE Statistics ----
+EXTENDS Naturals
+ChiSquare(expected, actual, alpha) == TRUE
+====
+"#;
+
+/// The module's definition is TRUE (the drawing is its Java override, which TLC 2.19 does not load)
+const GRAPH_VIZ: &str = r#"
+---- MODULE GraphViz ----
+DotDiGraph(G, VL(_), EL(_)) == TRUE
+====
+"#;
+
+/// Rationals `[num |-> n, den |-> d]` whose denominator is a power of two. Reducing takes the
+/// greatest common divisor among 1..num, so a numerator of 0 or less is an evaluation error, as in
+/// the module's definition
+const DYADIC_RATIONALS: &str = r#"
+---- MODULE DyadicRationals ----
+LOCAL INSTANCE Integers
+LOCAL INSTANCE Sequences
+LOCAL INSTANCE TLC
+LOCAL Gcd(a, b) ==
+  LET Common == {d \in (1..a) \cap (1..b) : a % d = 0 /\ b % d = 0} IN CHOOSE d \in Common : \A e \in Common : e <= d
+LOCAL Lowest(p) ==
+  LET g == Gcd(p.num, p.den) IN IF g = 1 THEN p ELSE [num |-> p.num \div g, den |-> p.den \div g]
+IsDyadicRational(r) == \E k \in 0..r.den : 2^k = r.den
+Zero == [num |-> 0, den |-> 1]
+One == [num |-> 1, den |-> 1]
+Add(p, q) ==
+  IF p = Zero THEN q
+  ELSE LET d == IF p.den < q.den THEN q.den ELSE p.den
+       IN Lowest([num |-> q.num * (d \div q.den) + p.num * (d \div p.den), den |-> d])
+Half(p) == Lowest([num |-> p.num, den |-> 2 * p.den])
+PrettyPrint(p) == CASE p = Zero -> "0" [] p = One -> "1" [] OTHER -> ToString(p.num) \o "/" \o ToString(p.den)
+====
+"#;
+
+/// Vector clocks: functions from nodes to counters, a missing node counting 0
+const VECTOR_CLOCKS: &str = r#"
+---- MODULE VectorClocks ----
+EXTENDS Naturals, Sequences, Functions
+LOCAL Before(a, b, D) == (\A d \in D : a[d] <= b[d]) /\ \E d \in D : a[d] < b[d]
+LOCAL Apart(a, b, D) == \E d, e \in D : d # e /\ a[d] < b[d] /\ a[e] > b[e]
+IsCausalOrder(log, clock(_)) ==
+  \A i \in 1..Len(log) : \A j \in 1..i - 1 :
+    LET D == DOMAIN clock(log[i]) \cup DOMAIN clock(log[j])
+        Full(c) == [d \in D |-> IF d \in DOMAIN c THEN c[d] ELSE 0]
+    IN Before(Full(clock(log[j])), Full(clock(log[i])), D) \/ Apart(Full(clock(log[j])), Full(clock(log[i])), D)
+CausalOrder(log, clock(_), node(_), domain(_)) ==
+  CHOOSE f \in {g \in [1..Len(log) -> Range(log)] : Range(g) = Range(log)} : IsCausalOrder(f, clock)
 ====
 "#;

@@ -83,7 +83,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ## CommunityModules (tlaplus/CommunityModules)
 
 `src/community.rs` provides modules of the CommunityModules (`Folds`, `Functions`, `FiniteSetsExt`,
-`SequencesExt`, `UndirectedGraphs`, `Bitwise`) for specs that extend or instantiate them. Their definitions are
+`SequencesExt`, `UndirectedGraphs`, `Bitwise`, `Relation`, `BagsExt`, `Graphs`, `Combinatorics`, `Statistics`,
+`GraphViz`, `DyadicRationals`, `VectorClocks`) for specs that extend or instantiate them. Their definitions are
 written for tla2rs from each operator's documented meaning and from TLC 2.19's measured results on them; what is
 taken from the modules is their interface (the names each module exports, in order, with their parameters, and what
 it extends), so that SANY's context, and the order TLC prints variables in, come out the same. No text of the
