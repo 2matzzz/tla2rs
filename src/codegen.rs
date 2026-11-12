@@ -5524,7 +5524,9 @@ const FORALL_REST: &str = "#forall-rest";
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)
 fn eval_error_bool(msg: &str) -> String {
-    format!("{{ let __b: bool = eval_error({msg:?}.to_string()); __b }}")
+    // TLC's own evaluation errors (for a failed arithmetic operation) are raised as such
+    let f = if msg.starts_with(crate::value::DIV_ZERO) || msg.starts_with(crate::value::MOD_NONPOS) { "arith_error" } else { "eval_error" };
+    format!("{{ let __b: bool = {f}({msg:?}.to_string()); __b }}")
 }
 
 /// `t` with every integer range outside sets made unbounded

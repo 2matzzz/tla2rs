@@ -162,16 +162,22 @@ fn record_print(line: Vec<Value>) {
     });
 }
 
+/// TLC's messages for failures that tla2rs evaluates at compile time
+pub const DIV_ZERO: &str = "The second argument of \\div is 0.";
+pub const MOD_NONPOS: &str = "The second argument of % should be a positive number, but instead it is:";
+pub const CASE_NONE: &str = "Attempted to evaluate a CASE with no conditions true.";
+pub const CHOOSE_NONE: &str = "Attempted to compute the value of an expression of form\nCHOOSE x \\in S: P, but no element of S satisfied P.";
+
 /// The starts of the error messages for failures that TLC raises too when it evaluates the same
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
 const EVAL_FAILURES: [&str; 11] = [
     "Attempted to check equality of string ",
     "The first argument of BagOfAll should be an operator",
     "Attempted to check if ",
-    "The second argument of \\div is 0.",
-    "The second argument of % should be a positive number",
-    "Attempted to evaluate a CASE with no conditions true.",
-    "CHOOSE: no element satisfies the predicate",
+    DIV_ZERO,
+    MOD_NONPOS,
+    CASE_NONE,
+    CHOOSE_NONE,
     "function applied outside its domain",
     "tuple index out of range",
     "no field ",
@@ -630,7 +636,7 @@ impl ConstEval<'_> {
                 }
                 match other {
                     Some(o) => self.eval(o, env)?,
-                    None => return Err(EVAL_FAILURES[2].into()),
+                    None => return Err(CASE_NONE.into()),
                 }
             }
             Quant(ex, bs, body) => {
@@ -658,7 +664,7 @@ impl ConstEval<'_> {
                         return Ok(v.clone());
                     }
                 }
-                return Err(EVAL_FAILURES[3].into());
+                return Err(CHOOSE_NONE.into());
             }
             SetLit(xs) => {
                 let vs: Vec<Value> = xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?;
@@ -1060,14 +1066,14 @@ impl ConstEval<'_> {
             Div => {
                 let (a, b) = (a.as_int()?, b.as_int()?);
                 if b == 0 {
-                    return Err(EVAL_FAILURES[0].into());
+                    return Err(DIV_ZERO.into());
                 }
                 Value::Int(floor_div(a, b))
             }
             Mod => {
                 let (a, b) = (a.as_int()?, b.as_int()?);
                 if b <= 0 {
-                    return Err(format!("{}, but instead it is: {b}", EVAL_FAILURES[1]));
+                    return Err(format!("{MOD_NONPOS}\n{b}"));
                 }
                 Value::Int(a.rem_euclid(b))
             }
