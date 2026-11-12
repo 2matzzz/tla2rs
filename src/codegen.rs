@@ -75,9 +75,11 @@ pub struct Gen<'a> {
     /// The comparison whose argument `gen_int` generates next: its symbol as TLC names it, and
     /// whether this is the first argument
     int_cmp: Option<(&'static str, bool)>,
-    /// Whether the checker follows TLC's order of printed lines: each successor (and initial
-    /// state) and the start of each action are marked as they are computed (PRINT_ORDER)
-    pub print_order: bool,
+    /// Strings numbered from here on may be made while exploring: the checker notes when it makes
+    /// one (`str_made` in the runtime)
+    pub track_from: u32,
+    /// Whether the checker notes a string it makes (STR_ORDER)
+    pub str_notes: bool,
     tmp: usize,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
@@ -137,7 +139,8 @@ impl<'a> Gen<'a> {
             int_module: "Naturals",
             int_op: None,
             int_cmp: None,
-            print_order: false,
+            track_from: u32::MAX,
+            str_notes: false,
             tmp: 0,
             scap: 8,
             qcap: 0,
@@ -423,6 +426,28 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `code`, which gives a string made by an operation that may be one of `ids`, noting the
+    /// string it makes when that may be one numbered for the strings made while exploring
+    fn note_made(&mut self, code: String, ids: &[u32]) -> String {
+        if !ids.iter().any(|&a| a >= self.track_from) {
+            return code;
+        }
+        self.str_notes = true;
+        format!("{{ let __s: u16 = {code}; str_made(__s); __s }}")
+    }
+
+    /// The code `c` of a constant, after noting the strings made while computing it (in `made`)
+    /// that may be made while exploring: TLC makes them when it evaluates the expression (a
+    /// definition without arguments, which TLC evaluates when it starts, makes none of those)
+    fn note_folded(&mut self, c: String, made: &[u32]) -> String {
+        let notes: Vec<String> = made.iter().filter(|&&a| a >= self.track_from).map(|a| format!("str_made({a}u16); ")).collect();
+        if notes.is_empty() {
+            return c;
+        }
+        self.str_notes = true;
+        format!("{{ {}{c} }}", notes.concat())
+    }
+
     /// `op` (Len, Head, Tail, Append, \o) on strings from the state: a match over every string the
     /// operands can be, with each result string interned now. A model value is an error, as in
     /// TLC (it is not a sequence).
@@ -490,7 +515,7 @@ impl<'a> Gen<'a> {
         } else {
             res_ids.sort();
             res_ids.dedup();
-            (code, Ty::Enum(res_ids))
+            (self.note_made(code, &res_ids), Ty::Enum(res_ids))
         })
     }
 
@@ -533,7 +558,8 @@ impl<'a> Gen<'a> {
         }
         res.sort();
         res.dedup();
-        Ok((format!("{{ let __m: i64 = {mc}; let __n: i64 = {nc}; match {qc} {{ {arms}_ => type_error(\"string\", \"\") }} }}"), Ty::Enum(res)))
+        let code = format!("{{ let __m: i64 = {mc}; let __n: i64 = {nc}; match {qc} {{ {arms}_ => type_error(\"string\", \"\") }} }}");
+        Ok((self.note_made(code, &res), Ty::Enum(res)))
     }
 
     /// Whether the value `x` of type `xt` is in [d -> r]: a function (sequences, bags, records
@@ -1092,6 +1118,13 @@ impl<'a> Gen<'a> {
         } else {
             None
         }
+    }
+
+    /// `try_const`, and the strings made while computing the value (see `note_folded`)
+    fn try_const_made(&self, e: &Expr, env: &Env) -> (Option<Value>, Vec<u32>) {
+        self.atoms.log_start();
+        let v = self.try_const(e, env);
+        (v, self.atoms.log_end())
     }
 
     // ---------------------------------------------------------------- Sets (bitmasks and SSet)
@@ -2101,8 +2134,9 @@ impl<'a> Gen<'a> {
         use Expr::*;
         // A definition of constant level: its value (see is_const)
         if matches!(e, Label(..)) {
-            if let Some(v) = self.try_const(e, env) {
-                return self.lit_auto(&v, want);
+            if let (Some(v), made) = self.try_const_made(e, env) {
+                let (c, t) = self.lit_auto(&v, want)?;
+                return Ok((self.note_folded(c, &made), t));
             }
         }
         // Where a CASE or CHOOSE is written, for TLC's error message (see ast::AT)
@@ -2112,8 +2146,11 @@ impl<'a> Gen<'a> {
         // alone is a function, over part of a type when its elements are records with different
         // fields)
         let bag = matches!(e, Call(f, _) if f == "SetToBag");
-        if let Some(v) = self.try_const(e, env).filter(|_| !bag) {
-            return self.lit_auto(&v, want);
+        if !bag {
+            if let (Some(v), made) = self.try_const_made(e, env) {
+                let (c, t) = self.lit_auto(&v, want)?;
+                return Ok((self.note_folded(c, &made), t));
+            }
         }
         // A constant comparison that TLC fails to evaluate fails when the checker evaluates it
         if matches!(e, Bin(BOp::Eq | BOp::Neq | BOp::In | BOp::NotIn, ..)) && self.is_const(e, env) {
@@ -2216,7 +2253,8 @@ impl<'a> Gen<'a> {
                         let mut res = ids.clone();
                         res.sort();
                         res.dedup();
-                        return Ok((format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", ")), Ty::Enum(res)));
+                        let code = format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", "));
+                        return Ok((self.note_made(code, &res), Ty::Enum(res)));
                     }
                     let vals = crate::types::all_values(&t, self.qcap, self.scap, room).ok_or_else(too_many)?;
                     let mut table: Vec<(String, u32)> = vals
@@ -2233,15 +2271,13 @@ impl<'a> Gen<'a> {
                     res.sort();
                     res.dedup();
                     let rows: Vec<String> = table.iter().map(|(s, i)| format!("({s:?}, {i})")).collect();
-                    (
-                        format!(
-                            "{{ static T: [(&str, u16); {}] = [{}]; let __k = fmt_{tid}(&{c}); match T.binary_search_by(|(s, _)| (*s).cmp(__k.as_str())) {{ \
-                             Ok(__i) => T[__i].1, Err(_) => eval_error(format!(\"ToString of {{__k}}: TLC prints this value in a way that depends on how it was built (an empty function prints as << >> or <<>>)\")) }} }}",
-                            rows.len(),
-                            rows.join(", ")
-                        ),
-                        Ty::Enum(res),
-                    )
+                    let code = format!(
+                        "{{ static T: [(&str, u16); {}] = [{}]; let __k = fmt_{tid}(&{c}); match T.binary_search_by(|(s, _)| (*s).cmp(__k.as_str())) {{ \
+                         Ok(__i) => T[__i].1, Err(_) => eval_error(format!(\"ToString of {{__k}}: TLC prints this value in a way that depends on how it was built (an empty function prints as << >> or <<>>)\")) }} }}",
+                        rows.len(),
+                        rows.join(", ")
+                    );
+                    (self.note_made(code, &res), Ty::Enum(res))
                 }
                 ("RandomElement", [SetLit(xs)]) if xs.len() == 1 => self.gen(&xs[0], env, want)?,
                 ("RandomElement", _) => return Err("RandomElement over a set from the state is not supported: TLC picks an element at random".into()),
@@ -3646,7 +3682,7 @@ impl<'a> Gen<'a> {
     /// indices instead (using them as function arguments avoids converting from atom values)
     fn iter_of_indexed(&mut self, s: &Expr, env: &Env) -> R<(String, Ty, Option<String>)> {
         let s = s.strip();
-        if let Some(v) = self.try_const(s, env) {
+        if let (Some(v), made) = self.try_const_made(s, env) {
             let set = v.as_set()?;
             let Ty::Set(et) = ty_of_value(&v)? else { unreachable!() };
             if set.is_empty() {
@@ -3657,14 +3693,14 @@ impl<'a> Gen<'a> {
                 let mut all = et.enumerate();
                 all.sort();
                 if all.into_iter().collect::<BTreeSet<_>>() == *set {
-                    return Ok((format!("(0..{n}u64)"), *et, Some(String::new())));
+                    return Ok((self.note_folded(format!("(0..{n}u64)"), &made), *et, Some(String::new())));
                 }
             }
             let mut parts = vec![];
             for x in set {
                 parts.push(self.lit(x, &et)?);
             }
-            return Ok((format!("[{}].into_iter()", parts.join(", ")), *et, None));
+            return Ok((self.note_folded(format!("[{}].into_iter()", parts.join(", ")), &made), *et, None));
         }
         // A product of sets that depend on the state, in TLC's order (the first element varies
         // slowest)
@@ -3752,6 +3788,18 @@ impl<'a> Gen<'a> {
 
     /// `x \in S`, where the value of x is already held in the variable named by `x`.
     fn gen_member(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
+        // TLC makes the strings of a constant set when it evaluates the membership (the set is
+        // evaluated here only if it has an operation that can make one: it may be large)
+        let ops = ["\\o", "Append", "Head", "Tail", "SubSeq", "ToString"];
+        let made = match s.any(&|e| matches!(e, Expr::Call(f, _) if ops.contains(&f.as_str()))) {
+            true => self.try_const_made(s, env).1,
+            false => vec![],
+        };
+        let code = self.gen_member_of(x, xt, s, env)?;
+        Ok(self.note_folded(code, &made))
+    }
+
+    fn gen_member_of(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
         // A set written out where it is used, holding tuples and x a string or the other way
         // round: TLC asks each element, in the order written, whether it equals x (a set from a
@@ -5066,9 +5114,9 @@ impl<'a> Gen<'a> {
         } else {
             writeln!(out, "out.push(({st}, {}));", env.label.unwrap_or(1)).unwrap();
         }
-        if self.print_order {
-            writeln!(out, "mark_push();").unwrap();
-        }
+        // For the order of printed lines and of strings made (a no-op in a checker that follows
+        // neither)
+        writeln!(out, "mark_push();").unwrap();
         Ok(())
     }
 
@@ -5168,9 +5216,7 @@ impl<'a> Gen<'a> {
         };
         env2.label = Some(self.label_id(&label));
         self.actions += 1;
-        if self.print_order {
-            writeln!(out, "mark_action();").unwrap();
-        }
+        writeln!(out, "mark_action();").unwrap();
         env2.split = false;
         self.gen_action(&with(&strip_pos(h)), &env2, out)?;
         Ok(true)

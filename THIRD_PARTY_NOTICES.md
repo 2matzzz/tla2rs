@@ -11,6 +11,11 @@ states exactly as TLC does. Source: https://github.com/tlaplus/tlaplus
 about a changed algorithm exactly when TLC does. It is written for tla2rs from TLC's measured behaviour and its
 published sources.
 
+`src/std_modules.rs` lists, for each of TLC's standard modules (`tla2sany/StandardModules/*.tla` in
+tla2tools.jar), the modules it reads, its identifiers, keywords and numbers in the order they first appear, and its
+strings, so that tla2rs orders strings as TLC does. It is generated from those module files; nothing else of their
+text is copied.
+
 ```
 MIT License
 

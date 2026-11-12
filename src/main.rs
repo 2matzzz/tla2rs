@@ -43,6 +43,11 @@ use std::time::Instant;
 /// and CAP_EXIT + CAP_SEQ in runtime.rs)
 const CAP_EXIT_SET: i32 = 70;
 const CAP_EXIT_SEQ: i32 = 71;
+/// The exit code of a checker that made strings in another order than they were numbered in
+/// (ORDER_EXIT in runtime.rs)
+const ORDER_EXIT: i32 = 72;
+/// How many times the checker is built again for the order of the strings it makes
+const ORDER_RUNS: usize = 8;
 
 /// Key of a built checker: every file cargo reads in the generated crate, and the compiler version.
 /// Two SipHash passes with different prefixes give 128 bits.
@@ -168,10 +173,17 @@ fn main() {
     // from the start; a spec that stays within the capacity runs as fast as before. The line printed
     // before the new run marks where its output starts (scripts/crosscheck.sh reads from there)
     let (mut setcap, mut seqcap) = (setcap, seqcap);
+    // The strings the checker made while exploring, in the order it made them: TLC orders strings
+    // by when it creates them, so when the checker made them in another order than they were
+    // numbered in, it is built again with them numbered in that order (see "the order of strings
+    // made" in runtime.rs)
+    let mut made: Vec<String> = vec![];
+    let mut order_runs = 0;
+    let order_file = dir.join("strings-made.txt");
     let mut first = true;
     loop {
         let t0 = Instant::now();
-        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, fp128, metal);
+        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, fp128, metal, &made);
         if first {
             for w in &output.warnings {
                 eprintln!("warning: {w}");
@@ -195,8 +207,24 @@ fn main() {
         // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs)
         let (scap, qcap) = output.caps;
         let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).collect();
-        let st = Command::new(bin).args(&pass).env("TLA2RS_GROW", grow).status().expect("run checker");
+        let mut cmd = Command::new(bin);
+        cmd.args(&pass).env("TLA2RS_GROW", grow);
+        if order_runs < ORDER_RUNS {
+            cmd.env("TLA2RS_ORDER", &order_file);
+        }
+        let st = cmd.status().expect("run checker");
         let code = st.code().unwrap_or(1);
+        if code == ORDER_EXIT {
+            let text = std::fs::read_to_string(&order_file).unwrap_or_default();
+            made = text.lines().filter_map(|l| l.parse::<usize>().ok()).filter_map(|a| output.atoms.get(a).cloned()).collect();
+            order_runs += 1;
+            if order_runs == ORDER_RUNS {
+                eprintln!("tla2rs: the strings made while exploring were made in another order each time; the last run may order them differently from TLC");
+            }
+            println!("tla2rs: strings were made in another order than they were numbered in; checking again from the start with them in that order");
+            first = false;
+            continue;
+        }
         let (what, old, new) = match code {
             CAP_EXIT_SET => ("a set", scap, (scap * 2).min(types::MAX_CAP)),
             CAP_EXIT_SEQ => ("a sequence", qcap, (qcap * 2).clamp(8, types::MAX_CAP)),
@@ -216,12 +244,12 @@ fn main() {
 /// stack: evaluating a recursive operator at compile time nests deeply (up to value::REC_LIMIT
 /// calls)
 #[allow(clippy::too_many_arguments)]
-fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> compile::Output {
-    let (src, cfg_src) = (src.to_string(), cfg_src.to_string());
+fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, fp128: bool, metal: bool, made: &[String]) -> compile::Output {
+    let (src, cfg_src, made) = (src.to_string(), cfg_src.to_string(), made.to_vec());
     let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
     let result = std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, fp128, metal))
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, fp128, metal, &made))
         .expect("start the compiler thread")
         .join()
         .unwrap_or_else(|_| Err("internal error in the compiler".into()));

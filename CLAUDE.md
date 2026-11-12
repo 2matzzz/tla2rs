@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 639 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 649 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -157,25 +157,59 @@ tla2rs only. The default stays strict: generated-count mismatches have caught re
 
 TLC orders strings by when it first creates them (`UniqueString` ids), not alphabetically, and that order decides how a
 set of strings is enumerated, which element CHOOSE picks, and how sets print. Measured on TLC 2.19 (`tests/tlc/StrRank*`),
-it creates: the strings and model values of the cfg; SANY's built-in names; the identifiers and keywords of each module
-as it parses them (root module first, then the modules it extends or instantiates, breadth first; a string equal to an
-identifier such as an operator name, or to a name in a standard module, takes that identifier's place); a few more
-built-in names; the string literals of each module, dependencies first. `tlc_string_ranks` reproduces this, with the
-standard modules' names in `src/std_modules.rs` (generated from TLC's jar). TLC orders every model value before every
-string (`{"zz", m1}` prints as `{m1, "zz"}`, a function over both lists the model values first, CHOOSE picks `m1`;
-`tests/tlc/ModelStr*`), so model values get the lower atom numbers.
+it creates: the strings and model values of the cfg; SANY's built-in names; the identifiers, keywords and numbers (as
+written: `007`, `\b101`; `StrRankNum`) of each module as it parses them (root module first, then the modules it extends
+or instantiates, breadth first; a string equal to an identifier such as an operator name, or to a name or number in a
+standard module, takes that identifier's place); a few more built-in names; the string literals of each module,
+dependencies first. `tlc_string_ranks` reproduces this, with the standard modules' names and numbers in
+`src/std_modules.rs` (generated from TLC's jar; Sequences has the numbers 1 and 0, Integers 0, TLC 1, Randomization 1
+and 5). TLC orders every model value before every string (`{"zz", m1}` prints as `{m1, "zz"}`, a function over both
+lists the model values first, CHOOSE picks `m1`; `tests/tlc/ModelStr*`), so model values get the lower atom numbers.
 
-Strings created while exploring (by `\o`, `Append`, `ToString`, ...) are not ordered as in TLC: tla2rs computes them at
-compile time and numbers them after the others. Reproducing TLC is not possible in general (Refs #23):
+Strings made by operations (`\o`, `Append`, `Head`, `Tail` and `SubSeq` on strings, `ToString`) come after those, in
+the order TLC first makes them. Measured on TLC 2.19 (`tests/tlc/StrMade*`), with one worker:
 
-- TLC creates such a string the first time it evaluates the expression, which depends on its evaluation of everything:
-  a definition of constant level that nothing uses changes the order, because TLC evaluates those at startup (with
-  `Words == {"c" \o s : s \in {"a", "b"}}` present, `{x \o "b", x \o "a"}` prints as `{"ca", "cb"}` and CHOOSE picks
-  `"ca"`; without it, `{"cb", "ca"}` and `"cb"`). tla2rs folds constant expressions at compile time and evaluates
-  others in its own order
+- When it starts, TLC evaluates the constants, every definition of constant level without arguments (used or not),
+  the constant invariants and properties, and the ASSUMEs, in that order; the strings these make come first
+  (`StrMadeStart`: an unused `Words == {"c" \o w : w \in {"a", "b"}}` puts `"ca"` before `"cb"`)
+- Then the strings made while exploring, in the order the search makes them: a string made and dropped counts (a
+  comparison, a branch that fails later), and so does one made by a constant expression inside an action or an
+  invariant, which TLC evaluates there each time (`StrMadeConst`). TLC checks the invariants on each successor as
+  soon as it computes it, so what they make comes before what the next successors make (`StrMadeInv`)
+- A string equal to a name or number of a module was created when TLC parsed it and keeps that place
+  (`StrMadeName`; `StrMadeToString`: `ToString(1)` is `"1"`, a number in the TLC module)
+
+The checker's strings are 16-bit ids fixed when it is built (and sets of them bit masks over those ids), so it cannot
+number a string when it makes one. tla2rs numbers them in an order measured instead:
+
+- The compiler evaluates the constant definitions that can make strings (`makes_strings`), the constant invariants
+  and properties and the ASSUMEs in TLC's order, noting the strings made (`Atoms::made`), and numbers those right after
+  the strings TLC knows from parsing. That order is known only after evaluating, which itself iterates sets in the
+  order of their strings, so `compile` compiles again until it does not change (`MADE_ORDER`, `Startup::made`)
+- The strings the checker may make while exploring are numbered from `TRACK_FROM`, first in the order a checker built
+  before made them, then as the compiler meets them. Code generation notes each such string the checker makes
+  (`Gen::note_made` for the operations on strings from the state and ToString, `Gen::note_folded` for a constant
+  expression TLC evaluates there: as a value, a set a quantifier ranges over, or a set tested for membership).
+  When tla2rs runs the checker with one worker, it names a file in `TLA2RS_ORDER`, and the checker records the
+  first time it makes each such string, where TLC would: what it makes while computing a successor counts after the
+  invariants of the successors before it (held like the printed lines, see "Messages and printed lines"), and the
+  search takes the default path, not `-batched`. A string made after one numbered later, or one a module names
+  (`RANKED_LATE`), means the order differs from TLC's: the checker explores to the end, writes the order it made the
+  strings in to the file and exits with 72; `main.rs` prints `tla2rs: strings were made in another order than they
+  were numbered in; checking again from the start with them in that order`, compiles with that order, and runs again
+  (at most 8 times). `crosscheck.sh` compares only what follows the last such line, as for capacities. A spec that
+  makes no strings while exploring generates the same checker as before, but for the calls that mark the states
+  pushed and the actions started, which do nothing then
+
+Not followed:
+
 - With several workers the order depends on thread scheduling: CHOOSE over `{ToString(n) \o "w" : n \in 1..2000}`
   after the search created those strings gave `"4w"`, `"1w"`, `"2w"` and `"4w"` in four runs with `-workers 4`, and
-  `"1w"` every time with one worker
+  `"1w"` every time with one worker. The checker notes nothing then and keeps the order it was built with
+- A string made by a constant expression that the compiler evaluates elsewhere (the condition of an IF, the set of a
+  `\A` that assigns variables in an action, ...), and the characters TLC makes when it takes a string apart
+  into a tuple (`SelectSeq`, `SortSeq`, a string compared with a tuple), are numbered as the compiler meets them and
+  not noted
 
 ### How TLC reads SPECIFICATION
 

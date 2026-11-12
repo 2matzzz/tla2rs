@@ -11,9 +11,33 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub struct Atoms {
     list: std::cell::RefCell<Vec<(bool, String)>>, // (is model value, name)
     map: std::cell::RefCell<HashMap<(bool, String), u32>>,
+    /// While Some, the strings that operations (`\o`, ToString, ...) make, in order (see `made`)
+    log: std::cell::RefCell<Option<Vec<u32>>>,
 }
 
 impl Atoms {
+    /// A string made by an operation (TLC creates its string then, which decides where it comes in
+    /// TLC's order of strings), noted while a log is kept
+    pub fn made(&self, a: u32) -> u32 {
+        if let Some(l) = self.log.borrow_mut().as_mut() {
+            l.push(a);
+        }
+        a
+    }
+    /// Starts noting the strings made, until `log_end`
+    pub fn log_start(&self) {
+        *self.log.borrow_mut() = Some(vec![]);
+    }
+    /// The strings made since `log_start`, each once, in the order first made
+    pub fn log_end(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = vec![];
+        for a in self.log.borrow_mut().take().unwrap_or_default() {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        out
+    }
     pub fn intern(&self, model: bool, s: &str) -> u32 {
         if let Some(&i) = self.map.borrow().get(&(model, s.to_string())) {
             return i;
@@ -343,14 +367,14 @@ impl ConstEval<'_> {
                         }
                         _ => return Err(format!("`{f}` with {} arguments", args.len())),
                     };
-                    Value::Atom(self.atoms.intern(false, &out))
+                    Value::Atom(self.atoms.made(self.atoms.intern(false, &out)))
                 }
                 ("ToString", [x]) => {
                     let v = self.eval(x, env)?;
                     if let Some((a, b)) = disordered_in(&v) {
                         return Err(crate::types::disordered_error(&a, &b));
                     }
-                    Value::Atom(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v)))
+                    Value::Atom(self.atoms.made(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v))))
                 }
                 ("TLCEval", [x]) => self.eval(x, env)?,
                 // Bags: functions from elements to their (positive) counts
