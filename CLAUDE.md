@@ -23,11 +23,12 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 585 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 630 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
-  one worker, and it compares the verdict, generated and distinct state counts, the counterexample (its states and
+  one worker, and it compares the verdict, generated and distinct state counts, the states left on
+  TLC's queue (see "The states left on queue"), the counterexample (its states and
   the action of each step; see "Counterexamples"), exit code, the messages and printed lines (see "Messages and
   printed lines"), and the state graph (the set of states and the set of transitions; see "State graphs"). A liveness counterexample is instead checked by TLC (it runs TLC on the
   `-lassocheck` output). If TLC produces no verdict, the check fails. `all.sh` prints, after `ok`, the rule that
@@ -125,6 +126,17 @@ configurations of `tests/tlc/` and 2 corpus models that run at 8 (to 36 to 5002;
 and widened every set held as an array there, and for `SlidingPuzzles` to 2^20. The bounds a spec implies by its logic (a queue that holds
 each process at most twice, the messages a protocol can send) are not derived: the Init/Next analysis of `seqlen.rs`
 covers sequence lengths only.
+
+### The states left on queue
+
+When TLC stops at an error it reports `N states left on queue`. Measured on TLC 2.19 with one worker
+(`tests/tlc/QueueLeft*`, and every configuration and corpus model since): N is the states of the
+level being expanded that come after the one whose expansion stopped, plus the states queued for
+the next level so far, without the state that stopped the search. A new state that violates an
+invariant is not queued, and neither is a successor that violates an action property (it is added
+to the visited states first). The three searches count the same (`SChunk::expanded`,
+`Collected::expanded` and `bad`, `Chunk::expanded` and `unqueued`); with several workers the
+number depends on what the others had taken off the queue. When the search ends it is 0.
 
 ### TLC counts generated states per `\/` branch
 
@@ -457,32 +469,87 @@ ASSUMEs, and the note `(Use the -nowarning option to disable this warning.)` aft
 of a run only (`compile::Startup`; with its default garbage collector, TLC's first warning is about
 that instead, which `-XX:+UseParallelGC` avoids).
 
-Printed lines: with one worker TLC prints them in a fixed order. They match in order for Print and
-PrintT in the constant definitions and ASSUMEs (printed once, when TLC starts), and in the search
-when the order of evaluation is the same (`PrintConst`). TLC checks the invariants of each initial
-state and of each successor as soon as it generates it, and evaluates the initial predicate and the
-actions again while rebuilding a counterexample. tla2rs computes all initial states, or all
-successors of a state, before checking them, and replays a counterexample its own way, so lines
-printed in Init, an action or an invariant come in another order (and number) when a state has more
-than one initial state or successor (`PrintNext`). With `-batched` / `-metal`, phase 1 checks the
-invariants of every candidate this thread has not seen, before the lookup; when an invariant prints,
-it first skips a candidate already visited or collected in the level (`INV_PRINTS`), since TLC checks
-new states only (`PrintConst` printed the invariant of a revisited state twice otherwise).
+Printed lines: with one worker TLC prints them in a fixed order, which tla2rs follows (measured on
+TLC 2.19, `tests/tlc/PrintNext`, `PrintOrder*`). Print and PrintT in the constant definitions and
+ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
+
+- TLC checks each initial state and each successor as soon as it computes it: what Init or an action
+  prints before a state comes before what the invariants print on it, and nothing is printed past the
+  state that stops the search
+- To show a behavior it rebuilds it from fingerprints. When the state it was expanding is the k-th of
+  the behavior, it first rebuilds states 1 to k-1 (Init evaluated again, all of it, then for each step
+  the actions in order up to the one that yields the next state, that action as a whole), prints
+  `The behavior up to this point is:` and those states, and then evaluates the step to state k (if
+  k > 1) and to the successor that stopped the search the same way, each before its state. No
+  invariant is evaluated again. After an evaluation error in the actions it evaluates the failing
+  step once more (to find where the error is), printing again up to the error
+
+When Init, Next or an invariant prints (`PRINT_ORDER` in the generated checker, set by
+`compile.rs`), the checker marks each state `init` or `next` pushes and the start of each action
+(`mark_push`, `mark_action`, generated only then), holds what Print and PrintT print while it
+computes states, and prints those lines as it handles the states (`Capturing`, `Held` in
+`runtime.rs`); `print_states_tlc` shows a behavior as above. Such specs are searched without
+`-batched` (on the default path), and a spec that prints nowhere else generates the same code as
+before. A property `[]P` checked as an invariant is not covered: with `-batched` / `-metal`, when it
+prints, phase 1 first skips a candidate already visited or collected in the level (`INV_PRINTS`),
+since TLC checks new states only.
+
+Other messages tla2rs words as TLC does, measured on TLC 2.19:
+
+- A successor that leaves variables unassigned (`tests/tlc/Unassigned*`): `Successor state is not
+  completely specified by the next-state action.` when the next-state relation is one action, `by
+  action A of the next-state relation.` otherwise (counting each element of a split `\E` as an
+  action), then `The following variable(s) is (are) not assigned: a, b.` in the order of the names.
+  TLC counts the successor as generated and shows it last in the behavior with those variables
+  `null` (exit 75). An initial state that leaves a variable unassigned: `current state is not a legal
+  state`, the state with the variable `null`, and no counts (exit 255)
+- After an error raised inside a value TLC built from an expression written there (a set `{...}`, a
+  tuple `<<...>>`, a product `S \X T`, a set of functions or records it cannot enumerate, set
+  operations on those), TLC reports a second error after the behavior (or the initial state): `TLC
+  was unable to fingerprint.` with the same reason (and its `Fingerprint Stack Trace`, dropped). Not
+  after `x \in S` for S from the state or a constant definition, `x \in 5..6`, `\E y \in {5, 6} : y =
+  x`, `t[i]` for t from the state, or `k \notin [{1} -> {1}]`, nor when a string's or a tuple's own
+  comparison fails (`<<"a">> \in {"ab"}`, `<<1, 2>> # s`) (`tests/tlc/FpErr*`). Code generation
+  wraps such an operation in an `FpSource` when it can fail (`Gen::fp_source`)
+- A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
+  value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
+  tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
+  set of tuples:` and the product (`tests/tlc/TupleVals*`)
+- A value that is not an integer in an interval: `Attempted to check if the value:`, the value, `is
+  in the integer interval 5..6`
+- A model value in `+`, `-`, `*`, `\div`, `%`, `^`, unary minus or `..`: TLC evaluates these with Java
+  methods and names the one that failed, `public static tlc2.value.impl.IntValue
+  tlc2.module.Naturals.Plus(tlc2.value.impl.IntValue,tlc2.value.impl.IntValue)` (`Minus`, `Times`,
+  `Divide`, `Mod`, `Expt`, `Neg` with one argument, `DotDot` giving an `IntervalValue`), in `Integers`
+  when the spec loads Integers or Reals, then `Cannot cast tlc2.value.impl.ModelValue to
+  tlc2.value.impl.IntValue` (`tests/tlc/ModelArith*`, `Gen::gen_int_of`). The comparisons (`<` ...)
+  are worded otherwise (`The first argument of < should be an integer`, with `>` for `>=` under
+  Naturals), which tla2rs does not follow yet
+- SANY's reports. A precedence conflict, a bad string escape and LAMBDA outside an operator's argument
+  stop SANY while it parses (`***Parse Error***` or `Lexical error at line L, column C.`, then
+  `Fatal errors while parsing TLA+ spec in file M`, `*** Abort messages: 1`, `In module M`, `Could
+  not parse module M from file M.tla`): a conflict names SANY's operators (`\land`, `\lor`, `/=`,
+  `\leq`, `\geq`, `\equiv`, `\union`, `\intersect`, `\times`, `-.` for unary minus) with the position
+  of the first `in block`, indented two spaces, or of the postfix operator without indent; an escape
+  gives the character, its code and the string read up to it (as Java escapes it); LAMBDA gives the
+  token before it, and `Was expecting "Expression or Instance"` after `==` (the parser marks these
+  with `lexer::SANY_ABORT`). A level error of a temporal formula gives the position of the innermost
+  operator whose arguments break the rules, infix junctions read as binary and to the left, and a
+  bulleted list is a `Conjunction list` or `Disjunction list`: the root module is parsed again with
+  SPAN labels (`parser::parse_module_spans`) and the definition checked as written
 
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
-compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.`, a second error TLC
-reports after the behavior in some configurations (below). 61 configurations, by reason:
+compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 41
+configurations, by reason:
 
 | Reason | Configurations |
 |---|---|
-| TLC gives a position tla2rs does not keep: of an identifier it fails to evaluate (also a variable a fair action leaves unspecified, which tla2rs reports in its own words), of an `x' \in S` it cannot enumerate | 9: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `FairPartial`, `RealSet-NextE` |
-| SANY's report: the position of the expression it refuses and its wording (`Semantic errors:`, `***Parse Error***`, a lexical error) | 34: `RejLevel`, `RejSanyChoose`, `-Escape`, `-Minus`, `-Prec`, `-PrecUser`, `-Shadow`, `-TlcOps`, `-Builtin`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-LocalRec`, `-Lambda`, `-OwnParam`, `-Postfix`, `-PrecAlways`, `-PrecDomain`, `-PrecEnabled`, `-PrecMinus`, `-QuantSet`, `-RecParam`, `-StdName`, `-StdUnext`, `-Subexpr`, `-Unknown`, `RejTempBox`, `-Ev`, `-Leads`, `-Mix`, `SubexprBad` |
-| TLC warns about an EXCEPT outside the domain on some of the evaluations that do one (3 of many in `SparseFun`), by a rule not found; `LazyFun*` also show the position of a function's body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
-| TLC reports a second error after the behavior: `TLC was unable to fingerprint.` with its reason | 5: `MixedIn`, `NatDom-InNat`, `RealSet-Sub`, `SeqIdx`, `RejTupleCross` |
-| TLC shows the values it compared when a tuple meets another value; tla2rs decides that failure from the types | 4: `RejTupleEq`, `RejTupleIn`, `TupleStr-InDef`, `RejTupleCross` (also above) |
-| TLC names the Java method and the cast that failed (a model value in `+`) | 1: `ArithNone` |
-| Order of evaluation: TLC reports the error from ENABLED of a fair action, tla2rs from its step; Print in the search (above) | 2: `LiveErr-Fair`, `PrintNext` |
+| SANY's semantic errors give the position of each name involved (also of the declaration it clashes with, in a standard module, or `--TLA+ BUILTINS--`) and add follow-on errors (an operator's arity, an infix symbol it cannot resolve) and warnings; tla2rs's syntax tree keeps no positions of names | 20: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-LocalRec`, `-Minus`, `-OwnParam`, `-QuantSet`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `-Unknown`, `SubexprBad` |
+| TLC gives the position of an identifier it fails to evaluate (also a substituted variable in ENABLED, and a variable a fair action leaves unspecified, which tla2rs reports in its own words) or of an `x' \in S` it cannot enumerate; tla2rs keeps no positions of identifiers | 11: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `EnSubst-EEarly`, `-Outer`, `FairPartial`, `RealSet-NextE` |
+| TLC warns, with the position of the function, about an EXCEPT outside the domain on some of the evaluations that do one (3 of many in `SparseFun`), by a rule not found; `LazyFun*` also print a lazy function with the position of its body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
+| TLC compares the value with the element its binary search of a sorted set reaches first (`x \in S` for S from the state: the element at index n/2) and words the error by that element; tla2rs decides the failure from the types | 2: `RejTupleIn`, `TupleStr-InDef` |
+| TLC reports the error from ENABLED of the fair action, tla2rs from the step of that action, which it evaluates first; why TLC does not is not found | 1: `LiveErr-Fair` |
 
 ### The corpus
 
