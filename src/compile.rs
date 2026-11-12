@@ -732,8 +732,20 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     out.inst_prefixes.push((raw(""), inst.name.as_ref().map_or(String::new(), |n| format!("{n}!")), params.len()));
     let names: HashSet<&str> = mm.defs.iter().map(|d| d.name.as_str()).collect();
     let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone())).collect();
-    fn rename(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]) -> Expr {
+    // The number of parameters of each definition, for one passed as an operator argument
+    let arities: HashMap<String, usize> = mm.defs.iter().map(|d| (d.name.clone(), d.params.len())).collect();
+    let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, &arities);
+    fn rename_inst(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr], arities: &HashMap<String, usize>) -> Expr {
+        let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, arities);
         match e {
+            // A definition with parameters named without arguments is an operator argument
+            // (`Test(S, Op)`): the hidden definition with the leading parameters bound
+            Expr::Ident(n) if names.contains(n.as_str()) && !pargs.is_empty() && arities.get(n).is_some_and(|&k| k > 0) => {
+                let ps: Vec<String> = (0..arities[n]).map(|i| format!("{n}#arg{i}")).collect();
+                let mut a = pargs.to_vec();
+                a.extend(ps.iter().map(|p| Expr::Ident(p.clone())));
+                Expr::Lambda(ps, Expr::Call(raw(n), a).b())
+            }
             Expr::Ident(n) if names.contains(n.as_str()) => {
                 if pargs.is_empty() { Expr::Ident(raw(n)) } else { Expr::Call(raw(n), pargs.to_vec()) }
             }
