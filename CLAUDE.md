@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 649 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 671 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -258,11 +258,17 @@ TLC evaluates `[x \in S |-> e]` lazily. Measured on TLC 2.19 with S = Nat (`test
 - Storing it in a variable fails ("Attempted to compute the number of elements in the overridden value Nat.", exit
   75), and so do comparing it, `DOMAIN f = Nat` and `f \in [Nat -> Nat]` in an invariant (when TLC fingerprints it).
   A finite function in `[Nat -> Nat]` fails too ("Attempted to check equality of the set ... with the value: Nat")
-- `ToString(f)` succeeds and prints the source text of the function
+- `ToString(f)`, `Print` and `PrintT` print `[n \in Nat |-> <expression line 5, col 26 to line 5, col 30 of module
+  M>]` (`tests/tlc/LazyFunText`): the bound variables, each group with the domain as TLC prints its value (`Seq({1,
+  2})`, `(Nat \X {1, 2})`), but only the first name of `a, c \in Nat`; then the position of the body without the
+  parentheses around it, or the body itself when it is a number (`<expression 007>`). EXCEPT changes nothing in it.
+  Over a set TLC can enumerate (`-5..-3`, or 0..200000), it prints the function as a value
 
 tla2rs compiles `f[k]` (also after EXCEPT with one index per update) and `k \in DOMAIN f` to the membership test and
-the body (`Gen::lazy_apply`), also over a constant set of more than 65536 elements (`lazy_domain`), and refuses such a
-function over an infinite set anywhere else. Constant folding applies `[x \in S |-> e][k]` the same way (`value.rs`).
+the body (`Gen::lazy_apply`), also over a constant set of more than 65536 elements (`lazy_domain`). The parser keeps
+how TLC prints a function in an FN label around it (`ast::FN`), which `codegen::lazy_fun_string` fills in for
+ToString, Print and PrintT, with the domains Nat, Int, STRING, `Seq(S)` and products of those and finite sets. Such a
+function over an infinite set is refused anywhere else, as are those three over another domain. Constant folding applies `[x \in S |-> e][k]` the same way (`value.rs`).
 
 ### Tuples compared with strings
 
@@ -271,8 +277,19 @@ TLC asks the value on the left of `=` whether it equals the one on the right. Me
 is TRUE for s = "ab"), a string asked about a tuple stops with an error, and a model value is unequal to both. For
 `x \in S`, a set written out where it is used asks each element in the order written (`s \in {<<"a", "b">>}` is
 TRUE), while a set from a definition or the state has been sorted, and comparing a string with a tuple then fails.
-`Gen::tuple_str_eq` follows this. One case is not matched: TLC finds `s \in TS \cup {}` TRUE where TS is such a sorted
-set (`s \in TS` fails); tla2rs fails on both.
+`Gen::tuple_str_eq` follows this. TLC also builds some sets where they are used without sorting them, and then asks
+each element (`Gen::member_unsorted`, `tests/tlc/TupleStrCup*`): `{f(y) : y \in S}`, and `A \cup B` when A is held as
+the set of its elements (written out, from the state or a definition, such a set, or a union with one), which TLC
+unites with B by copying A's elements and adding B's (`SetEnumValue.cup`). So `s \in TS \cup {}` is TRUE where `s \in
+TS` fails. When A is empty the union is B itself, and `s \in {} \cup TS` fails as `s \in TS` does.
+
+A set of strings compared with a set of integers (`{x} = {5}`, x a string) cannot be held as one type, so `Gen::str_int_eq`
+compares them as TLC does, measured on TLC 2.19 (`tests/tlc/StrIntSet*`): sets of different sizes are unequal;
+otherwise TLC compares the elements in its order pair by pair and stops at the first unequal pair, where a model
+value is unequal to anything but itself and a string meeting an integer is an error worded by the left one
+(`Attempted to check equality of string "a" with non-string:` or `... of integer 5 with non-integer:`). A set written
+out on the left adds TLC's `TLC was unable to fingerprint.` (see "Messages and printed lines"). Tuples of such sets
+compare element by element; other values holding them are still refused.
 
 ### `\div` in Naturals
 
@@ -353,12 +370,34 @@ operator as its body with the arguments bound; either can assign variables (`tes
 counts match TLC). Over a constant set or with constant arguments, tla2rs unrolls them at compile time. Otherwise:
 
 - `\A`: the checker collects the elements when it evaluates the quantifier. While B can still assign a variable, each
-  element is one level of generated code, up to the number of values of the set's element type (refused beyond 16);
-  once B only reads what is assigned, the remaining elements are a test (`Gen::gen_forall`)
+  element is one level of generated code, up to the number of values of the set's element type when that is at most
+  16; once B only reads what is assigned, the remaining elements are a test (`Gen::gen_forall`). Over a larger type,
+  the elements after the first are walked at run time by a recursive operator made for the quantifier, `F(S, k) == IF
+  k > Cardinality(S) THEN TRUE ELSE B(k-th element) /\ F(S, k + 1)` (`Gen::forall_rec`; `tests/tlc/ForallLarge`)
 - A recursive operator becomes a Rust function that evaluates its body as an action and returns each state it builds
-  with the bit mask of the variables assigned by then (at most 64 variables). The action continues from each returned
-  state, once per mask. A call of the operator in its own body uses the masks found so far, and the body is generated
-  again until they settle (`Gen::gen_rec_action`, `rec_action_fn`). In Init, arguments must still be constant
+  with the number of the set of variables assigned by then (`Gen::assigned_sets`, so any number of variables:
+  `RecManyVars`). The action continues from each returned state, once per set. A call of the operator in its own body
+  uses the sets found so far, and the body is generated again until they settle (`Gen::gen_rec_action`,
+  `rec_action_fn`). In Init the function starts from the state under construction, whose assigned variables are all
+  it reads of the variables (`RecInit`)
+
+### The order of variables
+
+TLC prints a state's variables in the order of `ModuleNode.getVariableDecls` of the root module: SANY's context of
+the module, a Java `Hashtable` keyed by name, enumerated and then reversed. `String.hashCode` is deterministic, so the
+order is too, and it depends only on the names and on how many names were in the table when each variable came, which
+decides when the table grew (11 slots, then 2n+1 once it holds three quarters; growing walks the old slots from the
+last and each chain from the front, and a new name goes to the front of its chain). Measured on SANY 2.19 with a
+dump of the context (a small Java program calling SANY's classes, not kept here): 72 built-in operators come first,
+then what each module in EXTENDS exports, in order and without repeats, then each statement of the module (a
+declaration, definition, theorem, named ASSUME, RECURSIVE declaration or nested module adds its name; `N == INSTANCE
+M` adds `N!d` for each definition d that M exports, then N; an unnamed INSTANCE adds the definitions M exports that
+are not there yet); a module exports all of these but the LOCAL ones. `sany::var_order` replays this, and the
+checker prints in that order (`Gen::print_order`; `tests/tlc/VarOrder*`, where 151 names grow the table to 383
+slots). The order agreed with SANY's on every root module of `examples/`, `tests/tlc/` and the corpus, and on 94
+generated modules (random names, 0 to 120 definitions, extended and instantiated modules). TLC lists the variables
+an action leaves unassigned in the order of their names instead (`VarOrder-Partial`). With VIEW and SYMMETRY the
+order also decides which permuted state is the smallest (see "VIEW and SYMMETRY together").
 
 ### State graphs
 
@@ -390,9 +429,8 @@ The canonical form (`src/graph.rs`) is the sorted set of state texts, each marke
 set of edges as pairs of those texts; the expected file keeps `states N <sha256>` and `edges M <sha256>` of them,
 not the graphs. Reducing to it:
 
-- The `/\ var = value` lines of a state are sorted. TLC lists the variables in the order of a Java `Hashtable` of
-  SANY's symbols (`Context.getVariableDecls`, reversed by `ModuleNode`), which depends on the hash of every symbol
-  of the module and its extensions, not on the state
+- The `/\ var = value` lines of a state stay in the order printed, which a checker prints in TLC's order (see "The
+  order of variables")
 - `<<>>` is read as `<< >>`. TLC prints the empty function as `<<>>` when it is held as a function and as `<< >>`
   when it is held as a tuple, depending on the expression that built it (`DynDomain`, `NatDom`, `PartFuns`,
   `SparseFun`, ...)
@@ -402,7 +440,15 @@ not the graphs. Reducing to it:
   variable assigned `1..3` prints as `1..3` until an operation turns it into an enumerated set, while tla2rs prints
   `{1, 2, 3}` (measured on the corpus's `DiningPhilosophers`). This applies to a variable printed on one line whose
   value fits in 80 columns once expanded, where TLC's pretty printer would also keep it on one line; a longer one is
-  kept as printed and then differs (no configuration has one)
+  kept as printed and then differs (no configuration has one). tla2rs does not print intervals as TLC does, because
+  the form depends on how the value was built, not on the value. Measured on TLC 2.19 (`tests/tlc/IntervalShow`):
+  `s = 1..3` prints `1..3` and, after `s' = {1, 2, 3}`, the same value prints `{1, 2, 3}`; a function built as `[i \in
+  1..2 |-> 1..i]` prints `<<1..1, 1..2>>`, and keeps `1..2` through an EXCEPT of the other entry; `s \cup {4}`
+  enumerates; an empty interval prints `{}`. A state graph labels each state by the first way it was reached. To
+  follow this, a checker would have to carry, for every set inside a state, whether TLC holds it as an interval,
+  outside the fingerprint and through every operation, while states are packed to fixed widths by type and sets of
+  integers are bit masks. Of the 671 configurations, only `IntervalShow` prints an interval (TLC's graphs and outputs
+  of all of them, searched), and of the corpus `DiningPhilosophers`
 
 Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
 are for the 483 configurations at the time of writing):
@@ -411,7 +457,6 @@ are for the 483 configurations at the time of writing):
 |---|---|---|
 | TLC did not end the file (automatic: no closing `}`) | 56 (stops in or before the initial states, and SANY or temporal refusals) | Not the graph; verdict, counts and exit code as before |
 | tla2rs stopped at a successor that left its declared type while `next` built it (automatic: "a successor that tla2rs cannot represent" in its output) | 1 (`SetOut`) | The numbers of states and edges and the length of the counterexample (tla2rs writes a placeholder node and state for the successor TLC adds) |
-| VIEW and SYMMETRY together (automatic), see below | 1 (`ViewSym-Both`) | The verdict only. `ViewSymSet-Both` has `\* crosscheck: exact`: TLC was measured to keep no two states with equal views there, and everything matches |
 
 `distinct-only` (three configurations) leaves the graph compared: duplicate edges collapse anyway.
 
@@ -420,7 +465,7 @@ are for the 483 configurations at the time of writing):
 A safety counterexample (invariant, action property, deadlock, an evaluation error with a behavior) is compared
 with TLC's as a whole: each step's first line, `State N: <Name line L, col C to line L2, col C2 of module M>`, and
 its state. `src/trace.rs` reduces both to that list, each state in the canonical form of the state graphs (its
-variables sorted, `<<>>` read as `<< >>`), and the expected file keeps `trace N <sha256>` of it.
+variables in the order printed, `<<>>` read as `<< >>`), and the expected file keeps `trace N <sha256>` of it.
 
 With one worker TLC's counterexample is deterministic: for all 186 configurations that have one, four runs (two with
 random fingerprint seeds, `-fp 1`, `-fp 50`) gave the same text. TLC rebuilds it from fingerprints, taking for each
@@ -486,7 +531,7 @@ counterexample. No configuration printed a Java stack trace. The rules:
 | TLC's evaluation stacks: `The error occurred when TLC was evaluating the nested expressions at the following positions:` with its numbered positions, and `Fingerprint Stack Trace:` with its frames | Dropped: deterministic, but they list TLC's own nested evaluations, which a checker that inlines every definition does not have |
 | SANY's parser stack (`Residual stack trace follows:` and its lines) and `tla2sany.semantic.AbortException` | Dropped (SANY's internals) |
 | `The exception was a java.lang.RuntimeException` and a Java class name before the message on the next line (`: tlc2.tool.EvalException: ...`) | The class lines are dropped and the message kept: they say how TLC passed the error on |
-| A state after a message (`... is violated by the initial state:`, `While working on the initial state:`) | One line, in the canonical form of a state (variables sorted) |
+| A state after a message (`... is violated by the initial state:`, `While working on the initial state:`) | One line, in the canonical form of a state |
 | Empty lines | Dropped |
 
 How TLC words an evaluation error depends on where it happens, measured on the `ErrCon*`, `EvalNext*`,
@@ -686,14 +731,14 @@ warning from TLC; tla2rs then prints the note too. A module reached through two 
 
 ### VIEW and SYMMETRY together
 
-TLC sometimes keeps states whose views are identical as separate states (its choice of representative depends on the
-state, not the view; changing `-fp` does not avoid it). tla2rs folds by orbits of the view, so its distinct count is at
-most TLC's. VIEW alone and SYMMETRY alone both match TLC exactly (`tests/tlc/ViewSym-NoSym.cfg` and
-`ViewSym-SymOnly.cfg`).
-
-So when a cfg has both VIEW and SYMMETRY, `scripts/crosscheck.sh` compares only the verdict and prints
-`MATCH(verdict only; VIEW+SYMMETRY)`, unless the cfg has a line `\* crosscheck: exact` (for one where TLC was
-measured to keep no such duplicates; everything is compared then). To compare counts, run a cfg without SYMMETRY.
+With both, TLC fingerprints a state by first taking the smallest of its permutations and then the VIEW of that state
+(`TLCStateMut.fingerPrint`): it compares the permuted states value by value in its order of values, the variables in
+the order it prints them (see "The order of variables"). Two states with equal views can have smallest states whose
+views differ, and TLC keeps both. `fresh_fp` in the runtime does the same with `tlc_state_cmp` (generated by
+`Gen::gen_perms` from `Gen::tlc_cmp`), so counts and state graphs match TLC (`tests/tlc/ViewSym-Both`,
+`ViewSymSet-Both`; `ViewSymOrder` keeps 26 states where taking the smallest view would keep 10, and 10 when the
+variable left out of the view is printed after the other). Without a VIEW, the smallest packed state is taken: any
+representative of the orbit gives the same count.
 
 With VIEW (in particular together with CONSTRAINT) and several workers, the distinct count can vary slightly from run
 to run, for TLC as well as tla2rs, because which state becomes the representative depends on search order. With one

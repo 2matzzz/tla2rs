@@ -1,4 +1,4 @@
-key 13b9ebd23a436e1e8bd447af0e6cf0d986cbd18b326b01938dbd84268316be4e
+key 7ae6895a76aacca053b4f2a37836690eb17241e91f4908dec3e534bcd3912c0f
 tlc Version 2.19
 rc 12
 Invariant KlotskiGoal is violated

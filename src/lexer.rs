@@ -47,6 +47,8 @@ pub struct Token {
     pub first: bool,
     /// The column just after the token (tokens do not span lines)
     pub end: usize,
+    /// A number as written (`007`, `\b11`), which TLC prints for a function's body
+    pub raw: Option<String>,
 }
 
 const SYMS: &[&str] = &[
@@ -171,7 +173,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
             }
             continue;
         }
-        let (tl, tc, first) = (line, col, !line_has_tok);
+        let (tl, tc, first, start) = (line, col, !line_has_tok, i);
         let tok = if c == '-' && cs[i..].iter().take(4).all(|&x| x == '-') && cs.len() - i >= 4 {
             while i < cs.len() && cs[i] == '-' {
                 adv!();
@@ -266,7 +268,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                 for _ in 0..4 {
                     adv!();
                 }
-                out.push(Token { tok: Tok::Sym("-+->".into()), line: tl, col: tc, first, end: col });
+                out.push(Token { tok: Tok::Sym("-+->".into()), line: tl, col: tc, first, end: col, raw: None });
                 line_has_tok = true;
                 continue;
             }
@@ -277,7 +279,7 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
                     adv!();
                 }
                 let name = if rest == "(+)" { "\\oplus" } else { "\\ominus" };
-                out.push(Token { tok: Tok::Sym(name.into()), line: tl, col: tc, first, end: col });
+                out.push(Token { tok: Tok::Sym(name.into()), line: tl, col: tc, first, end: col, raw: None });
                 line_has_tok = true;
                 continue;
             }
@@ -297,13 +299,14 @@ fn lex_from(src: &str, module: bool) -> R<Vec<Token>> {
             depth -= 1;
         }
         let end = module && tok == Tok::Sym("====".into()) && depth <= 0;
-        out.push(Token { tok, line: tl, col: tc, first, end: col });
+        let raw = matches!(tok, Tok::Num(_)).then(|| cs[start..i].iter().collect());
+        out.push(Token { tok, line: tl, col: tc, first, end: col, raw });
         line_has_tok = true;
         if end {
             break;
         }
     }
-    out.push(Token { tok: Tok::Eof, line, col: 0, first: true, end: 0 });
+    out.push(Token { tok: Tok::Eof, line, col: 0, first: true, end: 0, raw: None });
     Ok(out)
 }
 

@@ -32,7 +32,7 @@ while [[ $# -gt 0 ]]; do
     *) extra+=("$1"); shift ;;
   esac
 done
-# A narrowing rule (`distinct-only`, `exact`, `ignore-exit`, `error-lines`) applies when the cfg has a line
+# A narrowing rule (`distinct-only`, `ignore-exit`, `error-lines`) applies when the cfg has a line
 # `\* crosscheck: <rule>`, or when CROSSCHECK_RULES names it (scripts/corpus.sh passes the rules of
 # tests/corpus.txt this way, since the corpus's cfgs are not edited)
 has_rule() {
@@ -206,18 +206,6 @@ if [[ $((grown + reordered)) -gt 0 ]]; then
   tail -n +"$((last + 1))" rs.out > rs.last && mv rs.last rs.out
 fi
 
-# With both VIEW and SYMMETRY, TLC may keep states with equal views as distinct (its choice of
-# representative depends on the state itself). tla2rs collapses by orbit of the view, so its
-# distinct count can be lower than TLC's. In that case compare only the verdict.
-verdict_only=0
-if grep -qE '^[[:space:]]*VIEW[[:space:]]' "$c" && grep -qE '^[[:space:]]*SYMMETRY[[:space:]]' "$c"; then
-  verdict_only=1
-fi
-# `\* crosscheck: exact` in such a cfg compares everything after all: TLC has been measured to keep
-# no two states with equal views there, so the counts and the state graph agree
-if has_rule exact; then
-  verdict_only=0
-fi
 # If the cfg says `\* crosscheck: distinct-only`, don't compare generated-state counts.
 # TLC counts successors per \/ branch, so in specs where both branches can hold it counts the
 # same successor more than once (distinct counts and verdicts still match).
@@ -270,9 +258,7 @@ if has_rule error-lines; then
   a=$(grep -v '^messages ' <<< "$a"); b=$(grep -v '^messages ' <<< "$b")
   graph_note="$graph_note; messages: error lines only"
 fi
-if [[ $verdict_only == 1 ]]; then
-  a=$(echo "$a" | head -1); b=$(echo "$b" | head -1)
-elif [[ $distinct_only == 1 ]]; then
+if [[ $distinct_only == 1 ]]; then
   a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
 fi
 # A liveness counterexample (lasso) is not compared with TLC's, which depends on TLC's random
@@ -314,9 +300,7 @@ rebuilt=""; [[ $grown -gt 0 ]] && rebuilt="; rebuilt $grown more times with more
 [[ $reordered -gt 0 ]] && rebuilt="$rebuilt; rebuilt $reordered more times for the order of strings made"
 printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build%s)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)" "$rebuilt"
 if [[ "$a" == "$b" ]]; then
-  if [[ $verdict_only == 1 ]]; then
-    echo "  MATCH(verdict only; VIEW+SYMMETRY): $(echo "$a" | tr '\n' ' ')"
-  elif [[ $distinct_only == 1 ]]; then
+  if [[ $distinct_only == 1 ]]; then
     echo "  MATCH(distinct only; TLC counts \\/-duplicates$graph_note): $(echo "$a" | tr '\n' ' ')"
   elif [[ -n $graph_note ]]; then
     echo "  MATCH(${graph_note#; }): $(echo "$a" | tr '\n' ' ')"

@@ -2,8 +2,8 @@
 //! (`-dumpgraph FILE`) to a form that depends on neither node ids nor the order of the file: the
 //! sorted set of state texts and the sorted set of edges between them.
 //!
-//! - A node's label is the state as TLC prints it. The variables are sorted: TLC lists them in the
-//!   order of a Java hash table of SANY's symbols, which says nothing about the state
+//! - A node's label is the state as TLC prints it, its variables in TLC's order, which a checker
+//!   follows (see `sany::var_order`)
 //! - Initial states (filled nodes) are marked
 //! - Edges are deduplicated (TLC writes one per successor generated, so a successor generated
 //!   twice is written twice), and the stuttering edges TLC adds for liveness checking (dashed) are
@@ -42,7 +42,7 @@ fn unescape(s: &str) -> String {
 }
 
 /// The canonical text of a state: its `/\ var = value` conjuncts (each with its continuation
-/// lines) sorted, on one line with "\" and newlines escaped
+/// lines) in the order printed, on one line with "\" and newlines escaped
 fn canon_state(label: &str) -> String {
     canon_state_text(&unescape(label))
 }
@@ -59,8 +59,7 @@ pub fn canon_state_text(text: &str) -> String {
             _ => parts.push(line.to_string()),
         }
     }
-    let mut parts: Vec<String> = parts.iter().map(|p| intervals(p)).collect();
-    parts.sort();
+    let parts: Vec<String> = parts.iter().map(|p| intervals(p)).collect();
     empty_seqs(&parts.join("\n")).replace('\\', "\\\\").replace('\n', "\\n")
 }
 

@@ -1,0 +1,10 @@
+key f3c84156ab5fe07e9fe6b92fb80ec46d57d5a156ea2ac5a43557ba332c97361a
+tlc Version 2.19
+rc 12
+Invariant Bound is violated
+4 states generated 4 distinct states found 0 states left on queue
+trace 4 3386a137daf53a9ec63c119b063193f66e27fb624d17ae19c070d810951dfceb
+states 4 be2ac1bc9cf959b5df63031f814cf1dbb71c8ce402e525aed1f2b6213e315e72
+edges 3 0a68167a16ffa9b0edf6c0b69762b0e4b38c417163a499978f0c81a3e53af414
+messages 2 d526d72d91f0ee97fc27a7041ad4f12110e5ee7405f28d8c0f4064c0ce878837
+errors 2 d526d72d91f0ee97fc27a7041ad4f12110e5ee7405f28d8c0f4064c0ce878837

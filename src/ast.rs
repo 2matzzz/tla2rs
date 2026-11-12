@@ -192,6 +192,13 @@ pub const AT: &str = "#at ";
 /// `#span ` followed by the position as SANY prints it, for SANY's report of a level error
 pub const SPAN: &str = "#span ";
 
+/// The name of the label the parser puts around a function constructor `[x \in S |-> e]`: `#fn `
+/// followed by how TLC prints the function when it cannot enumerate S (`FcnLambdaValue`): its
+/// bound variables with `\u{2}k\u{3}` where the k-th part of the domain goes (`*` for the whole
+/// domain), `\u{1}`, and its body, a number as written or the body's position. Read by
+/// `codegen::lazy_fun_string`
+pub const FN: &str = "#fn ";
+
 /// `e` wrapped in an AT label for the position `at`
 pub fn at_err(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{AT}{at}"), vec![], e.b())

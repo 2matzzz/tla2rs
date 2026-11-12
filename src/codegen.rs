@@ -58,6 +58,8 @@ pub struct Gen<'a> {
     pub atoms: &'a Atoms,
     pub ce: ConstEval<'a>,
     pub vars: Vec<(String, Ty)>,
+    /// The variables in the order TLC prints them in a state (see `sany::var_order`)
+    pub print_order: Vec<String>,
     tys: Vec<Ty>,
     ty_ids: HashMap<Ty, usize>,
     convs: BTreeSet<(usize, usize)>,
@@ -98,9 +100,15 @@ pub struct Gen<'a> {
     /// Function name -> its code (the latest version)
     rec_code: std::collections::BTreeMap<String, String>,
     /// Functions for recursive operators that assign variables, per key (`rec_action_fn`): the
-    /// name, the sets of variables assigned when it returns (bit masks over `vars`), and whether
-    /// these are settled
-    ract: HashMap<String, (String, BTreeSet<u64>, bool)>,
+    /// name, the sets of variables assigned when it returns (numbers of `assigned_sets`), and
+    /// whether these are settled
+    ract: HashMap<String, (String, BTreeSet<u32>, bool)>,
+    /// The sets of variables (indexes into `vars`) a function of `gen_rec_action` may have
+    /// assigned when it returns a state, numbered in the order found: the function returns each
+    /// state with the number of its set
+    assigned_sets: Vec<Vec<usize>>,
+    /// The recursive operators made for `\A x \in S : B` in actions (see `forall_rec`), by x and B
+    forall_recs: HashMap<String, usize>,
     ract_progress: Vec<String>,
     /// The position of each definition's body (from its POS label), for a recursive operator
     /// unrolled while splitting the next-state relation
@@ -124,6 +132,7 @@ fn rid(n: &str) -> String {
 impl<'a> Gen<'a> {
     pub fn new(atoms: &'a Atoms, constants: &'a HashMap<String, Value>) -> Self {
         Gen {
+            print_order: vec![],
             case_at: None,
             zero_defs: HashSet::new(),
             unroll: 0,
@@ -151,6 +160,8 @@ impl<'a> Gen<'a> {
             rec_names: HashMap::new(),
             rec_code: std::collections::BTreeMap::new(),
             ract: HashMap::new(),
+            assigned_sets: vec![],
+            forall_recs: HashMap::new(),
             ract_progress: vec![],
             def_pos: HashMap::new(),
             inst_prefixes: vec![],
@@ -254,6 +265,55 @@ impl<'a> Gen<'a> {
         match t {
             Ty::Enum(d) | Ty::IntAtom(_, _, d) => d.iter().any(|&a| !self.atoms.is_model(a)),
             _ => false,
+        }
+    }
+
+    /// Whether t has a set that may hold both strings and integers, which tla2rs cannot represent
+    fn mixed_set(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Set(e) if matches!(e.as_ref(), Ty::IntAtom(..)) && self.has_str(e) => true,
+            Ty::Set(e) | Ty::Seq(e) | Ty::Opt(e) | Ty::Bag(e) | Ty::Fun(_, e) | Ty::PFun(_, e) => self.mixed_set(e),
+            Ty::Rec(fs) => fs.iter().any(|(_, t)| self.mixed_set(t)),
+            _ => false,
+        }
+    }
+
+    /// `a = b` as TLC evaluates it (`a.equals(b)`) where a and b hold strings and integers in
+    /// places where the other holds the other kind (`{x} = {5}` with x a string; measured on TLC
+    /// 2.19, `tests/tlc/StrIntSet*`). Sets of different sizes are unequal; otherwise TLC compares
+    /// their elements in its order, pair by pair, and stops at the first pair that is unequal. A
+    /// model value is unequal to anything but itself, and a string compared with an integer stops
+    /// TLC with an error worded by the value on the left. Tuples compare element by element
+    fn str_int_eq(&mut self, ac: &str, at: &Ty, bc: &str, bt: &Ty) -> R<String> {
+        let leaf = |t: &Ty| matches!(t, Ty::Enum(_) | Ty::IntAtom(..) | Ty::Int(..));
+        match (at, bt) {
+            (Ty::Set(ea), Ty::Set(eb)) => {
+                let (x, y, p, q) = (self.fresh("x"), self.fresh("y"), self.fresh("p"), self.fresh("q"));
+                let (nx, ny) = (self.s_card(&x, at), self.s_card(&y, bt));
+                let (ix, iy) = (self.s_iter(&x, at)?, self.s_iter(&y, bt)?);
+                let inner = self.str_int_eq(&p, ea, &q, eb)?;
+                Ok(format!("{{ let ({x}, {y}) = ({ac}, {bc}); {nx} == {ny} && {{ let __all = {ix}.zip({iy}).all(|({p}, {q})| {inner}); __all }} }}"))
+            }
+            (Ty::Rec(fa), Ty::Rec(fb)) if tuple_elems(at).is_some() && tuple_elems(bt).is_some() => {
+                if fa.len() != fb.len() {
+                    return Ok(format!("{{ let _ = {ac}; let _ = {bc}; false }}"));
+                }
+                let (x, y) = (self.fresh("x"), self.fresh("y"));
+                let mut parts = vec![];
+                for (i, ((_, ta), (_, tb))) in fa.iter().zip(fb).enumerate() {
+                    let f = rec_field(fa.len(), i);
+                    parts.push(self.str_int_eq(&format!("{x}{f}"), ta, &format!("{y}{f}"), tb)?);
+                }
+                Ok(format!("{{ let ({x}, {y}) = ({ac}, {bc}); {} }}", parts.join(" && ")))
+            }
+            (a, b) if leaf(a) && leaf(b) => {
+                let as_i64 = |c: &str, t: &Ty| match t {
+                    Ty::Enum(_) => format!("(i64::MIN + ({c}) as i64)"),
+                    _ => format!("(({c}) as i64)"),
+                };
+                Ok(format!("str_int_eq({}, {})", as_i64(ac, a), as_i64(bc, b)))
+            }
+            _ => Err("comparing values that hold strings where the other holds integers is supported only for sets and tuples".into()),
         }
     }
 
@@ -1322,6 +1382,35 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// How TLC prints a function over a set it cannot enumerate (see `lazy_fun_string`), when f is
+    /// one whose domain TLC prints as tla2rs can: Nat, Int, STRING, `Seq(S)` and products of
+    /// those and of finite sets, the finite ones printed as their values
+    fn lazy_fun_shown(&mut self, f: &Expr, env: &Env) -> Option<String> {
+        let d = self.lazy_fun_domain(f, env)?;
+        if self.try_const(d, env).is_some() {
+            return None;
+        }
+        lazy_fun_string(f, &mut |p| self.lazy_set_shown(p, env))
+    }
+
+    /// A domain part of a function over a set TLC cannot enumerate, as TLC prints its value
+    fn lazy_set_shown(&mut self, s: &Expr, env: &Env) -> Option<String> {
+        match s.strip() {
+            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && self.lazy_domain(s, env) => Some(n.clone()),
+            Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Some(format!("Seq({})", self.lazy_set_shown(&a[0], env)?)),
+            Expr::Call(f, parts) if f == "\\X" => {
+                let ps: Vec<String> = parts.iter().map(|p| self.lazy_set_shown(p, env)).collect::<Option<_>>()?;
+                Some(format!("({})", ps.join(" \\X ")))
+            }
+            // TLC prints an interval as written
+            Expr::Bin(BOp::Range, a, b) => match (self.try_const(a, env)?, self.try_const(b, env)?) {
+                (Value::Int(a), Value::Int(b)) => Some(format!("{a}..{b}")),
+                _ => None,
+            },
+            s => Some(crate::compile::show_value(self.atoms, &self.try_const(s, env)?)),
+        }
+    }
+
     /// The domain of `f` when it is a function evaluated only where it is applied (see
     /// `lazy_domain`), possibly with EXCEPT
     fn lazy_fun_domain<'e>(&self, f: &'e Expr, env: &Env) -> Option<&'e Expr> {
@@ -1423,6 +1512,13 @@ impl<'a> Gen<'a> {
     fn tlc_cmp(&mut self, t: &Ty, a: &str, b: &str) -> R<String> {
         Ok(match t {
             Ty::Set(_) if !is_sparse(t) => format!("tlc_set_cmp(*{a}, *{b})"),
+            // A sorted array whose elements Rust orders otherwise than TLC: by size, then the
+            // elements in TLC's order
+            Ty::Set(e) if needs_tlc_order(e) => {
+                let (ix, iy) = (self.s_iter(&format!("(*{a})"), t)?, self.s_iter(&format!("(*{b})"), t)?);
+                let inner = self.tlc_cmp(e, "__fa", "__fb")?;
+                format!("{a}.len.cmp(&{b}.len).then_with(|| {ix}.zip({iy}).map(|(__fa, __fb)| {{ let (__fa, __fb) = (&__fa, &__fb); {inner} }}).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal))")
+            }
             // A sparse function or bag: its pairs sort by key, so the Rust order of the set of pairs
             // is TLC's (by the size of the domain, then key and value pair by pair) when it is so
             // for keys and values
@@ -2215,6 +2311,15 @@ impl<'a> Gen<'a> {
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
+                (FORALL_NTH, [s, k]) => {
+                    let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                    let kc = self.gen_as(k, env, &Ty::Int(1, BIG))?;
+                    let val = match ix {
+                        Some(_) => format!("dec_{}(__e)", self.ty_id(&et)?),
+                        None => "__e".into(),
+                    };
+                    (format!("{{ let __e = {it}.nth(({kc} - 1) as usize).unwrap(); {val} }}"), et)
+                }
                 // An unbounded quantifier or CHOOSE: TLC stops when it evaluates one
                 (f, []) if crate::parser::unbounded_error(f).is_some() => {
                     let t = want.cloned().unwrap_or(if f.contains("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
@@ -2226,6 +2331,13 @@ impl<'a> Gen<'a> {
                 // ToString of a value from the state: the string of every value of its type is
                 // interned now. A Boolean, integer, string, model value or tuple of them indexes a
                 // table by its encoding; other values print at run time and look their string up.
+                // ToString of a function over a set TLC cannot enumerate: its text, the same each time
+                ("ToString", [x]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    let id = self.atoms.intern(false, &s);
+                    let code = self.lit(&Value::Atom(id), &Ty::Enum(vec![id]))?;
+                    return Ok((self.note_made(code, &[id]), Ty::Enum(vec![id])));
+                }
                 ("ToString", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     fn scalar_or_tuple(t: &Ty) -> bool {
@@ -2364,6 +2476,16 @@ impl<'a> Gen<'a> {
                         ),
                         st,
                     )
+                }
+                ("PrintT", [x]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    (format!("{{ tlc_print(ppr({s:?})); true }}"), Ty::Bool)
+                }
+                ("Print", [x, v]) if self.lazy_fun_shown(x, env).is_some() => {
+                    let s = self.lazy_fun_shown(x, env).unwrap();
+                    let (vc, vt) = self.gen(v, env, want)?;
+                    let vid = self.ty_id(&vt)?;
+                    (format!("{{ let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr({s:?}), ppr(&fmt_{vid}(&__v)))); __v }}"), vt)
                 }
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
@@ -3497,6 +3619,15 @@ impl<'a> Gen<'a> {
                     }
                 }
                 let t = join(&at, &bt)?;
+                // Sets of strings compared with sets of integers, which tla2rs cannot hold as one
+                // type: compared as TLC compares them, without joining the types
+                if self.mixed_set(&t) && !self.mixed_set(&at) && !self.mixed_set(&bt) {
+                    let mut c = self.str_int_eq(&ac, &at, &bc, &bt)?;
+                    if self.built(a, env) {
+                        c = format!("{{ let __fp = FpSource::enter(); {c} }}");
+                    }
+                    return Ok((if op == Eq { c } else { format!("!{c}") }, Ty::Bool));
+                }
                 let ac = self.coerce(ac, &at, &t)?;
                 let bc = self.coerce(bc, &bt, &t)?;
                 if matches!(t, Ty::IntAtom(..)) && self.has_str(&t) && self.str_meets_int(&at, &bt) {
@@ -3799,6 +3930,61 @@ impl<'a> Gen<'a> {
         Ok(self.note_folded(code, &made))
     }
 
+    /// Whether TLC holds the value of e as a set of its elements (a set written out, a set from the
+    /// state or a definition, `{f(y) : y \in S}`, or a union of such sets), which it unites with
+    /// another set into a new set without sorting it (`SetEnumValue.cup`)
+    fn enum_like(e: &Expr) -> bool {
+        match e.strip() {
+            Expr::SetLit(_) | Expr::Ident(_) | Expr::SetMap(..) => true,
+            Expr::Bin(BOp::Cup, a, b) => Self::enum_like(a) || Self::enum_like(b),
+            _ => false,
+        }
+    }
+
+    /// `x \in S` where x is a string and S holds tuples, or the other way round, and TLC builds S
+    /// where it is used without sorting it, so that it asks each element whether it equals x (see
+    /// `tuple_str_eq`): `{f(y) : y \in S}`, and `A \cup B` with A held as a set of its elements
+    /// (`enum_like`). Measured on TLC 2.19 (`tests/tlc/TupleStrCup`): TLC unites A with B by
+    /// copying A's elements and adding B's, unsorted, so `s \in TS \cup {}` asks each tuple of TS
+    /// while `s \in TS` searches the sorted TS and fails; when A is empty the union is B itself.
+    /// None for any other membership
+    fn member_unsorted(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<Option<String>> {
+        let s = s.strip();
+        let (a, b) = match s {
+            Expr::Bin(BOp::Cup, a, b) if Self::enum_like(a) => (a.as_ref(), Some(b.as_ref())),
+            Expr::SetMap(..) => (s, None),
+            _ => return Ok(None),
+        };
+        let tupleish = |t: &Ty| tuple_elems(t).is_some() || matches!(t, Ty::Seq(_));
+        let Ok((_, st)) = self.gen(s, env, None) else { return Ok(None) };
+        let Ty::Set(et) = &st else { return Ok(None) };
+        if !((tupleish(et) && self.has_str(xt)) || (self.has_str(et) && tupleish(xt))) {
+            return Ok(None);
+        }
+        let et = et.as_ref().clone();
+        let e = self.fresh("e");
+        let Some(eq) = self.tuple_str_eq(&e, &et, x, xt, env)? else { return Ok(None) };
+        let Some(b) = b else {
+            let (sc, t) = self.gen(s, env, Some(&st))?;
+            let sc = self.coerce(sc, &t, &st)?;
+            let it = self.s_iter("__set", &st)?;
+            return Ok(Some(format!("{{ let __set = {sc}; let __any = {it}.any(|{e}| {eq}); __any }}")));
+        };
+        if matches!(a.strip(), Expr::SetLit(xs) if xs.is_empty()) {
+            return self.gen_member_of(x, xt, b, env).map(Some);
+        }
+        let (ac, at) = self.gen(a, env, Some(&st))?;
+        let ac = self.coerce(ac, &at, &st)?;
+        let (bc, bt) = self.gen(b, env, Some(&st))?;
+        let bc = self.coerce(bc, &bt, &st)?;
+        let in_b = self.gen_member_of(x, xt, b, env)?;
+        let n = self.s_card("__a", &st);
+        let (ia, ib) = (self.s_iter("__a", &st)?, self.s_iter("__b", &st)?);
+        Ok(Some(format!(
+            "{{ let __a = {ac}; let __b = {bc}; if {n} == 0 {{ {in_b} }} else {{ let __any = {ia}.chain({ib}).any(|{e}| {eq}); __any }} }}"
+        )))
+    }
+
     fn gen_member_of(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
         // A set written out where it is used, holding tuples and x a string or the other way
@@ -3826,6 +4012,9 @@ impl<'a> Gen<'a> {
             if special {
                 return Ok(format!("({})", parts.join(" || ")));
             }
+        }
+        if let Some(code) = self.member_unsorted(x, xt, s, env)? {
+            return Ok(code);
         }
         // Whether TLC builds the set here as written, or has it sorted (see the clash below)
         let written = self.built(s, env);
@@ -4341,9 +4530,6 @@ impl<'a> Gen<'a> {
             RecCall(i, args) if open && self.rec_assigns(*i, env) => {
                 let vals: Option<Vec<Value>> = args.iter().map(|a| self.try_const(a, env)).collect();
                 let Some(vals) = vals else {
-                    if env.init {
-                        return Err(format!("unsupported action form (a recursive operator whose arguments are not constant, in Init): {}", short(h)));
-                    }
                     return self.gen_rec_action(*i, args, rest, env, out);
                 };
                 if self.unroll >= 2000 {
@@ -4372,7 +4558,7 @@ impl<'a> Gen<'a> {
             }
             // The elements of `\A x \in S : B` (S from the state) from the i-th on (gen_forall)
             Call(f, a) if f == FORALL_REST => {
-                let [Ident(key), Ident(x), b, Num(i)] = a.as_slice() else { unreachable!() };
+                let [Ident(key), Ident(x), b, Num(i), set] = a.as_slice() else { unreachable!() };
                 let (els, et) = env.locals[key].clone();
                 if self.only_reads_assigned(b, env) {
                     // Nothing left to assign: B holds for each remaining element
@@ -4393,12 +4579,13 @@ impl<'a> Gen<'a> {
                     Some(n) if *i as u64 >= n => return self.gen_action(rest, env, out),
                     _ if *i == 0 => {}
                     Some(n) if n <= 16 => {}
-                    _ => {
-                        return Err(format!(
-                            "unsupported action form (\\A over a set from the state whose body assigns a variable for some elements only): {}",
-                            short(b)
-                        ))
+                    // A set that can hold more: the remaining elements are walked at run time
+                    _ if self.infer.is_none() => {
+                        let id = self.forall_rec(x, b);
+                        let call = RecCall(id, vec![set.clone(), Num(i + 1)]);
+                        return self.gen_action(&with(vec![call]), env, out);
                     }
+                    _ => return self.gen_action(rest, env, out),
                 }
                 writeln!(out, "if {els}.len() <= {i} {{").unwrap();
                 let env0 = self.renew_work(env, out);
@@ -4408,7 +4595,7 @@ impl<'a> Gen<'a> {
                 let e = self.fresh("e");
                 writeln!(out, "let {e} = {els}[{i}];").unwrap();
                 env2.bind(x, e, et);
-                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1)]);
+                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1), set.clone()]);
                 self.gen_action(&with(vec![b.clone(), next]), &env2, out)?;
                 out.push_str("}\n");
                 return Ok(());
@@ -4674,7 +4861,7 @@ impl<'a> Gen<'a> {
         let mut env2 = env.clone();
         let key = self.fresh("#els");
         env2.bind(&key, els, et);
-        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0)]);
+        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0), s.clone()]);
         let work: Vec<Expr> = std::iter::once(first).chain(rest.iter().cloned()).collect();
         self.gen_action(&work, &env2, out)
     }
@@ -4704,9 +4891,6 @@ impl<'a> Gen<'a> {
             self.unroll -= 1;
             return r;
         }
-        if self.vars.len() > 64 {
-            return Err(format!("recursive operator `{}` assigns variables of a spec with more than 64 variables", rd.name));
-        }
         let mut codes = vec![];
         let mut tys = vec![];
         for a in args {
@@ -4722,20 +4906,23 @@ impl<'a> Gen<'a> {
             codes.push(c);
             tys.push(t);
         }
-        let mask_in = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
-        let (name, masks) = self.rec_action_fn(i, &rd, &free, &tys, mask_in)?;
-        let w0 = env.work.clone().unwrap_or("*s".into());
+        let mask_in = self.assigned_id(env);
+        let (name, masks) = self.rec_action_fn(i, &rd, &free, &tys, mask_in, env.init)?;
+        // In Init the state under construction holds what is assigned so far, which is all the
+        // function reads of the variables
+        let mut env1 = env.clone();
+        let w0 = if env.init { self.work_var(&mut env1, out) } else { env.work.clone().unwrap_or("*s".into()) };
+        let s0 = if env.init { format!("&{w0}") } else { "s".into() };
         let (w, m) = (self.fresh("w"), self.fresh("m"));
-        writeln!(out, "for (mut {w}, {m}) in {name}(s, {w0}, {}) {{ match {m} {{", codes.join(", ")).unwrap();
+        writeln!(out, "for (mut {w}, {m}) in {name}({s0}, {w0}, {}) {{ match {m} {{", codes.join(", ")).unwrap();
         for mask in masks {
-            writeln!(out, "{mask}u64 => {{").unwrap();
+            writeln!(out, "{mask}u32 => {{").unwrap();
             let mut env2 = env.clone();
             env2.work = Some(w.clone());
             env2.primed = HashMap::new();
-            for (k, (v, t)) in self.vars.iter().enumerate() {
-                if mask >> k & 1 == 1 {
-                    env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t.clone()));
-                }
+            for &k in &self.assigned_sets[mask as usize] {
+                let (v, t) = self.vars[k].clone();
+                env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t));
             }
             self.gen_action(rest, &env2, out)?;
             out.push_str("}\n");
@@ -4749,8 +4936,44 @@ impl<'a> Gen<'a> {
     /// variables in `mask_in` assigned: its name and the sets of variables assigned when it
     /// returns. A call of itself inside uses the sets found so far, so the body is generated again
     /// until they settle.
-    fn rec_action_fn(&mut self, i: usize, rd: &crate::expand::RecDef, free: &[String], tys: &[Ty], mask_in: u64) -> R<(String, BTreeSet<u64>)> {
-        let key = format!("{i}|{tys:?}|{mask_in}");
+    /// A recursive operator for the elements of `\A x \in S : B` from the k-th on (in the order
+    /// the quantifier takes them), called as `F(S, k)`: IF k > Cardinality(S) THEN TRUE ELSE B with
+    /// x the k-th element /\ F(S, k + 1). An action calling it with arguments from the state is a
+    /// function that returns the states B builds (`gen_rec_action`), so the size of the generated
+    /// code does not grow with the number of elements
+    fn forall_rec(&mut self, x: &str, b: &Expr) -> usize {
+        use Expr::*;
+        let key = format!("{x}|{b:?}");
+        if let Some(&id) = self.forall_recs.get(&key) {
+            return id;
+        }
+        let n = self.forall_recs.len();
+        let (sp, kp) = (format!("#forall_s{n}"), format!("#forall_k{n}"));
+        let rd = |body| crate::expand::RecDef { name: "\\A".into(), params: vec![sp.clone(), kp.clone()], body };
+        let id = crate::expand::add_rec_def(rd(Bool(true)));
+        let elem = Call(FORALL_NTH.into(), vec![Ident(sp.clone()), Ident(kp.clone())]);
+        let next = RecCall(id, vec![Ident(sp.clone()), Bin(BOp::Add, Ident(kp.clone()).b(), Num(1).b())]);
+        let more = And(vec![replace_expr(b, &Ident(x.to_string()), &elem), next]);
+        let done = Bin(BOp::Gt, Ident(kp.clone()).b(), Call("Cardinality".into(), vec![Ident(sp.clone())]).b());
+        crate::expand::set_rec_def(id, rd(If(done.b(), Bool(true).b(), more.b())));
+        self.forall_recs.insert(key, id);
+        id
+    }
+
+    /// The number of the set of variables `env` has assigned (see `assigned_sets`)
+    fn assigned_id(&mut self, env: &Env) -> u32 {
+        let set: Vec<usize> = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).map(|(k, _)| k).collect();
+        match self.assigned_sets.iter().position(|m| *m == set) {
+            Some(i) => i as u32,
+            None => {
+                self.assigned_sets.push(set);
+                (self.assigned_sets.len() - 1) as u32
+            }
+        }
+    }
+
+    fn rec_action_fn(&mut self, i: usize, rd: &crate::expand::RecDef, free: &[String], tys: &[Ty], mask_in: u32, init: bool) -> R<(String, BTreeSet<u32>)> {
+        let key = format!("{i}|{tys:?}|{mask_in}|{init}");
         if let Some((n, ms, done)) = self.ract.get(&key) {
             if *done || self.ract_progress.contains(&key) {
                 return Ok((n.clone(), ms.clone()));
@@ -4770,11 +4993,11 @@ impl<'a> Gen<'a> {
             env.locals.insert(x.to_string(), (format!("a{k}"), t.clone()));
             write!(sig, "a{k}: {}, ", t.repr()).unwrap();
         }
-        for (k, (v, t)) in self.vars.iter().enumerate() {
-            if mask_in >> k & 1 == 1 {
-                env.primed.insert(v.clone(), (format!("__w.v_{v}"), t.clone()));
-            }
+        for &k in &self.assigned_sets[mask_in as usize] {
+            let (v, t) = &self.vars[k];
+            env.primed.insert(v.clone(), (format!("__w.v_{v}"), t.clone()));
         }
+        env.init = init;
         env.work = Some("__w".into());
         env.sink = Some(key.clone());
         loop {
@@ -4785,7 +5008,7 @@ impl<'a> Gen<'a> {
             self.ract_progress.pop();
             r?;
             let f = format!(
-                "#[allow(unused_mut, unused_variables)]\nfn {name}({sig}) -> Vec<(State, u64)> {{ rec_enter({:?}); let mut __res: Vec<(State, u64)> = Vec::new(); {{ {body} }} rec_leave(); __res }}\n",
+                "#[allow(unused_mut, unused_variables)]\nfn {name}({sig}) -> Vec<(State, u32)> {{ rec_enter({:?}); let mut __res: Vec<(State, u32)> = Vec::new(); {{ {body} }} rec_leave(); __res }}\n",
                 rd.name
             );
             self.rec_code.insert(name.clone(), f);
@@ -5063,17 +5286,18 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_state(&mut self, env: &Env, out: &mut String) -> R<()> {
-        if let Some(key) = &env.sink {
-            let mask = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
-            self.ract.get_mut(key).unwrap().1.insert(mask);
-            writeln!(out, "__res.push(({}, {mask}u64));", env.work.as_ref().unwrap()).unwrap();
+        if let Some(key) = env.sink.clone() {
+            let mask = self.assigned_id(env);
+            self.ract.get_mut(&key).unwrap().1.insert(mask);
+            writeln!(out, "__res.push(({}, {mask}u32));", env.work.as_ref().unwrap()).unwrap();
             return Ok(());
         }
         let mut unassigned: Vec<&str> =
             self.vars.iter().map(|(v, _)| v.as_str()).filter(|v| !env.partial && !env.primed.contains_key(*v)).collect();
         if !unassigned.is_empty() {
             // Fail only if this branch is reached. TLC shows the state with those variables as
-            // null, and names them in the order of their names
+            // null, and names them in the order of their names (not the order it prints them in:
+            // tests/tlc/VarOrder-Partial)
             let st = match &env.work {
                 Some(w) => w.clone(),
                 None => {
@@ -5664,106 +5888,6 @@ impl<'a> Gen<'a> {
         })
     }
 
-    /// Same layout as `pack_value`, but writes perm(c) (`pm`, inverse `pi`) without building the
-    /// permuted value. A function's entry j is read from the argument that `pm` maps to j, and a
-    /// sparse set's elements are written in the order of their permuted values.
-    fn pack_perm(&mut self, c: &str, t: &Ty, out: &mut String, at: &mut Option<u32>) -> R<u32> {
-        if is_sparse_fun(t) {
-            return self.pack_perm(c, &fun_pairs(t), out, at);
-        }
-        if let Ty::Bag(e) = t {
-            return self.pack_perm(c, &bag_fun(e), out, at);
-        }
-        if let Ty::PFun(d, cd) = t {
-            return self.pack_perm(c, &pfun_repr(d, cd), out, at);
-        }
-        let inv_key = |d: &Ty, k: &str| match d {
-            Ty::Enum(_) => Some(format!("pi[({k}) as usize]")),
-            Ty::Bool | Ty::Int(..) => Some(k.to_string()),
-            _ => None,
-        };
-        match t {
-            _ if t.size().is_some() => {
-                let pc = self.perm_code(c, t)?;
-                self.pack_value(&format!("({pc})"), t, out, at)
-            }
-            Ty::Rec(fs) => {
-                let mut total = 0;
-                for (i, (_, ft)) in fs.iter().enumerate() {
-                    total += self.pack_perm(&format!("{c}{}", rec_field(fs.len(), i)), ft, out, at)?;
-                }
-                Ok(total)
-            }
-            Ty::Opt(inner) => {
-                match at {
-                    Some(o) => {
-                        out.push_str(&Self::put_at(&format!("({c}).0 as u128"), 1, *o));
-                        *o += 1;
-                    }
-                    None => write!(out, "put(&mut w, &mut p, ({c}).0 as u128, 1); ").unwrap(),
-                }
-                Ok(1 + self.pack_perm(&format!("({c}).1"), inner, out, at)?)
-            }
-            Ty::Set(e) if is_sparse(t) => {
-                let cap = crate::types::set_cap(t, self.scap);
-                let lb = Self::bits_for(cap as u64 + 1);
-                let (n, ord, a, b, k) = (self.fresh("n"), self.fresh("ord"), self.fresh("a"), self.fresh("b"), self.fresh("k"));
-                let lhs = self.perm_code(&format!("({c}).items[{ord}[{b} - 1] as usize]"), e)?;
-                let rhs = self.perm_code(&format!("({c}).items[{ord}[{b}] as usize]"), e)?;
-                // Sorting is the costly part, so give up first if the words written so far
-                // already exceed the best key
-                match at {
-                    Some(o) => write!(out, "if prune(&w, __best, {}, &mut __cw) {{ return Some(None); }} let mut p = {o}u32; ", *o / 64).unwrap(),
-                    None => out.push_str("if prune(&w, __best, (p / 64) as usize, &mut __cw) { return Some(None); } "),
-                }
-                *at = None;
-                write!(
-                    out,
-                    "let {n} = ({c}).len as usize; let mut {ord} = [0u16; {}]; for {k} in 0..{n} {{ {ord}[{k}] = {k} as u16; }} \
-                     for {a} in 1..{n} {{ let mut {b} = {a}; while {b} > 0 && {lhs} > {rhs} {{ {ord}.swap({b} - 1, {b}); {b} -= 1; }} }} \
-                     put(&mut w, &mut p, {n} as u128, {lb}); for {k} in 0..{n} {{ ",
-                    cap
-                )
-                .unwrap();
-                let eb = self.pack_perm(&format!("({c}).items[{ord}[{k}] as usize]"), e, out, &mut None)?;
-                out.push_str("} ");
-                Ok(lb + eb * cap as u32)
-            }
-            Ty::Fun(d, cod) if inv_key(d, "").is_some() => {
-                let n = d.size().unwrap();
-                let did = self.ty_id(d)?;
-                if at.is_some() {
-                    let mut total = 0;
-                    for k in 0..n {
-                        let src = inv_key(d, &format!("dec_{did}({k}u64)")).unwrap();
-                        let words = at.map(|o| o / 64);
-                        total += self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, at)?;
-                        // The permutation decides which entry lands here, so a key often loses
-                        // to the best one within the first entries
-                        if let (Some(before), Some(o)) = (words, *at) {
-                            if o / 64 > before {
-                                write!(out, "if prune(&w, __best, {}, &mut __cw) {{ return Some(None); }} ", o / 64).unwrap();
-                            }
-                        }
-                    }
-                    return Ok(total);
-                }
-                let k = self.fresh("k");
-                let src = inv_key(d, &format!("dec_{did}({k} as u64)")).unwrap();
-                write!(out, "for {k} in 0..{n} {{ ").unwrap();
-                let b = self.pack_perm(&format!("{c}[idx_{did}({src})]"), cod, out, &mut None)?;
-                out.push_str("} ");
-                Ok(b * n as u32)
-            }
-            _ => {
-                let pv = self.fresh("pv");
-                let pc = self.perm_code(c, t)?;
-                write!(out, "let {pv} = {pc}; ").unwrap();
-                self.pack_value(&pv, t, out, at)
-            }
-        }
-    }
-
     fn unpack_value(&mut self, t: &Ty, at: &mut Option<u32>) -> R<String> {
         if is_sparse_fun(t) {
             return self.unpack_value(&fun_pairs(t), at);
@@ -5892,14 +6016,9 @@ impl<'a> Gen<'a> {
 
     /// Function that packs the deduplication key (the VIEW value if there is one, otherwise the
     /// state) into a bit string
-    /// state) into a bit string. With `equiv` (see `view_is_equivariant`), also emits `view_perm`,
-    /// which permutes an already computed view value.
-    pub fn gen_key(&mut self, view: Option<&Expr>, equiv: bool) -> R<String> {
+    pub fn gen_key(&mut self, view: Option<&Expr>) -> R<String> {
         let Some(view) = view else {
-            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\n\
-                       const VIEW_EQUIV: bool = false;\ntype View = ();\nfn view_val(_: &State) -> View {}\n\
-                       fn view_perm_pack(_: &View, _: &[u16], _: &[u16], _: Option<&Key>) -> Option<Option<Key>> { unreachable!() }\nfn view_pack_v(_: &View) -> Option<Key> { unreachable!() }\n"
-                .into());
+            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\n".into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
         let mut body = String::new();
@@ -5907,19 +6026,9 @@ impl<'a> Gen<'a> {
         let bits = self.pack_value("(*__v)", &vt, &mut body, &mut at)?;
         let vp = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let words = bits.div_ceil(64).max(1);
-        let mut pbody = String::new();
-        let mut pat = Some(0u32);
-        if equiv {
-            self.pack_perm("(*__v)", &vt, &mut pbody, &mut pat)?;
-        }
-        let pvp = if pat.is_some() { "" } else { "let mut p = 0u32; " };
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
-             const VIEW_EQUIV: bool = {equiv};\ntype View = {};\n\
-             fn view_val(s: &State) -> View {{ {vc} }}\n\
-             fn view_pack_v(__v: &View) -> Option<Key> {{ let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn view_perm_pack(__v: &View, pm: &[u16], pi: &[u16], __best: Option<&Key>) -> Option<Option<Key>> {{ let mut w: Key = [0; VWORDS]; let mut __cw = 0usize; {pvp}{pbody}Some(Some(w)) }}\n\
-             fn key_of(s: &State) -> Option<Key> {{ view_pack_v(&view_val(s)) }}\n",
+             fn key_of(s: &State) -> Option<Key> {{ let __v: &{} = &{{ {vc} }}; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n",
             vt.repr()
         ))
     }
@@ -6002,6 +6111,15 @@ impl<'a> Gen<'a> {
             fields.push(format!("v_{v}: {}", self.perm_code(&format!("s.v_{v}"), &t)?));
         }
         writeln!(s, "fn perm_state(s: &State, pm: &[u16]) -> State {{ State {{ {} }} }}", fields.join(", ")).unwrap();
+        // TLC's order of states: the variables in the order it prints them, each in its order of
+        // values (with a VIEW, the smallest permuted state is the one whose view is taken)
+        let mut cmp = String::from("std::cmp::Ordering::Equal");
+        for v in self.print_order.clone().iter().rev() {
+            let t = self.vars.iter().find(|(n, _)| n == v).map(|(_, t)| t.clone()).ok_or("a variable without a type")?;
+            let c = self.tlc_cmp(&t, &format!("(&a.v_{v})"), &format!("(&b.v_{v})"))?;
+            cmp = format!("{c}.then_with(|| {cmp})");
+        }
+        writeln!(s, "fn tlc_state_cmp(a: &State, b: &State) -> std::cmp::Ordering {{ {cmp} }}").unwrap();
         Ok(s)
     }
 
@@ -6013,7 +6131,11 @@ impl<'a> Gen<'a> {
              // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\
              fn mixed_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
              if ai != bi {{ let at = if ai {{ b }} else {{ a }}; let n = if ai {{ a }} else {{ b }}; if IS_STR[(at - i64::MIN) as usize] {{ \
-             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
+             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n\
+             // The same, worded by the value on the left (`Gen::str_int_eq`)\n\
+             fn str_int_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
+             if ai && !bi && IS_STR[(b - i64::MIN) as usize] {{ eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", a, ATOMS[(b - i64::MIN) as usize])) }} \
+             if bi && !ai && IS_STR[(a - i64::MIN) as usize] {{ eval_error(format!(\"Attempted to check equality of string {{}} with non-string:\\n{{}}\", ATOMS[(a - i64::MIN) as usize], b)) }} a == b }}\n",
             names.len(),
             names.join(", "),
             strs.len(),
@@ -6133,6 +6255,43 @@ fn pfun_parts(t: &Ty) -> Option<(Ty, Ty)> {
     }
 }
 
+/// How TLC prints function `f` (possibly after EXCEPT, which changes nothing in it) when it cannot
+/// enumerate its domain: `[x \in Nat |-> <expression line 5, col 26 to line 5, col 30 of module
+/// M>]`, with the bound variables as SANY groups them (only the first name of `a, c \in S`), each
+/// group's domain as TLC prints its value (`part`, None when it is not supported), and the body's
+/// position, or a number as written. Measured on TLC 2.19 (`tests/tlc/LazyFunText*`). None when f
+/// is not a function constructor
+pub fn lazy_fun_string(f: &Expr, part: &mut dyn FnMut(&Expr) -> Option<String>) -> Option<String> {
+    let mut e = f;
+    let (shape, inner) = loop {
+        match e {
+            Expr::Label(n, _, b) => match n.strip_prefix(crate::ast::FN) {
+                Some(shape) => break (shape, b.as_ref()),
+                None => e = b,
+            },
+            Expr::Except(b, _) => e = b,
+            _ => return None,
+        }
+    };
+    let Expr::FunCons(_, dom, _) = inner.strip() else { return None };
+    let (bounds, body) = shape.split_once('\u{1}')?;
+    let mut out = String::new();
+    let mut rest = bounds;
+    while let Some((pre, after)) = rest.split_once('\u{2}') {
+        let (k, after) = after.split_once('\u{3}')?;
+        out += pre;
+        let d = match (k, dom.strip()) {
+            ("*", _) => dom.as_ref(),
+            (k, Expr::Call(x, parts)) if x == "\\X" => parts.get(k.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+        out += &part(d)?;
+        rest = after;
+    }
+    out += rest;
+    Some(format!("[{out} |-> <expression {body}>]"))
+}
+
 /// `[x \in S |-> ...]` for messages, with the bound variable's name as written
 fn lazy_fun_text(x: &str, s: &Expr) -> String {
     let x = x.split("__").next().unwrap_or(x);
@@ -6167,7 +6326,7 @@ fn bag_fun(e: &Ty) -> Ty {
 fn needs_tlc_order(t: &Ty) -> bool {
     match t {
         Ty::Bag(_) | Ty::PFun(..) => true,
-        Ty::Set(_) => !is_sparse(t),
+        Ty::Set(e) => !is_sparse(t) || needs_tlc_order(e),
         // Records of different fields: TLC compares the number of fields first
         Ty::Rec(fs) if !is_tuple_fields(fs) && fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => true,
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
@@ -6191,6 +6350,8 @@ fn disordered_ty(t: &Ty) -> Option<(String, String)> {
 
 /// The conjunct standing for the elements after the first in `Gen::gen_forall`
 const FORALL_REST: &str = "#forall-rest";
+/// `#forall-nth(S, k)`: the k-th element of S in the order `\A` takes them (see `Gen::forall_rec`)
+const FORALL_NTH: &str = "#forall-nth";
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)

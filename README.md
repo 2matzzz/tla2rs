@@ -161,10 +161,11 @@ memory.
   (key, value) pairs, whose capacity grows as a set's does (`Cardinality(DOMAIN f) <= K` in `TypeOK` sets where it
   starts). A tuple literal has at most 99,999 elements (each is a field of the generated
   type)
-- A function over a set that cannot be enumerated (Nat, Int, STRING, `Seq(S)`) is supported only applied to an argument
-  (also after EXCEPT with one index per update) or in `x \in DOMAIN f`, where TLC evaluates it without enumerating its
-  domain. Used as a value (assigned to a variable, compared, printed, passed to `ToString`) it is refused: TLC stops
-  with an error on most such uses, and prints its source text for `ToString`
+- A function over a set that cannot be enumerated (Nat, Int, STRING, `Seq(S)`) is supported applied to an argument
+  (also after EXCEPT with one index per update), in `x \in DOMAIN f`, and in `ToString`, `Print` and `PrintT`, where
+  TLC evaluates it without enumerating its domain (it prints `[n \in Nat |-> <expression line 5, col 26 to line 5, col
+  30 of module M>]`, with the position of the body). Used as a value otherwise (assigned to a variable, compared,
+  inside another value) it is refused: TLC stops with an error on most such uses
 - Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC
@@ -174,10 +175,9 @@ memory.
   while it rebuilds a counterexample (see CLAUDE.md, "Messages and printed lines"). Such specs are searched without
   `-batched`
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
-  reason), sets that may hold both strings and integers, `Name <- [Module] Def` for a CONSTANT (TLC rejects it too),
-  `Op!@`, and a recursive operator that assigns variables called in Init with arguments that are not constant. `\A`
-  over a set from the state whose body assigns a variable for some elements only needs the set's element type to have
-  at most 16 values
+  reason), sets that may hold both strings and integers (a set of strings compared with a set of integers is
+  supported: unequal when the sizes differ, an evaluation error otherwise, as in TLC), `Name <- [Module] Def` for a
+  CONSTANT (TLC rejects it too), and `Op!@`
 - Specs that SANY refuses stop with exit 150, as in TLC, for these reasons: operators of overlapping precedence next
   to each other without parentheses, also prefix and postfix ones (`a /\ b \/ c`, `a = b = c`, `[]x = 1`, `ENABLED
   x' = 1`, `a * -b`, `DOMAIN f + 1`, `UNCHANGED x'`); a name used where nothing declares or defines it before, in
@@ -213,12 +213,15 @@ memory.
   compiles, other than a value, a set a quantifier ranges over or a set tested for membership (the condition of an
   IF, say), and the characters of a string taken apart into a tuple (`SelectSeq`, `SortSeq`, a string compared with a
   tuple) keep the order tla2rs meets them in
+- A set that TLC holds as an interval (`x = 1..3`) prints as `{1, 2, 3}`, where TLC prints `1..3` until an
+  operation enumerates it. Which form TLC prints depends on how the value was built (see CLAUDE.md, "State graphs"),
+  so the comparison with TLC reads an interval as the set it denotes
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
   it instead (`-lassocheck`)
-- With `VIEW` and `SYMMETRY` together, the distinct count can be lower than TLC's. TLC sometimes keeps states with
-  identical views as separate states (its choice of representative depends on the state itself), while tla2rs folds
-  by orbits of the view. With only one of the two, counts match TLC exactly
+- With `VIEW` and `SYMMETRY` together, a state is reduced as TLC reduces it: the smallest of its permutations (values
+  compared as TLC compares them, variables in the order TLC prints them), and then the view of that state. This
+  compares whole permuted states, which costs more than comparing views did
 
 ## Cross-checking against TLC
 
@@ -226,7 +229,8 @@ memory.
 generated and distinct state counts, the states left on TLC's queue when it stops at an error, the counterexample, exit code, the messages and printed lines, and the state
 graph: the set of states reached
 and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-dumpgraph`, each reduced to a SHA-256
-hash (with the variables of each state sorted, since TLC's order comes from a hash table). A safety counterexample is
+hash (each state with its variables in the order TLC prints them, which the checker follows: the order of SANY's
+hash table of the root module's names, replayed by tla2rs). A safety counterexample is
 compared step by step: each state and the action that led to it, as TLC names it (with one worker TLC's is the same
 on every run). A liveness counterexample depends on TLC's random fingerprint polynomial, so instead TLC is run on the
 spec `-lassocheck` writes, and must confirm that tla2rs's lasso is a fair behavior of the spec that violates the
