@@ -254,6 +254,10 @@ impl<'a> Expander<'a> {
                     match v {
                         // A bound variable renamed: still written here
                         Ident(m, p) if !p.known() => Ident(m.clone(), *at),
+                        // A substituted variable of an instance, written here
+                        Label(l, a, b) if l.starts_with(SUBVAR) && !l.contains(SUBVAR_AT) && at.known() => {
+                            Label(format!("{l}{SUBVAR_AT}{}", at.text()), a.clone(), b.clone())
+                        }
                         v => v.clone(),
                     }
                 } else if let Some((d, denv)) = env.locals.get(n) {

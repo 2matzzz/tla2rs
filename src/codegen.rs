@@ -2296,17 +2296,21 @@ impl<'a> Gen<'a> {
                     // Not bound yet: TLC fails on evaluation, naming the variable
                     None => {
                         let (_, t) = self.gen(b, env, want)?;
-                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
+                        let mut msg = undefined_ident(n, &NOPOS);
+                        if let Some(at) = crate::ast::subvar_pos(x) {
+                            msg = format!("{msg}\n{at}");
+                        }
+                        (format!("{{ let __v: {} = eval_error({msg:?}.into()); __v }}", t.repr()), t)
                     }
                 }
             }
             Prime(x) => match x.strip() {
-                Ident(n, _) if self.is_var(n) => match env.primed.get(n) {
+                Ident(n, at) if self.is_var(n) => match env.primed.get(n) {
                     Some(x) => x.clone(),
                     // As in TLC, fail only on evaluation (harmless if the branch is never reached)
                     None => {
                         let t = self.var_ty(n);
-                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
+                        (format!("{{ let __v: {} = eval_error({:?}.into()); __v }}", t.repr(), undefined_ident(n, at)), t)
                     }
                 },
                 x => {
@@ -2828,7 +2832,17 @@ impl<'a> Gen<'a> {
                 // variable not assigned yet)
                 match self.vars.iter().find(|(v, _)| !env.primed.contains_key(v)) {
                     Some((v, _)) => {
-                        (eval_error_bool(&format!("In evaluation, the identifier {v} is either undefined or not an operator.")), Ty::Bool)
+                        // TLC names the first variable not assigned yet that the action reads
+                        fn first_read(e: &Expr, unset: &dyn Fn(&str) -> bool) -> Option<(String, Pos)> {
+                            match e {
+                                Expr::Ident(n, at) if unset(n) => Some((n.clone(), *at)),
+                                Expr::Prime(_) => None,
+                                e => e.children().into_iter().find_map(|c| first_read(c, unset)),
+                            }
+                        }
+                        let unset = |n: &str| self.is_var(n) && !env.primed.contains_key(n);
+                        let (v, at) = first_read(x, &unset).unwrap_or((v.clone(), NOPOS));
+                        (eval_error_bool(&undefined_ident(&v, &at)), Ty::Bool)
                     }
                     None => {
                         let fields: Vec<String> =
@@ -6408,6 +6422,13 @@ pub fn with_at(msg: &str, at: &Option<String>) -> String {
         Some(p) => format!("{msg}\n{p}"),
         None => msg.to_string(),
     }
+}
+
+/// TLC's error for an identifier it cannot evaluate (a variable not assigned yet), with the
+/// position of the identifier when it is known
+fn undefined_ident(n: &str, at: &Pos) -> String {
+    let msg = format!("In evaluation, the identifier {n} is either undefined or not an operator.");
+    if at.known() { format!("{msg}\n{}", at.text()) } else { msg }
 }
 
 fn eval_error_bool(msg: &str) -> String {

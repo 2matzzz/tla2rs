@@ -291,8 +291,23 @@ pub const ENINST: &str = "#en_inst";
 pub fn subvar_of(e: &Expr) -> Option<(&str, &Expr)> {
     match e {
         Expr::Label(n, _, b) => match n.strip_prefix(SUBVAR) {
-            Some(v) => Some((v, b)),
+            Some(v) => Some((v.split(SUBVAR_AT).next().unwrap_or(v), b)),
             None => subvar_of(b),
+        },
+        _ => None,
+    }
+}
+
+/// After the name in a SUBVAR label: where that use of the variable is written in the
+/// instantiated module, as TLC prints a position (expansion adds it)
+pub const SUBVAR_AT: char = '\u{1}';
+
+/// Where the substituted variable `e` is written (see SUBVAR_AT)
+pub fn subvar_pos(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Label(n, _, b) => match n.strip_prefix(SUBVAR) {
+            Some(v) => v.split_once(SUBVAR_AT).map(|(_, at)| at),
+            None => subvar_pos(b),
         },
         _ => None,
     }
