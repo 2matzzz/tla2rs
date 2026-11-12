@@ -1,0 +1,10 @@
+key 533b551410b554e56355895c19181efe31bd313ca78c7dc299dcf2868661c5a7
+tlc Version 2.19
+rc 0
+No error has been found
+14296 states generated 4122 distinct states found
+trace 0
+states 4122 6a45e67c9c64437d268425cd7a4d1e8a68892f46ea04e37980b401188ea83db5
+edges 13509 1be4a3db58340babe18bc2ecee84cf75e80be9b70322bc4d2c17b805c4ac3f74
+messages 0
+errors 0
