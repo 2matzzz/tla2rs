@@ -2441,7 +2441,7 @@ impl<'a> Gen<'a> {
                     let Un(_, x) = s.strip() else { unreachable!() };
                     let (c, t) = self.gen(x, env, None)?;
                     let Ty::Set(el) = &t else { return Err("SUBSET of a non-set".into()) };
-                    let n = if is_sparse(&t) { self.scap as u32 } else { el.size().unwrap_or(0) as u32 };
+                    let n = if is_sparse(&t) { crate::types::set_cap(&t, self.scap) as u32 } else { el.size().unwrap_or(0) as u32 };
                     let hi = if n >= 62 { BIG } else { 1i64 << n };
                     (format!("(1i64 << {})", self.s_card(&c, &t)), Ty::Int(1, hi))
                 }
@@ -5343,7 +5343,8 @@ impl<'a> Gen<'a> {
             Ty::Set(e) if is_sparse(t) => {
                 // The count, followed by that many elements (the rest stay 0). The offset is only
                 // known at runtime from here on, so thread it
-                let lb = Self::bits_for(self.scap as u64 + 1);
+                let cap = crate::types::set_cap(t, self.scap);
+                let lb = Self::bits_for(cap as u64 + 1);
                 let k = self.fresh("k");
                 let n = self.fresh("n");
                 if let Some(o) = at {
@@ -5353,7 +5354,7 @@ impl<'a> Gen<'a> {
                 write!(out, "let {n} = ({c}).len as usize; put(&mut w, &mut p, {n} as u128, {lb}); for {k} in 0..{n} {{ ").unwrap();
                 let b = self.pack_value(&format!("({c}).items[{k}]"), e, out, &mut None)?;
                 out.push_str("} ");
-                lb + b * self.scap as u32
+                lb + b * cap as u32
             }
             Ty::Set(e) => {
                 let n = e.size().unwrap() as u32;
@@ -5444,7 +5445,8 @@ impl<'a> Gen<'a> {
                 Ok(1 + self.pack_perm(&format!("({c}).1"), inner, out, at)?)
             }
             Ty::Set(e) if is_sparse(t) => {
-                let lb = Self::bits_for(self.scap as u64 + 1);
+                let cap = crate::types::set_cap(t, self.scap);
+                let lb = Self::bits_for(cap as u64 + 1);
                 let (n, ord, a, b, k) = (self.fresh("n"), self.fresh("ord"), self.fresh("a"), self.fresh("b"), self.fresh("k"));
                 let lhs = self.perm_code(&format!("({c}).items[{ord}[{b} - 1] as usize]"), e)?;
                 let rhs = self.perm_code(&format!("({c}).items[{ord}[{b}] as usize]"), e)?;
@@ -5457,15 +5459,15 @@ impl<'a> Gen<'a> {
                 *at = None;
                 write!(
                     out,
-                    "let {n} = ({c}).len as usize; let mut {ord} = [0u8; {}]; for {k} in 0..{n} {{ {ord}[{k}] = {k} as u8; }} \
+                    "let {n} = ({c}).len as usize; let mut {ord} = [0u16; {}]; for {k} in 0..{n} {{ {ord}[{k}] = {k} as u16; }} \
                      for {a} in 1..{n} {{ let mut {b} = {a}; while {b} > 0 && {lhs} > {rhs} {{ {ord}.swap({b} - 1, {b}); {b} -= 1; }} }} \
                      put(&mut w, &mut p, {n} as u128, {lb}); for {k} in 0..{n} {{ ",
-                    self.scap
+                    cap
                 )
                 .unwrap();
                 let eb = self.pack_perm(&format!("({c}).items[{ord}[{k}] as usize]"), e, out, &mut None)?;
                 out.push_str("} ");
-                Ok(lb + eb * self.scap as u32)
+                Ok(lb + eb * cap as u32)
             }
             Ty::Fun(d, cod) if inv_key(d, "").is_some() => {
                 let n = d.size().unwrap();
@@ -5542,7 +5544,7 @@ impl<'a> Gen<'a> {
                 )
             }
             Ty::Set(e) if is_sparse(t) => {
-                let lb = Self::bits_for(self.scap as u64 + 1);
+                let lb = Self::bits_for(crate::types::set_cap(t, self.scap) as u64 + 1);
                 // Thread the offset from here on, assigning to the outer p (a fresh `let` inside
                 // the block would reset the offset to 0 on leaving it, so later fields would be
                 // read from the start)
@@ -5553,7 +5555,7 @@ impl<'a> Gen<'a> {
                 *at = None;
                 let inner = self.unpack_value(e, &mut None)?;
                 format!(
-                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u8; ss }}",
+                    "{{ {pre}let n = get(w, &mut p, {lb}) as usize; let mut ss = {}; for k in 0..n {{ ss.items[k] = {inner}; }} ss.len = n as u16; ss }}",
                     Self::default_code(t)
                 )
             }
@@ -5796,7 +5798,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> PartialOrd for Sq<T, N> {
 }
 #[cold]
 fn seq_too_long(n: usize) -> ! {
-    eval_error(format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
+    capacity_exceeded(CAP_SEQ, format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
 }
 impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     fn new() -> Self {

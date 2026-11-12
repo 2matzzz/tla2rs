@@ -391,7 +391,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> ConstDefault for SSet<T, N> {
 /// Unused slots hold the default value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct SSet<T: Copy + Ord + ConstDefault, const N: usize> {
-    len: u8,
+    len: u16,
     items: [T; N],
 }
 
@@ -422,7 +422,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
         if let Err(i) = self.slice().binary_search(&x) {
             let n = self.len as usize;
             if n == N {
-                eval_error(format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
+                capacity_exceeded(CAP_SET, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
             }
             self.items.copy_within(i..n, i + 1);
             self.items[i] = x;
@@ -484,7 +484,7 @@ impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize>
             Err(i) => {
                 let n = self.len as usize;
                 if n == N {
-                    eval_error(format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
+                    capacity_exceeded(CAP_SET, format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
                 }
                 self.items.copy_within(i..n, i + 1);
                 self.items[i] = (k, v);
@@ -510,6 +510,29 @@ impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize>
 #[cold]
 fn type_error(what: &str, v: &str) -> ! {
     std::panic::panic_any(EvalErr::Type(format!("{what} {v} is outside the type declared in TypeOK")))
+}
+
+/// The kinds of capacity a value can outgrow (see `capacity_exceeded`)
+const CAP_SET: u8 = 0;
+const CAP_SEQ: u8 = 1;
+/// The exit code that tells tla2rs which capacity to raise: CAP_EXIT + the kind
+const CAP_EXIT: i32 = 70;
+
+/// A set (or the domain of a sparse function or bag) or a sequence outgrew the capacity this checker
+/// was built with. TLC has no such bound, so this is not an error of the spec: when tla2rs runs the
+/// checker, it sets TLA2RS_GROW to the kinds it can raise (`s` for sets, `q` for sequences), and the
+/// checker then exits at once with CAP_EXIT + kind so that tla2rs builds it again with more room and
+/// checks from the start. Otherwise (the checker run directly, or the capacity at its maximum) it is
+/// an evaluation error.
+#[cold]
+fn capacity_exceeded(kind: u8, msg: String) -> ! {
+    let letter = if kind == CAP_SET { 's' } else { 'q' };
+    if std::env::var("TLA2RS_GROW").is_ok_and(|g| g.contains(letter)) {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(CAP_EXIT + kind as i32);
+    }
+    eval_error(msg)
 }
 
 #[cold]

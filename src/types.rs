@@ -118,6 +118,19 @@ pub fn is_sparse(t: &Ty) -> bool {
 
 pub const SET_BITS: u64 = 128;
 
+/// The largest capacity of a set held as an array and the longest sequence (their lengths are 16
+/// bits)
+pub const MAX_CAP: usize = 65535;
+
+/// The capacity of a set of type `t` held as an array (`is_sparse`) when sets are given `scap`
+/// elements: never more than its element type has values
+pub fn set_cap(t: &Ty, scap: usize) -> usize {
+    match t {
+        Ty::Set(e) => e.size().map_or(scap, |n| scap.min(n.min(MAX_CAP as u64) as usize)),
+        _ => scap,
+    }
+}
+
 /// A function over part of a type (or a bag) whose domain type has at most this many values is an
 /// array over the whole type; over a larger or unbounded type it is sparse
 pub const DENSE_MAX: u64 = 1 << 16;
@@ -307,7 +320,11 @@ impl Ty {
             Ty::Enum(_) => "u16".into(),
             Ty::Rec(fs) => rec_build(&fs.iter().map(|(_, t)| t.repr()).collect::<Vec<_>>()),
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
-            Ty::Set(e) if is_sparse(self) => format!("SSet<{}, SCAP>", e.repr()),
+            // A set holds at most as many elements as its element type has values (`set_cap`)
+            Ty::Set(e) if is_sparse(self) => match e.size() {
+                Some(n) if n < MAX_CAP as u64 => format!("SSet<{}, {{ set_cap({n}) }}>", e.repr()),
+                _ => format!("SSet<{}, SCAP>", e.repr()),
+            },
             Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),
             Ty::Bag(_) | Ty::PFun(..) if is_sparse_fun(self) => fun_pairs(self).repr(),
             Ty::Bag(e) => format!("[i64; {}]", e.size().unwrap_or(0)),

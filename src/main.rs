@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::Instant;
 
+/// The exit codes of a checker whose sets or sequences outgrew their capacity (CAP_EXIT + CAP_SET
+/// and CAP_EXIT + CAP_SEQ in runtime.rs)
+const CAP_EXIT_SET: i32 = 70;
+const CAP_EXIT_SEQ: i32 = 71;
+
 /// Key of a built checker: every file cargo reads in the generated crate, and the compiler version.
 /// Two SipHash passes with different prefixes give 128 bits.
 fn build_key(dir: &Path) -> String {
@@ -153,10 +158,66 @@ fn main() {
             exit(2)
         })
     };
-    let t0 = Instant::now();
-    // Compile on a thread with a large stack: evaluating a recursive operator at compile time nests
-    // deeply (up to value::REC_LIMIT calls)
     let (src, cfg_src) = (read(&tla), read(&cfg));
+    let stem = cfg.file_stem().unwrap().to_string_lossy().to_string();
+    let dir = out.unwrap_or_else(|| tla.parent().unwrap_or(Path::new(".")).join(".tla2rs").join(&stem));
+    let crate_name = format!("check_{}", stem.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+    // Sets held as arrays and sequences have a capacity fixed when the checker is built (-setcap and
+    // -seqcap set where it starts). TLC has no such bound, so when a value outgrows it the checker
+    // exits with CAP_EXIT + the kind, and the checker is built again with twice the room and run
+    // from the start; a spec that stays within the capacity runs as fast as before. The line printed
+    // before the new run marks where its output starts (scripts/crosscheck.sh reads from there)
+    let (mut setcap, mut seqcap) = (setcap, seqcap);
+    let mut first = true;
+    loop {
+        let t0 = Instant::now();
+        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, fp128, metal);
+        if first {
+            for w in &output.warnings {
+                eprintln!("warning: {w}");
+            }
+        }
+        // A false ASSUME, or a temporal formula TLC cannot check: as in TLC, stop before exploring,
+        // with the same message and exit code
+        if let Some((msg, code)) = &output.rejected {
+            // Nothing to explore (compile::NO_BEHAVIOR): the state graph is empty, and TLC ends its
+            // file
+            if *code == 0 {
+                if let Some(f) = pass.iter().position(|a| a == "-dumpgraph").and_then(|i| pass.get(i + 1)) {
+                    let empty = "strict digraph DiskGraph {\nnodesep=0.35;\nsubgraph cluster_graph {\ncolor=\"white\";\n}\n}";
+                    std::fs::write(f, empty).expect("write the state graph");
+                }
+            }
+            println!("{msg}");
+            exit(*code);
+        }
+        let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0) else { return };
+        // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs)
+        let (scap, qcap) = output.caps;
+        let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).collect();
+        let st = Command::new(bin).args(&pass).env("TLA2RS_GROW", grow).status().expect("run checker");
+        let code = st.code().unwrap_or(1);
+        let (what, old, new) = match code {
+            CAP_EXIT_SET => ("a set", scap, (scap * 2).min(types::MAX_CAP)),
+            CAP_EXIT_SEQ => ("a sequence", qcap, (qcap * 2).clamp(8, types::MAX_CAP)),
+            _ => exit(code),
+        };
+        if code == CAP_EXIT_SET {
+            setcap = new;
+        } else {
+            seqcap = new;
+        }
+        println!("tla2rs: {what} grew beyond {old} elements; checking again from the start with room for {new}");
+        first = false;
+    }
+}
+
+/// Compiles the spec, stopping with exit 1 on an error. The compiler runs on a thread with a large
+/// stack: evaluating a recursive operator at compile time nests deeply (up to value::REC_LIMIT
+/// calls)
+#[allow(clippy::too_many_arguments)]
+fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> compile::Output {
+    let (src, cfg_src) = (src.to_string(), cfg_src.to_string());
     let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
     let result = std::thread::Builder::new()
         .stack_size(1 << 30)
@@ -164,32 +225,15 @@ fn main() {
         .expect("start the compiler thread")
         .join()
         .unwrap_or_else(|_| Err("internal error in the compiler".into()));
-    let output = match result {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("tla2rs: {e}");
-            exit(1)
-        }
-    };
-    for w in &output.warnings {
-        eprintln!("warning: {w}");
-    }
-    // A false ASSUME, or a temporal formula TLC cannot check: as in TLC, stop before exploring, with
-    // the same message and exit code
-    if let Some((msg, code)) = &output.rejected {
-        // Nothing to explore (compile::NO_BEHAVIOR): the state graph is empty, and TLC ends its file
-        if *code == 0 {
-            if let Some(f) = pass.iter().position(|a| a == "-dumpgraph").and_then(|i| pass.get(i + 1)) {
-                let empty = "strict digraph DiskGraph {\nnodesep=0.35;\nsubgraph cluster_graph {\ncolor=\"white\";\n}\n}";
-                std::fs::write(f, empty).expect("write the state graph");
-            }
-        }
-        println!("{msg}");
-        exit(*code);
-    }
-    let stem = cfg.file_stem().unwrap().to_string_lossy().to_string();
-    let dir = out.unwrap_or_else(|| tla.parent().unwrap_or(Path::new(".")).join(".tla2rs").join(&stem));
-    let crate_name = format!("check_{}", stem.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+    result.unwrap_or_else(|e| {
+        eprintln!("tla2rs: {e}");
+        exit(1)
+    })
+}
+
+/// Writes the generated crate to `dir` and builds it (or takes the checker built earlier from the
+/// same sources, under TLA2RS_BUILD_CACHE). Returns the checker, or None with --emit-only
+fn build(dir: &Path, crate_name: &str, rust: &str, metal: bool, emit_only: bool, t0: Instant) -> Option<PathBuf> {
     std::fs::create_dir_all(dir.join("src")).expect("create output dir");
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -198,27 +242,26 @@ fn main() {
         ),
     )
     .expect("write Cargo.toml");
-    std::fs::write(dir.join("src/main.rs"), &output.rust).expect("write main.rs");
+    std::fs::write(dir.join("src/main.rs"), rust).expect("write main.rs");
     if metal {
         std::fs::write(dir.join("metal.m"), metal::METAL_M).expect("write metal.m");
         std::fs::write(dir.join("build.rs"), metal::BUILD_RS).expect("write build.rs");
     }
     eprintln!("tla2rs: generated {} in {:.0} ms", dir.join("src/main.rs").display(), t0.elapsed().as_secs_f64() * 1e3);
     if emit_only {
-        return;
+        return None;
     }
     // TLA2RS_BUILD_CACHE=DIR reuses a checker built earlier from the same sources, so test runs only
     // compile the specs whose generated code changed
-    let cache = std::env::var_os("TLA2RS_BUILD_CACHE").map(|c| PathBuf::from(c).join(build_key(&dir)));
+    let cache = std::env::var_os("TLA2RS_BUILD_CACHE").map(|c| PathBuf::from(c).join(build_key(dir)));
     if let Some(hit) = cache.as_ref().map(|c| c.join("checker")).filter(|b| b.is_file()) {
         eprintln!("tla2rs: reusing the checker in {}", hit.display());
-        let st = Command::new(hit).args(&pass).status().expect("run checker");
-        exit(st.code().unwrap_or(1));
+        return Some(hit);
     }
     let t1 = Instant::now();
     let st = Command::new("cargo")
         .args(["build", "--release", "--quiet", "--offline"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .status()
         .expect("run cargo");
     if !st.success() {
@@ -226,7 +269,7 @@ fn main() {
         exit(1);
     }
     eprintln!("tla2rs: built in {:.1} s", t1.elapsed().as_secs_f64());
-    let bin = dir.join("target/release").join(&crate_name);
+    let bin = dir.join("target/release").join(crate_name);
     if let Some(c) = &cache {
         // Copy under a unique name and rename, so a parallel run never sees a half-written file
         let tmp = c.with_extension(format!("tmp{}", std::process::id()));
@@ -237,6 +280,5 @@ fn main() {
             let _ = std::fs::remove_dir_all(&tmp);
         }
     }
-    let st = Command::new(bin).args(&pass).status().expect("run checker");
-    exit(st.code().unwrap_or(1));
+    Some(bin)
 }
