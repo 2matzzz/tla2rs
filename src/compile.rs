@@ -912,7 +912,15 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
                     "{report}\n\nFatal errors while parsing TLA+ spec in file {}\n\n*** Abort messages: 1\n\nIn module {module}\n\nCould not parse module {module} from file {module}.tla\n\nError: Parsing or semantic analysis failed.",
                     crate::lexer::module_name(tla)
                 ),
-                None => format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed."),
+                // A semantic error, with its position when it is known (see `sany::SEMANTIC`)
+                None => {
+                    let msg = match msg.strip_prefix(crate::sany::SEMANTIC).and_then(|m| m.split_once('\n')) {
+                        Some(("", m)) => m.to_string(),
+                        Some((at, m)) => format!("{at}\n\n{m}"),
+                        None => msg,
+                    };
+                    format!("Semantic errors:\n\n*** Errors: 1\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.")
+                }
             };
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));

@@ -204,6 +204,15 @@ fn sany_name(n: &str) -> &str {
     }
 }
 
+/// After SANY: a semantic error, `#sem ` followed by the position SANY gives it (or nothing when
+/// it is not known), a line break and the message
+pub const SEMANTIC: &str = "#sem ";
+
+/// A semantic error at `at` (see SEMANTIC)
+fn sem(at: &str, msg: &str) -> String {
+    format!("{SANY}{SEMANTIC}{at}\n{msg}")
+}
+
 fn clash(x: &str) -> String {
     format!("{SANY}Multiply-defined symbol '{x}': this definition or declaration conflicts with another one in scope.")
 }
@@ -451,11 +460,13 @@ struct Walker<'a> {
     locals: Vec<String>,
     /// The bound variables introduced since the enclosing label or definition
     label_bound: Vec<String>,
+    /// The position of the label being entered, from the AT label the parser puts around it
+    label_at: Option<String>,
 }
 
 impl<'a> Walker<'a> {
     fn new(scope: &'a Scope, known: bool, recursive: &'a [String]) -> Self {
-        Walker { scope, known, recursive, locals: vec![], label_bound: vec![] }
+        Walker { scope, known, recursive, locals: vec![], label_bound: vec![], label_at: None }
     }
 
     fn has(&self, n: &str) -> bool {
@@ -480,7 +491,7 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    fn resolve(&self, n: &str) -> R<()> {
+    fn resolve(&self, n: &str, at: &Pos) -> R<()> {
         if !self.known || n.contains('#') || n.starts_with('@') {
             return Ok(());
         }
@@ -491,7 +502,9 @@ impl<'a> Walker<'a> {
         if self.has(base) {
             return Ok(());
         }
-        if word {
+        if word && at.known() {
+            Err(sem(&at.text(), &format!("Unknown operator: `{base}'.")))
+        } else if word {
             Err(format!("{SANY}Unknown operator: `{base}'."))
         } else {
             Err(format!("{SANY}Could not find declaration or definition of symbol '{base}'."))
@@ -524,7 +537,7 @@ impl<'a> Walker<'a> {
         use Expr::*;
         match e {
             Num(_) | Str(_) | Bool(_) | At | RecCall(..) => Ok(()),
-            Ident(n, _) => self.resolve(n),
+            Ident(n, at) => self.resolve(n, at),
             Call(n, args) => {
                 if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA" {
                     // Their bound variables are not kept
@@ -541,12 +554,12 @@ impl<'a> Walker<'a> {
                     }
                     return Ok(());
                 }
-                self.resolve(n)?;
+                self.resolve(n, &NOPOS)?;
                 args.iter().try_for_each(|a| self.arg(a))
             }
             Un(op, x) => {
                 if *op == UOp::Neg {
-                    self.resolve("-.")?;
+                    self.resolve("-.", &NOPOS)?;
                 }
                 self.expr(x)
             }
@@ -565,7 +578,7 @@ impl<'a> Walker<'a> {
                     _ => None,
                 };
                 if let Some(s) = sym {
-                    self.resolve(s)?;
+                    self.resolve(s, &NOPOS)?;
                 }
                 self.expr(a)?;
                 self.expr(b)
@@ -638,7 +651,14 @@ impl<'a> Walker<'a> {
                 for a in args {
                     self.expr(a)?;
                 }
+                if let Some(at) = err_pos_of(n) {
+                    if body.is_user_label() {
+                        self.label_at = Some(at.to_string());
+                        return self.expr(body);
+                    }
+                }
                 let Some(head) = n.strip_suffix("::") else { return self.expr(body) };
+                let at = self.label_at.take();
                 let ps: Vec<&str> = match head.split_once('(') {
                     Some((_, rest)) => rest.trim_end_matches(')').split(',').filter(|p| !p.is_empty()).collect(),
                     None => vec![],
@@ -653,7 +673,11 @@ impl<'a> Walker<'a> {
                     }
                 }
                 if let Some(x) = self.label_bound.iter().find(|x| !ps.contains(&x.as_str())) {
-                    return Err(format!("{SANY}Label {l} must contain formal parameter `{x}'."));
+                    let msg = format!("Label {l} must contain formal parameter `{x}'.");
+                    return Err(match at {
+                        Some(at) => sem(&at, &msg),
+                        None => format!("{SANY}{msg}"),
+                    });
                 }
                 let saved = std::mem::take(&mut self.label_bound);
                 let r = self.expr(body);
