@@ -255,7 +255,10 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
             const_substs.push((n.clone(), def.clone()));
             continue;
         }
-        let Some(np) = def_params(m, n) else {
+        // An operator of a standard module that the spec uses as a set (`Nat <- MCNat`, `Seq <- BoundedSeq`):
+        // TLC replaces it everywhere, and so does a definition of the same name here
+        let builtin = [("Nat", 0), ("Int", 0), ("Seq", 1)].iter().find(|(b, _)| b == n).map(|&(_, k)| fresh(k));
+        let Some(np) = def_params(m, n).or(builtin) else {
             return Err(format!("cfg: `{n} <- {def}`: {n} is neither a CONSTANT nor a definition of the spec"));
         };
         if np.len() != dp.len() {
