@@ -18,6 +18,9 @@ pub struct Output {
     /// code: an ASSUME that is false or fails to evaluate (10), a temporal formula TLC cannot check
     /// (150 or 255). When set, no checker is generated.
     pub rejected: Option<(String, i32)>,
+    /// The capacity of sets held as arrays and the longest sequence the checker was built with
+    /// (SCAP and QCAP)
+    pub caps: (usize, usize),
 }
 
 /// What TLC prints when it starts, in its order: its warnings that a PlusCal algorithm or its
@@ -88,9 +91,15 @@ pub fn bounded_seq(e: &Expr) -> Option<(&Expr, &Expr)> {
 /// The maximum length of a sequence value. `-seqcap N` sets it. Otherwise it comes from bounds
 /// `Len(e) <= N` (or `< N`) among the conjuncts of TypeOK and of the CONSTRAINTs: one more than
 /// the largest, so that a state one element too long can still be built, counted, and reported
-/// by TypeOK or discarded by the constraint as in TLC. Without either it is the length of the
-/// longest tuple written in the spec, unless the spec makes sequences grow (Append, \o, Seq),
-/// in which case it stays unknown (0) and using a sequence is an error that asks for a bound.
+/// by TypeOK or discarded by the constraint as in TLC. Without either it is the longest length
+/// Init and Next reach when the lengths settle (`seqlen`), or else the length of the longest
+/// tuple written in the spec, unless the spec makes sequences grow (Append, \o, Seq): then a
+/// length test in the spec suggests it, or it starts at DEFAULT_QCAP. Either way a sequence that
+/// grows beyond it makes tla2rs build the checker again with twice the room (see main.rs), so
+/// this only decides where to start.
+/// Where the longest sequence starts when nothing in the spec bounds it
+const DEFAULT_QCAP: usize = 8;
+
 fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize, init: &Expr, next: &Expr) -> R<usize> {
     fn longest(e: &Expr) -> usize {
         let here = if let Expr::Tuple(xs) = e { xs.len() } else { 0 };
@@ -178,14 +187,14 @@ fn seq_cap(m: &Module, cfg: &Cfg, ex: &mut Expander, g: &Gen, seqcap: usize, ini
             Some(b) => b.max(lit),
             None => match settled()? {
                 Some(b) => b.max(lit),
-                None if m.defs.iter().any(|d| grows(&d.body)) => guard().map_or(0, |b| b.max(lit)),
+                None if m.defs.iter().any(|d| grows(&d.body)) => guard().unwrap_or(DEFAULT_QCAP).max(lit),
                 None => lit,
             },
         }
     };
     // A sequence's length is 16 bits
-    if cap > 65535 {
-        return Err(format!("sequences of up to {cap} elements are not supported (at most 65535: a length is 16 bits)"));
+    if cap > crate::types::MAX_CAP {
+        return Err(format!("sequences of up to {cap} elements are not supported (at most {}: a length is 16 bits)", crate::types::MAX_CAP));
     }
     Ok(cap)
 }
@@ -821,7 +830,7 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
             }
-            return Ok(Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)) });
+            return Ok(Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), caps: (0, 0) });
         }
         r => r?,
     };
@@ -987,7 +996,7 @@ fn compile_inner(
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
             // As SANY reports it, with the definition where SANY gives the position of the formula
             let msg = format!("Semantic errors:\n\n*** Errors: 1\n\nin definition {}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.", d.name);
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)) });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), caps: (0, 0) });
         }
     }
 
@@ -1024,7 +1033,7 @@ fn compile_inner(
                 Ok(Value::Bool(true)) | Err(_) => {}
                 Ok(v) => {
                     let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)) });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), caps: (0, 0) });
                 }
             }
         }
@@ -1038,7 +1047,7 @@ fn compile_inner(
     } else {
         match resolve_spec(&m, &cfg, &mut ex)? {
             Ok(p) => p,
-            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r) }),
+            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), caps: (0, 0) }),
         }
     };
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
@@ -1056,12 +1065,13 @@ fn compile_inner(
                         rust: String::new(),
                         warnings,
                         rejected: Some((format!("Error: Assumption {at} is false."), 10)),
+                        caps: (0, 0),
                     })
                 }
                 Ok(v) => return Err(format!("ASSUME at {at} is not a boolean: {v:?}")),
                 Err(e) if crate::value::is_eval_failure(&e) => {
                     let msg = format!("Error: Evaluating assumption {at} failed.\n{e}");
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)) });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), caps: (0, 0) });
                 }
                 Err(e) => return Err(format!("cannot evaluate the ASSUME at {at}: {e}")),
             }
@@ -1069,7 +1079,7 @@ fn compile_inner(
     }
 
     if no_behavior {
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)) });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), caps: (0, 0) });
     }
     if uses_real_time(&init) || next.as_ref().is_some_and(uses_real_time) {
         return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
@@ -1170,6 +1180,9 @@ fn compile_inner(
             _ => leftover += 1,
         }
     }
+    if g.scap > crate::types::MAX_CAP {
+        return Err(format!("sets of up to {} elements are not supported (at most {}: a size is 16 bits)", g.scap, crate::types::MAX_CAP));
+    }
     // Variables whose type TypeOK leaves open are inferred from the assignments in Init and Next
     let undeclared: Vec<String> = m.variables.iter().filter(|v| !decl.contains_key(*v)).cloned().collect();
     if !undeclared.is_empty() {
@@ -1179,6 +1192,11 @@ fn compile_inner(
     for v in &m.variables {
         g.vars.push((v.clone(), decl.remove(v).unwrap()));
     }
+    let start = set_cap_start(&g, &init);
+    if std::env::var_os("TLA2RS_DEBUG_CAP").is_some() && start > g.scap {
+        eprintln!("DEBUGCAP scap {} -> {}", g.scap, start);
+    }
+    g.scap = g.scap.max(start);
 
     // Init / Next
     let mut init_code = String::new();
@@ -1214,7 +1232,7 @@ fn compile_inner(
         if uses_real_time(&e) {
             startup.liveness_warnings(&cfg, true);
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0) });
         }
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, None, &mut parts)?;
@@ -1257,20 +1275,20 @@ fn compile_inner(
     }
     if no_next && (!inv_list.is_empty() || !cfg.invariants.is_empty() || !action_props.is_empty() || !live_parts.is_empty()) {
         let msg = "Error: The configuration file did not specify the next state predicate.";
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)) });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), caps: (0, 0) });
     }
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0) });
         }
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
     let live_code = match crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts)? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)) })
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0) })
         }
     };
     let mut prop_code = String::new();
@@ -1413,6 +1431,8 @@ fn compile_inner(
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
+    // The capacity of a set whose element type has n values (types::set_cap)
+    writeln!(src, "const fn set_cap(n: usize) -> usize {{ if SCAP < n {{ SCAP }} else {{ n }} }}").unwrap();
     writeln!(src, "const QCAP: usize = {};", g.qcap).unwrap();
     src += crate::codegen::SQ_RUNTIME;
     let fp_bits = if fp128 { 128 } else { 64 };
@@ -1422,7 +1442,7 @@ fn compile_inner(
     src += crate::runtime::RUNTIME;
     src += crate::runtime::PPR;
     src += crate::runtime::LIVENESS_RT;
-    Ok(Output { rust: src, warnings, rejected: None })
+    Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap) })
 }
 
 /// Whether VIEW(perm(s)) = perm(VIEW(s)) for every permutation, so the view can be computed once
@@ -1505,6 +1525,27 @@ fn collect_strings(e: &Expr, atoms: &mut Atoms) {
             collect_strings(&d.body, atoms);
         }
     }
+}
+
+/// A capacity for the sets held as arrays that Init is known to need: the size of the largest
+/// constant set it assigns to a variable of such a set type. A bound from TypeOK (`x \subseteq T`
+/// with T constant) is not used: it is often far above what the search reaches (5002 for a test
+/// whose sets hold a few elements), and the capacity decides the width of every such set
+fn set_cap_start(g: &Gen, init: &Expr) -> usize {
+    let mut best = 0;
+    let mut conj = vec![];
+    flatten_and(init, &mut conj);
+    for c in &conj {
+        let Expr::Bin(BOp::Eq, v, e) = c.strip() else { continue };
+        let Expr::Ident(v) = v.strip() else { continue };
+        if !g.vars.iter().any(|(n, t)| n == v && crate::types::is_sparse(t)) {
+            continue;
+        }
+        if let Ok(Value::Set(s)) = g.ce.eval(e, &HashMap::new()) {
+            best = best.max(s.len());
+        }
+    }
+    best
 }
 
 fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {

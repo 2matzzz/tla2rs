@@ -192,6 +192,14 @@ fi
 s1=$(date +%s.%N)
 "$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 s2=$(date +%s.%N)
+# When a set or sequence outgrew the capacity the checker was built with, tla2rs built it again with
+# more room and checked from the start, after a line saying so: only the last run counts
+restart='^tla2rs: .* checking again from the start with room for [0-9]+$'
+grown=$(grep -cE "$restart" rs.out || true)
+if [[ $grown -gt 0 ]]; then
+  last=$(grep -nE "$restart" rs.out | tail -1 | cut -d: -f1)
+  tail -n +"$((last + 1))" rs.out > rs.last && mv rs.last rs.out
+fi
 
 # With both VIEW and SYMMETRY, TLC may keep states with equal views as distinct (its choice of
 # representative depends on the state itself). tla2rs collapses by orbit of the view, so its
@@ -297,7 +305,8 @@ if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
   fi
 fi
 note=""; [[ $tlc_cached == 1 ]] && note=" cached"
-printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)"
+rebuilt=""; [[ $grown -gt 0 ]] && rebuilt="; rebuilt $grown more times with more room"
+printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build%s)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)" "$rebuilt"
 if [[ "$a" == "$b" ]]; then
   if [[ $verdict_only == 1 ]]; then
     echo "  MATCH(verdict only; VIEW+SYMMETRY): $(echo "$a" | tr '\n' ' ')"

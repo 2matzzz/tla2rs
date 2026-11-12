@@ -33,12 +33,9 @@ cargo build --release
 - `-workers N` sets the number of search threads (default: number of CPUs)
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
-- `-setcap N` sets the capacity of sets whose size is only known at run time, and of the domains of functions and bags
-  over large types (see Limitations)
-- `-seqcap N` sets the maximum length of sequences (at most 65535), when the spec does not bound them with
-  `Len(x) <= N` in `TypeOK` or a `CONSTRAINT`, or `UNION {[1..n -> S] : n \in 0..N}`. Otherwise the lengths are
-  computed from Init and Next until they stop growing (a length test such as `Len(q) < N` in an action bounds `q`
-  there); if they keep growing, the length tests in the spec suggest the bound
+- `-setcap N` and `-seqcap N` set where the capacity of sets held as arrays (and of the domains of functions and
+  bags over large types) and the maximum length of sequences start. They are never needed: a value that outgrows
+  its capacity makes tla2rs build the checker again with twice the room and check from the start (see Limitations)
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
   the CPU
@@ -135,8 +132,16 @@ memory.
   function holding model values and sets of them), and a variable may hold functions over domains of different sizes
   (`[i \in 0..n |-> e]` for different n)
 - A set whose element type has at most 128 values is a bitmask; a larger one (including sets of sets) is a sorted array
-  of up to `-setcap` elements. A sequence holds up to `-seqcap` elements (see above); growing past it is an
-  evaluation error
+  of a fixed capacity, and a sequence is an array of a fixed maximum length, so that states can be copied and
+  packed without allocating. A set's capacity starts at 8 (or `Cardinality(x) <= K` in `TypeOK`, or the largest
+  constant set Init assigns), and never exceeds the number of values of its element type. A sequence's starts at
+  one more than a bound `Len(x) <= N` in `TypeOK` or a `CONSTRAINT` (or `UNION {[1..n -> S] : n \in 0..N}`);
+  otherwise at the longest length Init and Next reach, computed until it stops growing (a length test such as
+  `Len(q) < N` in an action bounds `q` there); otherwise at a length test in the spec, or 8. When a value outgrows
+  its capacity, tla2rs prints `tla2rs: a set grew beyond N elements; checking again from the start with room for
+  2N` (or a sequence), builds the checker again and runs it from the start; output printed before that line
+  (progress, and Print in ASSUMEs) is repeated. Each rebuild costs a build (a few seconds), and a spec that stays
+  within its capacities runs as fast as before. Both are at most 65535; beyond that a value is an evaluation error
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of
   characters for `\o`, `Len`, `Head`, `Tail`, `Append`, `SubSeq`, and, giving tuples as in TLC, `SelectSeq`,
   `SortSeq` and a tuple followed by a string in `\o`), `Bags`, `STRING`, and from `TLC` `Print`, `PrintT`, `Assert`,
@@ -151,8 +156,8 @@ memory.
   on when that happens
 - A function over part of a type (and a bag) is an array over the whole type when the type has at most 65536 values.
   Over a larger or unbounded type (Nat, a large integer range, sets, records of those) it is the sorted list of its
-  (key, value) pairs, which holds at most `-setcap` keys (`Cardinality(DOMAIN f) <= K` in `TypeOK` raises that bound);
-  more keys are an evaluation error. A tuple literal has at most 99,999 elements (each is a field of the generated
+  (key, value) pairs, whose capacity grows as a set's does (`Cardinality(DOMAIN f) <= K` in `TypeOK` sets where it
+  starts). A tuple literal has at most 99,999 elements (each is a field of the generated
   type)
 - A function over a set that cannot be enumerated (Nat, Int, STRING, `Seq(S)`) is supported only applied to an argument
   (also after EXCEPT with one index per update) or in `x \in DOMAIN f`, where TLC evaluates it without enumerating its

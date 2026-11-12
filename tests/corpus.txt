@@ -18,7 +18,7 @@ check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specific
 skip specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg # TLC 2.19 did not finish in 150 s with one worker
 check specifications/Chameneos/Chameneos.tla specifications/Chameneos/Chameneos.cfg
 skip specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordination.cfg # TLC 2.19 did not finish in 150 s with one worker
-check specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg rules=distinct-only rsargs=-seqcap,8
+check specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg rules=distinct-only
 skip specifications/CigaretteSmokers/APCigaretteSmokers.tla specifications/CigaretteSmokers/APCigaretteSmokers.cfg # symbolic mode: checked with Apalache
 check specifications/CigaretteSmokers/CigaretteSmokers.tla specifications/CigaretteSmokers/CigaretteSmokers.cfg
 skip specifications/CoffeeCan/APCoffeeCan.tla specifications/CoffeeCan/APCoffeeCan.cfg # symbolic mode: checked with Apalache
@@ -36,9 +36,9 @@ skip specifications/DiningPhilosophers/DiningPhilosophers_anim.tla specification
 skip specifications/DiningPhilosophers/DiningPhilosophers_stats.tla specifications/DiningPhilosophers/DiningPhilosophers_stats.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/Disruptor/APDisruptor_MPMC.tla specifications/Disruptor/APDisruptor_MPMC.cfg # symbolic mode: checked with Apalache
 skip specifications/Disruptor/APDisruptor_SPMC.tla specifications/Disruptor/APDisruptor_SPMC.cfg # symbolic mode: checked with Apalache
-check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC.cfg rsargs=-seqcap,10
-check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC_liveliness.cfg rsargs=-seqcap,10
-check specifications/Disruptor/MCDisruptor_SPMC.tla specifications/Disruptor/MCDisruptor_SPMC.cfg rsargs=-seqcap,10
+check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC.cfg
+check specifications/Disruptor/MCDisruptor_MPMC.tla specifications/Disruptor/MCDisruptor_MPMC_liveliness.cfg
+check specifications/Disruptor/MCDisruptor_SPMC.tla specifications/Disruptor/MCDisruptor_SPMC.cfg
 skip specifications/EinsteinRiddle/Einstein.tla specifications/EinsteinRiddle/Einstein.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APCRDT.tla specifications/FiniteMonotonic/APCRDT.cfg # symbolic mode: checked with Apalache
 skip specifications/FiniteMonotonic/APReplicatedLog.tla specifications/FiniteMonotonic/APReplicatedLog.cfg # symbolic mode: checked with Apalache
@@ -102,13 +102,13 @@ check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisone
 check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSolo.cfg
 check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg
 skip specifications/ReadersWriters/APReadersWriters.tla specifications/ReadersWriters/APReadersWriters.cfg # symbolic mode: checked with Apalache
-check specifications/ReadersWriters/MC.tla specifications/ReadersWriters/MC.cfg rsargs=-seqcap,6
+check specifications/ReadersWriters/MC.tla specifications/ReadersWriters/MC.cfg
 skip specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.cfg # needs module Bitwise, not in tla2tools.jar
 skip specifications/SDP_Verification/SDP_Attack_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_Spec/MC.cfg # needs module Bitwise, not in tla2tools.jar
 skip specifications/SimplifiedFastPaxos/FastPaxos.tla specifications/SimplifiedFastPaxos/FastPaxos.cfg # TLC 2.19 took 134 s with one worker
-check specifications/SimplifiedFastPaxos/Paxos.tla specifications/SimplifiedFastPaxos/Paxos.cfg rsargs=-setcap,1024
+check specifications/SimplifiedFastPaxos/Paxos.tla specifications/SimplifiedFastPaxos/Paxos.cfg
 check specifications/SingleLaneBridge/MC.tla specifications/SingleLaneBridge/MC.cfg
-check specifications/SlidingPuzzles/SlidingPuzzles.tla specifications/SlidingPuzzles/SlidingPuzzles.cfg rsargs=-setcap,64
+check specifications/SlidingPuzzles/SlidingPuzzles.tla specifications/SlidingPuzzles/SlidingPuzzles.cfg
 skip specifications/SlidingPuzzles/SlidingPuzzles_anim.tla specifications/SlidingPuzzles/SlidingPuzzles_anim.cfg # needs module SVG, not in tla2tools.jar
 skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushLarge.cfg # manifest runtime 00:50:00: beyond the 60 s budget
 skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
@@ -169,9 +169,9 @@ check specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg
 check specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg
 check specifications/acp/ACP_SB_TLC.tla specifications/acp/ACP_SB_TLC.cfg
 skip specifications/acp/APACP_SB.tla specifications/acp/APACP_SB.cfg # symbolic mode: checked with Apalache
-check specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg rsargs=-seqcap,6
-check specifications/allocator/AllocatorRefinement.tla specifications/allocator/AllocatorRefinement.cfg rsargs=-seqcap,6
-check specifications/allocator/SchedulingAllocator.tla specifications/allocator/SchedulingAllocator.cfg rsargs=-seqcap,3
+check specifications/allocator/AllocatorImplementation.tla specifications/allocator/AllocatorImplementation.cfg
+check specifications/allocator/AllocatorRefinement.tla specifications/allocator/AllocatorRefinement.cfg
+check specifications/allocator/SchedulingAllocator.tla specifications/allocator/SchedulingAllocator.cfg
 check specifications/allocator/SimpleAllocator.tla specifications/allocator/SimpleAllocator.cfg
 skip specifications/barriers/APBarrier.tla specifications/barriers/APBarrier.cfg # symbolic mode: checked with Apalache
 check specifications/barriers/Barrier.tla specifications/barriers/Barrier.cfg
