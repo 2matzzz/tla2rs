@@ -44,7 +44,11 @@ fn unescape(s: &str) -> String {
 /// The canonical text of a state: its `/\ var = value` conjuncts (each with its continuation
 /// lines) sorted, on one line with "\" and newlines escaped
 fn canon_state(label: &str) -> String {
-    let text = unescape(label);
+    canon_state_text(&unescape(label))
+}
+
+/// `canon_state` of a state as printed (not escaped)
+pub fn canon_state_text(text: &str) -> String {
     let mut parts: Vec<String> = vec![];
     for line in text.split('\n') {
         match parts.last_mut() {
