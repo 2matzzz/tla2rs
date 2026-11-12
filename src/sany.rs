@@ -45,6 +45,97 @@ thread_local! {
     /// What each module checked so far exports to a module that extends it (`None` when it
     /// extends a module whose names are not known)
     static EXPORTS: RefCell<HashMap<String, Option<Vec<Sym>>>> = RefCell::new(HashMap::new());
+    /// The keys SANY puts in each module's context (see `Ctx`), `None` when a module it reads is
+    /// not known
+    static CONTEXTS: RefCell<HashMap<String, Option<Ctx>>> = RefCell::new(HashMap::new());
+}
+
+/// What a key of a module's context names
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Var,
+    Const,
+    /// A definition (also a theorem, a named ASSUME, a RECURSIVE declaration, an instance's name
+    /// and the definitions it brings): what an INSTANCE of the module copies
+    Def,
+    /// A nested module
+    Module,
+}
+
+/// The names SANY's context of a module holds after its built-in operators, in the order they
+/// are first put there (`all`), and those of them a module that extends it takes over (`exported`,
+/// in that order: all but the LOCAL ones). TLC prints a state's variables in the order of the
+/// root module's context, a Java `Hashtable` keyed by name (see `var_order`). Measured on SANY
+/// 2.19 with a dump of the context: EXTENDS adds what each module exports, in order, skipping
+/// names already there; a declaration, definition, theorem, named ASSUME, RECURSIVE declaration
+/// or nested module adds its name; `N == INSTANCE M` adds `N!d` for each definition d M exports,
+/// then N; an unnamed INSTANCE adds the definitions M exports not there yet
+#[derive(Clone, Default)]
+struct Ctx {
+    all: Vec<(String, Kind)>,
+    exported: Vec<(String, Kind)>,
+}
+
+impl Ctx {
+    fn add(&mut self, n: &str, k: Kind, export: bool) {
+        if !self.all.iter().any(|(m, _)| m == n) {
+            self.all.push((n.to_string(), k));
+        }
+        if export && !self.exported.iter().any(|(m, _)| m == n) {
+            self.exported.push((n.to_string(), k));
+        }
+    }
+}
+
+/// The context keys module `m` exports (`None` when they are not known)
+fn ctx_exports(m: &str) -> Option<Vec<(String, Kind)>> {
+    if let Some(s) = std_exports(m) {
+        return Some(s.into_iter().map(|s| (s.name, if s.decl { Kind::Var } else { Kind::Def })).collect());
+    }
+    CONTEXTS.with(|c| c.borrow().get(m).cloned().flatten()).map(|c| c.exported)
+}
+
+/// The number of built-in operators SANY puts in every module's context first (measured)
+const SANY_BUILTINS: usize = 72;
+
+/// The variables of root module `root` in the order TLC prints them in a state, or None when a
+/// module it reads is not known. TLC takes them from SANY's context of the root module, a Java
+/// `Hashtable` keyed by name (`String.hashCode`), and reverses the order the table enumerates
+/// them in. The table starts with room for 11 and grows to 2n+1 when it holds three quarters of
+/// its room and one more name comes; a name goes to the front of the chain of its slot, growing
+/// walks the old slots from the last and each chain from the front, and enumerating walks the
+/// slots from the last. The other names only decide when the table grows: the order of two
+/// variables depends on their hashes and on how many names were in the table when each came
+pub fn var_order(root: &str) -> Option<Vec<String>> {
+    let ctx = CONTEXTS.with(|c| c.borrow().get(root).cloned().flatten())?;
+    let hash = |n: &str| n.encode_utf16().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32));
+    let slot = |h: i32, cap: usize| (h & 0x7FFF_FFFF) as usize % cap;
+    // The variables only, each chain from its front
+    let mut table: Vec<Vec<(i32, String)>> = vec![vec![]; 11];
+    let mut count = 0usize;
+    let keys = std::iter::repeat_n(None, SANY_BUILTINS).chain(ctx.all.iter().map(Some));
+    for key in keys {
+        let cap = table.len();
+        if count >= cap * 3 / 4 {
+            let mut grown: Vec<Vec<(i32, String)>> = vec![vec![]; 2 * cap + 1];
+            for chain in table.iter().rev() {
+                for (h, n) in chain {
+                    let i = slot(*h, grown.len());
+                    grown[i].insert(0, (*h, n.clone()));
+                }
+            }
+            table = grown;
+        }
+        if let Some((n, Kind::Var)) = key {
+            let h = hash(n);
+            let i = slot(h, table.len());
+            table[i].insert(0, (h, n.clone()));
+        }
+        count += 1;
+    }
+    let mut order: Vec<String> = table.iter().rev().flat_map(|c| c.iter().map(|(_, n)| n.clone())).collect();
+    order.reverse();
+    Some(order)
 }
 
 /// The names the standard modules export (as SANY names operator symbols: `\leq`, `-.` for unary
@@ -154,7 +245,13 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
         scope.push(s);
     }
     let mut out: Vec<Sym> = vec![];
+    let mut ctx = Ctx::default();
+    let mut ctx_known = true;
     for e in &m.extends {
+        match ctx_exports(e) {
+            Some(keys) => keys.iter().for_each(|(n, k)| ctx.add(n, *k, true)),
+            None => ctx_known = false,
+        }
         match exports(e) {
             Some(Some(syms)) => {
                 for s in syms {
@@ -182,12 +279,19 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                 let s = own(n, matches!(u, Unit::Decl(_)));
                 scope.push(s.clone());
                 out.push(s);
+                let k = match u {
+                    Unit::Decl(_) if m.variables.contains(n) => Kind::Var,
+                    Unit::Decl(_) => Kind::Const,
+                    _ => Kind::Def,
+                };
+                ctx.add(n, k, true);
             }
             Unit::Recursive(n) => {
                 if scope.has(n) {
                     return Err(clash(n));
                 }
                 pending_rec.push(n.clone());
+                ctx.add(n, Kind::Def, true);
                 // Exported even when the definition is LOCAL (measured: a module that extends
                 // one with `RECURSIVE F(_)` and `LOCAL F(n) == ...` may not define F)
                 scope.push(own(n, false));
@@ -240,6 +344,7 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                     }
                     w.expr(&d.body)?;
                 }
+                ctx.add(&d.name, Kind::Def, !m.local_defs.contains(&d.name));
                 let s = own(&d.name, false);
                 if !scope.syms.contains(&s) {
                     scope.push(s.clone());
@@ -250,6 +355,20 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
             }
             Unit::Inst(i, local) => {
                 let inst = &m.instances[*i];
+                match ctx_exports(&inst.module) {
+                    Some(keys) => {
+                        for (n, _) in keys.iter().filter(|(_, k)| *k == Kind::Def) {
+                            match &inst.name {
+                                Some(p) => ctx.add(&format!("{p}!{n}"), Kind::Def, !local),
+                                None => ctx.add(n, Kind::Def, !local),
+                            }
+                        }
+                        if let Some(p) = &inst.name {
+                            ctx.add(p, Kind::Def, !local);
+                        }
+                    }
+                    None => ctx_known = false,
+                }
                 match &inst.name {
                     Some(n) => {
                         if scope.has(n) {
@@ -306,9 +425,11 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                 let inner = &m.nested[*i];
                 let ex = module(inner, scope.syms.clone(), known)?;
                 EXPORTS.with(|e| e.borrow_mut().insert(inner.name.clone(), ex));
+                ctx.add(&inner.name, Kind::Module, true);
             }
         }
     }
+    CONTEXTS.with(|c| c.borrow_mut().insert(m.name.clone(), ctx_known.then_some(ctx)));
     // The module's own definitions are fixed when nothing in it is a constant or variable
     if !scope.syms.iter().any(|s| s.decl) {
         let prefix = format!("{}.", m.name);

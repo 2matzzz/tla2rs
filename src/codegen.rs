@@ -58,6 +58,8 @@ pub struct Gen<'a> {
     pub atoms: &'a Atoms,
     pub ce: ConstEval<'a>,
     pub vars: Vec<(String, Ty)>,
+    /// The variables in the order TLC prints them in a state (see `sany::var_order`)
+    pub print_order: Vec<String>,
     tys: Vec<Ty>,
     ty_ids: HashMap<Ty, usize>,
     convs: BTreeSet<(usize, usize)>,
@@ -124,6 +126,7 @@ fn rid(n: &str) -> String {
 impl<'a> Gen<'a> {
     pub fn new(atoms: &'a Atoms, constants: &'a HashMap<String, Value>) -> Self {
         Gen {
+            print_order: vec![],
             case_at: None,
             zero_defs: HashSet::new(),
             unroll: 0,
@@ -5073,7 +5076,8 @@ impl<'a> Gen<'a> {
             self.vars.iter().map(|(v, _)| v.as_str()).filter(|v| !env.partial && !env.primed.contains_key(*v)).collect();
         if !unassigned.is_empty() {
             // Fail only if this branch is reached. TLC shows the state with those variables as
-            // null, and names them in the order of their names
+            // null, and names them in the order of their names (not the order it prints them in:
+            // tests/tlc/VarOrder-Partial)
             let st = match &env.work {
                 Some(w) => w.clone(),
                 None => {

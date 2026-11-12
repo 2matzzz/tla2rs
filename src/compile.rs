@@ -1234,6 +1234,11 @@ fn compile_inner(
         _ => None,
     }).collect();
     g.inst_prefixes = m.inst_prefixes.clone();
+    // TLC's order of the variables in a state (the declared order when a module is not known)
+    g.print_order = match crate::sany::var_order(&m.name) {
+        Some(o) if o.len() == m.variables.len() && m.variables.iter().all(|v| o.contains(v)) => o,
+        _ => m.variables.clone(),
+    };
     if setcap > 0 {
         g.scap = setcap;
     }
@@ -1569,7 +1574,8 @@ fn compile_inner(
         "fn show(s: &State) -> String { show_with(s, &[]) }\nfn show_with(s: &State, null: &[&str]) -> String { let mut o = String::new(); ",
     );
     let one = g.vars.len() == 1;
-    for (i, (v, t)) in g.vars.clone().iter().enumerate() {
+    let shown: Vec<(String, Ty)> = g.print_order.iter().filter_map(|p| g.vars.iter().find(|(v, _)| v == p).cloned()).collect();
+    for (i, (v, t)) in shown.iter().enumerate() {
         let tid = g.ty_id_pub(t)?;
         let nl = if i + 1 < g.vars.len() { "\\n" } else { "" };
         let bullet = if one { "" } else { "/\\\\ " };
