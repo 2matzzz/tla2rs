@@ -1048,6 +1048,17 @@ fn compile_inner(
         crate::types::note_written_fields(&a.expr);
     }
     let mut strings: Vec<String> = (0..seen.len() as u32).filter(|&a| !seen.is_model(a)).map(|a| seen.name(a)).collect();
+    // The names of the records written in the spec are strings TLC created when it parsed them,
+    // which DOMAIN of such a record gives (`tests/tlc/CmJson`)
+    let mut fields = vec![];
+    for e in m.defs.iter().map(|d| &d.body).chain(m.assumes.iter().map(|a| &a.expr)) {
+        written_field_names(e, &mut fields);
+    }
+    for x in fields {
+        if ranks.contains_key(&x) && !strings.contains(&x) {
+            strings.push(x);
+        }
+    }
     let literals: HashSet<String> = strings.iter().cloned().collect();
     // A string made by an operation that is also a name or number of a module was created by TLC
     // when it parsed that, and takes its place (see `compile` for the order of the others)
@@ -1662,6 +1673,21 @@ fn generated_group(mut listed: Vec<Vec<u16>>) -> Vec<Vec<u16>> {
     group.retain(|p| !in_list.contains(p));
     listed.append(&mut group);
     listed
+}
+
+/// The field names of the record constructors and sets of records in e
+fn written_field_names(e: &Expr, out: &mut Vec<String>) {
+    if let Expr::RecLit(fs) | Expr::RecSet(fs) = e {
+        out.extend(fs.iter().map(|f| f.0.clone()));
+    }
+    for c in e.children() {
+        written_field_names(c, out);
+    }
+    if let Expr::Let(defs, _) = e {
+        for d in defs {
+            written_field_names(&d.body, out);
+        }
+    }
 }
 
 fn collect_strings(e: &Expr, atoms: &mut Atoms) {
