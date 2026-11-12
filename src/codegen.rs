@@ -3315,6 +3315,11 @@ impl<'a> Gen<'a> {
             }
             Field(r, k) => {
                 let (rc, rt) = self.gen(r, env, None)?;
+                // An element of a set that has no elements yet (while types are inferred from a
+                // variable that starts as {}): there is no value to take the field of
+                if rt == Ty::Enum(vec![]) {
+                    return Ok((format!("{{ let _ = {rc}; type_error(\"a record\", \"with a field {k}\") }}"), Ty::Enum(vec![])));
+                }
                 let Ty::Rec(fs) = rt else { return Err(format!("field .{k} of a non-record")) };
                 let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
                 let fp = rec_field(fs.len(), i);
