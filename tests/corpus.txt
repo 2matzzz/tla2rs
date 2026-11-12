@@ -75,8 +75,8 @@ skip specifications/MisraReachability/MCReachable.tla specifications/MisraReacha
 skip specifications/MissionariesAndCannibals/APMissionariesAndCannibals.tla specifications/MissionariesAndCannibals/APMissionariesAndCannibals.cfg # symbolic mode: checked with Apalache
 check specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg
 skip specifications/Moving_Cat_Puzzle/APCat.tla specifications/Moving_Cat_Puzzle/APCat.cfg # symbolic mode: checked with Apalache
-gap specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatEvenBoxes.cfg # tla2rs reports a successor with a variable unassigned; TLC assigns it
-gap specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatOddBoxes.cfg # tla2rs reports a successor with a variable unassigned; TLC assigns it
+check specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatEvenBoxes.cfg
+check specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatOddBoxes.cfg
 skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessLarge.cfg # manifest runtime 00:11:00: beyond the 60 s budget
 check specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessMedium.cfg
 skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetyLarge.cfg # manifest runtime 00:10:00: beyond the 60 s budget

@@ -742,7 +742,7 @@ pub fn compile(
             let chg = g.gen_as(&changed(&f.sub), &step_env, &Ty::Bool).map_err(|m| format!("{what} subscript: {m}"))?;
             let act = g.gen_as(&f.action, &step_env, &Ty::Bool).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
             let mut succ = String::new();
-            g.gen_action(&[f.action.clone()], &Gen::env_enabled(genv.clone()), &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
+            g.gen_action(&[f.action.clone()], &g.env_fair(genv.clone(), &f.sub), &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
             writeln!(src, "#[allow(unused_variables)]\nfn fchg_{i}(s: &State, t: &State) -> bool {{ {chg} }}").unwrap();
             writeln!(src, "#[allow(unused_variables)]\nfn fstep_{i}(s: &State, t: &State) -> bool {{ ({act}) && fchg_{i}(s, t) }}").unwrap();
             writeln!(

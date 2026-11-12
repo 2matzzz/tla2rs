@@ -35,6 +35,9 @@ pub struct Env {
     work: Option<String>,
     /// Inside ENABLED: a successor need not determine every variable (as in TLC)
     partial: bool,
+    /// With `partial`, the variables a successor must still determine: those the subscript of a
+    /// fairness condition reads (TLC fails evaluating it on a successor that leaves one out)
+    need: Vec<String>,
     /// Computing whether an action is enabled (ENABLED, or for fairness), which TLC's error
     /// messages name
     enabled: bool,
@@ -4529,7 +4532,7 @@ impl<'a> Gen<'a> {
             return Ok(());
         }
         for (v, _) in &self.vars {
-            if env.primed.contains_key(v) || env.partial {
+            if env.primed.contains_key(v) || (env.partial && !env.need.contains(v)) {
                 continue;
             }
             // Fail only if this branch is reached (TLC: Successor state is not completely specified)
@@ -4568,6 +4571,16 @@ impl<'a> Gen<'a> {
     /// Environment for computing whether an action is enabled (for fairness)
     pub fn env_enabled(mut env: Env) -> Env {
         env.enabled = true;
+        env
+    }
+
+    /// Environment for whether the action of WF_sub / SF_sub is enabled: as TLC computes ENABLED,
+    /// a successor may leave variables undetermined, except those `sub` reads (measured on TLC
+    /// 2.19, `tests/tlc/FairPartial*`)
+    pub fn env_fair(&self, env: Env, sub: &Expr) -> Env {
+        let mut env = Self::env_enabled(env);
+        env.partial = true;
+        env.need = self.vars.iter().map(|(v, _)| v.clone()).filter(|v| sub.any(&|x| matches!(x, Expr::Ident(n) if n == v))).collect();
         env
     }
 
