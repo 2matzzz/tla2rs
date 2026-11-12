@@ -879,14 +879,16 @@ fn compile_inner(
     }
     let mut strings: Vec<String> = (0..seen.len() as u32).filter(|&a| !seen.is_model(a)).map(|a| seen.name(a)).collect();
     strings.sort_by_key(|x| ranks.get(x).copied().unwrap_or(usize::MAX));
+    // TLC orders a model value before any string (measured: {"zz", m1} prints as {m1, "zz"} and
+    // CHOOSE picks m1), and atoms are ordered by their number
     let atoms = Atoms::default();
-    for x in &strings {
-        atoms.intern(false, x);
-    }
     for a in 0..seen.len() as u32 {
         if seen.is_model(a) {
             atoms.intern(true, &seen.name(a));
         }
+    }
+    for x in &strings {
+        atoms.intern(false, x);
     }
 
     // Constants

@@ -112,7 +112,7 @@ check specifications/SlidingPuzzles/SlidingPuzzles.tla specifications/SlidingPuz
 skip specifications/SlidingPuzzles/SlidingPuzzles_anim.tla specifications/SlidingPuzzles/SlidingPuzzles_anim.cfg # needs module SVG, not in tla2tools.jar
 skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushLarge.cfg # manifest runtime 00:50:00: beyond the 60 s budget
 skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
-gap specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushSmall.cfg # counts, verdict and the numbers of states and edges match, the texts of the states differ; cause not identified (graphs of 1.2 million edges not diffed)
+check specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushSmall.cfg
 skip specifications/SpanningTree/APSpanTree.tla specifications/SpanningTree/APSpanTree.cfg # symbolic mode: checked with Apalache
 check specifications/SpanningTree/SpanTree.tla specifications/SpanningTree/SpanTree.cfg
 skip specifications/SpanningTree/SpanTreeRandom.tla specifications/SpanningTree/SpanTreeRandom.cfg # TLC picks values at random (RandomElement, Randomization): two runs of TLC 2.19 gave different results
