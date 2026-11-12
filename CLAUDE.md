@@ -21,7 +21,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 559 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 581 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -51,7 +51,8 @@ It has no crate dependencies.
 
 | File | Role |
 |---|---|
-| `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also the checks of SANY that tla2rs repeats (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150. The positions TLC names actions by are kept in POS labels (`ast::POS`, see "Counterexamples") |
+| `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also SANY's precedence checks and string escapes (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150. The statements of a module are kept in the order written (`Module::units`). The positions TLC names actions by are kept in POS labels (`ast::POS`, see "Counterexamples") |
+| `src/sany.rs` | SANY's checks of names (see "What SANY refuses"): what is in scope at each statement, what each module exports, labels and LAMBDA. Run on each module read from a file once the modules it extends and instantiates are loaded (`compile::load_parsed`), and on the modules nested in it |
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
 | `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first) |
@@ -191,23 +192,50 @@ set (`s \in TS` fails); tla2rs fails on both.
 ### What SANY refuses
 
 TLC stops with exit 150 before checking anything when SANY refuses a spec. tla2rs repeats these of SANY's checks
-(measured on SANY 2.19, `tests/tlc/RejSany*`):
+(measured on SANY 2.19 with small specs; `tests/tlc/RejSany*`, `SanyScope*`):
 
-- Precedence conflicts: two infix operators whose ranges in the TLA+ table overlap, next to each other without
+- Scope (`sany.rs`). A name is in scope only after the statement that declares or defines it: an operator
+  parameter, bound variable or LET definition may be named like a VARIABLE, CONSTANT or definition written later
+  in the module (issue #43). In scope from the start are TRUE, FALSE, BOOLEAN, STRING and what the modules in
+  EXTENDS export: their CONSTANTs, VARIABLEs and definitions that are not LOCAL, and what they extend in turn. The
+  standard modules export what TLC's jar defines in them; those that instantiate Naturals LOCALly (Sequences,
+  FiniteSets, TLC, Bags) do not export Nat or `+`. An INSTANCE brings the instantiated module's definitions into
+  scope at that point (a LOCAL INSTANCE too, without exporting them), `N == INSTANCE M` only N. A RECURSIVE
+  declaration puts its name in scope. A nested module sees what is in scope where it starts
+- Every name used must be in scope (`Unknown operator`, `Could not find declaration or definition of symbol`),
+  in every definition, used or not; this covers the operators of standard modules not extended (`Len`, `+`, unary
+  minus as `-.`, `:>`). The sets of `\E x \in S, y \in T` are read outside the quantifier, so T cannot use x
+- No declaration, definition, parameter, LET definition, bound variable or LAMBDA parameter may reuse a name in
+  scope. A definition's own name is in scope in its parameters (`F(F)` is refused) but not in its body (`F == \E F
+  \in S : P` is accepted), unless it is a function definition `f[x \in S] == e` or declared RECURSIVE. The same
+  definition reached twice is one symbol: a module extended along two paths, or a module without constants or
+  variables both extended and instantiated (or instantiated twice). An INSTANCE of a module with constants or
+  variables gives new definitions, so instantiating it twice without names is refused. Two different definitions
+  of one name in two extended modules are only a warning for SANY, and are not refused
+- A label `l(p, q) :: e` must list exactly the bound variables introduced between it and the enclosing label or
+  definition, each once; a LET definition starts afresh, and operator parameters and LET names do not count. LAMBDA
+  is accepted only as an argument of an operator or in a WITH substitution
+- Precedence (`parser.rs`): two infix operators whose ranges in the TLA+ table overlap, next to each other without
   parentheses, unless they are the same operator and it associates (`a + b + c` is fine, `a = b = c`, `a % b % c`,
-  `a /\ b \/ c` and `a * b \div c` are not). The parser checks each operator against the one before it at the same level
-  and the one it is the right operand of (`parser::sany_range`)
-- Names: a bound variable, operator parameter or LET definition named like a CONSTANT or VARIABLE, a definition before
-  it in the module, Nat / Int (when extended), or an enclosing bound variable. A LET definition is in scope only after
-  its own body (`LET i == CHOOSE i \in S : P` is fine). A CHOOSE body extends as far as it can, so a second CHOOSE with
-  the same bound name later on the same line is inside the first and refused
-- Unary minus without Integers (or Reals), `:>` and `@@` without TLC (or Bags, which extends it) unless defined. The
-  other standard modules instantiate theirs LOCALly, so extending them gives nothing
+  `a /\ b \/ c` and `a * b \div c` are not). The parser checks each operator against the one before it at the same
+  level and the one it is the right operand of (`parser::sany_range`). A prefix operator conflicts with an infix
+  operator after its operand whose range overlaps its own: `[]`, `<>`, ENABLED and UNCHANGED have 4-15, so
+  `[]x = 1` and `ENABLED x' = 1` are refused, and so is a postfix operator on their operand (`UNCHANGED x'`); unary
+  minus has 12 (`-a \X b` is refused); SUBSET, UNION and DOMAIN behave as if their range were 10-13, measured
+  over every pair: `SUBSET a + b` is refused, `SUBSET a \cup b` is `(SUBSET a) \cup b` and `SUBSET 1..2` is
+  `(SUBSET 1)..2` (TLC then fails to evaluate it). Unary minus as the operand of an infix operator whose range
+  starts above 12 is refused (`a * -b`, `a ^ -b`); `~` never conflicts
+- Positional subexpression names (`Op!3`, `Op!(1, 2)`, `Op!lab`) that name nothing, in every definition and ASSUME
+  (`Expander::check_subexprs`), also in definitions nothing uses
 - String escapes other than `\\ \" \n \t \r \f`
 
-Not repeated: names that clash with definitions of other modules the spec extends, other operators of standard modules
-used without extending them, prefix operators in precedence conflicts, and SANY errors in definitions nothing uses
-(SANY checks every definition; tla2rs finds a bad subexpression name only when it expands it).
+LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile::hide_locals`), since they are not
+in scope in the module that reads it, which may define the same name.
+
+Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
+(their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
+a LET definition; and SANY's checks of other kinds (operator arities, levels outside temporal formulas, the
+warning for two definitions of one name in two extended modules).
 
 ### Quantifiers and CHOOSE without a set
 
@@ -405,12 +433,12 @@ new states only (`PrintConst` printed the invariant of a revisited state twice o
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
 compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.`, a second error TLC
-reports after the behavior in some configurations (below). 40 configurations, by reason:
+reports after the behavior in some configurations (below). 60 configurations, by reason:
 
 | Reason | Configurations |
 |---|---|
 | TLC gives a position tla2rs does not keep: of an identifier it fails to evaluate (also a variable a fair action leaves unspecified, which tla2rs reports in its own words), of an `x' \in S` it cannot enumerate | 9: `ActForms-AllFn`, `-InitEnFirst`, `-UnchFirst`, `-UnchMix`, `-UnchSum`, `RejPrimeExpr`, `RejTempBound`, `FairPartial`, `RealSet-NextE` |
-| SANY's report: the position of the expression it refuses and its wording (`Semantic errors:`, `***Parse Error***`, a lexical error) | 13: `RejLevel`, `RejSanyChoose`, `-Escape`, `-Minus`, `-Prec`, `-PrecUser`, `-Shadow`, `-TlcOps`, `RejTempBox`, `-Ev`, `-Leads`, `-Mix`, `SubexprBad` |
+| SANY's report: the position of the expression it refuses and its wording (`Semantic errors:`, `***Parse Error***`, a lexical error) | 33: `RejLevel`, `RejSanyChoose`, `-Escape`, `-Minus`, `-Prec`, `-PrecUser`, `-Shadow`, `-TlcOps`, `-Builtin`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-Label`, `-Lambda`, `-OwnParam`, `-Postfix`, `-PrecAlways`, `-PrecDomain`, `-PrecEnabled`, `-PrecMinus`, `-QuantSet`, `-RecParam`, `-StdName`, `-StdUnext`, `-Subexpr`, `-Unknown`, `RejTempBox`, `-Ev`, `-Leads`, `-Mix`, `SubexprBad` |
 | TLC warns about an EXCEPT outside the domain on some of the evaluations that do one (3 of many in `SparseFun`), by a rule not found; `LazyFun*` also show the position of a function's body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
 | TLC reports a second error after the behavior: `TLC was unable to fingerprint.` with its reason | 5: `MixedIn`, `NatDom-InNat`, `RealSet-Sub`, `SeqIdx`, `RejTupleCross` |
 | TLC shows the values it compared when a tuple meets another value; tla2rs decides that failure from the types | 4: `RejTupleEq`, `RejTupleIn`, `TupleStr-InDef`, `RejTupleCross` (also above) |

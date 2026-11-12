@@ -171,9 +171,16 @@ memory.
   over a set from the state whose body assigns a variable for some elements only needs the set's element type to have
   at most 16 values
 - Specs that SANY refuses stop with exit 150, as in TLC, for these reasons: operators of overlapping precedence next
-  to each other without parentheses (`a /\ b \/ c`, `a = b = c`), a bound variable, parameter or LET definition named
-  like a CONSTANT, VARIABLE, earlier definition or enclosing bound variable, unary minus without `Integers`, `:>` / `@@`
-  without `TLC`, and invalid string escapes. SANY's other checks are not repeated; tla2rs may accept such a spec
+  to each other without parentheses, also prefix and postfix ones (`a /\ b \/ c`, `a = b = c`, `[]x = 1`, `ENABLED
+  x' = 1`, `a * -b`, `DOMAIN f + 1`, `UNCHANGED x'`); a name used where nothing declares or defines it before, in
+  any definition, used or not (an operator of a standard module the spec does not extend, such as `Len`, `+` or
+  unary minus); a declaration, definition, parameter, LET definition or bound variable named like something in
+  scope at that point (also a definition of an extended or instantiated module, or of a standard module extended);
+  labels that do not list the bound variables around them; LAMBDA anywhere but as an argument; wrong positional
+  subexpression names, also in definitions nothing uses; invalid string escapes. A name is in scope only after the
+  statement that introduces it, as in SANY: an operator parameter may be named like a VARIABLE declared later. Not
+  repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and `\AA`; positional names of LET
+  definitions; and SANY's other checks (see CLAUDE.md, "What SANY refuses")
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning
