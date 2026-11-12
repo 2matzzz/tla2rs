@@ -99,8 +99,8 @@ skip specifications/PaxosHowToWinATuringAward/MCVoting.tla specifications/PaxosH
 check specifications/Prisoners/Prisoners.tla specifications/Prisoners/Prisoners.cfg
 check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/Prisoner.cfg
 check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerLightUnknown.cfg
-gap specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSolo.cfg # Init: a function over the empty set is typed as an empty record
-gap specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg # Init: a function over the empty set is typed as an empty record
+check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSolo.cfg
+check specifications/Prisoners_Single_Switch/Prisoner.tla specifications/Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg
 skip specifications/ReadersWriters/APReadersWriters.tla specifications/ReadersWriters/APReadersWriters.cfg # symbolic mode: checked with Apalache
 check specifications/ReadersWriters/MC.tla specifications/ReadersWriters/MC.cfg rsargs=-seqcap,6
 skip specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.cfg # needs module Bitwise, not in tla2tools.jar

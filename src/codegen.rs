@@ -1655,6 +1655,11 @@ impl<'a> Gen<'a> {
             return Ok(format!("{{ let __u: {} = {{ let _ = {code}; unreachable!() }}; __u }}", to.repr()));
         }
         match (from, to) {
+            // The function over the empty set, built as the empty record (its domain has no
+            // element, so the record of no fields is the same value)
+            (Ty::Rec(a), Ty::Fun(d, _) | Ty::PFun(d, _)) if a.is_empty() && d.size() == Some(0) => {
+                Ok(format!("{{ let _ = {code}; {} }}", Self::default_code(to)))
+            }
             (Ty::Set(a), Ty::Set(b)) if !is_sparse(from) && !is_sparse(to) && a.kind_eq(b) && Self::trivial(a, b) => {
                 let (a, b) = (self.ty_id(from)?, self.ty_id(to)?);
                 self.convs.insert((a, b));
@@ -5035,6 +5040,8 @@ impl<'a> Gen<'a> {
                     let fid = self.ty_id(inner)?;
                     format!("if v.0 {{ fmt_{fid}(&v.1) }} else {{ \"<none>\".into() }}")
                 }
+                // The function over the empty set (TLC's spelling for an empty function)
+                Ty::Fun(d, _) if d.size() == Some(0) => "\"<< >>\".to_string()".into(),
                 Ty::Fun(d, c) => {
                     let (did, cid) = (self.ty_id(d)?, self.ty_id(c)?);
                     if let Ty::Int(1, _) = d.as_ref() {
