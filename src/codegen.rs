@@ -3809,6 +3809,61 @@ impl<'a> Gen<'a> {
         Ok(self.note_folded(code, &made))
     }
 
+    /// Whether TLC holds the value of e as a set of its elements (a set written out, a set from the
+    /// state or a definition, `{f(y) : y \in S}`, or a union of such sets), which it unites with
+    /// another set into a new set without sorting it (`SetEnumValue.cup`)
+    fn enum_like(e: &Expr) -> bool {
+        match e.strip() {
+            Expr::SetLit(_) | Expr::Ident(_) | Expr::SetMap(..) => true,
+            Expr::Bin(BOp::Cup, a, b) => Self::enum_like(a) || Self::enum_like(b),
+            _ => false,
+        }
+    }
+
+    /// `x \in S` where x is a string and S holds tuples, or the other way round, and TLC builds S
+    /// where it is used without sorting it, so that it asks each element whether it equals x (see
+    /// `tuple_str_eq`): `{f(y) : y \in S}`, and `A \cup B` with A held as a set of its elements
+    /// (`enum_like`). Measured on TLC 2.19 (`tests/tlc/TupleStrCup`): TLC unites A with B by
+    /// copying A's elements and adding B's, unsorted, so `s \in TS \cup {}` asks each tuple of TS
+    /// while `s \in TS` searches the sorted TS and fails; when A is empty the union is B itself.
+    /// None for any other membership
+    fn member_unsorted(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<Option<String>> {
+        let s = s.strip();
+        let (a, b) = match s {
+            Expr::Bin(BOp::Cup, a, b) if Self::enum_like(a) => (a.as_ref(), Some(b.as_ref())),
+            Expr::SetMap(..) => (s, None),
+            _ => return Ok(None),
+        };
+        let tupleish = |t: &Ty| tuple_elems(t).is_some() || matches!(t, Ty::Seq(_));
+        let Ok((_, st)) = self.gen(s, env, None) else { return Ok(None) };
+        let Ty::Set(et) = &st else { return Ok(None) };
+        if !((tupleish(et) && self.has_str(xt)) || (self.has_str(et) && tupleish(xt))) {
+            return Ok(None);
+        }
+        let et = et.as_ref().clone();
+        let e = self.fresh("e");
+        let Some(eq) = self.tuple_str_eq(&e, &et, x, xt, env)? else { return Ok(None) };
+        let Some(b) = b else {
+            let (sc, t) = self.gen(s, env, Some(&st))?;
+            let sc = self.coerce(sc, &t, &st)?;
+            let it = self.s_iter("__set", &st)?;
+            return Ok(Some(format!("{{ let __set = {sc}; let __any = {it}.any(|{e}| {eq}); __any }}")));
+        };
+        if matches!(a.strip(), Expr::SetLit(xs) if xs.is_empty()) {
+            return self.gen_member_of(x, xt, b, env).map(Some);
+        }
+        let (ac, at) = self.gen(a, env, Some(&st))?;
+        let ac = self.coerce(ac, &at, &st)?;
+        let (bc, bt) = self.gen(b, env, Some(&st))?;
+        let bc = self.coerce(bc, &bt, &st)?;
+        let in_b = self.gen_member_of(x, xt, b, env)?;
+        let n = self.s_card("__a", &st);
+        let (ia, ib) = (self.s_iter("__a", &st)?, self.s_iter("__b", &st)?);
+        Ok(Some(format!(
+            "{{ let __a = {ac}; let __b = {bc}; if {n} == 0 {{ {in_b} }} else {{ let __any = {ia}.chain({ib}).any(|{e}| {eq}); __any }} }}"
+        )))
+    }
+
     fn gen_member_of(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
         // A set written out where it is used, holding tuples and x a string or the other way
@@ -3836,6 +3891,9 @@ impl<'a> Gen<'a> {
             if special {
                 return Ok(format!("({})", parts.join(" || ")));
             }
+        }
+        if let Some(code) = self.member_unsorted(x, xt, s, env)? {
+            return Ok(code);
         }
         // Whether TLC builds the set here as written, or has it sorted (see the clash below)
         let written = self.built(s, env);

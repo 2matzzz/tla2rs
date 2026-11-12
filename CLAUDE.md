@@ -271,8 +271,11 @@ TLC asks the value on the left of `=` whether it equals the one on the right. Me
 is TRUE for s = "ab"), a string asked about a tuple stops with an error, and a model value is unequal to both. For
 `x \in S`, a set written out where it is used asks each element in the order written (`s \in {<<"a", "b">>}` is
 TRUE), while a set from a definition or the state has been sorted, and comparing a string with a tuple then fails.
-`Gen::tuple_str_eq` follows this. One case is not matched: TLC finds `s \in TS \cup {}` TRUE where TS is such a sorted
-set (`s \in TS` fails); tla2rs fails on both.
+`Gen::tuple_str_eq` follows this. TLC also builds some sets where they are used without sorting them, and then asks
+each element (`Gen::member_unsorted`, `tests/tlc/TupleStrCup*`): `{f(y) : y \in S}`, and `A \cup B` when A is held as
+the set of its elements (written out, from the state or a definition, such a set, or a union with one), which TLC
+unites with B by copying A's elements and adding B's (`SetEnumValue.cup`). So `s \in TS \cup {}` is TRUE where `s \in
+TS` fails. When A is empty the union is B itself, and `s \in {} \cup TS` fails as `s \in TS` does.
 
 ### `\div` in Naturals
 
