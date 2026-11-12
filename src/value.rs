@@ -164,6 +164,19 @@ fn record_print(line: Vec<Value>) {
 
 /// TLC's messages for failures that tla2rs evaluates at compile time
 pub const DIV_ZERO: &str = "The second argument of \\div is 0.";
+
+thread_local! {
+    /// Whether `\div` is that of Naturals (the spec does not load Integers): see `nat_div`
+    pub static NAT_DIV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `a \div b` as TLC's Naturals computes it, measured on TLC 2.19: rounded toward zero, then one
+/// less when that is negative and the division is not exact, so `(0 - 1) \div 3` is 0 where
+/// Integers (and the floor of the quotient) gives -1
+pub fn nat_div(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    if a % b != 0 && q < 0 { q - 1 } else { q }
+}
 pub const MOD_NONPOS: &str = "The second argument of % should be a positive number, but instead it is:";
 pub const CASE_NONE: &str = "Attempted to evaluate a CASE with no conditions true.";
 pub const CHOOSE_NONE: &str = "Attempted to compute the value of an expression of form\nCHOOSE x \\in S: P, but no element of S satisfied P.";
@@ -1111,7 +1124,7 @@ impl ConstEval<'_> {
                 if b == 0 {
                     return Err(DIV_ZERO.into());
                 }
-                Value::Int(floor_div(a, b))
+                Value::Int(if NAT_DIV.with(|n| n.get()) { nat_div(a, b) } else { floor_div(a, b) })
             }
             Mod => {
                 let (a, b) = (a.as_int()?, b.as_int()?);

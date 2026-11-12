@@ -919,6 +919,7 @@ fn compile_inner(
     let mut warnings = vec![];
     INTEGERS.with(|i| i.set(false));
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
+    crate::value::NAT_DIV.with(|n| n.set(!INTEGERS.with(|i| i.get())));
     let cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
 

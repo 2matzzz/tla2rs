@@ -3544,7 +3544,8 @@ impl<'a> Gen<'a> {
                     }
                     Div => {
                         let m = alo.abs().max(ahi.abs());
-                        (format!("tla_div({ac}, {bc})"), Ty::Int(-m, m))
+                        let f = if self.int_module == "Naturals" { "tla_div_nat" } else { "tla_div" };
+                        (format!("{f}({ac}, {bc})"), Ty::Int(-m, m))
                     }
                     _ => (format!("tla_mod({ac}, {bc})"), Ty::Int(0, clamp((bh - 1).max(0)))),
                 };

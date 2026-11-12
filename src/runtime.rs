@@ -322,6 +322,17 @@ fn tla_div(a: i64, b: i64) -> i64 {
     if a % b != 0 && ((a < 0) != (b < 0)) { q - 1 } else { q }
 }
 
+/// `\div` of Naturals in TLC, when the spec does not load Integers: rounded toward zero, then one
+/// less only when that is negative (`(0 - 1) \div 3` is 0)
+#[inline]
+fn tla_div_nat(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        arith_error("The second argument of \\div is 0.".into());
+    }
+    let q = a / b;
+    if a % b != 0 && q < 0 { q - 1 } else { q }
+}
+
 #[inline]
 fn tla_mod(a: i64, b: i64) -> i64 {
     if b <= 0 {
