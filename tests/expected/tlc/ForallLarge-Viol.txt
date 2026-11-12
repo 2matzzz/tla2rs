@@ -1,0 +1,10 @@
+key b54cfcdb6a458f2cb3c4df40454ba3fad16318594c3ddddfc36db9bb1635e316
+tlc Version 2.19
+rc 12
+Invariant NotSeven is violated
+19 states generated 12 distinct states found 7 states left on queue
+trace 3 1da6ac68aa43d397c4efeee6bcf4dfd5ca7f6051537fcc0f71ddd31074421f86
+states 12 b9d82e0c796885e3f05113479454bb2d7f9990ff45e61eab4384a115cee10697
+edges 17 0f5eb3ca469807c4dbc281f0678de3134c574b370b1a306d82e2c306f6280b96
+messages 2 5eb347d4cc3268de68a5c5d5ba3f91a04c6d8ab281ffd9d8b77d382eae511496
+errors 2 5eb347d4cc3268de68a5c5d5ba3f91a04c6d8ab281ffd9d8b77d382eae511496
