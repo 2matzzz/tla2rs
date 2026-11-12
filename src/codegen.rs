@@ -859,7 +859,9 @@ impl<'a> Gen<'a> {
             write!(sig, "{a}: {}, ", t.repr()).unwrap();
         }
         let mut last_err = String::new();
-        for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool] {
+        // The type of a call not resolved yet: a body that iterates over the result of its
+        // recursive call (a set built from smaller ones) needs a set
+        for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool, Ty::Set(Ty::Enum(vec![]).into())] {
             let mut ret = seed;
             for round in 0..30 {
                 self.rec_progress.push((key.clone(), ret.clone()));
