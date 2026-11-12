@@ -597,6 +597,11 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
                     // A bound that reads a variable: TLC adds the error it got evaluating it
                     if let Some(v) = m.strip_prefix('`').and_then(|x| x.strip_suffix("` is not a constant")).filter(|v| g.vars.iter().any(|(n, _)| n == v)) {
                         r.0 += &format!(":\nIn evaluation, the identifier {v} is either undefined or not an operator.");
+                        // With the position of the variable in the bounds, where TLC met it
+                        let at = bs.iter().find_map(|(_, s)| first_named(s, v));
+                        if let Some(at) = at {
+                            r.0 += &format!("\n{}", at.text());
+                        }
                     }
                     return Ok(Err(r));
                 }
@@ -804,4 +809,12 @@ pub fn compile(
     // the others when the state is expanded
     writeln!(src, "const SATOMS_TABLEAU: u64 = {tableau};").unwrap();
     Ok(Ok(src))
+}
+
+/// The position of the first identifier named v written in e
+fn first_named(e: &Expr, v: &str) -> Option<Pos> {
+    match e {
+        Expr::Ident(n, at) if n == v && at.known() => Some(*at),
+        e => e.children().into_iter().find_map(|c| first_named(c, v)),
+    }
 }

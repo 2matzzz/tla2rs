@@ -92,7 +92,7 @@ pub fn bounded_seq(e: &Expr) -> Option<(&Expr, &Expr)> {
     let [(n, r)] = bs.as_slice() else { return None };
     let Expr::FunSet(d, s) = f.strip() else { return None };
     match d.strip() {
-        Expr::Bin(BOp::Range, lo, hi) if matches!(lo.strip(), Expr::Num(1)) && matches!(hi.strip(), Expr::Ident(m) if m == n) => Some((r, s)),
+        Expr::Bin(BOp::Range, lo, hi) if matches!(lo.strip(), Expr::Num(1)) && matches!(hi.strip(), Expr::Ident(m, _) if m == n) => Some((r, s)),
         _ => None,
     }
 }
@@ -242,7 +242,7 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
             return Err(format!("cfg: `{n}` is given a value more than once"));
         }
         let ps = fresh(k);
-        let body = Expr::Call(def.clone(), ps.iter().map(|p| Expr::Ident(p.clone())).collect());
+        let body = Expr::Call(def.clone(), ps.iter().map(|p| Expr::Ident(p.clone(), NOPOS)).collect());
         extra.push(Def { name: n.clone(), params: ps, arity: vec![0; k], body });
         op_done.push(n.clone());
     }
@@ -293,8 +293,8 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
             return Err(format!("cfg: `{n} <- {def}`: they take {} and {} arguments", np.len(), dp.len()));
         }
         // Name(p1, ...) == Def(p1, ...); defined last, so it takes precedence
-        let args: Vec<Expr> = np.iter().map(|p| Expr::Ident(p.clone())).collect();
-        let body = if args.is_empty() { Expr::Ident(def.clone()) } else { Expr::Call(def.clone(), args) };
+        let args: Vec<Expr> = np.iter().map(|p| Expr::Ident(p.clone(), NOPOS)).collect();
+        let body = if args.is_empty() { Expr::Ident(def.clone(), NOPOS) } else { Expr::Call(def.clone(), args) };
         let arity = m.defs.iter().rev().find(|d| d.name == *n).map(|d| d.arity.clone()).unwrap_or_default();
         extra.push(Def { name: n.clone(), params: np, arity, body });
     }
@@ -432,7 +432,7 @@ fn hide_locals(mut m: Module) -> Module {
     let prefix = format!("{}#local#", m.name);
     fn rn(e: &Expr, locals: &HashSet<String>, prefix: &str) -> Expr {
         match e {
-            Expr::Ident(n) if locals.contains(n) => Expr::Ident(format!("{prefix}{n}")),
+            Expr::Ident(n, at) if locals.contains(n) => Expr::Ident(format!("{prefix}{n}"), *at),
             Expr::Call(n, a) if locals.contains(n) => Expr::Call(format!("{prefix}{n}"), a.iter().map(|x| rn(x, locals, prefix)).collect()),
             Expr::Let(ds, b) => Expr::Let(
                 ds.iter().map(|d| Def { body: rn(&d.body, locals, prefix), ..d.clone() }).collect(),
@@ -501,7 +501,7 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
     fn cfg_values(e: &Expr, order: &mut Vec<String>) {
         match e {
             Expr::Str(x) => order.push(x.clone()),
-            Expr::Ident(n) => {
+            Expr::Ident(n, _) => {
                 if let Some(mv) = n.strip_prefix("@model:") {
                     order.push(mv.to_string());
                 }
@@ -717,9 +717,9 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
         if let Some(n) = &inst.name {
             for &(op, k) in std_ops(mname) {
                 let ps: Vec<String> = (1..=k).map(|i| format!("#a{i}")).collect();
-                let args: Vec<Expr> = ps.iter().map(|p| Expr::Ident(p.clone())).collect();
+                let args: Vec<Expr> = ps.iter().map(|p| Expr::Ident(p.clone(), NOPOS)).collect();
                 let body = if op.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-                    if k == 0 { Expr::Ident(op.into()) } else { Expr::Call(op.into(), args) }
+                    if k == 0 { Expr::Ident(op.into(), NOPOS) } else { Expr::Call(op.into(), args) }
                 } else {
                     let mut it = args.into_iter();
                     crate::parser::bin(op, it.next().unwrap(), it.next().unwrap())
@@ -749,7 +749,7 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     let raw = |d: &str| format!("{mname}#i{k}#{d}");
     out.inst_prefixes.push((raw(""), inst.name.as_ref().map_or(String::new(), |n| format!("{n}!")), params.len()));
     let names: HashSet<&str> = mm.defs.iter().map(|d| d.name.as_str()).collect();
-    let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone())).collect();
+    let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone(), NOPOS)).collect();
     // The number of parameters of each definition, for one passed as an operator argument
     let arities: HashMap<String, usize> = mm.defs.iter().map(|d| (d.name.clone(), d.params.len())).collect();
     let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, &arities);
@@ -758,14 +758,14 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
         match e {
             // A definition with parameters named without arguments is an operator argument
             // (`Test(S, Op)`): the hidden definition with the leading parameters bound
-            Expr::Ident(n) if names.contains(n.as_str()) && !pargs.is_empty() && arities.get(n).is_some_and(|&k| k > 0) => {
+            Expr::Ident(n, _) if names.contains(n.as_str()) && !pargs.is_empty() && arities.get(n).is_some_and(|&k| k > 0) => {
                 let ps: Vec<String> = (0..arities[n]).map(|i| format!("{n}#arg{i}")).collect();
                 let mut a = pargs.to_vec();
-                a.extend(ps.iter().map(|p| Expr::Ident(p.clone())));
+                a.extend(ps.iter().map(|p| Expr::Ident(p.clone(), NOPOS)));
                 Expr::Lambda(ps, Expr::Call(raw(n), a).b())
             }
-            Expr::Ident(n) if names.contains(n.as_str()) => {
-                if pargs.is_empty() { Expr::Ident(raw(n)) } else { Expr::Call(raw(n), pargs.to_vec()) }
+            Expr::Ident(n, _) if names.contains(n.as_str()) => {
+                if pargs.is_empty() { Expr::Ident(raw(n), NOPOS) } else { Expr::Call(raw(n), pargs.to_vec()) }
             }
             Expr::Call(n, args) if names.contains(n.as_str()) => {
                 let mut a = pargs.to_vec();
@@ -811,11 +811,11 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     for (p, _) in &params {
         match inst.subs.iter().find(|(x, _)| x == p) {
             // A variable substituted by anything but itself is marked (see ast::SUBVAR)
-            Some((_, e)) if mm.variables.contains(p) && !matches!(e, Expr::Ident(n) if n == p) => {
+            Some((_, e)) if mm.variables.contains(p) && !matches!(e, Expr::Ident(n, _) if n == p) => {
                 args.push(Expr::Label(format!("{}{p}", crate::ast::SUBVAR), vec![], e.clone().b()))
             }
             Some((_, e)) => args.push(e.clone()),
-            None if known(p) || inst.params.contains(p) => args.push(Expr::Ident(p.clone())),
+            None if known(p) || inst.params.contains(p) => args.push(Expr::Ident(p.clone(), NOPOS)),
             None => return Err(format!("INSTANCE {mname}: {p} has no WITH substitution and is not declared or defined here")),
         }
     }
@@ -824,8 +824,8 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
             continue;
         }
         let mut call_args = args.clone();
-        call_args.extend(d.params.iter().map(|p| Expr::Ident(p.clone())));
-        let body = if call_args.is_empty() { Expr::Ident(raw(&d.name)) } else { Expr::Call(raw(&d.name), call_args) };
+        call_args.extend(d.params.iter().map(|p| Expr::Ident(p.clone(), NOPOS)));
+        let body = if call_args.is_empty() { Expr::Ident(raw(&d.name), NOPOS) } else { Expr::Call(raw(&d.name), call_args) };
         // TLC names an action inside it by the INSTANCE statement
         let body = if inst.at.is_empty() { body } else { at_pos(&inst.at, body) };
         let (name, params, arity) = match &inst.name {
@@ -912,7 +912,15 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
                     "{report}\n\nFatal errors while parsing TLA+ spec in file {}\n\n*** Abort messages: 1\n\nIn module {module}\n\nCould not parse module {module} from file {module}.tla\n\nError: Parsing or semantic analysis failed.",
                     crate::lexer::module_name(tla)
                 ),
-                None => format!("*** Errors: 1\n\n{msg}\n\nError: Parsing or semantic analysis failed."),
+                // A semantic error, with its position when it is known (see `sany::SEMANTIC`)
+                None => {
+                    let msg = match msg.strip_prefix(crate::sany::SEMANTIC).and_then(|m| m.split_once('\n')) {
+                        Some(("", m)) => m.to_string(),
+                        Some((at, m)) => format!("{at}\n\n{m}"),
+                        None => msg,
+                    };
+                    format!("Semantic errors:\n\n*** Errors: 1\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.")
+                }
             };
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
@@ -952,7 +960,7 @@ fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
 /// Whether e is of constant level (no variable, prime or temporal operator)
 fn constant_level(e: &Expr, m: &Module) -> bool {
     !e.any(&|x| match x {
-        Expr::Ident(v) => m.variables.contains(v),
+        Expr::Ident(v, _) => m.variables.contains(v),
         Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => true,
         Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) => true,
         x => x.is_unchecked_temporal(),
@@ -979,7 +987,7 @@ fn makes_strings(e: &Expr, constants: &HashMap<String, Value>, atoms: &Atoms) ->
     ["\\o", "Append", "Head", "Tail", "SubSeq"].iter().any(|n| op(n))
         && e.any(&|x| match x {
             Expr::Str(_) => true,
-            Expr::Ident(n) => constants.get(n).is_some_and(|v| has_str(v, atoms)),
+            Expr::Ident(n, _) => constants.get(n).is_some_and(|v| has_str(v, atoms)),
             _ => false,
         })
 }
@@ -1311,10 +1319,10 @@ fn compile_inner(
         match c.strip() {
             // STRING is not a set of values here: the variable's type is inferred, and the conjunct
             // is checked as an invariant
-            Expr::Bin(BOp::In | BOp::Subseteq, _, s) if matches!(s.strip(), Expr::Ident(n) if n == "STRING") => leftover += 1,
+            Expr::Bin(BOp::In | BOp::Subseteq, _, s) if matches!(s.strip(), Expr::Ident(n, _) if n == "STRING") => leftover += 1,
             Expr::Bin(BOp::In, v, s) => {
                 let mut taken = false;
-                if let Expr::Ident(v) = v.strip() {
+                if let Expr::Ident(v, _) = v.strip() {
                     // A set that gives no type (one with Int inside, records mixed with other values)
                     // leaves the variable's type to inference, which stops the search where a value
                     // leaves the type inferred
@@ -1336,7 +1344,7 @@ fn compile_inner(
             }
             Expr::Bin(BOp::Subseteq, v, s) => {
                 let mut taken = false;
-                if let Expr::Ident(v) = v.strip() {
+                if let Expr::Ident(v, _) = v.strip() {
                     if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
                         taken = !crate::types::mixes_atoms(&t);
                         decl.insert(v.clone(), Ty::Set(t.into()));
@@ -1661,7 +1669,7 @@ fn collect_strings(e: &Expr, atoms: &mut Atoms) {
         Expr::Str(s) => {
             atoms.intern(false, s);
         }
-        Expr::Ident(n) => {
+        Expr::Ident(n, _) => {
             if let Some(mv) = n.strip_prefix("@model:") {
                 atoms.intern(true, mv);
             }
@@ -1688,7 +1696,7 @@ fn set_cap_start(g: &Gen, init: &Expr) -> usize {
     flatten_and(init, &mut conj);
     for c in &conj {
         let Expr::Bin(BOp::Eq, v, e) = c.strip() else { continue };
-        let Expr::Ident(v) = v.strip() else { continue };
+        let Expr::Ident(v, _) = v.strip() else { continue };
         if !g.vars.iter().any(|(n, t)| n == v && crate::types::is_sparse(t)) {
             continue;
         }
@@ -1728,10 +1736,10 @@ fn ty_of_set(g: &Gen, s: &Expr) -> R<Ty> {
         Expr::Call(f, parts) if f == "\\X" => tuple_ty(parts.iter().map(|x| ty_of_set(g, x)).collect::<R<_>>()?)?,
         Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Ty::Seq(ty_of_set(g, &a[0])?.into()),
         e if bounded_seq(e).is_some() => Ty::Seq(ty_of_set(g, bounded_seq(e).unwrap().1)?.into()),
-        Expr::Ident(n) if n == "BOOLEAN" => Ty::Bool,
+        Expr::Ident(n, _) if n == "BOOLEAN" => Ty::Bool,
         // Unbounded integers are stored as 64-bit
-        Expr::Ident(n) if n == "Nat" => Ty::Int(0, BIG),
-        Expr::Ident(n) if n == "Int" => Ty::Int(-BIG, BIG),
+        Expr::Ident(n, _) if n == "Nat" => Ty::Int(0, BIG),
+        Expr::Ident(n, _) if n == "Int" => Ty::Int(-BIG, BIG),
         e => {
             let v = ce.eval(e, &no)?;
             let set = v.as_set()?;
@@ -1766,7 +1774,7 @@ fn is_temporal(e: &Expr, m: &Module, seen: &mut HashSet<String>) -> bool {
 
 fn collect_refs(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr::Ident(n) | Expr::Call(n, _) => out.push(n.clone()),
+        Expr::Ident(n, _) | Expr::Call(n, _) => out.push(n.clone()),
         _ => {}
     }
     for c in e.children() {
@@ -1806,10 +1814,10 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
             None => None,
         };
         let written = Ok(crate::lasso::Written {
-            init: vec![Expr::Ident(i.clone())],
+            init: vec![Expr::Ident(i.clone(), NOPOS)],
             next: cfg.next.as_ref().map(|n| {
-                let vars = Expr::Tuple(m.variables.iter().map(|v| Expr::Ident(v.clone())).collect());
-                Expr::BoxAction(Expr::Ident(n.clone()).b(), vars.b())
+                let vars = Expr::Tuple(m.variables.iter().map(|v| Expr::Ident(v.clone(), NOPOS)).collect());
+                Expr::BoxAction(Expr::Ident(n.clone(), NOPOS).b(), vars.b())
             }),
             temporal: vec![],
         });
@@ -1820,7 +1828,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
     if !ex.has_def(spec) {
         return Err(format!("no definition `{spec}`"));
     }
-    w.walk(&Expr::Ident(spec.clone()), m, ex)?;
+    w.walk(&Expr::Ident(spec.clone(), NOPOS), m, ex)?;
     w.init = w.init.iter().map(strip_pos).collect();
     w.temporal = w.temporal.iter().map(strip_pos).collect();
     if w.init.is_empty() {
@@ -1880,11 +1888,11 @@ impl SpecWalk {
                     }
                 }
             },
-            Expr::Ident(n) if ex.def(n).is_some_and(|d| d.params.is_empty()) => {
+            Expr::Ident(n, _) if ex.def(n).is_some_and(|d| d.params.is_empty()) => {
                 let b = ex.def(n).unwrap().body.clone();
                 // A definition of an instance: its body calls the instantiated module's definition,
                 // which is split after substitution
-                let inst = matches!(b.unpos(), Expr::Ident(r) | Expr::Call(r, _) if r.contains("#i"));
+                let inst = matches!(b.unpos(), Expr::Ident(r, _) | Expr::Call(r, _) if r.contains("#i"));
                 if inst {
                     ex.keep_pos = true;
                     let x = ex.expand_top(e);

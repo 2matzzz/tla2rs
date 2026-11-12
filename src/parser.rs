@@ -304,7 +304,7 @@ fn tuple_lets(t: &str, names: Vec<String>) -> Vec<Def> {
             name: n,
             params: vec![],
             arity: vec![],
-            body: Expr::App(Expr::Ident(t.to_string()).b(), Expr::Num(i as i64 + 1).b()),
+            body: Expr::App(Expr::Ident(t.to_string(), NOPOS).b(), Expr::Num(i as i64 + 1).b()),
         })
         .collect()
 }
@@ -323,7 +323,7 @@ fn free_names(e: &Expr, out: &mut Vec<String>) {
 }
 
 fn all_names(e: &Expr, out: &mut Vec<String>) {
-    if let Expr::Ident(n) = e {
+    if let Expr::Ident(n, _) = e {
         if !n.starts_with('@') {
             out.push(n.clone());
         }
@@ -353,17 +353,17 @@ fn rename_instance(e: &Expr, r: &(String, String, Vec<String>)) -> Expr {
     let prefix = format!("{local}!");
     let target = |n: &str| n.strip_prefix(&prefix).map(|op| format!("{unique}!{op}"));
     match e {
-        Expr::Ident(n) | Expr::Call(n, _) if target(n).is_some() => {
-            let mut args: Vec<Expr> = names.iter().map(|n| Expr::Ident(n.clone())).collect();
+        Expr::Ident(n, _) | Expr::Call(n, _) if target(n).is_some() => {
+            let mut args: Vec<Expr> = names.iter().map(|n| Expr::Ident(n.clone(), NOPOS)).collect();
             if let Expr::Call(_, a) = e {
                 args.extend(a.iter().map(|x| rename_instance(x, r)));
             }
             let name = target(match e {
-                Expr::Ident(n) | Expr::Call(n, _) => n,
+                Expr::Ident(n, _) | Expr::Call(n, _) => n,
                 _ => unreachable!(),
             })
             .unwrap();
-            if args.is_empty() { Expr::Ident(name) } else { Expr::Call(name, args) }
+            if args.is_empty() { Expr::Ident(name, NOPOS) } else { Expr::Call(name, args) }
         }
         _ => crate::codegen::map_children(e, &|c| rename_instance(c, r)),
     }
@@ -372,7 +372,7 @@ fn rename_instance(e: &Expr, r: &(String, String, Vec<String>)) -> Expr {
 /// e with every application `f[a]` replaced by the call `app(a)`
 fn calls_for_apps(e: &Expr, f: &str, app: &str) -> Expr {
     match e {
-        Expr::App(g, a) if matches!(g.as_ref(), Expr::Ident(n) if n == f) => {
+        Expr::App(g, a) if matches!(g.as_ref(), Expr::Ident(n, _) if n == f) => {
             Expr::Call(app.to_string(), vec![calls_for_apps(a, f, app)])
         }
         _ => crate::codegen::map_children(e, &|c| calls_for_apps(c, f, app)),
@@ -395,7 +395,7 @@ fn fun_cons(bs: Vec<(String, Expr)>, body: Expr) -> Expr {
             name: x.clone(),
             params: vec![],
             arity: vec![],
-            body: Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b()),
+            body: Expr::App(Expr::Ident(t.clone(), NOPOS).b(), Expr::Num(i as i64 + 1).b()),
         })
         .collect();
     let dom = Expr::Call("\\X".into(), bs.into_iter().map(|(_, s)| s).collect());
@@ -430,6 +430,12 @@ impl Parser {
         }
         let (s, e) = (&self.toks[a], &self.toks[b]);
         format!("line {}, col {} to line {}, col {} of module {}", s.line, s.col + 1, e.line, e.end, self.module)
+    }
+
+    /// The position of the tokens a..=b (see `Pos`)
+    fn pos_of(&self, a: usize, b: usize) -> Pos {
+        let (s, e) = (&self.toks[a], &self.toks[b]);
+        Pos { line: s.line as u32, col: s.col as u32 + 1, end_line: e.line as u32, end_col: e.end as u32, module: module_id(&self.module) }
     }
 
     /// `e`, parsed from the token at `start` to the last one consumed, in a SPAN label
@@ -753,7 +759,7 @@ impl Parser {
                 let e = match infix(self.peek()) {
                     Some((_, _, op)) if matches!(self.peek2(), Tok::Sym(c) if c == ",") || matches!(self.peek2(), Tok::Eof) || self.toks[self.pos + 1].first => {
                         self.pos += 1;
-                        let (a, b) = (Expr::Ident("#l".into()), Expr::Ident("#r".into()));
+                        let (a, b) = (Expr::Ident("#l".into(), NOPOS), Expr::Ident("#r".into(), NOPOS));
                         Expr::Lambda(vec!["#l".into(), "#r".into()], bin(op, a, b).b())
                     }
                     _ => self.expr(0)?,
@@ -858,7 +864,7 @@ impl Parser {
             let body = if lets.is_empty() { body } else { Expr::Let(lets, body.b()) };
             let _ = at;
             let n = bs.len();
-            if body.any(&|e| matches!(e, Expr::Ident(n) | Expr::Call(n, _) if *n == name)) {
+            if body.any(&|e| matches!(e, Expr::Ident(n, _) | Expr::Call(n, _) if *n == name)) {
                 let mut defs = self.rec_fun(name, bs, body);
                 let whole = defs.last_mut().unwrap();
                 whole.body = self.fn_label(&groups, n, b0, b1, std::mem::replace(&mut whole.body, Expr::Bool(true)));
@@ -898,8 +904,8 @@ impl Parser {
         };
         // Applying f outside its domain is an error, as in TLC (CHOOSE from the empty set fails)
         let outside = Expr::Choose("#none".into(), Expr::SetLit(vec![]).b(), Expr::Bool(true).b());
-        let guarded = Expr::If(Expr::Bin(BOp::In, Expr::Ident(x.clone()).b(), dom.clone().b()).b(), inner.b(), outside.b());
-        let whole = Expr::FunCons(x.clone(), dom.b(), Expr::Call(app.clone(), vec![Expr::Ident(x.clone())]).b());
+        let guarded = Expr::If(Expr::Bin(BOp::In, Expr::Ident(x.clone(), NOPOS).b(), dom.clone().b()).b(), inner.b(), outside.b());
+        let whole = Expr::FunCons(x.clone(), dom.b(), Expr::Call(app.clone(), vec![Expr::Ident(x.clone(), NOPOS)]).b());
         vec![
             Def { name: app, params: vec![x], arity: vec![0], body: guarded },
             Def { name, params: vec![], arity: vec![], body: whole },
@@ -1037,7 +1043,7 @@ impl Parser {
                 self.tuple_binders += 1;
                 let t = format!("#tup{}", self.tuple_binders);
                 for (i, n) in names.into_iter().enumerate() {
-                    let body = Expr::App(Expr::Ident(t.clone()).b(), Expr::Num(i as i64 + 1).b());
+                    let body = Expr::App(Expr::Ident(t.clone(), NOPOS).b(), Expr::Num(i as i64 + 1).b());
                     lets.push(Def { name: n, params: vec![], arity: vec![], body });
                 }
                 out.push((t, s));
@@ -1397,7 +1403,7 @@ impl Parser {
             if let Some((_, _, name)) = infix(self.peek()) {
                 if matches!(self.peek2(), Tok::Sym(s) if s == "," || s == close) {
                     self.pos += 1;
-                    v.push(Expr::Ident(name.to_string()));
+                    v.push(Expr::Ident(name.to_string(), NOPOS));
                     if self.is(",") {
                         self.pos += 1;
                         continue;
@@ -1444,10 +1450,13 @@ impl Parser {
                     return Ok(Expr::Fair(s == "WF_", sub.b(), a.b()));
                 }
                 if (s.starts_with("WF_") || s.starts_with("SF_")) && self.is("(") {
+                    // The subscript is written after `WF_`
+                    let at = self.pos_of(self.pos - 1, self.pos - 1);
+                    let at = Pos { col: at.col + 3, ..at };
                     self.pos += 1;
                     let a = self.nested(|p| p.expr(0))?;
                     self.expect(")")?;
-                    return Ok(Expr::Fair(s.starts_with("WF_"), Expr::Ident(s[3..].into()).b(), a.b()));
+                    return Ok(Expr::Fair(s.starts_with("WF_"), Expr::Ident(s[3..].into(), at).b(), a.b()));
                 }
                 // A label `l :: e` or `l(a, b) :: e`: kept as a Label named `l::`, which nothing
                 // but liveness looks at (TLC cannot check a labeled temporal formula)
@@ -1510,7 +1519,7 @@ impl Parser {
                         _ => break,
                     }
                 }
-                let base = if call || !args.is_empty() { Expr::Call(name, args) } else { Expr::Ident(name) };
+                let base = if call || !args.is_empty() { Expr::Call(name, args) } else { Expr::Ident(name, self.pos_of(id_tok, self.pos - 1)) };
                 // RTnow(v) and RTBound(A, v, D, E) of RealTime are temporal formulas TLC refuses,
                 // naming them by position
                 if matches!(&base, Expr::Call(n, _) if n == "RTnow" || n == "RTBound") {
@@ -1528,7 +1537,7 @@ impl Parser {
                     parts.push(match next {
                         Tok::Num(n) => Expr::Num(n),
                         Tok::Sym(c) if c == "(" => Expr::Tuple(self.nested(|p| p.comma_list(")"))?),
-                        Tok::Sym(c) if ["<<", ">>", ":", "@"].contains(&c.as_str()) => Expr::Ident(c),
+                        Tok::Sym(c) if ["<<", ">>", ":", "@"].contains(&c.as_str()) => Expr::Ident(c, NOPOS),
                         Tok::Ident(l) => {
                             let mut largs = vec![];
                             if self.is("(") {
@@ -1563,7 +1572,7 @@ impl Parser {
                         if u.starts_with('_') && self.raw().line == line && self.raw().col == end {
                             let u = u.clone();
                             self.pos += 1;
-                            let sub = if u == "_" { self.primary()? } else { Expr::Ident(u[1..].to_string()) };
+                            let sub = if u == "_" { self.primary()? } else { Expr::Ident(u[1..].to_string(), NOPOS) };
                             let [a] = <[Expr; 1]>::try_from(v).map_err(|_| "<<...>>_v takes one action".to_string())?;
                             let same = Expr::Bin(BOp::Eq, Expr::Prime(sub.clone().b()).b(), sub.b());
                             // Marked, so that <>(<<A>>_v) can be told from <> of another action
@@ -1616,7 +1625,7 @@ impl Parser {
         if self.is(":") {
             self.pos += 1;
             if let (true, Expr::Bin(BOp::In, x, s)) = (filter_shape, &first) {
-                if let Expr::Ident(x) = x.as_ref() {
+                if let Expr::Ident(x, _) = x.as_ref() {
                     let p = self.expr(0)?;
                     self.expect("}")?;
                     return Ok(Expr::SetFilter(x.clone(), s.clone(), p.b()));
@@ -1663,7 +1672,7 @@ impl Parser {
         let start = self.pos;
         let e = self.expr(0)?;
         let e_end = self.pos;
-        if self.is(",") && matches!(&e, Expr::Ident(_) | Expr::Bin(BOp::In, ..)) {
+        if self.is(",") && matches!(&e, Expr::Ident(_, _) | Expr::Bin(BOp::In, ..)) {
             // [x \in S, y \in T |-> e] or [x, y \in S |-> e]
             self.pos = start;
             // A tuple of bound variables `<<a, b>> \in S` among them names the components of
@@ -1718,7 +1727,7 @@ impl Parser {
         }
         if self.is("|->") {
             if let Expr::Bin(BOp::In, x, s) = &e {
-                if let Expr::Ident(x) = x.as_ref() {
+                if let Expr::Ident(x, _) = x.as_ref() {
                     self.pos += 1;
                     let b0 = self.pos;
                     let body = self.expr(0)?;
@@ -1729,7 +1738,7 @@ impl Parser {
                 }
                 // [<<x, y>> \in S |-> e]
                 if let Expr::Tuple(xs) = x.as_ref() {
-                    if let Some(names) = xs.iter().map(|x| if let Expr::Ident(n) = x { Some(n.clone()) } else { None }).collect::<Option<Vec<_>>>() {
+                    if let Some(names) = xs.iter().map(|x| if let Expr::Ident(n, _) = x { Some(n.clone()) } else { None }).collect::<Option<Vec<_>>>() {
                         self.pos += 1;
                         let b0 = self.pos;
                         let body = self.expr(0)?;
@@ -1750,7 +1759,7 @@ impl Parser {
             if let Some(v) = sub.strip_prefix('_') {
                 let v = v.to_string();
                 self.pos += 1;
-                let sub = if v.is_empty() { self.primary()? } else { Expr::Ident(v) };
+                let sub = if v.is_empty() { self.primary()? } else { Expr::Ident(v, NOPOS) };
                 let e = at_pos(&self.span_text(start, e_end - 1), e);
                 return Ok(Expr::BoxAction(e.b(), sub.b()));
             }

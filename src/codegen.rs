@@ -439,7 +439,7 @@ impl<'a> Gen<'a> {
                         self.atoms.intern(false, ch);
                         let mut env2 = env.clone();
                         env2.bind("#elem", code.clone(), et.clone());
-                        let eq = Expr::Bin(BOp::Eq, Expr::Ident("#elem".into()).b(), Expr::Str(ch.clone()).b());
+                        let eq = Expr::Bin(BOp::Eq, Expr::Ident("#elem".into(), NOPOS).b(), Expr::Str(ch.clone()).b());
                         parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
                     }
                 }
@@ -658,7 +658,7 @@ impl<'a> Gen<'a> {
                     let mut env2 = env.clone();
                     env2.locals.insert("#seq".into(), (x.to_string(), xt.clone()));
                     let (dc, dt) = self.gen(d, env, None)?;
-                    let range = Expr::Bin(BOp::Range, Expr::Num(1).b(), Expr::Call("Len".into(), vec![Expr::Ident("#seq".into())]).b());
+                    let range = Expr::Bin(BOp::Range, Expr::Num(1).b(), Expr::Call("Len".into(), vec![Expr::Ident("#seq".into(), NOPOS)]).b());
                     let (rc, rt) = self.gen(&range, &env2, Some(&dt))?;
                     let t = join(&dt, &rt)?;
                     let same = format!("({} == {})", self.coerce(dc, &dt, &t)?, self.coerce(rc, &rt, &t)?);
@@ -802,7 +802,7 @@ impl<'a> Gen<'a> {
 
     /// Whether `b` is a bag held in the state (a constant bag is a plain function value)
     fn is_bag(&mut self, b: &Expr, env: &Env) -> bool {
-        matches!(b.strip(), Expr::Ident(n) if n == "EmptyBag") || matches!(self.gen(b, env, None), Ok((_, Ty::Bag(_))))
+        matches!(b.strip(), Expr::Ident(n, _) if n == "EmptyBag") || matches!(self.gen(b, env, None), Ok((_, Ty::Bag(_))))
             || matches!(b.strip(), Expr::Call(f, _) if f == "SetToBag")
     }
 
@@ -925,7 +925,7 @@ impl<'a> Gen<'a> {
             };
             let n = bound.len();
             bound.extend(binders);
-            if let Expr::Ident(x) = e {
+            if let Expr::Ident(x, _) = e {
                 if !bound.contains(x) && !out.contains(x) {
                     out.push(x.clone());
                 }
@@ -1083,7 +1083,7 @@ impl<'a> Gen<'a> {
 
     fn collect_reads(&self, e: &Expr, primed: bool, reads: &mut BTreeSet<String>, primes: &mut BTreeSet<String>, todo: &mut Vec<usize>) {
         match e {
-            Expr::Ident(n) if self.is_var(n) => {
+            Expr::Ident(n, _) if self.is_var(n) => {
                 if primed {
                     primes.insert(n.clone());
                 } else {
@@ -1134,7 +1134,7 @@ impl<'a> Gen<'a> {
     /// Rewrites (e)' as e with every variable in it primed
     fn prime_vars(&self, e: &Expr) -> Expr {
         match e {
-            Expr::Ident(n) if self.is_var(n) => Expr::Prime(e.clone().b()),
+            Expr::Ident(n, _) if self.is_var(n) => Expr::Prime(e.clone().b()),
             Expr::Prime(_) => e.clone(),
             Expr::Label(n, ..) if n.starts_with(crate::ast::SUBVAR) => Expr::Prime(e.clone().b()),
             _ => map_children(e, &|c| self.prime_vars(c)),
@@ -1161,7 +1161,7 @@ impl<'a> Gen<'a> {
             // arguments even where its body reads none of them
             Expr::Label(_, _, b) => self.is_const(b, env),
             Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
-            Expr::Ident(n) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
+            Expr::Ident(n, _) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
             _ => e.children().into_iter().all(|c| self.is_const(c, env)),
         }
     }
@@ -1170,7 +1170,7 @@ impl<'a> Gen<'a> {
     fn is_const_quiet(&self, e: &Expr, env: &Env) -> bool {
         match e {
             Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
-            Expr::Ident(n) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
+            Expr::Ident(n, _) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
             // The arguments of a call site are only a trace (see is_const)
             Expr::Label(_, _, b) => self.is_const_quiet(b, env),
             _ => e.children().into_iter().all(|c| self.is_const_quiet(c, env)),
@@ -1213,7 +1213,7 @@ impl<'a> Gen<'a> {
                 if is_tuple_fields(fs) && self.try_const(i, env).is_none() {
                     self.tmp += 1;
                     let at = format!("@dyn{}", self.tmp);
-                    let base = Expr::Ident(at.clone());
+                    let base = Expr::Ident(at.clone(), NOPOS);
                     let arms = (1..=fs.len())
                         .map(|k| {
                             let mut inner: Vec<Path> = vec![Path::Idx(Expr::Num(k as i64))];
@@ -1378,7 +1378,7 @@ impl<'a> Gen<'a> {
     /// elements than a function over part of a type is held as an array for
     fn lazy_domain(&self, s: &Expr, env: &Env) -> bool {
         match s.strip() {
-            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) => {
+            Expr::Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) => {
                 !env.locals.contains_key(n) && !self.is_var(n) && !self.ce.constants.contains_key(n)
             }
             Expr::Call(f, a) if f == "Seq" && a.len() == 1 => true,
@@ -1401,7 +1401,7 @@ impl<'a> Gen<'a> {
     /// A domain part of a function over a set TLC cannot enumerate, as TLC prints its value
     fn lazy_set_shown(&mut self, s: &Expr, env: &Env) -> Option<String> {
         match s.strip() {
-            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && self.lazy_domain(s, env) => Some(n.clone()),
+            Expr::Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && self.lazy_domain(s, env) => Some(n.clone()),
             Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Some(format!("Seq({})", self.lazy_set_shown(&a[0], env)?)),
             Expr::Call(f, parts) if f == "\\X" => {
                 let ps: Vec<String> = parts.iter().map(|p| self.lazy_set_shown(p, env)).collect::<Option<_>>()?;
@@ -2262,7 +2262,7 @@ impl<'a> Gen<'a> {
             }
         }
         Ok(match e {
-            Ident(n) => {
+            Ident(n, _) => {
                 if let Some((c, t)) = env.locals.get(n) {
                     (c.clone(), t.clone())
                 } else if self.is_var(n) {
@@ -2296,17 +2296,21 @@ impl<'a> Gen<'a> {
                     // Not bound yet: TLC fails on evaluation, naming the variable
                     None => {
                         let (_, t) = self.gen(b, env, want)?;
-                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
+                        let mut msg = undefined_ident(n, &NOPOS);
+                        if let Some(at) = crate::ast::subvar_pos(x) {
+                            msg = format!("{msg}\n{at}");
+                        }
+                        (format!("{{ let __v: {} = eval_error({msg:?}.into()); __v }}", t.repr()), t)
                     }
                 }
             }
             Prime(x) => match x.strip() {
-                Ident(n) if self.is_var(n) => match env.primed.get(n) {
+                Ident(n, at) if self.is_var(n) => match env.primed.get(n) {
                     Some(x) => x.clone(),
                     // As in TLC, fail only on evaluation (harmless if the branch is never reached)
                     None => {
                         let t = self.var_ty(n);
-                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
+                        (format!("{{ let __v: {} = eval_error({:?}.into()); __v }}", t.repr(), undefined_ident(n, at)), t)
                     }
                 },
                 x => {
@@ -2828,7 +2832,17 @@ impl<'a> Gen<'a> {
                 // variable not assigned yet)
                 match self.vars.iter().find(|(v, _)| !env.primed.contains_key(v)) {
                     Some((v, _)) => {
-                        (eval_error_bool(&format!("In evaluation, the identifier {v} is either undefined or not an operator.")), Ty::Bool)
+                        // TLC names the first variable not assigned yet that the action reads
+                        fn first_read(e: &Expr, unset: &dyn Fn(&str) -> bool) -> Option<(String, Pos)> {
+                            match e {
+                                Expr::Ident(n, at) if unset(n) => Some((n.clone(), *at)),
+                                Expr::Prime(_) => None,
+                                e => e.children().into_iter().find_map(|c| first_read(c, unset)),
+                            }
+                        }
+                        let unset = |n: &str| self.is_var(n) && !env.primed.contains_key(n);
+                        let (v, at) = first_read(x, &unset).unwrap_or((v.clone(), NOPOS));
+                        (eval_error_bool(&undefined_ident(&v, &at)), Ty::Bool)
                     }
                     None => {
                         let fields: Vec<String> =
@@ -2913,7 +2927,7 @@ impl<'a> Gen<'a> {
                 let mut parts = vec![];
                 for v in names {
                     let (p, _) = env.primed.get(&v).cloned().ok_or(format!("UNCHANGED {v} before {v}' is decided"))?;
-                    let (c, _) = self.gen(&Ident(v.clone()), env, None)?;
+                    let (c, _) = self.gen(&Ident(v.clone(), NOPOS), env, None)?;
                     parts.push(format!("{p} == {c}"));
                 }
                 (format!("({})", if parts.is_empty() { "true".into() } else { parts.join(" && ") }), Ty::Bool)
@@ -3302,7 +3316,7 @@ impl<'a> Gen<'a> {
                 }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
                 // If the argument is a bound variable with a known index, use it without conversion
-                if let Ident(n) = x.strip() {
+                if let Ident(n, _) = x.strip() {
                     if let Some((t, iv)) = env.idx.get(n) {
                         if *t == *d {
                             return Ok((format!("({fc})[{iv} as usize]"), *c));
@@ -3387,7 +3401,7 @@ impl<'a> Gen<'a> {
                                 // A bound variable with a known index needs neither conversion nor
                                 // a bounds check
                                 let known = match i.strip() {
-                                    Expr::Ident(n) => env.idx.get(n).filter(|(t, _)| *t == **d).map(|(_, v)| v.clone()),
+                                    Expr::Ident(n, _) => env.idx.get(n).filter(|(t, _)| *t == **d).map(|(_, v)| v.clone()),
                                     _ => None,
                                 };
                                 match known {
@@ -3560,7 +3574,7 @@ impl<'a> Gen<'a> {
                 // So are the variables it reads (in Init, the values assigned so far) and the primed
                 // variables it reads, which must be determined before the call
                 for v in &reads {
-                    let (c, t) = self.gen(&Ident(v.clone()), env, None)?;
+                    let (c, t) = self.gen(&Ident(v.clone(), NOPOS), env, None)?;
                     let vt = self.var_ty(v);
                     codes.push(self.coerce(c, &t, &vt)?);
                     tys.push(vt);
@@ -3591,7 +3605,7 @@ impl<'a> Gen<'a> {
         // S \subseteq "Reals" (Real): each element of S is checked against the string, which fails
         if op == Subseteq && matches!(self.try_const(b, env), Some(Value::Atom(x)) if !self.atoms.is_model(x)) {
             let y = self.fresh("sub");
-            let e = Expr::Quant(false, vec![(y.clone(), a.clone())], Expr::Bin(In, Expr::Ident(y).b(), b.clone().b()).b());
+            let e = Expr::Quant(false, vec![(y.clone(), a.clone())], Expr::Bin(In, Expr::Ident(y, NOPOS).b(), b.clone().b()).b());
             return self.gen(&e, env, want);
         }
         Ok(match op {
@@ -3691,7 +3705,7 @@ impl<'a> Gen<'a> {
             }
             // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
             Subseteq
-                if matches!(b.strip(), Expr::Ident(n) if n == "Nat" || n == "Int" || n == "STRING")
+                if matches!(b.strip(), Expr::Ident(n, _) if n == "Nat" || n == "Int" || n == "STRING")
                     || matches!(b.strip(), Expr::Call(f, a) if f == "Seq" && a.len() == 1) =>
             {
                 let (ac, at) = self.gen(a, env, None)?;
@@ -3970,7 +3984,7 @@ impl<'a> Gen<'a> {
     /// another set into a new set without sorting it (`SetEnumValue.cup`)
     fn enum_like(e: &Expr) -> bool {
         match e.strip() {
-            Expr::SetLit(_) | Expr::Ident(_) | Expr::SetMap(..) => true,
+            Expr::SetLit(_) | Expr::Ident(_, _) | Expr::SetMap(..) => true,
             Expr::Bin(BOp::Cup, a, b) => Self::enum_like(a) || Self::enum_like(b),
             _ => false,
         }
@@ -4039,7 +4053,7 @@ impl<'a> Gen<'a> {
                         let mut env2 = env.clone();
                         env2.bind("#elem", c.clone(), t.clone());
                         env2.bind("#x", x.to_string(), xt.clone());
-                        let eq = Bin(BOp::Eq, Ident("#elem".into()).b(), Ident("#x".into()).b());
+                        let eq = Bin(BOp::Eq, Ident("#elem".into(), NOPOS).b(), Ident("#x".into(), NOPOS).b());
                         parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
                     }
                 }
@@ -4083,7 +4097,7 @@ impl<'a> Gen<'a> {
                 return Ok(format!("({})", conj.join(" && ")));
             }
             if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
-                || matches!(s, Ident(n) if ["BOOLEAN", "Nat", "Int", "STRING"].contains(&n.as_str()))
+                || matches!(s, Ident(n, _) if ["BOOLEAN", "Nat", "Int", "STRING"].contains(&n.as_str()))
             {
                 return Ok(eval_error_bool(&format!("Attempted to check if the tuple {x} is an element of {}", short(s))));
             }
@@ -4100,10 +4114,10 @@ impl<'a> Gen<'a> {
             // A sparse function: its keys in D and its values in R, and as many keys as D has
             // elements, which needs D finite (TLC fails to compare a domain with Nat, Int or STRING)
             FunSet(d, r) if matches!(xt, Ty::PFun(..)) && is_sparse_fun(xt) && self.try_const(d, env).is_none() => {
-                if let Ident(n) = d.strip() {
+                if let Ident(n, _) = d.strip() {
                     if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.locals.contains_key(n) {
                         let dt = Ty::Set(fun_kv(xt).0.into());
-                        let (dc, _) = self.gen(&Un(UOp::Domain, Ident("#f".into()).b()), &{
+                        let (dc, _) = self.gen(&Un(UOp::Domain, Ident("#f".into(), NOPOS).b()), &{
                             let mut e2 = env.clone();
                             e2.locals.insert("#f".into(), (x.to_string(), xt.clone()));
                             e2
@@ -4212,8 +4226,8 @@ impl<'a> Gen<'a> {
                     _ => "false".into(),
                 });
             }
-            Ident(n) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
-            Ident(n) if n == "Any" => return Ok("true".into()),
+            Ident(n, _) if n == "BOOLEAN" => return Ok(matches!(xt, Ty::Bool).to_string()),
+            Ident(n, _) if n == "Any" => return Ok("true".into()),
             // x \in UNION {[1..n -> S] : n \in R}: the length in R and each element in S
             _ if crate::compile::bounded_seq(s).is_some() && matches!(xt, Ty::Seq(_)) => {
                 let (r, el) = crate::compile::bounded_seq(s).unwrap();
@@ -4223,11 +4237,11 @@ impl<'a> Gen<'a> {
                 let in_s = self.gen_member(&e, et, el, env)?;
                 return Ok(format!("{{ let {l} = ({x}).len as i64; let __all = {in_r} && ({x}).iter().all(|{e}| {in_s}); __all }}"));
             }
-            Ident(n) if n == "Nat" => {
+            Ident(n, _) if n == "Nat" => {
                 return Ok(if matches!(xt, Ty::Int(..) | Ty::IntAtom(..)) { format!("({x} >= 0)") } else { "false".into() })
             }
             // TRUE for a string, FALSE for a model value, and an error for anything else, as in TLC
-            Ident(n) if n == "STRING" && !env.locals.contains_key(n) => {
+            Ident(n, _) if n == "STRING" && !env.locals.contains_key(n) => {
                 let err = |what: &str| format!("Attempted to check if the value:\n{what}\nis an element of STRING.");
                 return Ok(match xt {
                     Ty::Enum(d) => {
@@ -4251,7 +4265,7 @@ impl<'a> Gen<'a> {
                     }
                 });
             }
-            Ident(n) if n == "Int" => {
+            Ident(n, _) if n == "Int" => {
                 return Ok(match xt {
                     Ty::Int(..) => "true".into(),
                     Ty::IntAtom(..) => format!("({x} >= i64::MIN + 65536)"),
@@ -4447,7 +4461,7 @@ impl<'a> Gen<'a> {
                 let parts = leaves
                     .into_iter()
                     .map(|l| match l.strip() {
-                        Ident(n) if self.is_var(n) => Un(UOp::Unchanged, l.clone().b()),
+                        Ident(n, _) if self.is_var(n) => Un(UOp::Unchanged, l.clone().b()),
                         _ => Bin(BOp::Eq, Prime(l.clone().b()).b(), l.b()),
                     })
                     .collect();
@@ -4524,7 +4538,7 @@ impl<'a> Gen<'a> {
             // first bound variable varies fastest), so it can assign variables
             Quant(false, bs, body)
                 if action && !self.only_reads_assigned(h, env)
-                    || env.init && body.any(&|e| matches!(e, Ident(n) if self.is_var(n) && !env.primed.contains_key(n))) =>
+                    || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n))) =>
             {
                 let sets: Option<Vec<(String, Vec<Value>)>> = bs
                     .iter()
@@ -4593,7 +4607,7 @@ impl<'a> Gen<'a> {
             }
             // The elements of `\A x \in S : B` (S from the state) from the i-th on (gen_forall)
             Call(f, a) if f == FORALL_REST => {
-                let [Ident(key), Ident(x), b, Num(i), set] = a.as_slice() else { unreachable!() };
+                let [Ident(key, _), Ident(x, _), b, Num(i), set] = a.as_slice() else { unreachable!() };
                 let (els, et) = env.locals[key].clone();
                 if self.only_reads_assigned(b, env) {
                     // Nothing left to assign: B holds for each remaining element
@@ -4630,7 +4644,7 @@ impl<'a> Gen<'a> {
                 let e = self.fresh("e");
                 writeln!(out, "let {e} = {els}[{i}];").unwrap();
                 env2.bind(x, e, et);
-                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1), set.clone()]);
+                let next = Call(FORALL_REST.into(), vec![Ident(key.clone(), NOPOS), Ident(x.clone(), NOPOS), b.clone(), Num(i + 1), set.clone()]);
                 self.gen_action(&with(vec![b.clone(), next]), &env2, out)?;
                 out.push_str("}\n");
                 return Ok(());
@@ -4706,7 +4720,7 @@ impl<'a> Gen<'a> {
                     // x' = [x EXCEPT ...] updates the state under construction in place
                     // (avoiding a copy out and back in)
                     match rhs.strip() {
-                        Except(base, ups) if matches!(base.strip(), Ident(n) if *n == v) => {
+                        Except(base, ups) if matches!(base.strip(), Ident(n, _) if *n == v) => {
                             self.gen_except_into(&place, ups, &t, &env2, out)?;
                         }
                         _ => match self.gen_set_update(&place, &v, rhs, &t, env) {
@@ -4863,7 +4877,7 @@ impl<'a> Gen<'a> {
                 let parts: Vec<Expr> = leaves
                     .into_iter()
                     .map(|l| match l.strip() {
-                        Ident(n) if self.is_var(n) && crate::ast::subvar_of(&l).is_none() => Un(UOp::Unchanged, l.clone().b()),
+                        Ident(n, _) if self.is_var(n) && crate::ast::subvar_of(&l).is_none() => Un(UOp::Unchanged, l.clone().b()),
                         _ => Bin(BOp::Eq, Prime(l.clone().b()).b(), l.b()),
                     })
                     .collect();
@@ -4896,7 +4910,7 @@ impl<'a> Gen<'a> {
         let mut env2 = env.clone();
         let key = self.fresh("#els");
         env2.bind(&key, els, et);
-        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0), s.clone()]);
+        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key, NOPOS), Expr::Ident(x.clone(), NOPOS), inner, Expr::Num(0), s.clone()]);
         let work: Vec<Expr> = std::iter::once(first).chain(rest.iter().cloned()).collect();
         self.gen_action(&work, &env2, out)
     }
@@ -4986,10 +5000,10 @@ impl<'a> Gen<'a> {
         let (sp, kp) = (format!("#forall_s{n}"), format!("#forall_k{n}"));
         let rd = |body| crate::expand::RecDef { name: "\\A".into(), params: vec![sp.clone(), kp.clone()], body };
         let id = crate::expand::add_rec_def(rd(Bool(true)));
-        let elem = Call(FORALL_NTH.into(), vec![Ident(sp.clone()), Ident(kp.clone())]);
-        let next = RecCall(id, vec![Ident(sp.clone()), Bin(BOp::Add, Ident(kp.clone()).b(), Num(1).b())]);
-        let more = And(vec![replace_expr(b, &Ident(x.to_string()), &elem), next]);
-        let done = Bin(BOp::Gt, Ident(kp.clone()).b(), Call("Cardinality".into(), vec![Ident(sp.clone())]).b());
+        let elem = Call(FORALL_NTH.into(), vec![Ident(sp.clone(), NOPOS), Ident(kp.clone(), NOPOS)]);
+        let next = RecCall(id, vec![Ident(sp.clone(), NOPOS), Bin(BOp::Add, Ident(kp.clone(), NOPOS).b(), Num(1).b())]);
+        let more = And(vec![replace_expr(b, &Ident(x.to_string(), NOPOS), &elem), next]);
+        let done = Bin(BOp::Gt, Ident(kp.clone(), NOPOS).b(), Call("Cardinality".into(), vec![Ident(sp.clone(), NOPOS)]).b());
         crate::expand::set_rec_def(id, rd(If(done.b(), Bool(true).b(), more.b())));
         self.forall_recs.insert(key, id);
         id
@@ -5070,10 +5084,10 @@ impl<'a> Gen<'a> {
             // Bound by its name while computing ENABLED (see gen_phantom)
             (Expr::Prime(x), false) if env.phantom && crate::ast::subvar_of(x).is_some() => return None,
             (Expr::Prime(x), false) => match x.strip() {
-                Expr::Ident(n) => n.clone(),
+                Expr::Ident(n, _) => n.clone(),
                 _ => return None,
             },
-            (Expr::Ident(n), true) => n.clone(),
+            (Expr::Ident(n, _), true) => n.clone(),
             _ => return None,
         };
         (self.is_var(&n) && !env.primed.contains_key(&n)).then_some(n)
@@ -5095,11 +5109,11 @@ impl<'a> Gen<'a> {
         match e {
             // A primed constant is the constant
             Expr::Prime(p) => match p.strip() {
-                Expr::Ident(n) if self.is_var(n) => env.primed.contains_key(n),
+                Expr::Ident(n, _) if self.is_var(n) => env.primed.contains_key(n),
                 p => self.only_reads_assigned(p, env),
             },
             // UNCHANGED e reads e' (every variable in e primed)
-            Expr::Un(UOp::Unchanged, v) => !v.any(&|x| matches!(x, Expr::Ident(n) if self.is_var(n) && !env.primed.contains_key(n))),
+            Expr::Un(UOp::Unchanged, v) => !v.any(&|x| matches!(x, Expr::Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n))),
             // ENABLED A reads no primed variable of the step around it
             Expr::Un(UOp::Enabled, _) => true,
             e => e.children().into_iter().all(|c| self.only_reads_assigned(c, env)),
@@ -5116,7 +5130,7 @@ impl<'a> Gen<'a> {
 
     fn unchanged_vars(e: &Expr, out: &mut Vec<String>) -> R<()> {
         match e.strip() {
-            Expr::Ident(n) => out.push(n.clone()),
+            Expr::Ident(n, _) => out.push(n.clone()),
             Expr::Tuple(xs) => {
                 for x in xs {
                     Self::unchanged_vars(x, out)?;
@@ -5136,7 +5150,7 @@ impl<'a> Gen<'a> {
             return None;
         }
         match e.strip() {
-            Ident(n) if n == v => Some(String::new()),
+            Ident(n, _) if n == v => Some(String::new()),
             Bin(op @ (BOp::Cup | BOp::SetMinus), a, b) => {
                 let base = self.gen_set_update(place, v, a, st, env)?;
                 let method = if *op == BOp::Cup { "insert" } else { "remove" };
@@ -5214,7 +5228,7 @@ impl<'a> Gen<'a> {
                     }
                     (Path::Idx(i), Ty::Fun(d, c)) => {
                         let known = match i.strip() {
-                            Expr::Ident(n) => env.idx.get(n).filter(|(t, _)| *t == **d).map(|(_, v)| v.clone()),
+                            Expr::Ident(n, _) => env.idx.get(n).filter(|(t, _)| *t == **d).map(|(_, v)| v.clone()),
                             _ => None,
                         };
                         match known {
@@ -5484,7 +5498,7 @@ impl<'a> Gen<'a> {
     /// Whether `e` depends on the state (has level 1 or more for SANY)
     fn mentions_state(&self, e: &Expr) -> bool {
         e.any(&|x| {
-            matches!(x, Expr::Ident(n) if self.is_var(n))
+            matches!(x, Expr::Ident(n, _) if self.is_var(n))
                 || matches!(x, Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled, _) | Expr::BoxAction(..))
         })
     }
@@ -6331,7 +6345,7 @@ pub fn lazy_fun_string(f: &Expr, part: &mut dyn FnMut(&Expr) -> Option<String>) 
 fn lazy_fun_text(x: &str, s: &Expr) -> String {
     let x = x.split("__").next().unwrap_or(x);
     let s = match s.strip() {
-        Expr::Ident(n) => n.clone(),
+        Expr::Ident(n, _) => n.clone(),
         s => short(s),
     };
     format!("[{x} \\in {s} |-> ...]")
@@ -6410,6 +6424,13 @@ pub fn with_at(msg: &str, at: &Option<String>) -> String {
     }
 }
 
+/// TLC's error for an identifier it cannot evaluate (a variable not assigned yet), with the
+/// position of the identifier when it is known
+fn undefined_ident(n: &str, at: &Pos) -> String {
+    let msg = format!("In evaluation, the identifier {n} is either undefined or not an operator.");
+    if at.known() { format!("{msg}\n{}", at.text()) } else { msg }
+}
+
 fn eval_error_bool(msg: &str) -> String {
     // TLC's own evaluation errors (for a failed arithmetic operation) are raised as such
     let f = if msg.starts_with(crate::value::DIV_ZERO) || msg.starts_with(crate::value::MOD_NONPOS) { "arith_error" } else { "eval_error" };
@@ -6437,7 +6458,7 @@ impl Env {
 /// e with the identifier `from` (a bound variable, named uniquely by expansion) renamed to `to`
 fn rename_ident(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
-        Expr::Ident(n) if n == from => Expr::Ident(to.to_string()),
+        Expr::Ident(n, _) if n == from => Expr::Ident(to.to_string(), NOPOS),
         _ => map_children(e, &|c| rename_ident(c, from, to)),
     }
 }
@@ -6456,7 +6477,7 @@ pub fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
     let m = |x: &Expr| f(x);
     let mb = |x: &Expr| f(x).b();
     match e {
-        Num(_) | Str(_) | Bool(_) | Ident(_) | At => e.clone(),
+        Num(_) | Str(_) | Bool(_) | Ident(_, _) | At => e.clone(),
         Call(n, a) => Call(n.clone(), a.iter().map(m).collect()),
         Prime(x) => Prime(mb(x)),
         Un(o, x) => Un(*o, mb(x)),
@@ -6502,7 +6523,8 @@ pub fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
 }
 
 pub fn short(e: &Expr) -> String {
-    let s = format!("{e:?}");
+    // Without the positions of names (see `Pos`)
+    let s = format!("{e:?}").replace("\", _)", "\")");
     if s.len() > 200 {
         format!("{}…", &s[..s.char_indices().nth(200).map(|x| x.0).unwrap_or(s.len())])
     } else {

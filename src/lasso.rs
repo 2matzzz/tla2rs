@@ -47,7 +47,7 @@ pub fn tla(e: &Expr) -> Result<String, String> {
         Ok(bs.iter().map(|(x, s)| Ok(format!("{} \\in {}", name(x)?, tla(s)?))).collect::<Result<Vec<_>, String>>()?.join(", "))
     };
     let sub = |v: &Expr| match v {
-        Ident(n) => name(n),
+        Ident(n, _) => name(n),
         Tuple(xs) => Ok(format!("<<{}>>", list(xs, ", ")?)),
         _ => Err("a subscript other than a name or a tuple".to_string()),
     };
@@ -56,8 +56,8 @@ pub fn tla(e: &Expr) -> Result<String, String> {
         Str(s) => format!("{s:?}"),
         Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
         // A model value of the cfg
-        Ident(n) if n.starts_with("@model:") => n["@model:".len()..].to_string(),
-        Ident(n) => name(n)?,
+        Ident(n, _) if n.starts_with("@model:") => n["@model:".len()..].to_string(),
+        Ident(n, _) => name(n)?,
         Call(n, a) if n == "\\X" => format!("({})", list(a, " \\X ")?),
         Call(n, a) if n.starts_with(|c: char| c.is_ascii_alphabetic()) => {
             if a.is_empty() { n.clone() } else { format!("{n}({})", list(a, ", ")?) }
@@ -231,8 +231,8 @@ pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> Str
 }
 
 fn model_values(e: &Expr, out: &mut Vec<String>) {
-    if let Some(n) = matches!(e, Expr::Ident(_)).then_some(e).and_then(|e| match e {
-        Expr::Ident(n) => n.strip_prefix("@model:"),
+    if let Some(n) = matches!(e, Expr::Ident(_, _)).then_some(e).and_then(|e| match e {
+        Expr::Ident(n, _) => n.strip_prefix("@model:"),
         _ => None,
     }) {
         if !out.iter().any(|x| x == n) {

@@ -5,8 +5,9 @@ pub enum Expr {
     Num(i64),
     Str(String),
     Bool(bool),
-    /// A variable, constant, bound variable, or zero-argument operator
-    Ident(String),
+    /// A variable, constant, bound variable, or zero-argument operator, and where it is written
+    /// (see `Pos`)
+    Ident(String, Pos),
     /// An operator application (including built-ins such as Cardinality)
     Call(String, Vec<Expr>),
     Prime(Box<Expr>),
@@ -43,6 +44,65 @@ pub enum Expr {
     /// A call of a recursive operator that is not inlined: an index into `expand::rec_def` and the
     /// (expanded) arguments
     RecCall(usize, Vec<Expr>),
+}
+
+/// Where a name is written, as SANY reports it (1-based line and column, the end column
+/// inclusive), or nowhere (`NOPOS`) for a name the compiler made. It never takes part in
+/// comparing expressions: two expressions that differ only in where their names are written are
+/// equal, so code generation does not depend on it. TLC names an identifier it fails to evaluate
+/// by this position
+#[derive(Clone, Copy, Default)]
+pub struct Pos {
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    /// An index into the names of the modules parsed (`module_id`)
+    pub module: u32,
+}
+
+pub const NOPOS: Pos = Pos { line: 0, col: 0, end_line: 0, end_col: 0, module: 0 };
+
+impl PartialEq for Pos {
+    fn eq(&self, _: &Pos) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Pos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "_")
+    }
+}
+
+thread_local! {
+    static MODULE_NAMES: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(vec![String::new()]);
+}
+
+/// The number `Pos::module` gives the module named `m`
+pub fn module_id(m: &str) -> u32 {
+    MODULE_NAMES.with(|ns| {
+        let mut ns = ns.borrow_mut();
+        match ns.iter().position(|n| n == m) {
+            Some(i) => i as u32,
+            None => {
+                ns.push(m.to_string());
+                (ns.len() - 1) as u32
+            }
+        }
+    })
+}
+
+impl Pos {
+    pub fn known(&self) -> bool {
+        self.line > 0
+    }
+
+    /// As TLC prints a position: `line 3, col 9 to line 3, col 9 of module M`
+    pub fn text(&self) -> String {
+        let m = MODULE_NAMES.with(|ns| ns.borrow().get(self.module as usize).cloned().unwrap_or_default());
+        format!("line {}, col {} to line {}, col {} of module {m}", self.line, self.col, self.end_line, self.end_col)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -231,8 +291,23 @@ pub const ENINST: &str = "#en_inst";
 pub fn subvar_of(e: &Expr) -> Option<(&str, &Expr)> {
     match e {
         Expr::Label(n, _, b) => match n.strip_prefix(SUBVAR) {
-            Some(v) => Some((v, b)),
+            Some(v) => Some((v.split(SUBVAR_AT).next().unwrap_or(v), b)),
             None => subvar_of(b),
+        },
+        _ => None,
+    }
+}
+
+/// After the name in a SUBVAR label: where that use of the variable is written in the
+/// instantiated module, as TLC prints a position (expansion adds it)
+pub const SUBVAR_AT: char = '\u{1}';
+
+/// Where the substituted variable `e` is written (see SUBVAR_AT)
+pub fn subvar_pos(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Label(n, _, b) => match n.strip_prefix(SUBVAR) {
+            Some(v) => v.split_once(SUBVAR_AT).map(|(_, at)| at),
+            None => subvar_pos(b),
         },
         _ => None,
     }
@@ -260,7 +335,7 @@ impl Expr {
     pub fn children(&self) -> Vec<&Expr> {
         use Expr::*;
         match self {
-            Num(_) | Str(_) | Bool(_) | Ident(_) | At => vec![],
+            Num(_) | Str(_) | Bool(_) | Ident(..) | At => vec![],
             Call(_, a) | And(a) | Or(a) | SetLit(a) | Tuple(a) => a.iter().collect(),
             Prime(x) | Un(_, x) | Field(x, _) => vec![x],
             Bin(_, a, b) | App(a, b) | FunSet(a, b) | BoxAction(a, b) | Fair(_, a, b) => vec![a, b],

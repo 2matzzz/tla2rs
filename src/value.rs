@@ -263,7 +263,7 @@ impl ConstEval<'_> {
 
     fn lazy_set_shown(&self, s: &Expr, env: &HashMap<String, Value>) -> Option<String> {
         match s.strip() {
-            Expr::Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
+            Expr::Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
                 Some(n.clone())
             }
             Expr::Call(f, a) if f == "Seq" && a.len() == 1 => Some(format!("Seq({})", self.lazy_set_shown(&a[0], env)?)),
@@ -285,7 +285,7 @@ impl ConstEval<'_> {
             Num(n) => Value::Int(*n),
             Bool(b) => Value::Bool(*b),
             Str(s) => Value::Atom(self.atoms.get(false, s).ok_or("unknown string")?),
-            Ident(n) => {
+            Ident(n, _) => {
                 if let Some(v) = env.get(n) {
                     v.clone()
                 } else if let Some(v) = self.constants.get(n) {
@@ -318,7 +318,7 @@ impl ConstEval<'_> {
                     }
                     set.iter().next().unwrap().clone()
                 }
-                ("IsFiniteSet", [s]) if matches!(s.strip(), Ident(n) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n)) => {
+                ("IsFiniteSet", [s]) if matches!(s.strip(), Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n)) => {
                     Value::Bool(false)
                 }
                 ("IsFiniteSet", [s]) => {
@@ -1020,7 +1020,7 @@ impl ConstEval<'_> {
                 }
                 Ok(true)
             }
-            Expr::Ident(n) if ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
+            Expr::Ident(n, _) if ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
                 self.in_builtin_set(n, v.clone())
             }
             // TLC tests membership in these without building the set: the right operand of `\` only
@@ -1071,7 +1071,7 @@ impl ConstEval<'_> {
     /// from, Nat, Int, STRING or TLC's Any
     fn lazy_set(&self, set: &Expr, env: &HashMap<String, Value>) -> bool {
         match set.strip() {
-            Expr::Ident(n) => ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n),
+            Expr::Ident(n, _) => ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n),
             Expr::Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.lazy_set(a, env) || self.lazy_set(b, env),
             Expr::SetFilter(_, s, _) => self.lazy_set(s, env),
             Expr::Call(f, parts) if f == "\\X" => parts.iter().any(|p| self.lazy_set(p, env)),

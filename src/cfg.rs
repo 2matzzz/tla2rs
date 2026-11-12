@@ -1,6 +1,6 @@
 //! TLC .cfg files (common directives only)
 
-use crate::ast::Expr;
+use crate::ast::{Expr, NOPOS};
 use crate::lexer::{lex, Tok, R};
 
 #[derive(Debug, Default)]
@@ -132,7 +132,7 @@ fn cfg_value(toks: &[crate::lexer::Token], mut i: usize) -> R<(Expr, usize)> {
         Tok::Str(s) => (Expr::Str(s.clone()), i),
         Tok::Ident(s) if s == "TRUE" || s == "FALSE" => (Expr::Bool(s == "TRUE"), i),
         // Model value. Prefixed with `@model:` to keep it distinct from constant names
-        Tok::Ident(s) => (Expr::Ident(format!("@model:{s}")), i),
+        Tok::Ident(s) => (Expr::Ident(format!("@model:{s}"), NOPOS), i),
         Tok::Sym(s) if s == "{" => {
             let mut v = vec![];
             loop {

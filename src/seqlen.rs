@@ -149,7 +149,7 @@ impl Walk<'_> {
             Num(_) | Bool(_) => Len::default(),
             // A string becomes a sequence of characters under SelectSeq, SortSeq and \o with a tuple
             Str(x) => Len::flat(x.chars().count()),
-            Ident(n) => match env.get(n) {
+            Ident(n, _) => match env.get(n) {
                 Some(l) => *l,
                 None if self.vars.contains(n) => self.bound.get(n).copied().unwrap_or_default(),
                 None => match self.constants.get(n) {
@@ -179,10 +179,10 @@ impl Walk<'_> {
             Bin(op @ (BOp::Eq | BOp::In), a, b) => {
                 let target = match (a.strip(), init) {
                     (Prime(v), false) => match v.strip() {
-                        Ident(n) if self.vars.contains(n) => Some(n.clone()),
+                        Ident(n, _) if self.vars.contains(n) => Some(n.clone()),
                         _ => None,
                     },
-                    (Ident(n), true) if self.vars.contains(n) => Some(n.clone()),
+                    (Ident(n, _), true) if self.vars.contains(n) => Some(n.clone()),
                     _ => None,
                 };
                 let lb = self.len(b, env, facts, init)?;
@@ -357,7 +357,7 @@ impl Walk<'_> {
             Expr::Bin(BOp::Range, lo, hi) => match (lo.strip(), hi.strip()) {
                 (_, Expr::Num(n)) => Some((*n).max(0) as usize),
                 (Expr::Num(1), Expr::Call(f, a)) if f == "Len" && a.len() == 1 => Some(self.len(&a[0], env, facts, init)?.top),
-                (_, Expr::Ident(n)) => match self.constants.get(n) {
+                (_, Expr::Ident(n, _)) => match self.constants.get(n) {
                     Some(Value::Int(n)) => Some((*n).max(0) as usize),
                     _ => None,
                 },
