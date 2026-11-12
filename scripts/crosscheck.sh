@@ -2,13 +2,26 @@
 # Run the same spec with TLC and tla2rs and compare state counts, violated invariants, and
 # counterexample lengths.
 #   scripts/crosscheck.sh examples/DieHard.tla [examples/DieHard.cfg] [-deadlock]
+#   scripts/crosscheck.sh examples/DieHard.cfg            (the spec is the cfg name up to the first -)
+# For a configuration in examples/ or tests/tlc/, TLC's side is the static result in tests/expected/,
+# written by scripts/expected.sh; this script does not run TLC for them. A missing or stale result
+# fails the check. For any other configuration it runs TLC.
+#   scripts/crosscheck.sh --expected X.cfg        write X's result if missing or stale (expected.sh)
+#   scripts/crosscheck.sh --expected-force X.cfg  rewrite it
+#   scripts/crosscheck.sh --expected-check X.cfg  rerun TLC and compare with the file, without writing
 # Pass tla2tools.jar via TLA_TOOLS (default ~/.tla/tla2tools.jar).
 # State counts at a violation depend on search order, so TLC runs with one worker for a fixed order.
 set -euo pipefail
-orig=("$@"); origdir="$PWD"
+mode=compare
+case "${1:-}" in --expected|--expected-force|--expected-check) mode="${1#--}"; shift ;; esac
 tla="$1"; shift
-cfg="${tla%.tla}.cfg"
-if [[ $# -gt 0 && "$1" == *.cfg ]]; then cfg="$1"; shift; fi
+if [[ "$tla" == *.cfg ]]; then
+  cfg="$tla"; base=$(basename "$cfg" .cfg); tla="$(dirname "$cfg")/${base%%-*}.tla"
+  [[ -f "$tla" ]] || tla="$(dirname "$cfg")/$base.tla"
+else
+  cfg="${tla%.tla}.cfg"
+  if [[ $# -gt 0 && "$1" == *.cfg ]]; then cfg="$1"; shift; fi
+fi
 # Split arguments into those passed to both TLC and tla2rs and those for tla2rs only
 extra=(); rsonly=()
 while [[ $# -gt 0 ]]; do
@@ -26,12 +39,21 @@ fi
 jar="${TLA_TOOLS:-$HOME/.tla/tla2tools.jar}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$root/target/release/tla2rs"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-# The other modules next to the spec too, for EXTENDS (e.g. an MC.tla that extends the spec)
-cp "$(dirname "$tla")"/*.tla "$cfg" "$work/"
-cd "$work"
+cfg_abs="$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")"; cfg_rel="${cfg_abs#"$root"/}"
+spec_dir="$(cd "$(dirname "$tla")" && pwd)"
 t=$(basename "$tla"); c=$(basename "$cfg")
+# The modules of the spec's directory that the spec reads: every module whose name appears as a word
+# in the spec or in a module already found (EXTENDS and INSTANCE, also across lines and inside LET).
+# A name that appears for another reason only adds a file, which is harmless.
+modules=()
+local_names=$(cd "$spec_dir" && ls *.tla | sed 's/\.tla$//')
+queue=("${t%.tla}")
+while [[ ${#queue[@]} -gt 0 ]]; do
+  m="${queue[0]}"; queue=("${queue[@]:1}")
+  [[ -f "$spec_dir/$m.tla" && " ${modules[*]-} " != *" $m "* ]] || continue
+  modules+=("$m")
+  for f in $(grep -owF "$local_names" "$spec_dir/$m.tla" | sort -u); do queue+=("$f"); done
+done
 
 summarize() {
   # Line 1: verdict (ok / violated invariant / deadlock / failed invariant or assumption), line 2:
@@ -59,45 +81,75 @@ summarize() {
   printf '%s\n%s\ntrace=%s\n' "$res" "$counts" "$trace"
 }
 
-# TLC's result depends only on the jar, the cfg, the arguments and the modules the spec reads, so it
-# is kept in target/crosscheck/tlc under a hash of those and reused. CROSSCHECK_NO_CACHE=1 turns
-# both caches off. Modules are followed through EXTENDS and INSTANCE within the spec's directory
-# (standard modules come from the jar).
-cache_root="$root/target/crosscheck"
+# TLC's result depends only on the jar, the cfg, the arguments and the modules the spec reads
+# (followed through EXTENDS and INSTANCE within the spec's directory; standard modules come from the
+# jar). For a configuration in examples/ or tests/tlc/, the summary TLC gives (verdict, counts, trace
+# length, exit code) is kept in tests/expected/ with a hash of those inputs (the key). The parts of
+# TLC's output that vary from run to run (times, the fingerprint seed, the shape of a liveness
+# counterexample) are not part of the summary, so the file is the same for every TLC run.
+# CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  local seen=() queue=("${t%.tla}") m f
-  while [[ ${#queue[@]} -gt 0 ]]; do
-    m="${queue[0]}"; queue=("${queue[@]:1}")
-    [[ -f "$m.tla" ]] || continue
-    [[ " ${seen[*]-} " == *" $m "* ]] && continue
-    seen+=("$m")
-    for f in $(grep -oE '(EXTENDS|INSTANCE)[[:space:]]+[A-Za-z0-9_, ]+' "$m.tla" | sed -E 's/^(EXTENDS|INSTANCE)//; s/,/ /g'); do
-      queue+=("$f")
-    done
-  done
-  { echo "v1 -workers 1 ${extra[*]-}"; shasum -a 256 "$jar" | cut -d' ' -f1; cat "$c"
-    for m in $(printf '%s\n' "${seen[@]}" | sort); do echo "== $m"; cat "$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
+  { echo "v1 -workers 1 ${extra[*]-}"; shasum -a 256 "$jar" | cut -d' ' -f1; cat "$cfg_abs"
+    for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
+expected=""
+case "$cfg_rel" in
+  examples/*.cfg) expected="$root/tests/expected/examples/$(basename "$cfg_rel" .cfg).txt" ;;
+  tests/tlc/*.cfg) expected="$root/tests/expected/tlc/$(basename "$cfg_rel" .cfg).txt" ;;
+esac
+key=$(tlc_key)
+if [[ -z "${CROSSCHECK_NO_CACHE:-}" ]]; then export TLA2RS_BUILD_CACHE="$root/target/crosscheck/build"; fi
+
 run_tlc() {
   rc_tlc=0
   # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
   mkdir -p "$work/jtmp"
   java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
-  if [[ -n "$tlc_cache" ]]; then
-    rm -rf "$tlc_cache"; mkdir -p "$tlc_cache.tmp$$" && cp tlc.out "$tlc_cache.tmp$$/" && echo "$rc_tlc" > "$tlc_cache.tmp$$/rc" &&
-      mv "$tlc_cache.tmp$$" "$tlc_cache" 2>/dev/null || rm -rf "$tlc_cache.tmp$$"
-  fi
+  a=$(summarize tlc.out)
 }
-tlc_cache=""; tlc_cached=0
-if [[ -z "${CROSSCHECK_NO_CACHE:-}" ]]; then
-  tlc_cache="$cache_root/tlc/$(tlc_key)"
-  export TLA2RS_BUILD_CACHE="$cache_root/build"
+expected_text() { echo "key $key"; echo "tlc $(grep -m1 -oE 'Version [0-9.]+' tlc.out || true)"; echo "rc $rc_tlc"; echo "$a"; }
+fresh=0
+[[ -n "$expected" && -f "$expected" && "$(sed -n 1p "$expected")" == "key $key" ]] && fresh=1
+
+if [[ $mode != compare ]]; then
+  [[ -n "$expected" ]] || { echo "ERROR $cfg_rel: not in examples/ or tests/tlc/"; exit 1; }
+  if [[ $mode == expected && $fresh == 1 ]]; then echo "fresh $cfg_rel"; exit 0; fi
+fi
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+for m in "${modules[@]}"; do cp "$spec_dir/$m.tla" "$work/"; done
+cp "$cfg_abs" "$work/$c"
+cd "$work"
+
+if [[ $mode != compare ]]; then
+  run_tlc
+  if [[ -z "$(echo "$a" | head -1)" ]]; then
+    echo "ERROR $cfg_rel: no verdict from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
+    exit 1
+  fi
+  if [[ $mode == expected-check ]]; then
+    if [[ -f "$expected" ]] && diff -q <(expected_text | sed 1,2d) <(sed 1,2d "$expected") > /dev/null && [[ $fresh == 1 ]]; then
+      echo "same $cfg_rel"
+    else
+      echo "DIFF $cfg_rel"; diff <(sed 1,2d "$expected" 2>/dev/null) <(expected_text | sed 1,2d) | sed 's/^/    /'
+      [[ $fresh == 1 ]] || echo "    (the key is stale or the file is missing)"
+    fi
+    exit 0
+  fi
+  mkdir -p "$(dirname "$expected")"
+  expected_text > "$expected.tmp$$" && mv "$expected.tmp$$" "$expected"
+  echo "updated $cfg_rel"; exit 0
 fi
 
 s0=$(date +%s.%N)
-rc_tlc=0; rc_rs=0
-if [[ -n "$tlc_cache" && -f "$tlc_cache/rc" ]]; then
-  cp "$tlc_cache/tlc.out" tlc.out; rc_tlc=$(cat "$tlc_cache/rc"); tlc_cached=1
+rc_rs=0; tlc_cached=0
+if [[ -n "$expected" ]]; then
+  if [[ $fresh == 0 ]]; then
+    echo "$t: no TLC result, or a stale one, in ${expected#"$root"/}"
+    echo "  STALE: run scripts/expected.sh $cfg_rel"
+    exit 1
+  fi
+  rc_tlc=$(sed -n 3p "$expected" | cut -d' ' -f2); a=$(sed -n '4,$p' "$expected"); tlc_cached=1
 else
   run_tlc
 fi
@@ -120,17 +172,10 @@ if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*distinct-only' 
   distinct_only=1
 fi
 
-a=$(summarize tlc.out); b=$(summarize rs.out)
+b=$(summarize rs.out)
 # If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
-# A result read from the cache that does not match is checked again with a fresh TLC run, so a
-# stale or bad entry never decides a test
-retry_fresh() {
-  [[ $tlc_cached == 1 ]] || return 0
-  rm -rf "$tlc_cache"; cd "$origdir"; rm -rf "$work"; exec "$root/scripts/crosscheck.sh" "${orig[@]}"
-}
 if [[ -z "$(echo "$a" | head -1)" ]]; then
-  retry_fresh
-  echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
+  echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out 2>/dev/null | grep -vE 'Parsing|Semantic' | head -10
   exit 1
 fi
 # Compare exit codes too: identical verdict strings with different exit paths are not a match.
@@ -152,7 +197,6 @@ if [[ $verdict_only == 1 ]]; then
 elif [[ $distinct_only == 1 ]]; then
   a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
 fi
-[[ "$a" == "$b" ]] || retry_fresh
 note=""; [[ $tlc_cached == 1 ]] && note=" cached"
 printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)"
 if [[ "$a" == "$b" ]]; then

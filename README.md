@@ -169,10 +169,15 @@ memory.
 generated and distinct state counts, counterexample length, and exit code. `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
 `TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). `all.sh` runs four configurations at a time
-(`JOBS=N` to change). TLC results are kept in `target/crosscheck/tlc` under a hash of the jar, the cfg, the arguments
-and the modules the spec reads, and built checkers in `target/crosscheck/build` under a hash of the generated code,
-so a rerun only runs what changed. A cached TLC result that does not match is checked again with a fresh TLC run.
-`CROSSCHECK_NO_CACHE=1` turns both caches off.
+(`JOBS=N` to change). TLC's result for each configuration is committed in `tests/expected/`: the verdict, the
+state counts, the trace length and the exit code, with a hash of the jar, the cfg, the arguments and the modules the
+spec reads. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
+recorded, so the files are the same for every TLC run. `crosscheck.sh` and `all.sh` only compare against these
+files and never run TLC for them; a missing or stale file fails the check. `scripts/expected.sh [cfg ...]` is what
+runs TLC: it writes missing and stale files and leaves the others alone, so a second run changes nothing.
+`expected.sh -check` reruns TLC and reports any file that differs, without writing; `-force` rewrites them all.
+Built checkers are kept in `target/crosscheck/build` under a hash of the generated code and the rustc version
+(`CROSSCHECK_NO_CACHE=1` builds them from scratch).
 
 ```
 $ scripts/all.sh

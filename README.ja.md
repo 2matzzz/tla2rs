@@ -114,7 +114,7 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 ## 確かめ方
 
 `scripts/crosscheck.sh` は TLC（`-workers 1`）と tla2rs で同じ構成を回し、結果・生成状態数・distinct 状態数・反例の長さ・終了コードを比べる。
-`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は jar・cfg・引数・仕様が読むモジュールのハッシュで `target/crosscheck/tlc` に、ビルドした検査器は生成コードのハッシュで `target/crosscheck/build` に残すので、再実行では変わったものだけが走る。キャッシュから読んだ TLC の結果が一致しないときは、TLC を回し直して確かめる。`CROSSCHECK_NO_CACHE=1` で両方のキャッシュを使わない。
+`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は構成ごとに `tests/expected/` にコミットしてある。中身は判定・状態数・反例の長さ・終了コードと、jar・cfg・引数・仕様が読むモジュールのハッシュである。時刻・指紋の種・liveness の反例の形は TLC の実行ごとに変わるので記録せず、ファイルはどの実行でも同じになる。`crosscheck.sh` と `all.sh` はこのファイルと比べるだけで、TLC は回さない。ファイルが無いか古いときは失敗にする。TLC を回すのは `scripts/expected.sh [cfg ...]` だけで、無いものと古いものだけを書き、ほかには触らないので、2 回目は何も変えない。`expected.sh -check` は TLC を回し直して食い違うファイルを報告し、書き込みはしない。`-force` はすべて書き直す。ビルドした検査器は、生成コードと rustc の版のハッシュで `target/crosscheck/build` に残す(`CROSSCHECK_NO_CACHE=1` で毎回ビルドし直す)。
 
 ```
 $ scripts/all.sh
