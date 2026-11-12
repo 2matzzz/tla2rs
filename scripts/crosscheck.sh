@@ -76,7 +76,7 @@ done
 # (see src/community.rs)
 cm_version=202611060952
 cm_sha256=a3b27c40f1fb5085f30c6ead37e918457f8cfc62c1e50a1dc668ef592ad2b5fb
-cm_names="BagsExt Bitwise CBOR CSV Combinatorics DifferentialEquations DyadicRationals FiniteSetsExt Folds Functions GraphViz Graphs HTML IOUtils Json Relation SVG SequencesExt ShiViz Statistics UndirectedGraphs VectorClocks"
+cm_names="BagsExt Bitwise CBOR CSV Combinatorics DifferentialEquations DyadicRationals FiniteSetsExt Folds Functions GraphViz Graphs HTML IOUtils Json Quorum Relation SVG SequencesExt ShiViz Statistics UndirectedGraphs VectorClocks"
 uses_cm=0
 for m in ${modules[@]+"${modules[@]}"}; do
   for n in $(tr '\n' ' ' < "$spec_dir/$m.tla" | grep -oE '(EXTENDS|INSTANCE)[[:space:]]+[A-Za-z0-9_]+([[:space:]]*,[[:space:]]*[A-Za-z0-9_]+)*' | sed -E 's/^(EXTENDS|INSTANCE)//' | tr ',' ' '); do

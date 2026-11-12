@@ -351,12 +351,18 @@ fn find_module(name: &str, how: &str, dir: &std::path::Path, warnings: &mut Vec<
 }
 
 /// A module of the CommunityModules, whose operators listed in `community::UNSUPPORTED` are
-/// refused where they are used
+/// refused where they are used, and those in `community::CONST_ONLY` where their value is not
+/// constant
 fn community_module(name: &str, src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
     let mut m = load_module(src, dir, warnings, depth)?;
     for &(module, op, why) in crate::community::UNSUPPORTED.iter().filter(|u| u.0 == name) {
         let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
         d.body = Expr::Call(format!("{op} of the CommunityModules' {module}, which tla2rs does not support: {why}"), vec![]);
+    }
+    for &(module, op, why) in crate::community::CONST_ONLY.iter().filter(|u| u.0 == name) {
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
+        let msg = format!("{op} of the CommunityModules' {module} is supported only on constant arguments: {why}");
+        d.body = Expr::Label(format!("{}{msg}", crate::ast::CONST_ONLY), vec![], std::mem::replace(&mut d.body, Expr::Bool(true)).b());
     }
     Ok(m)
 }

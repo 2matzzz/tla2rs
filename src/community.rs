@@ -33,6 +33,9 @@ pub fn source(name: &str) -> Option<&'static str> {
         "GraphViz" => GRAPH_VIZ,
         "DyadicRationals" => DYADIC_RATIONALS,
         "VectorClocks" => VECTOR_CLOCKS,
+        "Quorum" => QUORUM,
+        "Json" => JSON,
+        "IOUtils" => IO_UTILS,
         _ => return None,
     })
 }
@@ -49,7 +52,30 @@ pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
     ("Graphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
     ("Graphs", "IsStronglyConnected", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
     ("Graphs", "IsTreeWithRoot", "TLC 2.19 cannot evaluate it without its Java override (AreConnectedIn, \\E over Seq(S))"),
+    ("Json", "JsonDeserialize", "it reads a file; TLC 2.19 stops on its definition (an unbounded CHOOSE)"),
+    ("Json", "ndJsonDeserialize", "it reads a file; TLC 2.19 stops on its definition (an unbounded CHOOSE)"),
+    ("IOUtils", "IODeserialize", "it reads a file; TLC 2.19 stops on its definition (an unbounded CHOOSE)"),
+    ("IOUtils", "Serialize", "it writes a file; TLC 2.19 stops on its definition (a CHOOSE over records with an Int field)"),
+    ("IOUtils", "Deserialize", "it reads a file; TLC 2.19 stops on its definition (an unbounded CHOOSE)"),
+    ("IOUtils", "IOExec", "it runs a command; TLC 2.19 stops on its definition (a CHOOSE over records with an Int field)"),
+    ("IOUtils", "IOEnvExec", "it runs a command; TLC 2.19 stops on its definition (a CHOOSE over records with an Int field)"),
+    ("IOUtils", "IOExecTemplate", "it runs a command; TLC 2.19 stops on its definition (a CHOOSE over records with an Int field)"),
+    ("IOUtils", "IOEnvExecTemplate", "it runs a command; TLC 2.19 stops on its definition (a CHOOSE over records with an Int field)"),
+    ("IOUtils", "IOEnv", "it reads the environment; TLC 2.19 stops on its definition (a CHOOSE over [STRING -> STRING])"),
+    ("IOUtils", "atoi", "TLC 2.19 stops on its definition (a CHOOSE over Int)"),
 ];
+
+/// The operators of each module that tla2rs evaluates only when compiling, with the reason: their
+/// value on values from the state is refused (the checker numbers its strings when it is built,
+/// and these build strings by recursion over values it would print at run time)
+pub const CONST_ONLY: &[(&str, &str, &str)] = &[
+    ("Json", "ToJson", STRINGS_BY_RECURSION),
+    ("Json", "ToJsonArray", STRINGS_BY_RECURSION),
+    ("Json", "ToJsonObject", STRINGS_BY_RECURSION),
+    ("IOUtils", "zeroPadN", STRINGS_BY_RECURSION),
+];
+
+const STRINGS_BY_RECURSION: &str = "it builds a string by recursion, which the checker cannot do at run time";
 
 /// Folding a set: `op(f(x1), op(f(x2), ... op(f(xn), base)))` where x1 is `choose(S)`, x2 is
 /// `choose(S \ {x1})`, and so on
@@ -403,5 +429,78 @@ IsCausalOrder(log, clock(_)) ==
     IN Before(Full(clock(log[j])), Full(clock(log[i])), D) \/ Apart(Full(clock(log[j])), Full(clock(log[i])), D)
 CausalOrder(log, clock(_), node(_), domain(_)) ==
   CHOOSE f \in {g \in [1..Len(log) -> Range(log)] : Range(g) = Range(log)} : IsCausalOrder(f, clock)
+====
+"#;
+
+/// Sets of subsets of S any two of which meet, closed under supersets within S
+const QUORUM: &str = r#"
+---- MODULE Quorum ----
+QuorumSystem(S) ==
+  {Q \in SUBSET SUBSET S :
+     /\ Q # {}
+     /\ \A A, B \in Q : A \cap B # {}
+     /\ \A A, B \in SUBSET S : (A \in Q /\ A \subseteq B) => B \in Q}
+====
+"#;
+
+/// JSON text of a function, built with ToString: each element of the domain is taken as CHOOSE
+/// takes it (the smallest first), each value printed as TLC prints it (a nested record or tuple is
+/// not turned into JSON), and a key is the string of the string ToString gives. ToJson of a record
+/// lists its values as an array, as the module's definition does. The strings are concatenated in
+/// the order the module's definition concatenates them, which is the order TLC makes them in.
+/// Writing to and reading from files is not done: the serializing operators are TRUE in the
+/// module's definition
+const JSON: &str = r#"
+---- MODULE Json ----
+LOCAL INSTANCE Sequences
+LOCAL INSTANCE FiniteSets
+LOCAL INSTANCE TLC
+LOCAL IsSequence(F, D) == TRUE
+LOCAL ToJsonKeyValue(F, d) == ToString(ToString(d)) \o ":" \o ToString(F[d])
+RECURSIVE ToJsonObjectString(_, _)
+LOCAL ToJsonObjectString(F, D) ==
+  LET d == CHOOSE e \in D : TRUE
+      tail == IF D \ {d} = {} THEN "}" ELSE ToJsonObjectString(F, D \ {d})
+  IN (IF D = DOMAIN F THEN "{" ELSE ", ") \o ToJsonKeyValue(F, d) \o tail
+RECURSIVE ToJsonArrayString(_, _)
+LOCAL ToJsonArrayString(F, D) ==
+  LET d == CHOOSE e \in D : TRUE
+      tail == IF D \ {d} = {} THEN "]" ELSE ToJsonArrayString(F, D \ {d})
+  IN (IF D = DOMAIN F THEN "[" ELSE ", ") \o ToString(F[d]) \o tail
+RECURSIVE ToJsonString(_, _)
+LOCAL ToJsonString(F, D) == ToJsonArrayString(F, D)
+ToJson(value) == IF DOMAIN value = {} THEN "{}" ELSE ToJsonString(value, DOMAIN value)
+ToJsonArray(value) == IF DOMAIN value = {} THEN "[]" ELSE ToJsonArrayString(value, DOMAIN value)
+ToJsonObject(value) == IF DOMAIN value = {} THEN "{}" ELSE ToJsonObjectString(value, DOMAIN value)
+JsonSerialize(absoluteFilename, value) == TRUE
+JsonDeserialize(absoluteFilename) == FALSE
+ndJsonSerialize(absoluteFilename, value) == TRUE
+ndJsonDeserialize(absoluteFilename) == FALSE
+====
+"#;
+
+/// Files, commands and the environment are not read or written: what TLC 2.19 evaluates of the
+/// module's definitions is IOSerialize (TRUE) and zeroPadN, n printed with ToString after as
+/// many "0" as it is shorter than width
+const IO_UTILS: &str = r#"
+---- MODULE IOUtils ----
+LOCAL INSTANCE TLC
+LOCAL INSTANCE Integers
+LOCAL INSTANCE Sequences
+LOCAL INSTANCE SequencesExt
+IOSerialize(val, absoluteFilename, compress) == TRUE
+IODeserialize(absoluteFilename, compressed) == FALSE
+Serialize(value, dest, options) == FALSE
+Deserialize(src, options) == FALSE
+IOExec(command) == FALSE
+IOEnvExec(env, command) == FALSE
+IOExecTemplate(commandTemplate, parameters) == FALSE
+IOEnvExecTemplate(env, commandTemplate, parameters) == FALSE
+IOEnv == FALSE
+atoi(str) == FALSE
+zeroPadN(n, width) ==
+  LET s == ToString(n)
+      pad == [i \in 1..width - Len(s) |-> "0"]
+  IN FoldLeft(LAMBDA a, b : a \o b, "", pad) \o s
 ====
 "#;
