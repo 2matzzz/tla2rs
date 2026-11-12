@@ -26,6 +26,7 @@ mod live;
 mod ltl;
 mod metal;
 mod parser;
+mod pcal;
 mod ppr;
 mod runtime;
 mod seqlen;
@@ -61,6 +62,7 @@ fn usage() -> ! {
     eprintln!("       tla2rs --graph FILE | --graph-text FILE");
     eprintln!("       tla2rs --trace FILE | --trace-text FILE");
     eprintln!("       tla2rs --messages FILE | --messages-text FILE");
+    eprintln!("       tla2rs --pcal-text FILE");
     exit(2)
 }
 
@@ -75,6 +77,9 @@ fn main() {
         }
         if mode == "--messages" || mode == "--messages-text" {
             exit(messages::main(mode, path));
+        }
+        if mode == "--pcal-text" {
+            exit(pcal::main(path));
         }
     }
     let mut tla: Option<PathBuf> = None;
