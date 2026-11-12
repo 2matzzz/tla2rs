@@ -1438,8 +1438,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
         return Err(format!("no definition `{spec}`"));
     }
     w.walk(&Expr::Ident(spec.clone()), m, ex)?;
-    let init_parts = std::mem::take(&mut w.init);
-    w.init = init_parts.iter().map(strip_pos).collect();
+    w.init = w.init.iter().map(strip_pos).collect();
     w.temporal = w.temporal.iter().map(strip_pos).collect();
     if w.init.is_empty() {
         return Ok(Err((NO_INIT.into(), 151)));
