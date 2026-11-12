@@ -66,6 +66,9 @@ pub struct Gen<'a> {
     pub labels: Vec<String>,
     /// The number of actions the next-state relation splits into (see `gen_split`)
     pub actions: usize,
+    /// Whether the checker follows TLC's order of printed lines: each successor (and initial
+    /// state) and the start of each action are marked as they are computed (PRINT_ORDER)
+    pub print_order: bool,
     tmp: usize,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
@@ -122,6 +125,7 @@ impl<'a> Gen<'a> {
             need_subsets: false,
             labels: vec!["Init".into(), "Next".into()],
             actions: 0,
+            print_order: false,
             tmp: 0,
             scap: 8,
             qcap: 0,
@@ -2255,7 +2259,7 @@ impl<'a> Gen<'a> {
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;
-                    (format!("{{ println!(\"{{}}\", ppr(&fmt_{id}(&{c}))); true }}"), Ty::Bool)
+                    (format!("{{ tlc_print(ppr(&fmt_{id}(&{c}))); true }}"), Ty::Bool)
                 }
                 // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
@@ -2263,7 +2267,7 @@ impl<'a> Gen<'a> {
                     let id = self.ty_id(&t)?;
                     let (vc, vt) = self.gen(v, env, want)?;
                     let vid = self.ty_id(&vt)?;
-                    (format!("{{ let __x = {c}; let __v = {vc}; println!(\"{{}}  {{}}\", ppr(&fmt_{id}(&__x)), ppr(&fmt_{vid}(&__v))); __v }}"), vt)
+                    (format!("{{ let __x = {c}; let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr(&fmt_{id}(&__x)), ppr(&fmt_{vid}(&__v)))); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int(a, env)?;
@@ -4891,6 +4895,9 @@ impl<'a> Gen<'a> {
         } else {
             writeln!(out, "out.push(({st}, {}));", env.label.unwrap_or(1)).unwrap();
         }
+        if self.print_order {
+            writeln!(out, "mark_push();").unwrap();
+        }
         Ok(())
     }
 
@@ -4990,6 +4997,9 @@ impl<'a> Gen<'a> {
         };
         env2.label = Some(self.label_id(&label));
         self.actions += 1;
+        if self.print_order {
+            writeln!(out, "mark_action();").unwrap();
+        }
         env2.split = false;
         self.gen_action(&with(&strip_pos(h)), &env2, out)?;
         Ok(true)

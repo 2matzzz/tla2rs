@@ -332,6 +332,7 @@ fn tla_mod(a: i64, b: i64) -> i64 {
 
 /// An evaluation error. Raised via panic, caught outside state expansion, and reported with a
 /// trace.
+#[derive(Clone)]
 enum EvalErr {
     /// A value outside the type declared in TypeOK (a set element, a function argument, etc.).
     Type(String),
@@ -543,6 +544,183 @@ fn eval_error(msg: String) -> ! {
     std::panic::panic_any(EvalErr::Other(msg))
 }
 
+// ---------------------------------------------------------------- the order of printed lines
+//
+// With one worker TLC prints in a fixed order (measured on TLC 2.19, `tests/tlc/PrintNext*`): it
+// checks each initial state and each successor as soon as it computes it, so what Init or an
+// action prints before a state comes before what the invariants print on it, and nothing is
+// printed past the state that stops the search. When it shows a behavior, it rebuilds it from
+// fingerprints and evaluates Init again (all of it) and, for each step, the actions in order up to
+// the one that yields the next state (each action as a whole), printing again: the states before
+// the one it was expanding are rebuilt before `The behavior up to this point is:`, the steps to it
+// and to the successor that stopped the search after it, each before its state. With PRINT_ORDER
+// (Init, an action or an invariant prints), the checker computes successors as before but holds
+// the lines printed meanwhile, with the number of successors pushed and of actions started before
+// each, and prints them in that order; it then expands in order without -batched, and rebuilds a
+// behavior as TLC does.
+
+/// Lines held while computing states (see above)
+#[derive(Default)]
+struct Capture {
+    pushes: u32,
+    acts: u32,
+    /// The action each pushed state came from
+    push_acts: Vec<u32>,
+    /// (states pushed before, actions started before, line)
+    lines: Vec<(u32, u32, String)>,
+}
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<Capture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A line printed by Print or PrintT: held while capturing, printed otherwise
+fn tlc_print(line: String) {
+    CAPTURE.with(|c| match &mut *c.borrow_mut() {
+        Some(c) => c.lines.push((c.pushes, c.acts, line)),
+        None => println!("{line}"),
+    })
+}
+
+/// A state pushed by `init` or `next` (PRINT_ORDER only)
+fn mark_push() {
+    CAPTURE.with(|c| {
+        if let Some(c) = &mut *c.borrow_mut() {
+            c.push_acts.push(c.acts);
+            c.pushes += 1;
+        }
+    })
+}
+
+/// The start of an action of the next-state relation (PRINT_ORDER only)
+fn mark_action() {
+    CAPTURE.with(|c| {
+        if let Some(c) = &mut *c.borrow_mut() {
+            c.acts += 1;
+        }
+    })
+}
+
+/// Holds the lines printed until `finish` (or until dropped, when they are discarded, also
+/// while unwinding). Does nothing unless PRINT_ORDER
+struct Capturing(Option<Capture>);
+
+impl Capturing {
+    fn start() -> Self {
+        if PRINT_ORDER {
+            Capturing(CAPTURE.with(|c| c.borrow_mut().replace(Capture::default())))
+        } else {
+            Capturing(None)
+        }
+    }
+    fn finish(self) -> Held {
+        if !PRINT_ORDER {
+            return Held::default();
+        }
+        let cap = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
+        Held { cap, next: 0 }
+    }
+}
+
+impl Drop for Capturing {
+    fn drop(&mut self) {
+        if PRINT_ORDER {
+            // Back to what was there before (nothing, or an outer capture)
+            let outer = self.0.take();
+            CAPTURE.with(|c| *c.borrow_mut() = outer);
+        }
+    }
+}
+
+/// Lines held, printed in order as the states they come before are handled
+#[derive(Default)]
+struct Held {
+    cap: Capture,
+    next: usize,
+}
+
+impl Held {
+    /// Prints the lines printed before the `n`th state was pushed (all with u32::MAX)
+    #[inline]
+    fn flush(&mut self, n: u32) {
+        if !PRINT_ORDER {
+            return;
+        }
+        while let Some((p, _, l)) = self.cap.lines.get(self.next) {
+            if *p >= n {
+                break;
+            }
+            println!("{l}");
+            self.next += 1;
+        }
+    }
+}
+
+/// The step s -> t evaluated again as TLC does while showing a behavior: the actions in order up
+/// to the one that yields t, printing what they print
+fn step_prints(s: &State, t: &State) {
+    let cap = Capturing::start();
+    let mut buf = vec![];
+    let _ = successors(s, &mut buf, true);
+    let held = cap.finish();
+    let same = |x: &State| match (pack(x), pack(t)) {
+        (Some(a), Some(b)) => state_fp(x, &a) == state_fp(t, &b),
+        _ => x == t,
+    };
+    let Some(j) = buf.iter().position(|(x, _)| same(x)) else { return };
+    let last = held.cap.push_acts[j];
+    for (_, a, l) in &held.cap.lines {
+        if *a <= last {
+            println!("{l}");
+        }
+    }
+}
+
+/// After the behavior that ends with s, whose successors failed to evaluate: TLC evaluates them
+/// again to show where the error is, printing again what they print up to the error
+fn eval_again_prints(s: &State, e: &EvalErr) {
+    if !PRINT_ORDER || matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
+        return;
+    }
+    let cap = Capturing::start();
+    let mut buf = vec![];
+    let _ = successors(s, &mut buf, true);
+    cap.finish().flush(u32::MAX);
+}
+
+/// Shows a behavior as TLC does with PRINT_ORDER: `k` is the number of the state that was being
+/// expanded (the states after it are successors), `extra` one more state after the trace
+fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)>) -> usize {
+    let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
+    let state = |n: usize, (s, l): &(State, u32)| println!("State {n}: <{}>\n{}\n", name(*l), show(s));
+    if k >= 2 {
+        let mut v = vec![];
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
+        for i in 1..k - 1 {
+            step_prints(&trace[i - 1].0, &trace[i].0);
+        }
+    }
+    println!("Error: The behavior up to this point is:");
+    for (i, st) in trace.iter().enumerate().take(k.saturating_sub(1)) {
+        state(i + 1, st);
+    }
+    for i in k.max(1) - 1..trace.len() {
+        if i > 0 {
+            step_prints(&trace[i - 1].0, &trace[i].0);
+        }
+        state(i + 1, &trace[i]);
+    }
+    let mut n = trace.len();
+    if let Some(x) = extra {
+        if let Some((last, _)) = trace.last() {
+            step_prints(last, &x.0);
+        }
+        n += 1;
+        state(n, &x);
+    }
+    n
+}
+
 /// The state that left variables unassigned (with the label of its action, `u32::MAX` for an
 /// initial state, and the variables), shown at the end of the behavior with those variables null
 static INCOMPLETE: std::sync::Mutex<Option<(State, u32, &'static [&'static str])>> = std::sync::Mutex::new(None);
@@ -699,11 +877,18 @@ impl Graph {
         n
     }
 
-    fn print_trace(&self, mut id: u32, extra: Option<(&State, u32)>) {
+    /// `succ`: the last state is a successor of the one being expanded (see `print_states_tlc`)
+    fn print_trace(&self, mut id: u32, extra: Option<(&State, u32)>, succ: bool) {
         let mut ids = vec![];
         while id != u32::MAX {
             ids.push(id);
             id = self.parent[id as usize].0;
+        }
+        if PRINT_ORDER {
+            let trace: Vec<(State, u32)> =
+                ids.iter().rev().map(|i| (unpack(&self.states[*i as usize]), self.parent[*i as usize].1)).collect();
+            print_states_tlc(&trace, trace.len() - succ as usize, extra.map(|(s, l)| (*s, l)));
+            return;
         }
         println!("Error: The behavior up to this point is:");
         let mut n = 0;
@@ -951,8 +1136,33 @@ fn expand_one(
     careful: bool,
 ) -> Option<Found> {
     let s = unpack(&g.states[head]);
+    let cap = Capturing::start();
     let failed = successors(&s, buf, careful);
+    let mut held = cap.finish();
+    let g0 = c.generated;
+    let r = expand_one_succ(g, head, seen, me, check_deadlock, c, buf, &s, failed, &mut held);
+    // What was printed up to the successor that stops the search, or all of it
+    held.flush(if r.is_some() { (c.generated - g0) as u32 } else { u32::MAX });
+    r
+}
+
+/// The rest of `expand_one`, once the successors of s are computed
+#[allow(clippy::too_many_arguments)]
+fn expand_one_succ(
+    g: &Graph,
+    head: usize,
+    seen: &Shards,
+    me: usize,
+    check_deadlock: bool,
+    c: &mut Chunk,
+    buf: &mut [(State, u32)],
+    s: &State,
+    failed: Option<Box<dyn std::any::Any + Send>>,
+    held: &mut Held,
+) -> Option<Found> {
+    let s = *s;
     if failed.is_none() && buf.is_empty() && check_deadlock {
+        held.flush(u32::MAX);
         return Some(Found::Deadlock(head as u32));
     }
     let sfp = if LIVENESS { state_fp(&s, &g.states[head]) } else { 0 };
@@ -994,6 +1204,7 @@ fn expand_one(
             c.states.push(w);
             c.parent.push((head as u32, l));
             c.unqueued = true;
+            held.flush(k as u32 + 1);
             match eval_invariants(&t) {
                 Ok(None) => {}
                 Ok(Some(inv)) => return Some(Found::New(me, c.states.len() - 1, SMsg::Inv(inv))),
@@ -1010,6 +1221,7 @@ fn expand_one(
         }
     }
     if let Some(p) = failed {
+        held.flush(u32::MAX);
         raise_next(p);
     }
     // After the successors, in TLC's order: the action atoms and fairness steps of each step
@@ -1353,7 +1565,7 @@ fn main() {
         }
         if LIVENESS {
             run_liveness(&opt);
-        } else if opt.batched {
+        } else if opt.batched && !PRINT_ORDER {
             run_safety_batched(&opt);
         } else {
             run_safety(&opt);
@@ -1546,7 +1758,9 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     let mut inits = Vec::new();
     // The states computed before an error are still checked first, as TLC checks each one as soon
     // as it is generated.
+    let cap = Capturing::start();
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err();
+    let mut held = cap.finish();
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
     let mut generated = 0u64;
@@ -1555,6 +1769,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     let mut buf = String::new();
     for s in inits {
         generated += 1;
+        held.flush(generated as u32);
         let step = std::panic::catch_unwind(|| {
             let in_model = constraint(&s);
             let w = pack(&s);
@@ -1607,6 +1822,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             exit(eval_code(&e));
         }
     }
+    held.flush(u32::MAX);
     if let Some(p) = failed {
         let e = describe_panic(p);
         // TLC shows the state with the variables it leaves unassigned null, and no counts
@@ -1768,6 +1984,8 @@ struct SWork {
     /// ready to be written
     dpend: Vec<(usize, String)>,
     dump: String,
+    /// The lines printed while computing the successors (PRINT_ORDER)
+    held: Held,
 }
 
 /// Expands a single state, pushing newly found states onto c.next.
@@ -1783,8 +2001,11 @@ fn expand_safety_one(
     let s = unpack(w);
     ws.cand.clear();
     ws.dpend.clear();
+    let cap = Capturing::start();
     let failed = successors(&s, &mut ws.buf, careful);
+    ws.held = cap.finish();
     if failed.is_none() && ws.buf.is_empty() && opt.check_deadlock {
+        ws.held.flush(u32::MAX);
         return Some(SFound::new(sfp, None, SMsg::Deadlock));
     }
     // All successors are fingerprinted before any is looked up, so that their table lines arrive
@@ -1798,9 +2019,12 @@ fn expand_safety_one(
     let examined = c.generated;
     let found = insert_candidates(base, sfp, seen, c, ws);
     if found.is_some() {
+        ws.held.flush((c.generated - base) as u32);
         return found;
     }
     c.generated = examined;
+    // What was printed up to the successor that stops the search, or all of it
+    ws.held.flush(if matches!(stopped, Ok(None)) { u32::MAX } else { (examined - base) as u32 });
     // A successor that violates an action property is added to the visited states, but TLC
     // stops before queueing it
     if let (Ok(Some(f)), Some(&(i, tfp, _))) = (&stopped, ws.cand.last()) {
@@ -1889,6 +2113,7 @@ fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut
             return Some(pack_failed(sfp, *t, *l));
         };
         c.distinct += 1;
+        ws.held.flush(i as u32 + 1);
         match eval_invariants(t) {
             Ok(None) => {}
             Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
@@ -1915,6 +2140,7 @@ fn expand_safety(
         mine: Seen::new(),
         dpend: vec![],
         dump: String::new(),
+        held: Held::default(),
     };
     for i in lo..hi {
         if stop.load(Relaxed) {
@@ -1998,7 +2224,15 @@ fn fp_chain(seen: &dyn Visited, target: Fp) -> Option<Vec<Fp>> {
 
 /// Rebuilds the actual states by replaying a sequence of fingerprints from an initial state.
 fn replay(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
-    let first = initial_states().0.into_iter().find(|(_, _, fp)| *fp == chain[0])?;
+    // With PRINT_ORDER, quietly: `print_states_tlc` prints what TLC prints meanwhile
+    let _quiet = Capturing::start();
+    let first = if PRINT_ORDER {
+        let mut v = vec![];
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
+        v.into_iter().find_map(|s| pack(&s).map(|w| (s, w, state_fp(&s, &w))).filter(|x| x.2 == chain[0]))?
+    } else {
+        initial_states().0.into_iter().find(|(_, _, fp)| *fp == chain[0])?
+    };
     let mut out = vec![(first.0, u32::MAX)];
     let mut cur = first.0;
     let mut buf: Vec<(State, u32)> = vec![];
@@ -2042,6 +2276,11 @@ fn report_trace(seen: &dyn Visited, f: &SFound) -> usize {
         return 0;
     }
     match fp_chain(seen, f.fp).and_then(|c| replay(&c)) {
+        // The state being expanded is the one before a new state that violates an invariant
+        Some(trace) if PRINT_ORDER => {
+            let succ = f.extra.is_none() && matches!(f.msg, SMsg::Inv(_) | SMsg::InvEval(..));
+            print_states_tlc(&trace, trace.len() - succ as usize, f.extra)
+        }
         Some(trace) => print_states(&trace, f.extra),
         None => {
             println!("Error: could not reconstruct the behavior (this is a tla2rs bug; please report the spec)");
@@ -2191,6 +2430,13 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     }
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
+    }
+    if let (SMsg::Eval(e), true) = (&f.msg, shown > 0) {
+        if let Some(chain) = fp_chain(seen, f.fp) {
+            if let Some((s, _)) = replay(&chain).and_then(|t| t.last().copied()) {
+                eval_again_prints(&s, e);
+            }
+        }
     }
     println!("{generated} states generated, {distinct} distinct states found, {left} states left on queue.");
     exit(code);
@@ -2993,12 +3239,12 @@ fn run_liveness(opt: &Opt) {
                         dump_replay(&s, state_fp(&s, &g.states[p]), &|fp| seen.contains(fp));
                     }
                     let code = report_msg(&msg, true);
-                    g.print_trace((base[w] + idx) as u32, None);
+                    g.print_trace((base[w] + idx) as u32, None, true);
                     code
                 }
                 Found::Deadlock(id) => {
                     println!("Error: Deadlock reached.");
-                    g.print_trace(id, None);
+                    g.print_trace(id, None, false);
                     11
                 }
                 Found::Succ(p, t, l, msg, in_model) => {
@@ -3007,7 +3253,7 @@ fn run_liveness(opt: &Opt) {
                         distinct += 1;
                     }
                     let code = report_msg(&msg, in_model);
-                    g.print_trace(p, Some((&t, l)));
+                    g.print_trace(p, Some((&t, l)), false);
                     code
                 }
                 // TLC shows no behavior for these
@@ -3015,8 +3261,12 @@ fn run_liveness(opt: &Opt) {
                 Found::Eval(p, e) => {
                     let pseudo = matches!(e, EvalErr::Type(_));
                     let unassigned = matches!(e, EvalErr::Incomplete(_));
+                    let again = PRINT_ORDER.then(|| e.clone());
                     let code = report_msg(&SMsg::Eval(e), true);
-                    g.print_trace(p, None);
+                    g.print_trace(p, None, false);
+                    if let Some(e) = again {
+                        eval_again_prints(&unpack(&g.states[p as usize]), &e);
+                    }
                     if unassigned {
                         generated += show_incomplete(g.trace_len(p));
                     }

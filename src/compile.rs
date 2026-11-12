@@ -1205,7 +1205,12 @@ fn compile_inner(
     }
     g.scap = g.scap.max(start);
 
-    // Init / Next
+    // Init / Next. When they or an invariant print (Print, PrintT), the checker follows TLC's
+    // order of the lines printed (see PRINT_ORDER in the runtime)
+    let print_order = has_prints(&init)
+        || has_prints(&next_pos)
+        || cfg.invariants.iter().any(|n| ex.expand_def(n).is_ok_and(|e| has_prints(&e)));
+    g.print_order = print_order;
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
@@ -1421,6 +1426,7 @@ fn compile_inner(
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
+    writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a
