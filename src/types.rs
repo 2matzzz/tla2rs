@@ -551,6 +551,9 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
             }
         }
         (Ty::Fun(d1, _), Ty::Fun(d2, _)) if seq_domain(d1).is_some() && seq_domain(d2).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
+        // Functions over different domains (other than 1..n): functions over part of the joined
+        // domain type
+        (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
         (Ty::Seq(_), t) | (t, Ty::Seq(_)) if seq_elems(t).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(join(x, y)?.into()),
         (Ty::Bag(x), Ty::Bag(y)) => Ty::Bag(join(x, y)?.into()),

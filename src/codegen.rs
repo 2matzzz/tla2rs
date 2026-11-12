@@ -262,6 +262,10 @@ impl<'a> Gen<'a> {
         Ok(match (tuple_elems(a), tuple_elems(b)) {
             (Some(x), Some(y)) if x.len() != y.len() => Cmp::Unequal,
             (Some(x), Some(y)) => all(x.iter().zip(&y).map(|(s, t)| self.tuple_cmp(s, t)).collect::<R<_>>()?),
+            // The empty tuple is the function over the empty set, so it compares with a function
+            // over part of a type
+            (Some(x), None) if x.is_empty() && matches!(b, Ty::PFun(..)) => Cmp::Normal,
+            (None, Some(y)) if y.is_empty() && matches!(a, Ty::PFun(..)) => Cmp::Normal,
             (Some(_), None) => self.tuple_vs(b)?,
             (None, Some(_)) => self.tuple_vs(a)?,
             (None, None) => match (a, b) {
