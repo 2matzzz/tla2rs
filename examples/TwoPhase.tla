@@ -1,5 +1,6 @@
 ---------------------------- MODULE TwoPhase ----------------------------
 (* Two-phase commit (Lamport's TwoPhase, with every message normalized to the same record shape) *)
+(* Adapted from https://github.com/tlaplus/Examples (MIT License; see THIRD_PARTY_NOTICES.md) *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANT RM

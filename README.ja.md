@@ -150,3 +150,7 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 
 - 列（`Sequences`）と、集合の集合
 - 定数を実行時の引数にして、構成を変えるたびのビルドを省く
+
+## ライセンス表記
+
+tla2rs の一部は TLC と TLA+ Examples から派生している。どちらも MIT License で、表示と許諾文は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にある。
