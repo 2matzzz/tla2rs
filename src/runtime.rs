@@ -564,21 +564,48 @@ impl EvalErr {
 }
 
 /// Reports a state leaving its declared type in TLC's terms: if TypeOK is an invariant, as a
-/// violation of it.
-fn report_eval(e: &EvalErr) {
-    match e {
-        EvalErr::Type(m) => {
-            // The invariant that declares the types may not be checked at run time, since `pack`
-            // performs the same check.
-            if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) {
-                println!("Error: Invariant {TYPE_INVARIANT} is violated.");
-            } else {
-                println!("Error: a successor leaves the type declared in {TYPE_INVARIANT}.");
-            }
-            println!("  ({m}; tla2rs cannot represent that state)");
-        }
-        EvalErr::Arith(m) | EvalErr::Assert(m) | EvalErr::Other(m) => println!("Error: {m}"),
+/// violation of it. Returns false for any other error.
+fn report_type(e: &EvalErr) -> bool {
+    let EvalErr::Type(m) = e else { return false };
+    // The invariant that declares the types may not be checked at run time, since `pack`
+    // performs the same check.
+    if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) {
+        println!("Error: Invariant {TYPE_INVARIANT} is violated.");
+    } else {
+        println!("Error: a successor leaves the type declared in {TYPE_INVARIANT}.");
     }
+    eprintln!("  ({m}; tla2rs cannot represent that state)");
+    true
+}
+
+/// Whether TLC raises the error as its own evaluation error (`EvalException`), as opposed to a
+/// runtime exception: a failed arithmetic operation and a false Assert
+fn tlc_eval_exception(e: &EvalErr) -> bool {
+    matches!(e, EvalErr::Arith(_) | EvalErr::Assert(_))
+}
+
+/// Reports an evaluation error as TLC does. TLC reports an error as an exception it did not expect
+/// (with the lines below before the message, and the Java class of the exception, which a checker
+/// does not have) when it is raised while evaluating the CONSTRAINT, ACTION_CONSTRAINT, VIEW or a
+/// temporal property, or while computing successors when it is not one of TLC's own evaluation
+/// errors (`unexpected` is then true).
+fn report_eval_as(e: &EvalErr, unexpected: bool) {
+    if report_type(e) {
+        return;
+    }
+    if unexpected {
+        println!("Error: TLC threw an unexpected exception.");
+        println!("This was probably caused by an error in the spec or model.");
+        println!("See the User Output or TLC Console for clues to what happened.");
+        println!("{}", e.msg());
+    } else {
+        println!("Error: {}", e.msg());
+    }
+}
+
+/// An error while computing successors, which TLC shows with the behavior up to the state
+fn report_eval(e: &EvalErr) {
+    report_eval_as(e, !tlc_eval_exception(e))
 }
 
 struct Graph {
@@ -722,13 +749,17 @@ fn report_msg(msg: &SMsg, in_model: bool) -> i32 {
             println!("Error: Evaluating action property {name} failed.\n{}", e.msg());
             eval_code(e)
         }
-        SMsg::Eval(e) | SMsg::Untraced(e) => {
+        SMsg::Eval(e) => {
             report_eval(e);
             eval_code(e)
         }
+        SMsg::Untraced(e) => {
+            report_eval_as(e, true);
+            eval_code(e)
+        }
         SMsg::Live(what, e) => {
-            report_eval(e);
-            println!("  (while evaluating {what})");
+            report_eval_as(e, true);
+            eprintln!("  (while evaluating {what})");
             // TLC stops with an unexpected exception, and exits with 255 whatever the error
             255
         }
@@ -1644,9 +1675,14 @@ impl Iterator for Batches {
 /// states with their fingerprints, and the number of states generated.
 fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // TLC shows no behavior for an evaluation error in the initial states, only the counts so far.
-    fn stop(e: EvalErr, while_: &str, generated: u64, distinct: usize) -> ! {
-        report_eval(&e);
-        println!("  (while {while_})");
+    // An error that is not one of its own evaluation errors, raised while checking an initial
+    // state (CONSTRAINT, invariant, property), comes with that state.
+    fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize) -> ! {
+        report_eval_as(&e, false);
+        if let Some(s) = state.filter(|_| !tlc_eval_exception(&e) && !matches!(e, EvalErr::Type(_))) {
+            println!("While working on the initial state:\n{}\n", show(s));
+        }
+        eprintln!("  (while {while_})");
         println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
         exit(init_eval_code(&e));
     }
@@ -1670,7 +1706,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         });
         let (in_model, w, fp) = match step {
             Ok(v) => v,
-            Err(p) => stop(describe_panic(p), "checking an initial state", generated, out.len()),
+            Err(p) => stop(describe_panic(p), "checking an initial state", Some(&s), generated, out.len()),
         };
         if let (Some(w), Some(fp)) = (w, fp) {
             if !seen.insert(fp) {
@@ -1693,7 +1729,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                 exit(12);
             }
             Err((inv, e)) => {
-                stop(e, &format!("evaluating invariant {inv} on an initial state"), generated, out.len())
+                stop(e, &format!("evaluating invariant {inv} on an initial state"), Some(&s), generated, out.len())
             }
         }
         // A PROPERTY that is a state predicate holds if it holds in every initial state
@@ -1704,7 +1740,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                     println!("Error: Property {name} is violated by the initial state:\n{}", show(&s));
                     exit(13);
                 }
-                Err(p) => stop(describe_panic(p), &format!("evaluating property {name} on an initial state"), generated, out.len()),
+                Err(p) => stop(describe_panic(p), &format!("evaluating property {name} on an initial state"), Some(&s), generated, out.len()),
             }
         }
         if w.is_none() && (in_model || TYPE_INV_SUBSUMED) {
@@ -1715,7 +1751,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         }
     }
     if let Some(p) = failed {
-        stop(describe_panic(p), "computing the initial states", generated, out.len());
+        stop(describe_panic(p), "computing the initial states", None, generated, out.len());
     }
     (out, generated)
 }
@@ -2969,7 +3005,18 @@ fn run_liveness(opt: &Opt) {
         match state_bits(s, SATOMS_TABLEAU) {
             Ok(b) => ibits.push(b),
             Err(m) => {
-                let code = report_msg(&m, true);
+                // As an error in checking an initial state (see `initial_states`)
+                let code = match &m {
+                    SMsg::Live(what, e) => {
+                        report_eval_as(e, false);
+                        if !tlc_eval_exception(e) && !matches!(e, EvalErr::Type(_)) {
+                            println!("While working on the initial state:\n{}\n", show(s));
+                        }
+                        eprintln!("  (while evaluating {what})");
+                        255
+                    }
+                    m => report_msg(m, true),
+                };
                 println!("{generated} states generated, {n} distinct states found, {n} states left on queue.", n = inits.len());
                 exit(code);
             }
