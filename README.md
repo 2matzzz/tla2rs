@@ -201,9 +201,18 @@ memory.
   collision (an estimate is printed at the end)
 - Liveness checking keeps the whole state graph in memory (about 40 bytes per edge), and the search over its product
   with a property's automaton uses hash maps sized by the reachable product. For invariants only, see Memory above
-- Strings are ordered as TLC orders them (by when TLC first creates them) for strings that appear in the spec, its
-  modules, or the cfg. Strings created during the search (by `\o`, `ToString`, ...) can be ordered differently: TLC's
-  order for those depends on its evaluation order and, with several workers, on scheduling
+- Strings are ordered as TLC orders them, by when TLC first creates them: those of the cfg and the modules (names,
+  numbers as written, string literals) as TLC parses them, then those made by operations (`\o`, `Append`, `Head`,
+  `Tail`, `SubSeq`, `ToString`) in the order TLC makes them, first when it starts (it evaluates every definition of
+  constant level, used or not, then the ASSUMEs) and then while it explores. The checker's strings are numbered when
+  it is built, so with one worker it notes the order it makes them in; when that differs from their numbers, tla2rs
+  prints `tla2rs: strings were made in another order than they were numbered in; checking again from the start with
+  them in that order`, builds the checker again with that order and runs it from the start (at most 8 times; output
+  printed before the line is repeated). Not followed: with several workers TLC's order depends on scheduling, and the
+  checker keeps the order it was built with; a string made by a constant expression that tla2rs evaluates while it
+  compiles, other than a value, a set a quantifier ranges over or a set tested for membership (the condition of an
+  IF, say), and the characters of a string taken apart into a tuple (`SelectSeq`, `SortSeq`, a string compared with a
+  tuple) keep the order tla2rs meets them in
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
   it instead (`-lassocheck`)
