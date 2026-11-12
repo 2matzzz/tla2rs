@@ -1,6 +1,8 @@
-key 65d582874ca7dd4fd994ec3de597230acbe594bda646eec2ae87bdab45dfb029
+key 31df9c732d8a1845785334d39f25837693592cf3748a183715726418e9339cf0
 tlc Version 2.19
 rc 12
 Invariant Few is violated
 5 states generated 5 distinct states found
 trace=3
+states 5 81636e1fba6e2c5598327f6df6592e2297af2ca8f7bd8b86176b9740df4594d7
+edges 4 0b4b9879fb986746df3d5c9720782e1e19caed08899943579cef201d2ff1f4df

@@ -1,16 +1,19 @@
 //! tla2rs: compiles a TLA+ spec into an explicit-state model checker in Rust, specialized to that
 //! spec.
 //!
-//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched]
+//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE]
+//!   tla2rs --graph FILE | --graph-text FILE
 //!
 //! Builds the generated crate with `cargo build --release` and runs it. With --emit-only, it only
-//! writes the Rust code.
+//! writes the Rust code. `--graph` reduces a state graph written by `-dumpgraph` or by TLC's
+//! `-dump dot` to hashes (see graph.rs).
 
 mod ast;
 mod cfg;
 mod codegen;
 mod compile;
 mod expand;
+mod graph;
 mod lexer;
 mod std_modules;
 mod live;
@@ -46,12 +49,18 @@ fn build_key(dir: &Path) -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched]");
+    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE]");
+    eprintln!("       tla2rs --graph FILE | --graph-text FILE");
     exit(2)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [mode, path] = args.as_slice() {
+        if mode == "--graph" || mode == "--graph-text" {
+            exit(graph::main(mode, path));
+        }
+    }
     let mut tla: Option<PathBuf> = None;
     let mut cfg: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
@@ -91,9 +100,9 @@ fn main() {
                 i += 1;
                 seqcap = args.get(i).and_then(|x| x.parse().ok()).unwrap_or_else(|| usage());
             }
-            // Candidate budget (MB) the checker holds at once. Smaller values split each level into
-            // more chunks
-            "-memlimit" | "-tmpdir" => {
+            // Candidate budget (MB) the checker holds at once (smaller values split each level into
+            // more chunks), the spill directory, and the file to write the state graph to
+            "-memlimit" | "-tmpdir" | "-dumpgraph" => {
                 pass.push(args[i].clone());
                 i += 1;
                 pass.push(args.get(i).unwrap_or_else(|| usage()).clone());

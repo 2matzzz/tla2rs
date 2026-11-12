@@ -1,6 +1,8 @@
-key 8fc6cd2dd748ea325923ea10e66c6c86db70351bb47bb61445ea0dfaeeb6718c
+key b64a055505d4277a28d3238c4244e47bb5098f2b167f7705d27065cd4c951465
 tlc Version 2.19
 rc 12
 Invariant Bound is violated
 3 states generated 3 distinct states found
 trace=2
+states 3 91c6e48335d491cf539f2366260e0cb2a907b002a07cf982ce1bcd031cbb699b
+edges 1 665ae877edd92e755fe8504188724e0438a217c62edad817b262fb85e6289a88

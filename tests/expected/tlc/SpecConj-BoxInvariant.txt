@@ -1,6 +1,8 @@
-key 6b75cd166c136462bf362d9911e62b955c0de1c232622c31dab1a23bd33f7572
+key 8a56a43794817018b692278ddeed0bc871659fc58a241a849d735e17fd84eaff
 tlc Version 2.19
 rc 12
 Invariant PLt3 is violated
 4 states generated 4 distinct states found
 trace=4
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29

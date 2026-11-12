@@ -1,6 +1,8 @@
-key 3223a0a213f311508ba3b52cc5194fc84adc4a95599e9c746785bbcc3af31bd2
+key 52d21109e63b8eecfad8b76f0a3f5e27eff805c075d75fca774f05690d0387a6
 tlc Version 2.19
 rc 12
 Invariant Low is violated
 4 states generated 4 distinct states found
 trace=4
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29

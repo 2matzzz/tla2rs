@@ -1,6 +1,8 @@
-key a1258260ca71d5c4c928d0a8925fa300db50085eb5615c3bb178cfdebf148503
+key e54d729c3e0b92736c9e42e9492873c6f46b5abcffa4dda207556b4af70957dc
 tlc Version 2.19
 rc 12
 Invariant NoTriple is violated
 22 states generated 16 distinct states found
 trace=4
+states 16 fa0390fb9dd60ebbc1c69b435ca3ad37f1dad3e7eef25a929ffbe95876dcfcb0
+edges 21 5933d9efc07f3fcd211ff2bb5c7664a424971dd8fa183b85402cc1172b0e2ce2

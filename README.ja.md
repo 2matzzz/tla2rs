@@ -36,7 +36,8 @@ cargo build --release
 - `-seqcap N` は列の最大の長さ（65535 まで）。仕様が `TypeOK` か `CONSTRAINT` の `Len(x) <= N` や `UNION {[1..n -> S] : n \in 0..N}` で上限を書いていないときに使う。書いていなければ、Init と Next から長さを伸びなくなるまで求める（アクションの中の `Len(q) < N` のような長さの判定は、そこでの `q` の上限になる）。伸び続けるときは仕様の中の長さの判定から上限を決める
 - `-fp128` は指紋を 64 bit から 128 bit にする
 - `-metal` は「もう見たか」の問い合わせを GPU（Apple Metal）で行う。`-batched` は同じ 3 段の流れを CPU で行う
-- 出力（状態数・反例の書式）は TLC に寄せてある。終了コードも TLC と同じく 10 = ASSUME（偽、または評価に失敗）、11 = デッドロック、12 = 不変条件、13 = 性質（時相の性質と `[][A]_v`）。評価に失敗したときは、不変条件の中なら 76、初期状態なら 75、それ以外は算術の失敗（0 での `\div` など）なら 255、そのほかは 75 で終わる
+- `-dumpgraph FILE` は、探索でたどった状態と遷移を TLC の `-dump dot FILE` と同じ形で FILE に書き出す（状態ごとに節点を作り、TLC が表示するとおりの状態をラベルにし、後続状態ごとに辺を引く）。`tla2rs --graph FILE` はどちらのファイルも、節点の番号や並び順に左右されない状態と辺のハッシュにまとめる。`--graph-text FILE` はまとめる前の正規形をそのまま出す
+- 出力（状態数・反例の書式・80 桁を超える値の折り返し）は TLC に寄せてある。終了コードも TLC と同じく 10 = ASSUME（偽、または評価に失敗）、11 = デッドロック、12 = 不変条件、13 = 性質（時相の性質と `[][A]_v`）。評価に失敗したときは、不変条件の中なら 76、初期状態なら 75、それ以外は算術の失敗（0 での `\div` など）なら 255、そのほかは 75 で終わる
 
 ## 速さ
 
@@ -113,14 +114,16 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 
 ## 確かめ方
 
-`scripts/crosscheck.sh` は TLC（`-workers 1`）と tla2rs で同じ構成を回し、結果・生成状態数・distinct 状態数・反例の長さ・終了コードを比べる。
-`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は構成ごとに `tests/expected/` にコミットしてある。中身は判定・状態数・反例の長さ・終了コードと、jar・cfg・引数・仕様が読むモジュールのハッシュである。時刻・指紋の種・liveness の反例の形は TLC の実行ごとに変わるので記録せず、ファイルはどの実行でも同じになる。`crosscheck.sh` と `all.sh` はこのファイルと比べるだけで、TLC は回さない。ファイルが無いか古いときは失敗にする。TLC を回すのは `scripts/expected.sh [cfg ...]` だけで、無いものと古いものだけを書き、ほかには触らないので、2 回目は何も変えない。`expected.sh -check` は TLC を回し直して食い違うファイルを報告し、書き込みはしない。`-force` はすべて書き直す。ビルドした検査器は、生成コードと rustc の版のハッシュで `target/crosscheck/build` に残す(`CROSSCHECK_NO_CACHE=1` で毎回ビルドし直す)。
+`scripts/crosscheck.sh` は TLC（`-workers 1`）と tla2rs で同じ構成を回し、結果・生成状態数・distinct 状態数・反例の長さ・終了コードに加えて状態グラフを比べる。状態グラフとは、たどり着いた状態の集合と、状態どうしの遷移の集合のことで、TLC の `-dump dot` と tla2rs の `-dumpgraph` の出力をそれぞれ SHA-256 のハッシュにまとめて比べる。TLC が変数を並べる順はハッシュ表から来ていて状態とは関係がないので、各状態の変数は並べ替えてから比べる。グラフ全体を比べられない場合（初期状態の計算中に止まると TLC はグラフのファイルを最後まで書かない、tla2rs が表せない後続状態がある）は比べる範囲を狭め、`all.sh` がどの規則を使ったかを表示する。規則の一覧は CLAUDE.md にある。
+`scripts/all.sh` は `examples/` と `tests/tlc/` の全構成をこれで回す。`-batched` などの引数を付けると、各構成にそのまま渡す。`tla2tools.jar` は `TLA_TOOLS` で渡す（既定 `~/.tla/tla2tools.jar`）。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は構成ごとに `tests/expected/` にコミットしてある。中身は判定・状態数・反例の長さ・終了コード・状態グラフのハッシュと、jar・cfg・引数・仕様が読むモジュール・`src/graph.rs` のハッシュである。時刻・指紋の種・liveness の反例の形は TLC の実行ごとに変わるので記録せず、ファイルはどの実行でも同じになる。`crosscheck.sh` と `all.sh` はこのファイルと比べるだけで、TLC は回さない。ファイルが無いか古いときは失敗にする。TLC を回すのは `scripts/expected.sh [cfg ...]` だけで、無いものと古いものだけを書き、ほかには触らないので、2 回目は何も変えない。`expected.sh -check` は TLC を回し直して食い違うファイルを報告し、書き込みはしない。`-force` はすべて書き直す。ビルドした検査器は、生成コードと rustc の版のハッシュで `target/crosscheck/build` に残す(`CROSSCHECK_NO_CACHE=1` で毎回ビルドし直す)。
 
 ```
 $ scripts/all.sh
 ok    examples/DieHard.cfg
 ok    examples/Peterson-Live.cfg
 ok    examples/TwoPhase.cfg
+...
+ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending it)
 ...
 ```
 

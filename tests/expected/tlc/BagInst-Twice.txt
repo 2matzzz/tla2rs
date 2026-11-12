@@ -1,6 +1,8 @@
-key 683ae065884ccf9e9bf39c9e75bb8c1f1a26fadf91c434a789d3a16514848663
+key 7f7ccb0f2eb59f0e04acd8a436ae60611972a51f0560db9d4d2dd091cabc88aa
 tlc Version 2.19
 rc 12
 Invariant Twice is violated
 3 states generated 3 distinct states found
 trace=2
+states 3 7c1fe7780fe4e0b4e3b637ef84026237a8b9cd0db5818e9dfbedc82a357d40c0
+edges 2 3b7c000be90d416f3127b6239929fe5c4b2cc7cd5c9279e503cdd4132c94eec4

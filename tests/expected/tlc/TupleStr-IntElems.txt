@@ -1,6 +1,8 @@
-key b737b950377c9c8fa485a137c54c2cc65c5695f8c1c37af26de10e894b559db6
+key 3387b2c6e6a59667253026756a069e48d2ea7349b2fef0f09264de8595016b4c
 tlc Version 2.19
 rc 76
 Evaluating invariant IntElems failed
 2 states generated 2 distinct states found
 trace=2
+states 2 1ace21ece2b6d5292b641fa46ea2cd623c931db15f9d9b1e470dab6c4311326d
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424

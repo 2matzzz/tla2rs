@@ -1,6 +1,8 @@
-key 395d0aee28805d7a799f0cbf9c4df136df098c0f620ff3abfd4279fa4edcfe65
+key 6bce6a68e8ef41081eaab4c812d3129171763ae36fc4d56c6726f2f30dfc5f4f
 tlc Version 2.19
 rc 13
 Temporal property violated
 4 states generated 3 distinct states found
 trace=lasso
+states 3 5720c02caf08102ad2c9dea8eb06a49e4fcf40e40aac4c21dc34be81b5737c24
+edges 3 b2d516ac2fbfdf330a3807ea2448b0f4c0e9f82abd7a9eefdb1522aa364ec48e

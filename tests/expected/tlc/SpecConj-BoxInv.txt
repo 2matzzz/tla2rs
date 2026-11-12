@@ -1,6 +1,8 @@
-key 1525841a2e2bb0c3b9d5041cc34feab1a2ce0a28be8f5cf2e37ca0c5da6082d2
+key 3566226de16d017e39194e2a872bcfe7442565d539b2c995d651638428bf8e2d
 tlc Version 2.19
 rc 12
 Invariant PAlwLt3 is violated
 4 states generated 4 distinct states found
 trace=4
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29

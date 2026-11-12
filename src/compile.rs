@@ -1200,11 +1200,15 @@ fn compile_inner(
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
+    // As TLC prints a state: each value through its pretty printer, and the variables as a
+    // conjunction unless there is only one
     let mut show = String::from("fn show(s: &State) -> String { let mut o = String::new(); ");
+    let one = g.vars.len() == 1;
     for (i, (v, t)) in g.vars.clone().iter().enumerate() {
         let tid = g.ty_id_pub(t)?;
         let nl = if i + 1 < g.vars.len() { "\\n" } else { "" };
-        write!(show, "o += &format!(\"/\\\\ {v} = {{}}{nl}\", fmt_{tid}(&s.v_{v})); ").unwrap();
+        let bullet = if one { "" } else { "/\\\\ " };
+        write!(show, "o += &format!(\"{bullet}{v} = {{}}{nl}\", ppr(&fmt_{tid}(&s.v_{v}))); ").unwrap();
     }
     show += "o }\n";
     src += &show;

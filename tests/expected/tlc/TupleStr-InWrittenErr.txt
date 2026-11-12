@@ -1,6 +1,8 @@
-key 618e7b1bc51074b04405d43f48df47f6d8f492bcbcb62f8bfe9a380fd749a9c0
+key 78f95d21d8e9fc4a032e1685fb419332b5d49301d4094e83a77aa60397207749
 tlc Version 2.19
 rc 76
 Evaluating invariant InWrittenErr failed
 2 states generated 2 distinct states found
 trace=2
+states 2 1ace21ece2b6d5292b641fa46ea2cd623c931db15f9d9b1e470dab6c4311326d
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
