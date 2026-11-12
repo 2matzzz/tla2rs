@@ -20,6 +20,10 @@
 //! satisfies the spec's fairness (otherwise no behavior is fair and nothing is violated), and it
 //! violates the properties. Fairness and ENABLED stay those of the spec: its actions do not mention
 //! `tla2rsAt`.
+//!
+//! A lasso that returns to its entry only under the spec's VIEW (`lasso_states` in runtime.rs) ends
+//! with a step to the actual successor instead, and the cfg gets `VIEW Tla2rsView`, the spec's view
+//! with the position, so TLC folds that successor into the entry.
 
 use crate::ast::*;
 use crate::cfg::Cfg;
@@ -149,10 +153,10 @@ pub fn tla(e: &Expr) -> Result<String, String> {
 }
 
 /// The Rust static `LASSO_CHECK` for the generated checker: the spec's module, then the parts of
-/// Tla2rsLasso.tla before and after the lasso's states, and Tla2rsLasso.cfg; or why they cannot be
-/// written
+/// Tla2rsLasso.tla before and after the lasso's states, Tla2rsLasso.cfg, and the lines added to the
+/// cfg when the lasso returns to its entry only under the VIEW; or why they cannot be written
 pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> String {
-    let r = (|| -> Result<[String; 4], String> {
+    let r = (|| -> Result<[String; 5], String> {
         let w = written.as_ref().map_err(|e| e.clone())?;
         let next = w.next.as_ref().ok_or("no next-state relation")?;
         // The model values of the cfg that the module does not declare as constants (VIEW and
@@ -208,11 +212,21 @@ pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> Str
             c += &format!("ACTION_CONSTRAINTS {}\n", cfg.action_constraints.join(" "));
         }
         c += "CHECK_DEADLOCK TRUE\n";
-        Ok([m.name.clone(), pre, post, c])
+        // For a lasso that returns to a state equal to its entry only under the VIEW: the cfg lines
+        // that fold states as the spec's cfg does, with the position kept apart
+        let mut fold = String::new();
+        if let Some(v) = &cfg.view {
+            post += &format!("Tla2rsView == <<tla2rsAt, {v}>>\n");
+            fold += "VIEW Tla2rsView\n";
+            if let Some(s) = &cfg.symmetry {
+                fold += &format!("SYMMETRY {s}\n");
+            }
+        }
+        Ok([m.name.clone(), pre, post, c, fold])
     })();
     match r {
-        Ok(parts) => format!("static LASSO_CHECK: Result<[&str; 4], &str> = Ok({parts:?});\n"),
-        Err(e) => format!("static LASSO_CHECK: Result<[&str; 4], &str> = Err({e:?});\n"),
+        Ok(parts) => format!("static LASSO_CHECK: Result<[&str; 5], &str> = Ok({parts:?});\n"),
+        Err(e) => format!("static LASSO_CHECK: Result<[&str; 5], &str> = Err({e:?});\n"),
     }
 }
 

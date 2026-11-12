@@ -225,7 +225,9 @@ memory.
   so the comparison with TLC reads an interval as the set it denotes
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
-  it instead (`-lassocheck`)
+  it instead (`-lassocheck`). Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a
+  behavior; when a value the view leaves out only grows, the lasso returns to its first state of the cycle under the
+  view only, and the check folds states by the same view
 - With `VIEW` and `SYMMETRY` together, a state is reduced as TLC reduces it: the smallest of its permutations (values
   compared as TLC compares them, variables in the order TLC prints them), and then the view of that state. This
   compares whole permuted states, which costs more than comparing views did
@@ -296,8 +298,8 @@ written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model 
 selected (the exhaustive searches that TLC 2.19 finishes, with `tla2tools.jar` and the CommunityModules' modules, in
 60 seconds or less with one worker) and, for each of the others, why it is skipped. A selected model that tla2rs does
 not match yet is listed as a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost.
-Of the 105 selected models, 101 match TLC (6 of them on everything but the generated count, which TLC counts once per
-`\/` branch); the 4 gaps and their reasons are in `tests/corpus.txt` and CLAUDE.md.
+Of the 105 selected models, 102 match TLC (6 of them on everything but the generated count, which TLC counts once per
+`\/` branch); the 3 gaps and their reasons are in `tests/corpus.txt` and CLAUDE.md.
 
 | Example | What it is |
 |---|---|

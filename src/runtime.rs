@@ -3942,6 +3942,10 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
 /// Prints a lasso as TLC does: the states from an initial state to the entry of the cycle, then
 /// the cycle, ending with "Back to state N" (or "Stuttering" if it never leaves the entry state).
 /// Stuttering steps inside are not shown.
+///
+/// The graph keeps, for each fingerprint, the first state reached. With a VIEW or a SYMMETRY that
+/// state need not be a successor of the one before it on the lasso, so the lasso is replayed on
+/// actual states, as TLC rebuilds a behavior from fingerprints (`lasso_states`).
 fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     let mut shown: Vec<(u32, u32)> = vec![];
@@ -3950,13 +3954,6 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
             continue;
         }
         shown.push((s, l));
-    }
-    // The states shown, for -lassocheck
-    let mut texts: Vec<String> = vec![];
-    for (i, &(s, l)) in shown.iter().enumerate() {
-        let t = show(&unpack(&g.states[s as usize]));
-        println!("State {}: <{}>\n{t}\n", i + 1, name(l));
-        texts.push(t);
     }
     let entry_no = shown.len();
     let entry = shown[entry_no - 1].0;
@@ -3969,34 +3966,100 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
         moves.push((s, l));
         at = s;
     }
-    if moves.is_empty() {
-        println!("State {}: Stuttering", entry_no + 1);
-        write_lasso_check(&texts, None);
-        return;
+    // The lasso's nodes in order, without the last step back to the entry
+    let back_label = (!moves.is_empty()).then(|| moves[moves.len() - 1].1);
+    let mut path = shown.clone();
+    if back_label.is_some() {
+        path.extend_from_slice(&moves[..moves.len() - 1]);
     }
-    let last = moves.len() - 1;
-    let mut back = None;
-    for (j, &(s, l)) in moves.iter().enumerate() {
-        if j == last && s == entry {
-            println!("Back to state {entry_no}: <{}>", name(l));
-            back = Some(entry_no);
-        } else {
-            let t = show(&unpack(&g.states[s as usize]));
-            println!("State {}: <{}>\n{t}\n", entry_no + j + 1, name(l));
-            texts.push(t);
+    let (states, ret) = lasso_states(g, &path, entry_no, back_label);
+    // The states shown, for -lassocheck
+    let mut texts: Vec<String> = vec![];
+    for (i, &(s, l)) in states.iter().enumerate() {
+        let t = show(&s);
+        println!("State {}: <{}>\n{t}\n", i + 1, name(l));
+        texts.push(t);
+    }
+    match ret {
+        None => {
+            println!("State {}: Stuttering", states.len() + 1);
+            write_lasso_check(&texts, None);
+        }
+        Some((back, l, folded)) => {
+            println!("Back to state {back}: <{}>", name(l));
+            write_lasso_check(&texts, Some((back, folded.map(|t| show(&t)))));
         }
     }
-    write_lasso_check(&texts, back);
+}
+
+/// The states of a lasso through the graph's nodes `path` (with the action of each step), whose
+/// cycle starts at the node numbered `entry` (from 1) and returns to it by a step of action `back`
+/// (none: it ends stuttering), replayed on actual states: from the first state, an initial one,
+/// each step takes the successor whose fingerprint is the next node's, by the same action if one
+/// is. Without a VIEW, the state the cycle returns to has the fingerprint of the entry but may be
+/// another member of its symmetry class, so the cycle is followed again from there until it
+/// returns to a state it went through at the entry (at most once per permutation). With a VIEW the
+/// actual states need not repeat at all (a view can leave out a counter that only grows), so the
+/// lasso returns to its entry under the VIEW: the result names the successor it returns by, which
+/// the lasso check folds into the entry as TLC does. If a step has no such successor (TLC cannot
+/// rebuild such a behavior either), the states the graph keeps are shown instead.
+/// Returns the states, and the number of the state returned to, the action, and that successor.
+#[allow(clippy::type_complexity)]
+fn lasso_states(g: &Graph, path: &[(u32, u32)], entry: usize, back: Option<u32>) -> (Vec<(State, u32)>, Option<(usize, u32, Option<State>)>) {
+    let kept = || {
+        let states: Vec<(State, u32)> = path.iter().map(|&(s, l)| (unpack(&g.states[s as usize]), l)).collect();
+        (states, back.map(|l| (entry, l, None)))
+    };
+    if !HAS_VIEW && PERMS.is_empty() {
+        return kept();
+    }
+    let _quiet = Capturing::start();
+    let fp_of = |s: u32| {
+        let w = &g.states[s as usize];
+        state_fp(&unpack(w), w)
+    };
+    let mut buf: Vec<(State, u32)> = vec![];
+    let mut step = |cur: &State, want: Fp, l: u32| -> Option<(State, u32)> {
+        let _ = successors(cur, &mut buf, true);
+        let fits = |t: &State| pack(t).is_some_and(|w| state_fp(t, &w) == want);
+        buf.iter().find(|x| x.1 == l && fits(&x.0)).or_else(|| buf.iter().find(|x| fits(&x.0))).copied()
+    };
+    let mut out = vec![(unpack(&g.states[path[0].0 as usize]), path[0].1)];
+    for &(s, l) in &path[1..] {
+        let Some(t) = step(&out[out.len() - 1].0, fp_of(s), l) else { return kept() };
+        out.push(t);
+    }
+    let Some(lb) = back else { return (out, None) };
+    let entry_fp = fp_of(path[entry - 1].0);
+    // The states at the entry on each round, by their number
+    let mut entries = vec![entry];
+    for _ in 0..=PERMS.len() {
+        let Some((y, _)) = step(&out[out.len() - 1].0, entry_fp, lb) else { return kept() };
+        let wy = pack(&y);
+        if let Some(&k) = entries.iter().find(|&&k| pack(&out[k - 1].0) == wy) {
+            return (out, Some((k, lb, None)));
+        }
+        if HAS_VIEW {
+            return (out, Some((entry, lb, Some(y))));
+        }
+        out.push((y, lb));
+        entries.push(out.len());
+        for &(s, l) in &path[entry..] {
+            let Some(t) = step(&out[out.len() - 1].0, fp_of(s), l) else { return kept() };
+            out.push(t);
+        }
+    }
+    kept()
 }
 
 /// With `-lassocheck DIR`, writes DIR/Tla2rsLasso.tla and .cfg: a spec whose only behavior is the
 /// lasso `states` (as printed), returning to state `back` (1-based) or ending stuttering, for TLC
 /// to confirm that it is a behavior of the spec that violates the properties (see lasso.rs in
 /// tla2rs)
-fn write_lasso_check(states: &[String], back: Option<usize>) {
+fn write_lasso_check(states: &[String], back: Option<(usize, Option<String>)>) {
     let args: Vec<String> = std::env::args().collect();
     let Some(dir) = args.iter().position(|a| a == "-lassocheck").and_then(|i| args.get(i + 1)) else { return };
-    let [module, pre, post, cfg] = match LASSO_CHECK {
+    let [module, pre, post, cfg, fold] = match LASSO_CHECK {
         Ok(parts) => parts,
         Err(why) => {
             println!("The lasso check is not written: {why}.");
@@ -4013,19 +4076,27 @@ fn write_lasso_check(states: &[String], back: Option<usize>) {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let tlc = states.iter().any(|t| t.contains(":>") || t.contains("@@"));
+    let folded = back.as_ref().and_then(|b| b.1.as_ref());
+    let tlc = states.iter().chain(folded).any(|t| t.contains(":>") || t.contains("@@"));
     let mut o = format!("---- MODULE Tla2rsLasso ----\nEXTENDS {module}{}\n{pre}", if tlc { ", TLC" } else { "" });
     for (i, t) in states.iter().enumerate() {
         o += &format!("Tla2rsState{} ==\n{}Tla2rsGo{} ==\n{}", i + 1, indent(t), i + 1, indent(&primed(t)));
     }
+    // A lasso that returns to its entry under the VIEW only steps to the successor it returns by,
+    // which the VIEW in the cfg folds into the entry
+    if let Some(t) = folded {
+        o += &format!("Tla2rsGoBack ==\n{}", indent(&primed(t)));
+    }
     o += "Tla2rsStep ==\n";
     let n = states.len();
     for i in 1..=n {
-        let to = if i < n { i + 1 } else { back.unwrap_or(n) };
-        o += &format!("  \\/ tla2rsAt = {i} /\\ tla2rsAt' = {to} /\\ Tla2rsGo{to}\n");
+        let to = if i < n { i + 1 } else { back.as_ref().map_or(n, |b| b.0) };
+        let go = if i == n && folded.is_some() { "Tla2rsGoBack".to_string() } else { format!("Tla2rsGo{to}") };
+        o += &format!("  \\/ tla2rsAt = {i} /\\ tla2rsAt' = {to} /\\ {go}\n");
     }
     o += post;
     o += "====\n";
+    let cfg = if folded.is_some() { format!("{cfg}{fold}") } else { cfg.to_string() };
     let dir = std::path::Path::new(dir);
     let written = std::fs::write(dir.join("Tla2rsLasso.tla"), o).and_then(|_| std::fs::write(dir.join("Tla2rsLasso.cfg"), cfg));
     if let Err(e) = written {
