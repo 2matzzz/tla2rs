@@ -538,7 +538,7 @@ impl<'a> Expander<'a> {
 /// e without the labels around it (written ones and POS labels)
 fn strip_labels(e: &Expr) -> &Expr {
     match e {
-        Expr::Label(n, _, b) if n.ends_with("::") || pos_of(n).is_some() => strip_labels(b),
+        Expr::Label(n, _, b) if n.ends_with("::") || pos_of(n).is_some() || err_pos_of(n).is_some() => strip_labels(b),
         e => e,
     }
 }

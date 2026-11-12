@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the same spec with TLC and tla2rs and compare state counts, violated invariants,
-# counterexamples, exit codes and state graphs (see "State graphs" and "Counterexamples" in
-# CLAUDE.md).
+# counterexamples, exit codes, state graphs, and the messages and printed lines (see "State graphs",
+# "Counterexamples" and "Messages and printed lines" in CLAUDE.md).
 #   scripts/crosscheck.sh examples/DieHard.tla [examples/DieHard.cfg] [-deadlock]
 #   scripts/crosscheck.sh examples/DieHard.cfg            (the spec is the cfg name up to the first -)
 # For a configuration in examples/ or tests/tlc/, TLC's side is the static result in tests/expected/,
@@ -64,9 +64,8 @@ summarize() {
   local res
   local span='line [0-9]+, col [0-9]+ to line [0-9]+, col [0-9]+ of module [A-Za-z0-9_]+'
   res=$(grep -oE "Invariant [A-Za-z0-9_]+ is violated|Evaluating invariant [A-Za-z0-9_]+ failed|Action property [A-Za-z0-9_]+ is violated|Property [A-Za-z0-9_]+ is violated|Deadlock reached|Temporal propert(y .* is|ies were) violated|Assumption $span is false|Evaluating assumption $span failed|No error has been found" "$f" | head -1 || true)
-  # If none of the above matched but there is an Error: line, treat it as an evaluation error.
-  # The message may differ from TLC's (TLC can also stop on an internal exception), so compare
-  # only the kind (and the exit code below)
+  # If none of the above matched but there is an Error: line, treat it as an evaluation error. The
+  # message itself is compared with the other messages (see messages below)
   if [[ -z "$res" ]] && grep -qE '^Error:' "$f"; then
     res="Evaluation error"
   fi
@@ -87,14 +86,15 @@ summarize() {
 # TLC's result depends only on the jar, the cfg, the arguments and the modules the spec reads
 # (followed through EXTENDS and INSTANCE within the spec's directory; standard modules come from the
 # jar). For a configuration in examples/ or tests/tlc/, the summary TLC gives (verdict, counts, the
-# length and a hash of its counterexample, exit code, and hashes of its state graph) is kept in
-# tests/expected/ with a hash of those inputs and of src/graph.rs and src/trace.rs, which reduce the
-# graph and the counterexample to their hashes (the key). The parts of TLC's output that vary from
-# run to run (times, the fingerprint seed, the shape of a liveness counterexample) are not part of
-# the summary, so the file is the same for every TLC run.
+# length and a hash of its counterexample, exit code, hashes of its state graph and of its messages)
+# is kept in tests/expected/ with a hash of those inputs and of src/graph.rs, src/trace.rs and
+# src/messages.rs, which reduce the graph, the counterexample and the messages to their hashes (the
+# key). The parts of TLC's output that vary from run to run (times, the fingerprint seed, temporary
+# paths, the shape of a liveness counterexample) are not part of the summary, so the file is the
+# same for every TLC run.
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  { echo "v3 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" | cut -d' ' -f1; cat "$cfg_abs"
+  { echo "v4 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
 expected=""
@@ -111,16 +111,23 @@ run_tlc() {
   mkdir -p "$work/jtmp"
   java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 1 -dump dot tlc.dot -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
   a="$(summarize tlc.out)
-$(graph tlc.dot)"
+$(graph tlc.dot)
+$(messages tlc.out)"
 }
 # The state graph reduced to hashes of its states and its edges (see src/graph.rs).
 # CROSSCHECK_GRAPH_DIR=DIR keeps the graphs as DIR/<cfg name>.{tlc,rs}.dot (`tla2rs --graph-text`
-# prints them in canonical form, for diffing).
+# prints them in canonical form, for diffing), and the outputs as DIR/<cfg name>.{tlc,rs}.out
+# (`tla2rs --messages-text` and `--trace-text` print their canonical forms).
 graph() { "$bin" --graph "$1" || echo "graph unreadable"; }
+# The messages and printed lines, and the error lines among them, reduced to hashes (see
+# src/messages.rs)
+messages() { "$bin" --messages "$1" || echo "messages unreadable"; }
 keep_graph() {
-  if [[ -n "${CROSSCHECK_GRAPH_DIR:-}" && -f "$1" ]]; then
-    mkdir -p "$CROSSCHECK_GRAPH_DIR" && cp "$1" "$CROSSCHECK_GRAPH_DIR/$(basename "$c" .cfg).$2.dot"
-  fi
+  [[ -n "${CROSSCHECK_GRAPH_DIR:-}" ]] || return 0
+  mkdir -p "$CROSSCHECK_GRAPH_DIR"
+  [[ -f "$1" ]] && cp "$1" "$CROSSCHECK_GRAPH_DIR/$(basename "$c" .cfg).$2.dot"
+  [[ -f "$2.out" ]] && cp "$2.out" "$CROSSCHECK_GRAPH_DIR/$(basename "$c" .cfg).$2.out"
+  return 0
 }
 expected_text() { echo "key $key"; echo "tlc $(grep -m1 -oE 'Version [0-9.]+' tlc.out || true)"; echo "rc $rc_tlc"; echo "$a"; }
 fresh=0
@@ -195,7 +202,8 @@ fi
 
 keep_graph rs.dot rs
 b="$(summarize rs.out)
-$(graph rs.dot)"
+$(graph rs.dot)
+$(messages rs.out)"
 # If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
 if [[ -z "$(echo "$a" | head -1)" ]]; then
   echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out 2>/dev/null | grep -vE 'Parsing|Semantic' | head -10
@@ -228,6 +236,13 @@ if grep -q '^states incomplete' <<< "$a"; then
 elif grep -q '<a successor that tla2rs cannot represent>' rs.out; then
   a=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$a"); b=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$b")
   graph_note="; graph and counterexample sizes only: a successor tla2rs cannot represent"
+fi
+# `\* crosscheck: error-lines (reason)` compares only the error lines among the messages, for a
+# configuration where tla2rs cannot print all of TLC's text (the reason says why; see "Messages and
+# printed lines" in CLAUDE.md)
+if grep -qE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*error-lines' "$c"; then
+  a=$(grep -v '^messages ' <<< "$a"); b=$(grep -v '^messages ' <<< "$b")
+  graph_note="$graph_note; messages: error lines only"
 fi
 if [[ $verdict_only == 1 ]]; then
   a=$(echo "$a" | head -1); b=$(echo "$b" | head -1)

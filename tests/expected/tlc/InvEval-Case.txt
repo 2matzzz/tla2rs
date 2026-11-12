@@ -1,4 +1,4 @@
-key 416ca75afeb7c73e53c6c6e05c7541454c54d2800e52f4f0e9fbd274360c8513
+key 09f476dd1c728c5536a3da559cd7b9c3d3a32e3e6eb701ed1d4bca85ec3f4885
 tlc Version 2.19
 rc 76
 Evaluating invariant InvCase failed
@@ -6,3 +6,5 @@ Evaluating invariant InvCase failed
 trace 3 09c007f57320fdb61290bd41db5278f99827dfd871c7e4bd31a1f462ec3ed2f8
 states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
 edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 4 e665fd547018348d8c27bd3f6e4dd0e4a6f71eb1371c829c8c4ad4ac0d04e9f9
+errors 2 f304874efdfe94e2fd6221d372710c1009e538b97f33a2f56a7cff20be93af1b

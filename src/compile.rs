@@ -20,6 +20,45 @@ pub struct Output {
     pub rejected: Option<(String, i32)>,
 }
 
+/// What TLC prints when it starts, in its order: Print and PrintT in the definitions of constant
+/// level, its warnings about the configuration, then Print and PrintT in the ASSUMEs
+#[derive(Default)]
+pub struct Startup {
+    pub consts: Vec<String>,
+    pub warnings: Vec<String>,
+    pub assumes: Vec<String>,
+}
+
+/// TLC's note after the first warning it prints
+pub const NOWARNING: &str = "(Use the -nowarning option to disable this warning.)";
+
+impl Startup {
+    pub fn lines(&self) -> Vec<String> {
+        let mut v = self.consts.clone();
+        for (i, w) in self.warnings.iter().enumerate() {
+            v.push(w.clone());
+            if i == 0 {
+                v.push(NOWARNING.into());
+            }
+        }
+        v.extend(self.assumes.iter().cloned());
+        v
+    }
+
+    /// TLC's warnings when it checks temporal properties (`live`) with SYMMETRY or constraints
+    fn liveness_warnings(&mut self, cfg: &Cfg, live: bool) {
+        if !live || !self.warnings.is_empty() {
+            return;
+        }
+        if cfg.symmetry.is_some() {
+            self.warnings.push("Warning: Declaring symmetry during liveness checking is dangerous. It might cause TLC to miss violations of the stated liveness properties. Please check liveness without symmetry defined.".into());
+        }
+        if !cfg.constraints.is_empty() || !cfg.action_constraints.is_empty() {
+            self.warnings.push("Warning: Declaring state or action constraints during liveness checking is dangerous: Please read section 14.3.5 on page 247 of Specifying Systems (https://lamport.azurewebsites.net/tla/book.html) and optionally the discussion at https://discuss.tlapl.us/msg00994.html for more details.".into());
+        }
+    }
+}
+
 const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv", "TypeCorrect"];
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
@@ -510,6 +549,22 @@ fn uses_real_time(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Label(n, ..) if n == "RTBound" || n == "RTnow"))
 }
 
+/// How TLC names the first RTnow or RTBound in e when it refuses it: by its position (see
+/// ast::AT), or as written
+fn real_time_at(e: &Expr) -> String {
+    fn find(e: &Expr) -> Option<&str> {
+        if let Expr::Label(n, _, b) = e {
+            if let Some(p) = err_pos_of(n) {
+                if uses_real_time(b) && matches!(b.as_ref(), Expr::Label(r, ..) if r == "RTBound" || r == "RTnow") {
+                    return Some(p);
+                }
+            }
+        }
+        e.children().into_iter().find_map(find)
+    }
+    find(e).map(|p| p.to_string()).unwrap_or_else(|| format!("{} (RTBound / RTnow of RealTime)", short(e)))
+}
+
 /// The operators of the standard modules and their numbers of arguments, for a named instance
 /// (`S == INSTANCE Sequences` used as `S!Len(s)`)
 fn std_ops(m: &str) -> &'static [(&'static str, usize)] {
@@ -667,7 +722,7 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
-    let mut startup = vec![];
+    let mut startup = Startup::default();
     let mut out = match compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup) {
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
@@ -679,8 +734,9 @@ pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, s
     };
     // What TLC prints when it starts comes before its verdict on the spec
     if let Some((msg, _)) = &mut out.rejected {
-        if !startup.is_empty() {
-            *msg = format!("{}\n{msg}", startup.join("\n"));
+        let lines = startup.lines();
+        if !lines.is_empty() {
+            *msg = format!("{}\n{msg}", lines.join("\n"));
         }
     }
     Ok(out)
@@ -737,7 +793,7 @@ fn compile_inner(
     seqcap: usize,
     fp128: bool,
     metal: bool,
-    startup: &mut Vec<String>,
+    startup: &mut Startup,
 ) -> R<Output> {
     let mut warnings = vec![];
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
@@ -827,7 +883,8 @@ fn compile_inner(
     for d in &m.defs {
         let e = if d.params.is_empty() { ex.expand_def(&d.name).ok() } else { Some(d.body.clone()) };
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
-            let msg = format!("Error: {msg} (in {})\nError: Parsing or semantic analysis failed.", d.name);
+            // As SANY reports it, with the definition where SANY gives the position of the formula
+            let msg = format!("Semantic errors:\n\n*** Errors: 1\n\nin definition {}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.", d.name);
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)) });
         }
     }
@@ -845,7 +902,7 @@ fn compile_inner(
                 continue;
             }
             // TLC ignores a definition it fails to evaluate here
-            if eval_printing(&ce, &uncache_prints(&e, &cached), startup).is_ok() {
+            if eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.consts).is_ok() {
                 cached.insert(n);
             }
         }
@@ -859,7 +916,7 @@ fn compile_inner(
             let (l1, c1, l2, c2) = a.span;
             let at = format!("line {l1}, col {c1} to line {l2}, col {c2} of module {}", a.module);
             let e = ex.expand_top(&a.expr).map_err(|e| format!("ASSUME at {at}: {e}"))?;
-            match eval_printing(&ce, &uncache_prints(&e, &cached), startup) {
+            match eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.assumes) {
                 Ok(Value::Bool(true)) => {}
                 Ok(Value::Bool(false)) => {
                     return Ok(Output {
@@ -1018,11 +1075,14 @@ fn compile_inner(
     let type_inv_subsumed = leftover == 0 && ex.has_def(tname) && cfg.invariants.iter().any(|n| n == tname);
     let mut inv_code = String::new();
     let mut inv_list = vec![];
+    // Whether an invariant prints (Print, PrintT): see INV_PRINTS in the runtime
+    let mut inv_prints = false;
     for (i, name) in cfg.invariants.iter().enumerate() {
         if type_inv_subsumed && name == tname {
             continue;
         }
         let e = ex.expand_def(name)?;
+        inv_prints |= has_prints(&e);
         let c = g.gen_as(&e, &Gen::env_next(), &Ty::Bool).map_err(|m| format!("invariant {name}: {m}"))?;
         writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {c} }}").unwrap();
         inv_list.push(format!("({name:?}, inv_{i} as fn(&State) -> bool)"));
@@ -1035,13 +1095,14 @@ fn compile_inner(
     for name in &cfg.properties {
         let e = ex.expand_def(name)?;
         if uses_real_time(&e) {
-            let msg = format!("Error: TLC cannot handle the temporal formula {name} (RTBound / RTnow of RealTime)");
+            startup.liveness_warnings(&cfg, true);
+            let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
         }
         let mut parts = vec![];
-        split_property(&g, &e, &HashMap::new(), name, &mut parts)?;
+        split_property(&g, &e, &HashMap::new(), name, None, &mut parts)?;
         let whole = parts.len() == 1;
-        for (disp, kind, p, q, venv) in parts {
+        for (disp, kind, p, q, venv, at) in parts {
             if kind == 7 {
                 live_parts.push((disp, p, venv));
                 continue;
@@ -1049,11 +1110,16 @@ fn compile_inner(
             let env = crate::live::bind_env(&mut g, &venv).map_err(|m| format!("property {name}: {m}"))?;
             // As TLC does, []P for a state predicate P is checked as an invariant while exploring,
             // and a state predicate on its own only on the initial states. TLC names a part of a
-            // property by its position in the source, which tla2rs does not keep.
-            let part_name = if whole && disp == *name { disp.clone() } else { format!("{disp} (a part)") };
+            // property by its position, kept for `[]` (see ast::AT)
+            let part_name = match at {
+                _ if whole && disp == *name => disp.clone(),
+                Some(p) if disp == *name => p,
+                _ => format!("{disp} (a part)"),
+            };
             if kind == 4 || kind == 6 {
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 if kind == 4 {
+                    inv_prints |= has_prints(&p);
                     let i = inv_list.len() + 1000;
                     writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {pc} }}").unwrap();
                     inv_list.push(format!("({part_name:?}, inv_{i} as fn(&State) -> bool)"));
@@ -1076,9 +1142,10 @@ fn compile_inner(
         let msg = "Error: The configuration file did not specify the next state predicate.";
         return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)) });
     }
+    startup.liveness_warnings(&cfg, !live_parts.is_empty());
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
-            let msg = format!("Error: TLC cannot handle the temporal formula {} (RTBound / RTnow of RealTime)", short(f));
+            let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
             return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)) });
         }
     }
@@ -1209,6 +1276,7 @@ fn compile_inner(
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
+    writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a
@@ -1225,7 +1293,8 @@ fn compile_inner(
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
     writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();
-    writeln!(src, "static STARTUP_PRINTS: &[&str] = &{startup:?};").unwrap();
+    startup.liveness_warnings(&cfg, !live_parts.is_empty());
+    writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
     writeln!(src, "const QCAP: usize = {};", g.qcap).unwrap();
     src += crate::codegen::SQ_RUNTIME;
@@ -1470,7 +1539,11 @@ impl SpecWalk {
     /// Walks a conjunct as written
     fn walk(&mut self, e: &Expr, m: &Module, ex: &mut Expander) -> R<()> {
         match e {
-            Expr::Label(n, _, b) if pos_of(n).is_some() => self.walk(b, m, ex)?,
+            // The AT label of `[]` (see ast::AT); the others stay with the conjunct, which TLC names
+            // by them when it refuses it
+            Expr::Label(n, _, b) if pos_of(n).is_some() || (err_pos_of(n).is_some() && matches!(b.as_ref(), Expr::Un(UOp::Always, _))) => {
+                self.walk(b, m, ex)?
+            }
             Expr::And(xs) => {
                 for x in xs {
                     self.walk(x, m, ex)?;
@@ -1581,7 +1654,9 @@ pub fn show_value(atoms: &Atoms, v: &Value) -> String {
     }
 }
 
-type PropPart = (String, u8, Expr, Option<Expr>, HashMap<String, Value>);
+/// (name, kind, formula, the condition of a step that leaves v unchanged, constant bindings, the
+/// position of the part as written)
+type PropPart = (String, u8, Expr, Option<Expr>, HashMap<String, Value>, Option<String>);
 
 /// Splits a property into checkable forms: 0: <>P, 1: []<>P, 2: <>[]P, 3: P ~> Q, 4: []P (state
 /// predicate), 5: [][A]_v.
@@ -1598,7 +1673,8 @@ fn action_level(e: &Expr) -> bool {
     }
 }
 
-fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, out: &mut Vec<PropPart>) -> R<()> {
+/// `at` is the position of the innermost `[]` around e (see ast::AT), by which TLC names a part
+fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, at: Option<&str>, out: &mut Vec<PropPart>) -> R<()> {
     use Expr::*;
     let temporal = |x: &Expr| {
         x.any(&|y| matches!(y, Un(UOp::Always | UOp::Eventually, _) | Bin(BOp::LeadsTo, ..) | BoxAction(..) | Fair(..)) || y.is_unchecked_temporal())
@@ -1614,12 +1690,12 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
     }
     let disp = if tag.is_empty() { name.to_string() } else { format!("{name} [{tag}]") };
     match e {
-        Label(_, _, b) if !e.is_user_label() => split_property(g, b, env, name, out),
-        And(xs) => xs.iter().try_for_each(|x| split_property(g, x, env, name, out)),
+        Label(n, _, b) if !e.is_user_label() => split_property(g, b, env, name, err_pos_of(n).or(at), out),
+        And(xs) => xs.iter().try_for_each(|x| split_property(g, x, env, name, None, out)),
         Quant(false, bs, body) if temporal(body) => {
             let mut err = Ok(());
             let r = g.ce.each_binding(bs, env, &mut |env2| {
-                if let Err(m) = split_property(g, body, env2, name, out) {
+                if let Err(m) = split_property(g, body, env2, name, None, out) {
                     err = Err(m);
                     return Ok(false);
                 }
@@ -1628,23 +1704,26 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, o
             match r {
                 // A bound that depends on the state: left whole, for the liveness checks to refuse
                 // as TLC does
-                Err(m) if m.contains("is not a constant") => Ok(out.push((disp, 7, e.clone(), None, env.clone()))),
+                Err(m) if m.contains("is not a constant") => Ok(out.push((disp, 7, e.clone(), None, env.clone(), None))),
                 r => r.and(err),
             }
         }
-        Un(UOp::Always, p) => match p.strip() {
-            p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone()))),
-            // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since v
-            // need not be a tuple of variables, e.g. under a refinement mapping)
-            BoxAction(a, v) if !temporal(a) => {
-                let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
-                Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), env.clone())))
+        Un(UOp::Always, p) => {
+            let at = at.map(|a| a.to_string());
+            match p.strip() {
+                p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone(), at))),
+                // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since
+                // v need not be a tuple of variables, e.g. under a refinement mapping)
+                BoxAction(a, v) if !temporal(a) => {
+                    let same = Bin(BOp::Eq, Prime(v.clone()).b(), v.clone());
+                    Ok(out.push((disp, 5, a.as_ref().clone(), Some(same), env.clone(), at)))
+                }
+                _ => Ok(out.push((disp, 7, e.clone(), None, env.clone(), None))),
             }
-            _ => Ok(out.push((disp, 7, e.clone(), None, env.clone()))),
-        },
+        }
         // A state predicate: TLC checks it on the initial states
-        p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 6, p.clone(), None, env.clone()))),
-        p if temporal(p) => Ok(out.push((disp, 7, p.clone(), None, env.clone()))),
+        p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 6, p.clone(), None, env.clone(), None))),
+        p if temporal(p) => Ok(out.push((disp, 7, p.clone(), None, env.clone(), None))),
         _ => Err(format!("property {name}: an action formula must be under [] as [][A]_v ({})", short(e))),
     }
 }

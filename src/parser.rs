@@ -257,13 +257,13 @@ pub fn is_infix_name(name: &str) -> bool {
 }
 
 /// The name of the call an unbounded quantifier or CHOOSE becomes, followed by `\\E`, `\\A` or
-/// `CHOOSE`
+/// `CHOOSE`, a space and its position
 pub const UNBOUNDED: &str = "#unbounded";
 
 /// TLC's error when it evaluates the unbounded quantifier or CHOOSE named `call` (see UNBOUNDED)
 pub fn unbounded_error(call: &str) -> Option<String> {
-    let kind = call.strip_prefix(UNBOUNDED)?;
-    Some(format!("TLC attempted to evaluate an unbounded {kind}.\nMake sure that the expression is of form {kind} x \\in S: P(x)."))
+    let (kind, at) = call.strip_prefix(UNBOUNDED)?.split_once(' ')?;
+    Some(format!("TLC attempted to evaluate an unbounded {kind}.\nMake sure that the expression is of form {kind} x \\in S: P(x).\n{at}"))
 }
 
 /// `a op b` for an infix operator by its normalized name, as the parser builds it
@@ -1067,9 +1067,12 @@ impl Parser {
                 _ => return Ok(None),
             }
         }
+        // The position runs from the quantifier to the end of its body
+        let start = self.pos - 1;
         self.pos = i + 2;
         self.expr(0)?;
-        Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind}"), vec![])))
+        let at = self.span_text(start, self.pos - 1);
+        Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind} {at}"), vec![])))
     }
 
     fn prefix(&mut self) -> R<Expr> {
@@ -1084,9 +1087,13 @@ impl Parser {
                 self.pos += 1;
                 Ok(Expr::Un(UOp::Neg, self.expr(12)?.b()))
             }
+            // In an AT label: TLC names a part of a property, such as `[]P` checked as an
+            // invariant, by its position
             Tok::Sym(s) if s == "[]" => {
+                let start = self.pos;
                 self.pos += 1;
-                Ok(Expr::Un(UOp::Always, self.expr(4)?.b()))
+                let e = Expr::Un(UOp::Always, self.expr(4)?.b());
+                Ok(at_err(&self.span_text(start, self.pos - 1), e))
             }
             Tok::Sym(s) if s == "<>" => {
                 self.pos += 1;
@@ -1145,6 +1152,7 @@ impl Parser {
                     Ok(Expr::If(c.b(), a.b(), b.b()))
                 }
                 "CASE" => {
+                    let start = self.pos;
                     self.pos += 1;
                     let mut arms = vec![];
                     let mut other = None;
@@ -1165,7 +1173,7 @@ impl Parser {
                             break;
                         }
                     }
-                    Ok(Expr::Case(arms, other))
+                    Ok(at_err(&self.span_text(start, self.pos - 1), Expr::Case(arms, other)))
                 }
                 "LET" => {
                     self.pos += 1;
@@ -1211,6 +1219,7 @@ impl Parser {
                     Ok(Expr::Lambda(ps, body.b()))
                 }
                 "CHOOSE" => {
+                    let start = self.pos;
                     self.pos += 1;
                     if let Some(e) = self.unbounded("CHOOSE")? {
                         return Ok(e);
@@ -1232,7 +1241,7 @@ impl Parser {
                         Some(names) => Expr::Let(tuple_lets(&x, names), p.b()),
                         None => p,
                     };
-                    Ok(Expr::Choose(x, s.b(), p.b()))
+                    Ok(at_err(&self.span_text(start, self.pos - 1), Expr::Choose(x, s.b(), p.b())))
                 }
                 _ => self.postfix(),
             },
@@ -1334,12 +1343,15 @@ impl Parser {
                 }
                 // A label `l :: e` or `l(a, b) :: e`: kept as a Label named `l::`, which nothing
                 // but liveness looks at (TLC cannot check a labeled temporal formula)
+                // The label is in an AT label for its position, which TLC gives when it refuses it
+                let id_tok = self.pos - 1;
                 if self.is("::") {
                     self.pos += 1;
                     let start = self.pos;
                     let body = self.expr(0)?;
                     let body = self.at(start, body);
-                    return Ok(Expr::Label(format!("{s}::"), vec![], body.b()));
+                    let l = Expr::Label(format!("{s}::"), vec![], body.b());
+                    return Ok(at_err(&self.span_text(id_tok, self.pos - 1), l));
                 }
                 if self.is("(") {
                     let mut j = self.pos + 1;
@@ -1362,7 +1374,8 @@ impl Parser {
                         let start = self.pos;
                         let body = self.expr(0)?;
                         let body = self.at(start, body);
-                        return Ok(Expr::Label(format!("{s}({})::", ps.join(",")), vec![], body.b()));
+                        let l = Expr::Label(format!("{s}({})::", ps.join(",")), vec![], body.b());
+                        return Ok(at_err(&self.span_text(id_tok, self.pos - 1), l));
                     }
                 }
                 let mut name = s;
@@ -1390,6 +1403,11 @@ impl Parser {
                     }
                 }
                 let base = if call || !args.is_empty() { Expr::Call(name, args) } else { Expr::Ident(name) };
+                // RTnow(v) and RTBound(A, v, D, E) of RealTime are temporal formulas TLC refuses,
+                // naming them by position
+                if matches!(&base, Expr::Call(n, _) if n == "RTnow" || n == "RTBound") {
+                    return Ok(at_err(&self.span_text(id_tok, self.pos - 1), base));
+                }
                 // A positional subexpression name: `Op!1!2`, `Op!<<`, `Op!(e)`, `Op!:`, also
                 // followed by labels
                 if !(self.is("!") && is_selector(self.peek2())) {

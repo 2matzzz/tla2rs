@@ -1,4 +1,4 @@
-key 7a53627fbbac96a085605f3372b9c4593645a28dd803f553164ed3cb8856c7cb
+key 2e36b284fca2447b88e08686c20fe0fc5d04c08965b00d2de37c612f1c1c279e
 tlc Version 2.19
 rc 12
 Invariant TypeOK is violated
@@ -6,3 +6,5 @@ Invariant TypeOK is violated
 trace 2 a27ef239751a33da6e2bffe672bfacf0cdf08b0ac6b73c018af51ed4bf7cf382
 states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
 edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 2 d12dc7dd48d0f65dd49a1ab9b2fa50192b67dae1f495e8649c980d5fcc71dd72
+errors 2 d12dc7dd48d0f65dd49a1ab9b2fa50192b67dae1f495e8649c980d5fcc71dd72

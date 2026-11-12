@@ -35,6 +35,9 @@ pub struct Env {
     work: Option<String>,
     /// Inside ENABLED: a successor need not determine every variable (as in TLC)
     partial: bool,
+    /// Computing whether an action is enabled (ENABLED, or for fairness), which TLC's error
+    /// messages name
+    enabled: bool,
     /// Bound variables whose value is known at compile time (an unrolled \\A or recursive call)
     vals: HashMap<String, Value>,
     /// Inside the function of a recursive operator that assigns variables (`rec_action_fn`, by
@@ -43,6 +46,8 @@ pub struct Env {
 }
 
 pub struct Gen<'a> {
+    /// The position of the action-level CASE about to be generated (see `gen_action`)
+    case_at: Option<String>,
     /// The module's definitions without arguments (TLC keeps the value of those of constant level)
     pub zero_defs: HashSet<String>,
     /// How deep recursive operators are being unrolled in an action
@@ -94,6 +99,7 @@ fn rid(n: &str) -> String {
 impl<'a> Gen<'a> {
     pub fn new(atoms: &'a Atoms, constants: &'a HashMap<String, Value>) -> Self {
         Gen {
+            case_at: None,
             zero_defs: HashSet::new(),
             unroll: 0,
             atoms,
@@ -489,7 +495,13 @@ impl<'a> Gen<'a> {
     fn fun_set_member(&mut self, x: &str, xt: &Ty, d: &Expr, r: &Expr, s: &Expr, env: &Env) -> R<String> {
         let not_fun = |g: &mut Self| -> R<String> {
             let tid = g.ty_id(xt)?;
-            let msg = format!("Attempted to check if \n{{}}\nwhich is not a TLC function value, is in the set of functions:\n{}", short(s));
+            // TLC prints the set of functions as its value
+            let set = match g.try_const(s, env) {
+                Some(v) => crate::compile::show_value(g.atoms, &v),
+                None => short(s),
+            };
+            let set = set.replace('{', "{{").replace('}', "}}");
+            let msg = format!("Attempted to check if \n{{}}\nwhich is not a TLC function value, is in the set of functions:\n{set}");
             Ok(format!("{{ let __b: bool = eval_error(format!({msg:?}, fmt_{tid}(&{x}))); __b }}"))
         };
         let in_r = |g: &mut Self, v: &str, t: &Ty| -> R<String> {
@@ -1819,6 +1831,8 @@ impl<'a> Gen<'a> {
                 return self.lit_auto(&v, want);
             }
         }
+        // Where a CASE or CHOOSE is written, for TLC's error message (see ast::AT)
+        let at = err_at(e);
         let e = e.strip();
         // A constant bag is built by SetToBag below, which gives it the type of a bag (its value
         // alone is a function, over part of a type when its elements are records with different
@@ -1864,7 +1878,7 @@ impl<'a> Gen<'a> {
                     // As in TLC, fail only on evaluation (harmless if the branch is never reached)
                     None => {
                         let t = self.var_ty(n);
-                        (format!("{{ let __v: {} = eval_error(\"{n}' is read before the action determines it\".into()); __v }}", t.repr()), t)
+                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
                     }
                 },
                 x => {
@@ -1876,7 +1890,7 @@ impl<'a> Gen<'a> {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
                 // An unbounded quantifier or CHOOSE: TLC stops when it evaluates one
                 (f, []) if crate::parser::unbounded_error(f).is_some() => {
-                    let t = want.cloned().unwrap_or(if f.ends_with("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
+                    let t = want.cloned().unwrap_or(if f.contains("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
                     let msg = crate::parser::unbounded_error(f).unwrap();
                     (format!("{{ let __v: {} = eval_error({msg:?}.to_string()); __v }}", t.repr()), t)
                 }
@@ -1955,7 +1969,7 @@ impl<'a> Gen<'a> {
                         Some(v) => crate::compile::show_value(self.atoms, &v),
                         None => short(m),
                     };
-                    let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was: {shown}");
+                    let msg = format!("The first argument of Assert evaluated to FALSE; the second argument was:\n{shown}");
                     (format!("(if {pc} {{ true }} else {{ assert_error({msg:?}.to_string()) }})"), Ty::Bool)
                 }
                 // Print and PrintT write to stdout as TLC does, when the checker evaluates them
@@ -2300,7 +2314,19 @@ impl<'a> Gen<'a> {
                     let (qc, st) = self.as_seq(q, env, "SubSeq")?;
                     let (mc, _) = self.gen_int(m, env)?;
                     let (nc, _) = self.gen_int(n, env)?;
-                    (format!("({qc}).sub({mc}, {nc})"), st)
+                    // TLC's message shows the sequence and the index
+                    let id = self.ty_id(&st)?;
+                    let msg = |which: &str| format!("The {which} argument of SubSeq must be in the domain of its first argument:\n{{}}\n, but instead it is\n{{}}");
+                    (
+                        format!(
+                            "{{ let __q = {qc}; let (__m, __n): (i64, i64) = ({mc}, {nc}); if __m <= __n {{ \
+                             if __m < 1 || __m > __q.len as i64 {{ arith_error(format!({:?}, fmt_{id}(&__q), __m)) }} \
+                             if __n > __q.len as i64 {{ arith_error(format!({:?}, fmt_{id}(&__q), __n)) }} }} __q.sub(__m, __n) }}",
+                            msg("second"),
+                            msg("third")
+                        ),
+                        st,
+                    )
                 }
                 ("\\o", [a, b]) => {
                     let (ac, at) = self.gen(a, env, None)?;
@@ -2370,6 +2396,7 @@ impl<'a> Gen<'a> {
                 inner.work = None;
                 inner.init = false;
                 inner.partial = true;
+                inner.enabled = true;
                 let mut code = String::new();
                 self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
                 (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
@@ -2563,7 +2590,7 @@ impl<'a> Gen<'a> {
                 }
                 match oth {
                     Some((oc, ot)) => s += &format!("{{ {} }})", self.coerce(oc, &ot, &t)?),
-                    None => s += "{ eval_error(\"Attempted to evaluate a CASE with no conditions true.\".into()) })",
+                    None => s += &format!("{{ eval_error({:?}.into()) }})", with_at(crate::value::CASE_NONE, &at)),
                 }
                 (s, t)
             }
@@ -2765,10 +2792,11 @@ impl<'a> Gen<'a> {
                             let c = self.coerce(format!("{r}{}", rec_field(fs.len(), k)), ft, &t)?;
                             write!(arms, "{} => {c}, ", k + 1).unwrap();
                         }
+                        // TLC's message shows the tuple
+                        let tid = self.ty_id(&ft)?;
                         return Ok((
                             format!(
-                                "{{ let {r} = {fc}; let {i}: i64 = {ic}; match {i} {{ {arms}_ => eval_error(format!(\"Attempted to apply a tuple of length {} to the index {{}}\", {i})) }} }}",
-                                fs.len()
+                                "{{ let {r} = {fc}; let {i}: i64 = {ic}; match {i} {{ {arms}_ => eval_error(format!(\"Attempted to apply tuple\\n{{}}\\nto integer {{}} which is out of domain.\", fmt_{tid}(&{r}), {i})) }} }}"
                             ),
                             t,
                         ));
@@ -2998,8 +3026,9 @@ impl<'a> Gen<'a> {
                 (
                     format!(
                         "{{ let mut {r}: Option<{}> = None; for {lx} in {it} {{ if {pc} {{ {r} = Some({val}); break; }} }} \
-                         match {r} {{ Some(v) => v, None => eval_error(\"Attempted to compute the value of an expression of form CHOOSE x \\\\in S: P, but no element of S satisfied P.\".into()) }} }}",
-                        et.repr()
+                         match {r} {{ Some(v) => v, None => eval_error({:?}.into()) }} }}",
+                        et.repr(),
+                        with_at(crate::value::CHOOSE_NONE, &at)
                     ),
                     et,
                 )
@@ -3757,6 +3786,13 @@ impl<'a> Gen<'a> {
         if !open && h.is_action() && !self.only_reads_assigned(h, env) {
             return Err(format!("unsupported action form: {}", short(h)));
         }
+        // Where an action-level CASE is written (see ast::AT): kept from its label to the CASE
+        if let Label(n, _, b) = h {
+            if let Some(p) = err_pos_of(n).filter(|_| matches!(b.strip(), Case(..))) {
+                self.case_at = Some(p.to_string());
+            }
+        }
+        let case_at = if matches!(h, Label(..)) { None } else { self.case_at.take() };
         match h {
             Label(_, _, body) => return self.gen_action(&with(vec![body.as_ref().clone()]), env, out),
             And(xs) => return self.gen_action(&with(xs.clone()), env, out),
@@ -3933,7 +3969,9 @@ impl<'a> Gen<'a> {
                 out.push_str("}\n");
                 return Ok(());
             }
-            Case(arms, other) if action => {
+            // TLC computes successors through a CASE among the conjuncts of an action, also one that
+            // assigns nothing (which matters for its error message)
+            Case(arms, other) => {
                 for (i, (p, v)) in arms.iter().enumerate() {
                     let pc = match self.gen_as(p, env, &Ty::Bool) {
                         Err(_) if self.infer.is_some() => "true".into(),
@@ -3948,7 +3986,12 @@ impl<'a> Gen<'a> {
                 let eo = self.renew_work(env, out);
                 match other {
                     Some(o) => self.gen_action(&with(vec![o.as_ref().clone()]), &eo, out)?,
-                    None => out.push_str("eval_error(\"Attempted to evaluate a CASE with no conditions true.\".into());\n"),
+                    None => {
+                        // TLC's message names what it was computing
+                        let when = if env.enabled { "ENABLED" } else if env.init { "initial states" } else { "next states" };
+                        let msg = with_at(&format!("In computing {when}, TLC encountered a CASE with no conditions true."), &case_at);
+                        writeln!(out, "eval_error({msg:?}.into());").unwrap();
+                    }
                 }
                 out.push_str("}\n");
                 return Ok(());
@@ -4516,6 +4559,12 @@ impl<'a> Gen<'a> {
         env
     }
 
+    /// Environment for computing whether an action is enabled (for fairness)
+    pub fn env_enabled(mut env: Env) -> Env {
+        env.enabled = true;
+        env
+    }
+
     pub fn env_init() -> Env {
         Env { init: true, ..Default::default() }
     }
@@ -4543,6 +4592,14 @@ impl<'a> Gen<'a> {
                 return Ok(true);
             }
             Label(_, _, b) if h.is_user_label() => {
+                self.gen_action(&with(b), env, out)?;
+                return Ok(true);
+            }
+            // An AT label (see ast::AT) changes nothing in how TLC splits
+            Label(n, _, b) if err_pos_of(n).is_some() => {
+                if matches!(b.strip(), Case(..)) {
+                    self.case_at = err_pos_of(n).map(|p| p.to_string());
+                }
                 self.gen_action(&with(b), env, out)?;
                 return Ok(true);
             }
@@ -5344,7 +5401,7 @@ impl<'a> Gen<'a> {
              // Equality of integers-or-atoms (an atom is i64::MIN + its id). TLC stops when it compares a string with an integer\n\
              fn mixed_eq(a: i64, b: i64) -> bool {{ let (ai, bi) = (a >= i64::MIN + 65536, b >= i64::MIN + 65536); \
              if ai != bi {{ let at = if ai {{ b }} else {{ a }}; let n = if ai {{ a }} else {{ b }}; if IS_STR[(at - i64::MIN) as usize] {{ \
-             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer {{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
+             eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", n, ATOMS[(at - i64::MIN) as usize])) }} }} a == b }}\n",
             names.len(),
             names.join(", "),
             strs.len(),
@@ -5523,8 +5580,30 @@ const FORALL_REST: &str = "#forall-rest";
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)
+/// The position of the AT label among the labels around e, if any (see ast::AT)
+fn err_at(e: &Expr) -> Option<String> {
+    let mut x = e;
+    while let Expr::Label(n, _, b) = x {
+        if let Some(p) = err_pos_of(n) {
+            return Some(p.to_string());
+        }
+        x = b;
+    }
+    None
+}
+
+/// TLC's message followed by the position it gives, when known
+pub fn with_at(msg: &str, at: &Option<String>) -> String {
+    match at {
+        Some(p) => format!("{msg}\n{p}"),
+        None => msg.to_string(),
+    }
+}
+
 fn eval_error_bool(msg: &str) -> String {
-    format!("{{ let __b: bool = eval_error({msg:?}.to_string()); __b }}")
+    // TLC's own evaluation errors (for a failed arithmetic operation) are raised as such
+    let f = if msg.starts_with(crate::value::DIV_ZERO) || msg.starts_with(crate::value::MOD_NONPOS) { "arith_error" } else { "eval_error" };
+    format!("{{ let __b: bool = {f}({msg:?}.to_string()); __b }}")
 }
 
 /// `t` with every integer range outside sets made unbounded
