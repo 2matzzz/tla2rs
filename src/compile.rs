@@ -464,8 +464,8 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
 
 /// The order in which TLC creates the strings it knows before it starts exploring: TLC orders
 /// strings by when it first creates them. Measured on TLC 2.19: the strings and model values of
-/// the cfg; SANY's built-in names; the identifiers and keywords of each module as it parses them,
-/// root module first and then the modules it extends or instantiates, breadth first; a few more
+/// the cfg; SANY's built-in names; the identifiers, keywords and numbers (as written: `007`,
+/// `\b101`) of each module as it parses them, root module first and then the modules it extends or instantiates, breadth first; a few more
 /// built-in names; then the string literals of each module, dependencies before the modules that
 /// use them. Strings created later (by \o, ToString, ...) follow, in the order TLC happens to
 /// create them, which tla2rs does not reproduce (see CLAUDE.md).
@@ -509,9 +509,16 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
             };
         };
         let toks = crate::lexer::lex_module(&src).unwrap_or_default();
+        let lines: Vec<Vec<char>> = src.lines().map(|l| l.chars().collect()).collect();
         let (mut ids, mut deps, mut strs) = (vec![], vec![], vec![]);
         for (i, t) in toks.iter().enumerate() {
             match &t.tok {
+                // A number as written (`007`, `\b101`), among the identifiers
+                crate::lexer::Tok::Num(_) => {
+                    if let Some(w) = lines.get(t.line - 1).and_then(|l| l.get(t.col..t.end)) {
+                        ids.push(w.iter().collect());
+                    }
+                }
                 crate::lexer::Tok::Ident(w) if w == "MODULE" => {}
                 crate::lexer::Tok::Ident(w) => {
                     // SANY reads WF_v as WF_ and v
