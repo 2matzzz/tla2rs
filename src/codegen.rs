@@ -3409,7 +3409,22 @@ impl<'a> Gen<'a> {
                 match self.tuple_cmp(&at, &bt)? {
                     Cmp::Normal => {}
                     Cmp::Unequal => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", op == Neq), Ty::Bool)),
-                    Cmp::Fails(m) => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", eval_error_bool(&m)), Ty::Bool)),
+                    Cmp::Fails(m) => {
+                        // As TLC reports it, with both values, for a tuple and an integer
+                        let f = match (tuple_elems(&at).is_some(), &bt, &at, tuple_elems(&bt).is_some()) {
+                            (true, Ty::Int(..), _, _) => Some("Attempted to check equality of the function {} with the value:\n{}"),
+                            (_, _, Ty::Int(..), true) => Some("Attempted to check equality of integer {} with non-integer:\n{}"),
+                            _ => None,
+                        };
+                        if let Some(f) = f {
+                            let (aid, bid) = (self.ty_id(&at)?, self.ty_id(&bt)?);
+                            let code = format!(
+                                "{{ let __a = {ac}; let __b = {bc}; let __r: bool = eval_error(format!({f:?}, ppr(&fmt_{aid}(&__a)), ppr(&fmt_{bid}(&__b)))); __r }}"
+                            );
+                            return Ok((code, Ty::Bool));
+                        }
+                        return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", eval_error_bool(&m)), Ty::Bool));
+                    }
                 }
                 let t = join(&at, &bt)?;
                 let ac = self.coerce(ac, &at, &t)?;
@@ -3796,6 +3811,14 @@ impl<'a> Gen<'a> {
                             conj.push(format!("{{ let {e} = {x}[{i}]; {inner} }}"));
                         }
                         return Ok(format!("({})", conj.join(" && ")));
+                    }
+                    // As TLC reports it, with both values
+                    if let (Ok((sc, st)), Ok(xid)) = (self.gen(s, env, None), self.ty_id(xt)) {
+                        let sid = self.ty_id(&st)?;
+                        let f = "Attempted to check if non-tuple\n{}\nis in the set of tuples:\n{}";
+                        return Ok(format!(
+                            "{{ let __s = {sc}; let __r: bool = eval_error(format!({f:?}, ppr(&fmt_{xid}(&{x})), ppr(&fmt_{sid}(&__s)))); __r }}"
+                        ));
                     }
                     return Ok(eval_error_bool(&format!("Attempted to check if a non-tuple value of type {xt:?} is an element of a cartesian product")));
                 };
