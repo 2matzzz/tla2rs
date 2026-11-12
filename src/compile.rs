@@ -683,6 +683,11 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
                 a.extend(args.iter().map(|x| rename(x, names, raw, pargs)));
                 Expr::Call(raw(n), a)
             }
+            // The definitions of a LET too (map_children leaves them as they are)
+            Expr::Let(ds, b) => Expr::Let(
+                ds.iter().map(|d| Def { body: rename(&d.body, names, raw, pargs), ..d.clone() }).collect(),
+                rename(b, names, raw, pargs).b(),
+            ),
             // See ast::SUBVAR
             Expr::Un(UOp::Enabled, x) => {
                 Expr::Un(UOp::Enabled, Expr::Label(crate::ast::ENINST.into(), vec![], rename(x, names, raw, pargs).b()).b())
