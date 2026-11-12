@@ -933,6 +933,10 @@ struct Chunk {
     live: LiveChunk,
     /// With -dumpgraph, the lines for the states and edges found
     dump: String,
+    /// The states taken off the queue (see `SChunk::expanded`), and whether the new state that
+    /// stops the search is among `states`: TLC does not queue it
+    expanded: usize,
+    unqueued: bool,
 }
 
 /// Expands a single state. Returns a Found on error.
@@ -982,22 +986,26 @@ fn expand_one(
             c.live.edges.push((head as u32, tfp, l, 0, 0));
             c.live.pend.push(k);
         }
-        if seen.insert(tfp) {
+        let new = seen.insert(tfp);
+        if new {
             if dumping() {
                 dump_node(&mut c.dump, &tfp, &t, false);
             }
             c.states.push(w);
             c.parent.push((head as u32, l));
+            c.unqueued = true;
             match eval_invariants(&t) {
                 Ok(None) => {}
                 Ok(Some(inv)) => return Some(Found::New(me, c.states.len() - 1, SMsg::Inv(inv))),
                 Err((inv, e)) => return Some(Found::New(me, c.states.len() - 1, SMsg::InvEval(inv, e))),
             }
+            c.unqueued = false;
             if LIVENESS {
                 c.live.newk.push(k);
             }
         }
         if let Some(m) = act {
+            c.unqueued = new;
             return Some(Found::Succ(head as u32, t, l, m, true));
         }
     }
@@ -1097,12 +1105,15 @@ fn expand(g: &Graph, lo: usize, hi: usize, seen: &Shards, stop: &std::sync::atom
         found: None,
         live: LiveChunk::default(),
         dump: String::new(),
+        expanded: 0,
+        unqueued: false,
     };
     let mut buf: Vec<(State, u32)> = Vec::with_capacity(64);
     for head in lo..hi {
         if stop.load(Relaxed) {
             break;
         }
+        c.expanded += 1;
         let mark = c.dump.len();
         let r = expand_caught(&mut c, |c| c.generated, |c, careful| {
             c.dump.truncate(mark);
@@ -1682,6 +1693,9 @@ struct SChunk {
     generated: u64,
     distinct: u64,
     found: Option<SFound>,
+    /// The states of the level taken off the queue, including the one whose expansion stopped
+    /// the search
+    expanded: usize,
 }
 
 /// A successor that does not fit the packed layout: an invariant it violates, else an out-of-type
@@ -1787,6 +1801,14 @@ fn expand_safety_one(
         return found;
     }
     c.generated = examined;
+    // A successor that violates an action property is added to the visited states, but TLC
+    // stops before queueing it
+    if let (Ok(Some(f)), Some(&(i, tfp, _))) = (&stopped, ws.cand.last()) {
+        let act = f.in_model && matches!(f.msg, SMsg::Action(_) | SMsg::ActionEval(..));
+        if act && base + i as u64 + 1 == examined && c.next.last().is_some_and(|q| q.1 == tfp) {
+            c.next.pop();
+        }
+    }
     match stopped {
         Err(p) => match classify(p) {
             (e, false) => Some(SFound::new(sfp, None, SMsg::Untraced(e))),
@@ -1886,7 +1908,7 @@ fn expand_safety(
     opt: &Opt,
 ) -> SChunk {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut c = SChunk { next: vec![], generated: 0, distinct: 0, found: None };
+    let mut c = SChunk { next: vec![], generated: 0, distinct: 0, found: None, expanded: 0 };
     let mut ws = SWork {
         buf: Vec::with_capacity(64),
         cand: Vec::with_capacity(64),
@@ -1900,6 +1922,7 @@ fn expand_safety(
         }
         let (w, sfp) = &frontier[i];
         let base = c.generated;
+        c.expanded += 1;
         let r = expand_caught(&mut c, |c| c.generated, |c, careful| {
             expand_safety_one(w, *sfp, seen, opt, c, &mut ws, careful)
         });
@@ -2056,6 +2079,7 @@ fn run_safety(opt: &Opt) {
         let mut nxt = Level::new(opt.mem_limit);
         let mut found: Option<SFound> = None;
         let mut done = 0usize;
+        let mut expanded = 0usize;
         // Read the level one batch at a time and split each batch across threads for expansion.
         // While the workers expand a batch, this thread merges the previous batch's results (which
         // may spill them to disk) and reads the next batch, so up to two batches are in memory.
@@ -2070,7 +2094,7 @@ fn run_safety(opt: &Opt) {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 // An earlier batch found an error: skip the rest of the level.
                 for c in pending.drain(..) {
-                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt);
+                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt, &mut expanded);
                 }
                 cur = parts.next();
                 continue;
@@ -2086,7 +2110,7 @@ fn run_safety(opt: &Opt) {
                     })
                     .collect();
                 for c in pending.drain(..) {
-                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt);
+                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt, &mut expanded);
                 }
                 let next_part = parts.next();
                 let chunks: Vec<SChunk> =
@@ -2108,10 +2132,13 @@ fn run_safety(opt: &Opt) {
             }
         }
         for c in pending {
-            merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt);
+            merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt, &mut expanded);
         }
         if let Some(f) = found {
-            report_and_exit(&seen, f, generated, distinct, nxt.len() + (left_before - done));
+            // As TLC counts its queue when it stops: the states of this level not yet expanded
+            // and those queued for the next (with one worker; with more, what the others had
+            // taken off the queue varies)
+            report_and_exit(&seen, f, generated, distinct, nxt.len() + (left_before - expanded));
         }
         frontier = nxt;
         if !frontier.is_empty() {
@@ -2123,7 +2150,8 @@ fn run_safety(opt: &Opt) {
 
 /// Adds one worker's results to the totals and the next level. Chunks are merged in worker
 /// order, so the first error reported is the one from the earliest chunk.
-fn merge_chunk(c: SChunk, generated: &mut u64, distinct: &mut u64, nxt: &mut Level, found: &mut Option<SFound>, opt: &Opt) {
+fn merge_chunk(c: SChunk, generated: &mut u64, distinct: &mut u64, nxt: &mut Level, found: &mut Option<SFound>, opt: &Opt, expanded: &mut usize) {
+    *expanded += c.expanded;
     *generated += c.generated;
     *distinct += c.distinct;
     nxt.extend(c.next, opt);
@@ -2467,6 +2495,10 @@ struct Collected {
     found: Option<SFound>,
     /// With -dumpgraph, the edges collected (written by the caller)
     dump: String,
+    /// The states taken off the queue (see `SChunk::expanded`), and the candidate that stops the
+    /// search if it was collected: TLC does not queue it
+    expanded: usize,
+    bad: Option<Fp>,
 }
 
 /// Which thread owns a fingerprint. The 1024 shards are split evenly as is, so no two threads
@@ -2491,7 +2523,14 @@ fn collect_phase(
     prev: &[Vec<Vec<Cand>>],
 ) -> Collected {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut out = Collected { parts: (0..parts).map(|_| vec![]).collect(), generated: 0, found: None, dump: String::new() };
+    let mut out = Collected {
+        parts: (0..parts).map(|_| vec![]).collect(),
+        generated: 0,
+        found: None,
+        dump: String::new(),
+        expanded: 0,
+        bad: None,
+    };
     let mut buf: Vec<(State, u32)> = Vec::with_capacity(64);
     let mut mine = Seen::new();
     for i in lo..hi {
@@ -2500,6 +2539,7 @@ fn collect_phase(
         }
         let (w, sfp) = &frontier[i];
         let mark = out.dump.len();
+        out.expanded += 1;
         let r = expand_caught(&mut out, |o| o.generated, |out, careful| {
             out.dump.truncate(mark);
             let s = unpack(w);
@@ -2571,6 +2611,9 @@ fn collect_phase(
                     return Some(pack_failed(*sfp, t, l));
                 };
                 out.parts[part_of(tfp, parts)].push(Cand { w: tw, fp: tfp, pred: *sfp });
+                if act.is_some() || !matches!(inv, Ok(None)) {
+                    out.bad = Some(tfp);
+                }
                 // Stop generating once a violating state is found (so we stop at the same count as
                 // the non-batched path). This candidate also goes into the table in phase 3, so the
                 // counterexample can be traced back from its fingerprint.
@@ -2702,6 +2745,7 @@ fn run_safety_batched(opt: &Opt) {
         let mut nxt = Level::new(opt.mem_limit);
         let mut found_err: Option<SFound> = None;
         let mut done = 0usize;
+        let (mut expanded, mut bad, mut unqueued) = (0usize, None, 0usize);
         // While the GPU handles lookups, run phase 1 of the next batch, to cut the time either
         // the CPU or the GPU sits idle.
         // Running phases 1 and 3 concurrently was tried, but it put 20 threads on 10 cores and
@@ -2750,8 +2794,10 @@ fn run_safety_batched(opt: &Opt) {
                 for mut c in collected {
                     dump_write(&mut c.dump);
                     generated += c.generated;
+                    expanded += c.expanded;
                     if found_err.is_none() {
                         found_err = c.found;
+                        bad = c.bad;
                     }
                     for (t, v) in c.parts.into_iter().enumerate() {
                         if !v.is_empty() {
@@ -2820,6 +2866,10 @@ fn run_safety_batched(opt: &Opt) {
             for (v, d) in results {
                 distinct += d;
                 added += d as usize;
+                if let Some(b) = bad.filter(|b| v.iter().any(|q| q.1 == *b)) {
+                    unqueued += 1;
+                    bad = bad.filter(|x| *x != b);
+                }
                 nxt.extend(v, opt);
             }
             // Count after every batch, so that `reserve` for the next batch sees the current total.
@@ -2840,7 +2890,8 @@ fn run_safety_batched(opt: &Opt) {
             }
         }
         if let Some(f) = found_err {
-            report_and_exit(&tbl, f, generated, distinct, nxt.len() + (left_before - done));
+            // As in `run_safety`
+            report_and_exit(&tbl, f, generated, distinct, nxt.len() - unqueued + (left_before - expanded));
         }
         frontier = nxt;
         if !frontier.is_empty() {
@@ -2916,9 +2967,11 @@ fn run_liveness(opt: &Opt) {
         });
         let mut found = None;
         let mut base = vec![];
+        let (mut expanded, mut unqueued) = (0usize, false);
         for (i, mut c) in chunks.into_iter().enumerate() {
             dump_write(&mut c.dump);
             generated += c.generated;
+            expanded += c.expanded;
             base.push(g.states.len());
             live.edges.extend(c.live.edges);
             live.en.extend(c.live.en);
@@ -2927,6 +2980,7 @@ fn run_liveness(opt: &Opt) {
             g.parent.extend(c.parent);
             if found.is_none() {
                 found = c.found.map(|f| (i, f));
+                unqueued = c.unqueued && found.is_some();
             }
         }
         if let Some((_, f)) = found {
@@ -2977,9 +3031,10 @@ fn run_liveness(opt: &Opt) {
                     code
                 }
             };
+            // As in `run_safety`
             println!(
                 "{generated} states generated, {distinct} distinct states found, {} states left on queue.",
-                g.states.len() - lo
+                (hi - lo - expanded) + (g.states.len() - hi) - unqueued as usize
             );
             exit(code);
         }
