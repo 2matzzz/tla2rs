@@ -1,0 +1,10 @@
+key 815dff20f52ad3c665cb46e0a73af411ff38d78ddc5493d15518f54d9639895d
+tlc Version 2.19
+rc 12
+Invariant Watched is violated
+14 states generated 12 distinct states found 7 states left on queue
+trace 3 49f1a8ed9b23cab9799bf487cbf938f07ef8b3dbf9317b68734d03cba655c7c4
+states 12 81749bd4a1d08def5c9e7e81a7edd08834ebe66608e4ef23b443fe77fe994628
+edges 12 2bf7b60d68bd523073cb8976dc2c73bd6509e0cef8601959ba480db27a78bce6
+messages 35 d207380e053fe4f9adef534a617e19d270b119e3bb09f9b901434043ec12e1b9
+errors 2 63162d349b60d6f874efeb7c6027ece3688f26f1dbdb86f4d88a06b11a94849d
