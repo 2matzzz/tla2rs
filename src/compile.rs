@@ -339,8 +339,26 @@ fn find_module(name: &str, how: &str, dir: &std::path::Path, warnings: &mut Vec<
         return load_parsed(m, dir, warnings, depth);
     }
     let path = dir.join(format!("{name}.tla"));
-    let src = std::fs::read_to_string(&path).map_err(|_| format!("{how} {name}: module not found next to the spec"))?;
+    let src = match std::fs::read_to_string(&path) {
+        Ok(src) => src,
+        // A module of the CommunityModules that tla2rs provides (see src/community.rs)
+        Err(_) => match crate::community::source(name) {
+            Some(src) => return community_module(name, src, dir, warnings, depth),
+            None => return Err(format!("{how} {name}: module not found next to the spec")),
+        },
+    };
     load_module(&src, dir, warnings, depth)
+}
+
+/// A module of the CommunityModules, whose operators listed in `community::UNSUPPORTED` are
+/// refused where they are used
+fn community_module(name: &str, src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
+    let mut m = load_module(src, dir, warnings, depth)?;
+    for &(module, op, why) in crate::community::UNSUPPORTED.iter().filter(|u| u.0 == name) {
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{module}!{op}: not defined"))?;
+        d.body = Expr::Call(format!("{module}!{op} of the CommunityModules, which tla2rs does not support: {why}"), vec![]);
+    }
+    Ok(m)
 }
 
 fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
