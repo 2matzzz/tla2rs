@@ -161,6 +161,9 @@ pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> Str
         for (_, v) in &cfg.constants {
             model_values(v, &mut mvs);
         }
+        for (_, _, v) in &cfg.mod_values {
+            model_values(v, &mut mvs);
+        }
         mvs.retain(|n| !m.constants.contains(n));
         let mut pre = String::new();
         if !mvs.is_empty() {
@@ -181,6 +184,9 @@ pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> Str
         let mut c = String::from("CONSTANTS\n");
         for (n, v) in &cfg.constants {
             c += &format!("  {n} = {}\n", tla(v)?);
+        }
+        for (n, mm, v) in &cfg.mod_values {
+            c += &format!("  {n} = [{mm}] {}\n", tla(v)?);
         }
         for (n, module, d) in &cfg.substs {
             match module {

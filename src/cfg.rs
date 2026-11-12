@@ -19,6 +19,9 @@ pub struct Cfg {
     pub action_constraints: Vec<String>,
     pub view: Option<String>,
     pub symmetry: Option<String>,
+    /// CONSTANT name = [module] value: the definition `name` of that module (also when it is
+    /// instantiated) replaced by the value, as TLC does (measured on TLC 2.19)
+    pub mod_values: Vec<(String, String, Expr)>,
 }
 
 pub fn parse_cfg(src: &str) -> R<Cfg> {
@@ -96,6 +99,19 @@ pub fn parse_cfg(src: &str) -> R<Cfg> {
                     t => return Err(format!("cfg line {}: expected `=` after {name}, got {t:?}", toks[i].line)),
                 }
                 i += 1;
+                if matches!(&toks[i].tok, Tok::Sym(s) if s == "[") {
+                    let (Tok::Ident(m), Tok::Sym(close)) = (&toks[i + 1].tok, &toks[i + 2].tok) else {
+                        return Err(format!("cfg line {}: expected `[Module]` after `{name} =`", toks[i].line));
+                    };
+                    if close != "]" {
+                        return Err(format!("cfg line {}: expected `]` after `[{m}`", toks[i].line));
+                    }
+                    let m = m.clone();
+                    let (v, ni) = cfg_value(&toks, i + 3)?;
+                    i = ni;
+                    c.mod_values.push((name, m, v));
+                    continue;
+                }
                 let (v, ni) = cfg_value(&toks, i)?;
                 i = ni;
                 c.constants.push((name, v));

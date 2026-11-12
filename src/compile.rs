@@ -276,6 +276,25 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
         let arity = m.defs.iter().rev().find(|d| d.name == *n).map(|d| d.arity.clone()).unwrap_or_default();
         extra.push(Def { name: n.clone(), params: np, arity, body });
     }
+    // name = [M] value: the definition of M, or of each instance of M (whose definitions take the
+    // module's constants and variables as leading parameters), replaced by the value
+    for (n, md, v) in &cfg.mod_values {
+        let targets: Vec<Def> = m
+            .defs
+            .iter()
+            .filter(|d| (d.name == *n && m.modules.contains(md)) || d.name.strip_prefix(md.as_str()).and_then(|r| r.strip_prefix("#i")).is_some_and(|r| r.ends_with(&format!("#{n}")) && r[..r.len() - n.len() - 1].chars().all(|c| c.is_ascii_digit())))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Err(format!("cfg: `{n} = [{md}] ...`: no module {md} of the spec defines {n}"));
+        }
+        let mut seen = HashSet::new();
+        for d in targets {
+            if seen.insert(d.name.clone()) {
+                extra.push(Def { body: v.clone(), ..d });
+            }
+        }
+    }
     m.defs.extend(extra);
     Ok(const_substs)
 }
@@ -423,7 +442,7 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
             cfg_values(c, order);
         }
     }
-    for (_, v) in &cfg.constants {
+    for v in cfg.constants.iter().map(|(_, v)| v).chain(cfg.mod_values.iter().map(|(_, _, v)| v)) {
         cfg_values(v, &mut order);
     }
     for b in ["ENABLED", "UNCHANGED", "SUBSET", "UNION", "DOMAIN", "STRING", "FALSE", "TRUE", "BOOLEAN"] {
