@@ -26,6 +26,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "Bitwise" => BITWISE,
         "Relation" => RELATION,
         "BagsExt" => BAGS_EXT,
+        "Graphs" => GRAPHS,
         _ => return None,
     })
 }
@@ -37,6 +38,11 @@ pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
     ("UndirectedGraphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
     ("UndirectedGraphs", "ConnectedComponents", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
     ("UndirectedGraphs", "IsStronglyConnected", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("Graphs", "Path", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
+    ("Graphs", "SimplePath", "TLC 2.19 cannot enumerate it without its Java override (a subset of Seq(S))"),
+    ("Graphs", "AreConnectedIn", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("Graphs", "IsStronglyConnected", "TLC 2.19 cannot evaluate it without its Java override (\\E over Seq(S))"),
+    ("Graphs", "IsTreeWithRoot", "TLC 2.19 cannot evaluate it without its Java override (AreConnectedIn, \\E over Seq(S))"),
 ];
 
 /// Folding a set: `op(f(x1), op(f(x2), ... op(f(xn), base)))` where x1 is `choose(S)`, x2 is
@@ -289,5 +295,43 @@ MapThenFoldBag(op(_, _), base, f(_), choose(_), B) ==
 FoldBag(op(_, _), base, B) == MapThenFoldBag(op, base, LAMBDA a : a, LAMBDA T : CHOOSE a \in T : TRUE, B)
 SumBag(B) == FoldBag(LAMBDA a, b : a + b, 0, B)
 ProductBag(B) == FoldBag(LAMBDA a, b : a * b, 1, B)
+====
+"#;
+
+/// Directed graphs as records `[node |-> N, edge |-> E]` with E a set of pairs (values used more
+/// than once are bound as in Relation)
+const GRAPHS: &str = r#"
+---- MODULE Graphs ----
+EXTENDS Naturals, Sequences, FiniteSets, SequencesExt, Relation
+IsDirectedGraph(G) == G = [node |-> G.node, edge |-> G.edge] /\ G.edge \subseteq G.node \X G.node
+DirectedSubgraph(G) == {H \in [node : SUBSET G.node, edge : SUBSET G.edge] : H.edge \subseteq H.node \X H.node}
+Transpose(G) == [node |-> G.node, edge |-> {<<e[2], e[1]>> : e \in G.edge}]
+IsUndirectedGraph(G) == IsDirectedGraph(G) /\ \A e \in G.edge : <<e[2], e[1]>> \in G.edge
+UndirectedSubgraph(G) == {H \in DirectedSubgraph(G) : IsUndirectedGraph(H)}
+Path(G) == FALSE
+SimplePath(G) == FALSE
+AreConnectedIn(m, n, G) == FALSE
+IsStronglyConnected(G) == FALSE
+ConnectionsIn(G) == ReflexiveTransitiveClosure([p \in G.node \X G.node |-> p \in G.edge], G.node)
+IsTreeWithRoot(G, r) == FALSE
+GraphUnion(G, H) == [node |-> G.node \cup H.node, edge |-> G.edge \cup H.edge]
+IsBipartiteWithPartitions(G, U, V) ==
+  /\ U \cap V = {}
+  /\ G.node \subseteq U \cup V
+  /\ \A e \in G.edge : {e[1], e[2]} \cap U # {} /\ {e[1], e[2]} \cap V # {}
+HasCycle(G) == \E C \in {ConnectionsIn(G)} : \E e \in G.edge : e[1] \in G.node /\ e[2] \in G.node /\ C[e[2], e[1]]
+IsDag(G) == IsDirectedGraph(G) /\ ~HasCycle(G)
+Successors(G, n) == {m \in G.node : <<n, m>> \in G.edge}
+AllSuccessors(G, S) == UNION {Successors(G, n) : n \in S}
+Predecessors(G, n) == {m \in G.node : <<m, n>> \in G.edge}
+AllPredecessors(G, S) == UNION {Predecessors(G, n) : n \in S}
+Ancestors(G, n) == UNION {{m \in G.node : \E k \in Successors(G, m) : C[k, n]} : C \in {ConnectionsIn(G)}}
+Descendants(G, n) == UNION {{m \in G.node : \E k \in Successors(G, n) : C[k, m]} : C \in {ConnectionsIn(G)}}
+InDegree(G, n) == Cardinality(Predecessors(G, n))
+OutDegree(G, n) == Cardinality(Successors(G, n))
+Roots(G) == {n \in G.node : \A m \in G.node : <<m, n>> \notin G.edge}
+Leaves(G) == {n \in G.node : \A m \in G.node : <<n, m>> \notin G.edge}
+EmptyGraph == [node |-> {}, edge |-> {}]
+Graphs(S) == [node : {S}, edge : SUBSET (S \X S)]
 ====
 "#;
