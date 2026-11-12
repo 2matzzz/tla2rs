@@ -63,6 +63,12 @@ const TYPE_OK_NAMES: &[&str] = &["TypeOK", "TypeOk", "TypeInvariant", "TypeInv",
 
 const TYPE_DECL_NAMES: &[&str] = &["TypeDecl"];
 
+thread_local! {
+    /// Set while compiling again with every variable's type inferred, after the types from TypeOK
+    /// failed in Init or Next (see `compile`)
+    static INFER_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The bounded sequences `UNION {[1..n -> S] : n \in R}`: (R, S)
 pub fn bounded_seq(e: &Expr) -> Option<(&Expr, &Expr)> {
     let Expr::Un(UOp::Union, x) = e.strip() else { return None };
@@ -270,6 +276,25 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
         let arity = m.defs.iter().rev().find(|d| d.name == *n).map(|d| d.arity.clone()).unwrap_or_default();
         extra.push(Def { name: n.clone(), params: np, arity, body });
     }
+    // name = [M] value: the definition of M, or of each instance of M (whose definitions take the
+    // module's constants and variables as leading parameters), replaced by the value
+    for (n, md, v) in &cfg.mod_values {
+        let targets: Vec<Def> = m
+            .defs
+            .iter()
+            .filter(|d| (d.name == *n && m.modules.contains(md)) || d.name.strip_prefix(md.as_str()).and_then(|r| r.strip_prefix("#i")).is_some_and(|r| r.ends_with(&format!("#{n}")) && r[..r.len() - n.len() - 1].chars().all(|c| c.is_ascii_digit())))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Err(format!("cfg: `{n} = [{md}] ...`: no module {md} of the spec defines {n}"));
+        }
+        let mut seen = HashSet::new();
+        for d in targets {
+            if seen.insert(d.name.clone()) {
+                extra.push(Def { body: v.clone(), ..d });
+            }
+        }
+    }
     m.defs.extend(extra);
     Ok(const_substs)
 }
@@ -417,7 +442,7 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
             cfg_values(c, order);
         }
     }
-    for (_, v) in &cfg.constants {
+    for v in cfg.constants.iter().map(|(_, v)| v).chain(cfg.mod_values.iter().map(|(_, _, v)| v)) {
         cfg_values(v, &mut order);
     }
     for b in ["ENABLED", "UNCHANGED", "SUBSET", "UNION", "DOMAIN", "STRING", "FALSE", "TRUE", "BOOLEAN"] {
@@ -658,6 +683,20 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
                 a.extend(args.iter().map(|x| rename(x, names, raw, pargs)));
                 Expr::Call(raw(n), a)
             }
+            // The definitions of a LET too (map_children leaves them as they are)
+            Expr::Let(ds, b) => Expr::Let(
+                ds.iter().map(|d| Def { body: rename(&d.body, names, raw, pargs), ..d.clone() }).collect(),
+                rename(b, names, raw, pargs).b(),
+            ),
+            // See ast::SUBVAR
+            Expr::Un(UOp::Enabled, x) => {
+                Expr::Un(UOp::Enabled, Expr::Label(crate::ast::ENINST.into(), vec![], rename(x, names, raw, pargs).b()).b())
+            }
+            Expr::Fair(w, v, a) => Expr::Fair(
+                *w,
+                rename(v, names, raw, pargs).b(),
+                Expr::Label(crate::ast::ENINST.into(), vec![], rename(a, names, raw, pargs).b()).b(),
+            ),
             _ => crate::codegen::map_children(e, &|c| rename(c, names, raw, pargs)),
         }
     }
@@ -682,6 +721,10 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     let mut args = vec![];
     for (p, _) in &params {
         match inst.subs.iter().find(|(x, _)| x == p) {
+            // A variable substituted by anything but itself is marked (see ast::SUBVAR)
+            Some((_, e)) if mm.variables.contains(p) && !matches!(e, Expr::Ident(n) if n == p) => {
+                args.push(Expr::Label(format!("{}{p}", crate::ast::SUBVAR), vec![], e.clone().b()))
+            }
             Some((_, e)) => args.push(e.clone()),
             None if known(p) || inst.params.contains(p) => args.push(Expr::Ident(p.clone())),
             None => return Err(format!("INSTANCE {mname}: {p} has no WITH substitution and is not declared or defined here")),
@@ -726,7 +769,21 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 #[allow(clippy::too_many_arguments)]
 pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool) -> R<Output> {
     let mut startup = Startup::default();
-    let mut out = match compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup) {
+    let mut first = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut startup);
+    // Types from TypeOK that Init or Next contradict (a module that extends another and adds a
+    // record field its type invariant lacks): infer every type instead, keeping the first error if
+    // that fails too
+    if matches!(&first, Err(e) if (e.starts_with("Init: ") || e.starts_with("Next: ")) && !e.contains(crate::lexer::SANY)) {
+        INFER_ALL.with(|f| f.set(true));
+        let mut again = Startup::default();
+        let r = compile_inner(tla, cfg_src, dir, setcap, seqcap, fp128, metal, &mut again);
+        INFER_ALL.with(|f| f.set(false));
+        if r.is_ok() {
+            first = r;
+            startup = again;
+        }
+    }
+    let mut out = match first {
         // An error SANY reports too: TLC stops before checking anything
         Err(e) if e.contains(crate::lexer::SANY) => {
             let msg = e.replacen(crate::lexer::SANY, "", 1);
@@ -782,7 +839,8 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
     let r = ce.eval(e, &HashMap::new());
     let lines = PRINTED.with(|p| p.borrow_mut().take()).unwrap_or_default();
     for l in lines {
-        out.push(l.iter().map(|v| show_value(ce.atoms, v)).collect::<Vec<_>>().join("  "));
+        // TLC pretty-prints each value printed (80 columns)
+        out.push(l.iter().map(|v| crate::ppr::ppr(&show_value(ce.atoms, v))).collect::<Vec<_>>().join("  "));
     }
     r
 }
@@ -826,14 +884,16 @@ fn compile_inner(
     }
     let mut strings: Vec<String> = (0..seen.len() as u32).filter(|&a| !seen.is_model(a)).map(|a| seen.name(a)).collect();
     strings.sort_by_key(|x| ranks.get(x).copied().unwrap_or(usize::MAX));
+    // TLC orders a model value before any string (measured: {"zz", m1} prints as {m1, "zz"} and
+    // CHOOSE picks m1), and atoms are ordered by their number
     let atoms = Atoms::default();
-    for x in &strings {
-        atoms.intern(false, x);
-    }
     for a in 0..seen.len() as u32 {
         if seen.is_model(a) {
             atoms.intern(true, &seen.name(a));
         }
+    }
+    for x in &strings {
+        atoms.intern(false, x);
     }
 
     // Constants
@@ -1012,7 +1072,8 @@ fn compile_inner(
         }
     }
 
-    // Variable types come from TypeOK
+    // Variable types come from TypeOK (see INFER_ALL)
+    let infer_all = INFER_ALL.with(|f| f.get());
     let tname = TYPE_DECL_NAMES
         .iter()
         .chain(TYPE_OK_NAMES)
@@ -1020,7 +1081,7 @@ fn compile_inner(
         .copied()
         .unwrap_or("TypeOK");
     // Without a TypeOK, every type is inferred
-    let tok = if ex.has_def(tname) { ex.expand_def(tname)? } else { Expr::Bool(true) };
+    let tok = if ex.has_def(tname) && !infer_all { ex.expand_def(tname)? } else { Expr::Bool(true) };
     let mut decl: HashMap<String, Ty> = HashMap::new();
     let mut conj = vec![];
     flatten_and(&tok, &mut conj);
@@ -1039,9 +1100,10 @@ fn compile_inner(
                     // leaves the variable's type to inference, which stops the search where a value
                     // leaves the type inferred
                     if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
+                        // Packing checks the element type of a bounded sequence, not its length,
+                        // nor which records and model values a mixed set lists
+                        taken = bounded_seq(s).is_none() && !crate::types::mixes_atoms(&t);
                         decl.insert(v.clone(), t);
-                        // Packing checks the element type of a bounded sequence, not its length
-                        taken = bounded_seq(s).is_none();
                     }
                 }
                 if !taken {
@@ -1057,8 +1119,8 @@ fn compile_inner(
                 let mut taken = false;
                 if let Expr::Ident(v) = v.strip() {
                     if let (true, Ok(t)) = (m.variables.contains(v), ty_of_set(&g, s)) {
+                        taken = !crate::types::mixes_atoms(&t);
                         decl.insert(v.clone(), Ty::Set(t.into()));
-                        taken = true;
                     }
                 }
                 if !taken {
@@ -1088,7 +1150,7 @@ fn compile_inner(
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
     // packing the state and reports a violation under the same name.
-    let type_inv_subsumed = leftover == 0 && ex.has_def(tname) && cfg.invariants.iter().any(|n| n == tname);
+    let type_inv_subsumed = leftover == 0 && ex.has_def(tname) && !infer_all && cfg.invariants.iter().any(|n| n == tname);
     let mut inv_code = String::new();
     let mut inv_list = vec![];
     // Whether an invariant prints (Print, PrintT): see INV_PRINTS in the runtime
@@ -1319,6 +1381,7 @@ fn compile_inner(
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
     src += &crate::lasso::template(&m, &cfg, &written);
     src += crate::runtime::RUNTIME;
+    src += crate::runtime::PPR;
     src += crate::runtime::LIVENESS_RT;
     Ok(Output { rust: src, warnings, rejected: None })
 }

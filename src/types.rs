@@ -6,7 +6,12 @@ use crate::lexer::R;
 use crate::value::Value;
 use std::collections::{BTreeSet, HashMap};
 
+/// The largest record type with optional fields whose values are numbered in TLC's order (see
+/// `Ty::tlc_perm`; the generated checker holds the permutation as a table)
+pub const PERM_MAX: u64 = 4096;
+
 thread_local! {
+    static PERMS: std::cell::RefCell<HashMap<Ty, std::rc::Rc<Vec<u32>>>> = std::cell::RefCell::new(HashMap::new());
     /// The order in which TLC creates each name (see `compile::tlc_string_ranks`)
     static FIELD_RANKS: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
 }
@@ -199,6 +204,37 @@ pub fn is_tuple_fields(fs: &[(String, Ty)]) -> bool {
     fs.iter().all(|(n, _)| n.starts_with('#'))
 }
 
+/// The field of a record type that also holds model values (a value that is a record or a model
+/// value, as `[op : S] \cup {NoVal}`): present, it holds the model value, and no other field is
+/// present. Every field of such a type is optional. The name is no TLA+ identifier
+pub const ATOM_FIELD: &str = "(atom)";
+
+/// Whether a record type also holds model values (see ATOM_FIELD)
+pub fn has_atoms(fs: &[(String, Ty)]) -> bool {
+    fs.iter().any(|(n, _)| n == ATOM_FIELD)
+}
+
+/// Whether `t` has a record type that also holds model values inside. Packing a value of it does
+/// not check that each value is one of the records or model values a type invariant lists
+pub fn mixes_atoms(t: &Ty) -> bool {
+    match t {
+        Ty::Rec(fs) => has_atoms(fs) || fs.iter().any(|(_, t)| mixes_atoms(t)),
+        Ty::Opt(e) | Ty::Set(e) | Ty::Seq(e) | Ty::Bag(e) => mixes_atoms(e),
+        Ty::Fun(d, c) | Ty::PFun(d, c) => mixes_atoms(d) || mixes_atoms(c),
+        _ => false,
+    }
+}
+
+/// A value of a record type: a model value when it has only ATOM_FIELD
+pub fn rec_value(m: std::collections::BTreeMap<String, Value>) -> Value {
+    if m.len() == 1 {
+        if let Some(v) = m.get(ATOM_FIELD) {
+            return v.clone();
+        }
+    }
+    Value::Rec(m)
+}
+
 /// The element types of a tuple type
 pub fn tuple_elems(t: &Ty) -> Option<Vec<&Ty>> {
     match t {
@@ -267,7 +303,48 @@ impl Ty {
     }
 
     /// Values in enumeration order (the inverse of enc)
+    /// For a record type with optional fields (records of different fields) of at most
+    /// `PERM_MAX` values: the rank in TLC's order of each value by its mixed-radix index (first
+    /// field slowest, an absent field first). TLC compares records by their number of fields
+    /// first, so that index is not its order; `enumerate` and `enc` follow TLC's order instead
+    pub fn tlc_perm(&self) -> Option<std::rc::Rc<Vec<u32>>> {
+        let Ty::Rec(fs) = self else { return None };
+        if is_tuple_fields(fs) || !fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) || self.size()? > PERM_MAX {
+            return None;
+        }
+        PERMS.with(|m| {
+            if let Some(p) = m.borrow().get(self) {
+                return Some(p.clone());
+            }
+            let vals = self.enumerate_mixed();
+            let mut order: Vec<usize> = (0..vals.len()).collect();
+            order.sort_by(|&a, &b| vals[a].cmp(&vals[b]));
+            let mut perm = vec![0u32; vals.len()];
+            for (rank, &i) in order.iter().enumerate() {
+                perm[i] = rank as u32;
+            }
+            let p = std::rc::Rc::new(perm);
+            m.borrow_mut().insert(self.clone(), p.clone());
+            Some(p)
+        })
+    }
+
     pub fn enumerate(&self) -> Vec<Value> {
+        let vals = self.enumerate_mixed();
+        match self.tlc_perm() {
+            Some(perm) => {
+                let mut out = vals.clone();
+                for (i, v) in vals.into_iter().enumerate() {
+                    out[perm[i] as usize] = v;
+                }
+                out
+            }
+            None => vals,
+        }
+    }
+
+    /// The values of the type by their mixed-radix index (see `tlc_perm`)
+    fn enumerate_mixed(&self) -> Vec<Value> {
         match self {
             Ty::Bool => vec![Value::Bool(false), Value::Bool(true)],
             Ty::Int(lo, hi) => (*lo..=*hi).map(Value::Int).collect(),
@@ -302,13 +379,22 @@ impl Ty {
                     }
                     out = next;
                 }
-                out.into_iter().map(Value::Rec).collect()
+                out.into_iter().map(rec_value).collect()
             }
             _ => vec![],
         }
     }
 
     pub fn enc(&self, v: &Value) -> Option<u64> {
+        let i = self.enc_mixed(v)?;
+        match self.tlc_perm() {
+            Some(perm) => Some(perm[i as usize] as u64),
+            None => Some(i),
+        }
+    }
+
+    /// The mixed-radix index of a value (see `tlc_perm`)
+    fn enc_mixed(&self, v: &Value) -> Option<u64> {
         match (self, v) {
             (Ty::Bool, Value::Bool(b)) => Some(*b as u64),
             (Ty::Int(lo, hi), Value::Int(i)) if lo <= i && i <= hi => Some((i - lo) as u64),
@@ -324,6 +410,9 @@ impl Ty {
                     acc = acc * t.size()? + t.enc(x)?;
                 }
                 Some(acc)
+            }
+            (Ty::Rec(fs), Value::Atom(a)) if has_atoms(fs) => {
+                self.enc_mixed(&Value::Rec([(ATOM_FIELD.to_string(), Value::Atom(*a))].into_iter().collect()))
             }
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 if m.keys().any(|k| !fs.iter().any(|(n, _)| n == k)) {
@@ -363,6 +452,9 @@ impl Ty {
             (Ty::PFun(d, c), v) => crate::value::as_fun(v).is_some_and(|m| m.iter().all(|(k, x)| d.conforms(k) && c.conforms(x))),
             (Ty::Bag(e), v) => crate::value::as_fun(v)
                 .is_some_and(|m| m.iter().all(|(k, c)| e.conforms(k) && matches!(c, Value::Int(n) if *n > 0))),
+            (Ty::Rec(fs), Value::Atom(a)) if has_atoms(fs) => {
+                self.conforms(&Value::Rec([(ATOM_FIELD.to_string(), Value::Atom(*a))].into_iter().collect()))
+            }
             (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) => {
                 m.keys().all(|k| fs.iter().any(|(n, _)| n == k))
                     && fs.iter().all(|(k, t)| match (t, m.get(k)) {
@@ -427,6 +519,22 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
                 fs.push((n, t));
             }
             Ty::Rec(fs)
+        }
+        // Records and model values: a record type whose fields are all optional, with the model
+        // values in ATOM_FIELD
+        (Ty::Rec(fs), Ty::Enum(x)) | (Ty::Enum(x), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
+            let mut out: Vec<(String, Ty)> = fs
+                .iter()
+                .filter(|(n, _)| n != ATOM_FIELD)
+                .map(|(n, t)| (n.clone(), if matches!(t, Ty::Opt(_)) { t.clone() } else { Ty::Opt(t.clone().into()) }))
+                .collect();
+            let atoms = match fs.iter().find(|(n, _)| n == ATOM_FIELD) {
+                Some((_, t)) => join(t, &Ty::Enum(x.clone()))?,
+                None => Ty::Opt(Ty::Enum(x.clone()).into()),
+            };
+            out.push((ATOM_FIELD.to_string(), atoms));
+            out.sort_by(|a, b| field_cmp(&a.0, &b.0));
+            Ty::Rec(out)
         }
         (Ty::Fun(d1, c1), Ty::Fun(d2, c2)) if d1 == d2 => Ty::Fun(d1.clone(), join(c1, c2)?.into()),
         // A function over 1..n is a tuple of length n (TLA+ identifies them): with a tuple of the
@@ -575,7 +683,7 @@ pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<
                     if tuple {
                         Value::Tuple(r.into_iter().flatten().collect())
                     } else {
-                        Value::Rec(fs.iter().zip(r).filter_map(|((k, _), v)| v.map(|v| (k.clone(), v))).collect())
+                        rec_value(fs.iter().zip(r).filter_map(|((k, _), v)| v.map(|v| (k.clone(), v))).collect())
                     }
                 })
                 .collect()

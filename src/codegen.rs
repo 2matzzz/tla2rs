@@ -35,6 +35,9 @@ pub struct Env {
     work: Option<String>,
     /// Inside ENABLED: a successor need not determine every variable (as in TLC)
     partial: bool,
+    /// Inside an ENABLED written in an instantiated module: a substituted variable is bound by its
+    /// name (see gen_phantom)
+    phantom: bool,
     /// Computing whether an action is enabled (ENABLED, or for fairness), which TLC's error
     /// messages name
     enabled: bool,
@@ -90,6 +93,12 @@ pub struct Gen<'a> {
     /// TLC names them with (`N!` or nothing), and the number of constants and variables
     /// substituted
     pub inst_prefixes: Vec<(String, String, usize)>,
+}
+
+/// The local holding the value bound to the substituted variable `n` of an instance while
+/// computing whether an action is enabled (see `Gen::gen_phantom`)
+fn phantom(n: &str) -> String {
+    format!("'{n}")
 }
 
 fn rid(n: &str) -> String {
@@ -850,7 +859,41 @@ impl<'a> Gen<'a> {
             write!(sig, "{a}: {}, ", t.repr()).unwrap();
         }
         let mut last_err = String::new();
-        for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool] {
+        // The type of a call not resolved yet: a body that iterates over the result of its
+        // recursive call (a set built from smaller ones) needs a set, and one that applies it (a
+        // function built from the one at a smaller argument) a function over the domain the body
+        // builds its value on
+        let mut seeds = vec![Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool, Ty::Set(Ty::Enum(vec![]).into())];
+        // The values the body can take, through IF: one without a recursive call (a base case)
+        // gives its type
+        let mut values = vec![];
+        let mut todo = vec![&rd.body];
+        while let Some(e) = todo.pop() {
+            match e {
+                Expr::Label(_, _, b) => todo.push(b),
+                Expr::If(_, a, b) => {
+                    todo.push(b);
+                    todo.push(a);
+                }
+                e => values.push(e),
+            }
+        }
+        for value in values {
+            if let Expr::FunCons(_, dom, _) = value {
+                if let Ok((_, Ty::Set(dt))) = self.gen(dom, &env, None) {
+                    for c in [Ty::Bool, Ty::Int(0, 0), Ty::Enum(vec![])] {
+                        seeds.push(Ty::Fun(dt.clone(), c.into()));
+                    }
+                }
+            } else if !value.any(&|x| matches!(x, Expr::RecCall(..))) {
+                if let Ok((_, t)) = self.gen(value, &env, None) {
+                    if !seeds.contains(&t) {
+                        seeds.push(t);
+                    }
+                }
+            }
+        }
+        for seed in seeds {
             let mut ret = seed;
             for round in 0..30 {
                 self.rec_progress.push((key.clone(), ret.clone()));
@@ -964,6 +1007,7 @@ impl<'a> Gen<'a> {
         match e {
             Expr::Ident(n) if self.is_var(n) => Expr::Prime(e.clone().b()),
             Expr::Prime(_) => e.clone(),
+            Expr::Label(n, ..) if n.starts_with(crate::ast::SUBVAR) => Expr::Prime(e.clone().b()),
             _ => map_children(e, &|c| self.prime_vars(c)),
         }
     }
@@ -1339,11 +1383,44 @@ impl<'a> Gen<'a> {
                  let __dy: Vec<usize> = (0..__y.len()).filter(|&i| __y[i] > 0).collect(); \
                  __dx.len().cmp(&__dy.len()).then_with(|| __dx.iter().zip(__dy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| __x[__i].cmp(&__y[__j]))).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}"
             ),
+            // Records of different fields, as TLC compares records: by the number of fields, then
+            // name and value field by field (the fields are in TLC's order of names)
+            Ty::Rec(fs) if !is_tuple_fields(fs) && fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => {
+                if t.tlc_perm().is_some() {
+                    let id = self.ty_id(t)?;
+                    return Ok(format!("enc_{id}(*{a}).cmp(&enc_{id}(*{b}))"));
+                }
+                let mut present = vec![];
+                let mut arms = vec![];
+                for (i, (_, ft)) in fs.iter().enumerate() {
+                    let fp = rec_field(fs.len(), i);
+                    match ft {
+                        Ty::Opt(inner) => {
+                            present.push(format!("__x{fp}.0"));
+                            let c = self.tlc_cmp(inner, &format!("(&__x{fp}.1)"), &format!("(&__y{fp}.1)"))?;
+                            arms.push(format!("{i} => {c}"));
+                        }
+                        ft => {
+                            present.push("true".into());
+                            let c = self.tlc_cmp(ft, &format!("(&__x{fp})"), &format!("(&__y{fp})"))?;
+                            arms.push(format!("{i} => {c}"));
+                        }
+                    }
+                }
+                let px = present.join(", ");
+                let py = px.replace("__x", "__y");
+                format!(
+                    "{{ let (__x, __y) = ({a}, {b}); let __fx: Vec<usize> = [{px}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
+                     let __fy: Vec<usize> = [{py}].iter().enumerate().filter(|p| *p.1).map(|p| p.0).collect(); \
+                     __fx.len().cmp(&__fy.len()).then_with(|| __fx.iter().zip(__fy.iter()).map(|(&__i, &__j)| __i.cmp(&__j).then_with(|| if __i != __j {{ std::cmp::Ordering::Equal }} else {{ match __i {{ {}, _ => unreachable!() }} }})).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)) }}",
+                    arms.join(", ")
+                )
+            }
             Ty::Rec(fs) if needs_tlc_order(t) => {
                 let mut parts = vec![];
                 for (i, (_, ft)) in fs.iter().enumerate() {
                     let fp = rec_field(fs.len(), i);
-                    parts.push(self.tlc_cmp(ft, &format!("&{a}{fp}"), &format!("&{b}{fp}"))?);
+                    parts.push(self.tlc_cmp(ft, &format!("(&{a}{fp})"), &format!("(&{b}{fp})"))?);
                 }
                 let mut code = parts.pop().unwrap();
                 while let Some(p) = parts.pop() {
@@ -1473,6 +1550,11 @@ impl<'a> Gen<'a> {
             (Value::Bool(b), _) => b.to_string(),
             (Value::Int(i), _) => format!("{i}i64"),
             (Value::Atom(a), Ty::IntAtom(..)) => format!("(i64::MIN + {a}i64)"),
+            // A model value among records (see types::ATOM_FIELD)
+            (Value::Atom(a), Ty::Rec(fs)) if crate::types::has_atoms(fs) => {
+                let m = [(crate::types::ATOM_FIELD.to_string(), Value::Atom(*a))].into_iter().collect();
+                return self.lit(&Value::Rec(m), t);
+            }
             (Value::Atom(a), _) => format!("{a}u16"),
             (v, Ty::PFun(..) | Ty::Bag(_)) if is_sparse_fun(t) && crate::value::as_fun(v).is_some() => {
                 self.ty_id(t)?;
@@ -1612,6 +1694,22 @@ impl<'a> Gen<'a> {
             return Ok(format!("{{ let __u: {} = {{ let _ = {code}; unreachable!() }}; __u }}", to.repr()));
         }
         match (from, to) {
+            // A model value as a value that is a record or a model value (see types::ATOM_FIELD)
+            (Ty::Enum(_), Ty::Rec(fs)) if crate::types::has_atoms(fs) => {
+                let mut parts = vec![];
+                for (n, ft) in fs {
+                    parts.push(match ft {
+                        Ty::Opt(inner) if n == crate::types::ATOM_FIELD => format!("(true, {})", self.coerce(code.clone(), from, inner)?),
+                        ft => Self::default_code(ft),
+                    });
+                }
+                Ok(rec_build(&parts))
+            }
+            // The function over the empty set, built as the empty record (its domain has no
+            // element, so the record of no fields is the same value)
+            (Ty::Rec(a), Ty::Fun(d, _) | Ty::PFun(d, _)) if a.is_empty() && d.size() == Some(0) => {
+                Ok(format!("{{ let _ = {code}; {} }}", Self::default_code(to)))
+            }
             (Ty::Set(a), Ty::Set(b)) if !is_sparse(from) && !is_sparse(to) && a.kind_eq(b) && Self::trivial(a, b) => {
                 let (a, b) = (self.ty_id(from)?, self.ty_id(to)?);
                 self.convs.insert((a, b));
@@ -1878,6 +1976,22 @@ impl<'a> Gen<'a> {
                 }
             }
             At => env.locals.get("@").cloned().ok_or("`@` outside EXCEPT")?,
+            // A substituted variable of an instance: what it stands for, primed; while computing
+            // whether an action is enabled, the value bound to its name (see gen_action)
+            Prime(x) if crate::ast::subvar_of(x).is_some() => {
+                let (n, b) = crate::ast::subvar_of(x).unwrap();
+                if !env.phantom {
+                    return self.gen(&Prime(b.clone().b()), env, want);
+                }
+                match env.locals.get(&phantom(n)) {
+                    Some(x) => x.clone(),
+                    // Not bound yet: TLC fails on evaluation, naming the variable
+                    None => {
+                        let (_, t) = self.gen(b, env, want)?;
+                        (format!("{{ let __v: {} = eval_error(\"In evaluation, the identifier {n} is either undefined or not an operator.\".into()); __v }}", t.repr()), t)
+                    }
+                }
+            }
             Prime(x) => match x.strip() {
                 Ident(n) if self.is_var(n) => match env.primed.get(n) {
                     Some(x) => x.clone(),
@@ -2048,7 +2162,7 @@ impl<'a> Gen<'a> {
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let id = self.ty_id(&t)?;
-                    (format!("{{ println!(\"{{}}\", fmt_{id}(&{c})); true }}"), Ty::Bool)
+                    (format!("{{ println!(\"{{}}\", ppr(&fmt_{id}(&{c}))); true }}"), Ty::Bool)
                 }
                 // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
@@ -2056,7 +2170,7 @@ impl<'a> Gen<'a> {
                     let id = self.ty_id(&t)?;
                     let (vc, vt) = self.gen(v, env, want)?;
                     let vid = self.ty_id(&vt)?;
-                    (format!("{{ let __x = {c}; let __v = {vc}; println!(\"{{}}  {{}}\", fmt_{id}(&__x), fmt_{vid}(&__v)); __v }}"), vt)
+                    (format!("{{ let __x = {c}; let __v = {vc}; println!(\"{{}}  {{}}\", ppr(&fmt_{id}(&__x)), ppr(&fmt_{vid}(&__v))); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int(a, env)?;
@@ -2403,6 +2517,7 @@ impl<'a> Gen<'a> {
                 inner.init = false;
                 inner.partial = true;
                 inner.enabled = true;
+                inner.phantom = matches!(x.as_ref(), Label(n, ..) if n == crate::ast::ENINST);
                 let mut code = String::new();
                 self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
                 (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
@@ -2857,13 +2972,13 @@ impl<'a> Gen<'a> {
                 if let Ident(n) = x.strip() {
                     if let Some((t, iv)) = env.idx.get(n) {
                         if *t == *d {
-                            return Ok((format!("{fc}[{iv} as usize]"), *c));
+                            return Ok((format!("({fc})[{iv} as usize]"), *c));
                         }
                     }
                 }
                 let did = self.ty_id(&d)?;
                 let xc = self.gen_as(x, env, &d)?;
-                (format!("{fc}[idx_{did}({xc})]"), *c)
+                (format!("({fc})[idx_{did}({xc})]"), *c)
             }
             Field(r, k) => {
                 let (rc, rt) = self.gen(r, env, None)?;
@@ -3640,6 +3755,12 @@ impl<'a> Gen<'a> {
                     _ => format!("({l} && !{r})"),
                 });
             }
+            // x \in UNION {S}: x \in S, without enumerating S. With more sets TLC compares them to
+            // build the set of sets, which fails for a set it cannot enumerate (measured)
+            Un(UOp::Union, ss) if matches!(ss.strip(), SetLit(v) if v.len() == 1) && self.try_const(s, env).is_none() => {
+                let SetLit(ss) = ss.strip() else { unreachable!() };
+                return self.gen_member(x, xt, &ss[0], env);
+            }
             SetFilter(y, t, p) if self.try_const(s, env).is_none() => {
                 let m = self.gen_member(x, xt, t, env)?;
                 let mut env2 = env.clone();
@@ -3683,16 +3804,18 @@ impl<'a> Gen<'a> {
             if fits.is_empty() {
                 return Ok("false".into());
             }
-            if fits.len() <= 8 || !xt.is_scalar() {
-                let parts: Vec<String> =
-                    fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
-                return Ok(format!("({})", parts.join(" || ")));
-            }
             let Ty::Set(mut et) = ty_of_value(&v)? else { unreachable!() };
             if narrows(xt, &et) {
                 et = join(xt, &et)?.into();
             }
             let st = Ty::Set(et.clone());
+            // Element by element, also for a set of more than 128 possible elements (records of
+            // different fields), which would be an array of limited capacity
+            if fits.len() <= 8 || !xt.is_scalar() || is_sparse(&st) {
+                let parts: Vec<String> =
+                    fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
+                return Ok(format!("({})", parts.join(" || ")));
+            }
             let mask = self.lit(&v, &st)?;
             let eid = self.ty_id(&et)?;
             let xc = self.coerce(x.to_string(), xt, &et)?;
@@ -3761,6 +3884,11 @@ impl<'a> Gen<'a> {
         let with = |x: Vec<Expr>| -> Vec<Expr> { x.into_iter().chain(rest.iter().cloned()).collect() };
         if env.split && !env.init && self.gen_split(h, rest, env, out)? {
             return Ok(());
+        }
+        if env.phantom && !env.init {
+            if let Some(r) = self.gen_phantom(h, rest, env, out) {
+                return r;
+            }
         }
         match h.strip() {
             // [A]_v is A \/ UNCHANGED v (TLC follows both)
@@ -4130,6 +4258,71 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// While computing whether an action is enabled, TLC binds a primed variable by its name in a
+    /// partial state (`TLCStateFun`) and reads it from there. A variable of an instantiated module
+    /// that the INSTANCE substitutes (see ast::SUBVAR) is bound the same way, as if it were a
+    /// variable of its own: `x' = e` and `x' \in S` bind it when it is not bound yet, UNCHANGED x
+    /// binds it to what x stands for, and `x'` elsewhere reads it (failing when it is not bound),
+    /// never the substitution (measured on TLC 2.19, `tests/tlc/EnSubst*`). The binding does not
+    /// assign any variable of the state. Returns None for a conjunct that binds nothing.
+    fn gen_phantom(&mut self, h: &Expr, rest: &[Expr], env: &Env, out: &mut String) -> Option<R<()>> {
+        use Expr::*;
+        let unbound = |e: &Expr| match e.strip() {
+            Prime(x) => crate::ast::subvar_of(x).map(|(n, _)| n.to_string()).filter(|n| !env.locals.contains_key(&phantom(n))),
+            _ => None,
+        };
+        match h.strip() {
+            Bin(BOp::Eq, lhs, rhs) => {
+                let n = unbound(lhs)?;
+                Some((|| {
+                    let (c, t) = self.gen(rhs, env, None)?;
+                    let x = self.fresh("ph");
+                    writeln!(out, "{{ let {x} = {c};").unwrap();
+                    let mut env2 = env.clone();
+                    env2.bind(&phantom(&n), x, t);
+                    self.gen_action(rest, &env2, out)?;
+                    out.push_str("}\n");
+                    Ok(())
+                })())
+            }
+            Bin(BOp::In, lhs, s) => {
+                let n = unbound(lhs)?;
+                Some((|| {
+                    let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                    let x = self.fresh("ph");
+                    let val = match ix {
+                        Some(_) => format!("dec_{}({x})", self.ty_id(&et)?),
+                        None => x.clone(),
+                    };
+                    let y = self.fresh("ph");
+                    writeln!(out, "for {x} in {it} {{ let {y} = {val};").unwrap();
+                    let mut env2 = self.renew_work(env, out);
+                    env2.bind(&phantom(&n), y, et);
+                    self.gen_action(rest, &env2, out)?;
+                    out.push_str("}\n");
+                    Ok(())
+                })())
+            }
+            Un(UOp::Unchanged, x) => {
+                let mut leaves = vec![];
+                Self::unchanged_leaves(x, &mut leaves);
+                if !leaves.iter().any(|l| crate::ast::subvar_of(l).is_some()) {
+                    return None;
+                }
+                let parts: Vec<Expr> = leaves
+                    .into_iter()
+                    .map(|l| match l.strip() {
+                        Ident(n) if self.is_var(n) && crate::ast::subvar_of(&l).is_none() => Un(UOp::Unchanged, l.clone().b()),
+                        _ => Bin(BOp::Eq, Prime(l.clone().b()).b(), l.b()),
+                    })
+                    .collect();
+                let work: Vec<Expr> = parts.into_iter().chain(rest.iter().cloned()).collect();
+                Some(self.gen_action(&work, env, out))
+            }
+            _ => None,
+        }
+    }
+
     /// `\A x \in S : B` that assigns variables, with S from the state. TLC evaluates it as the
     /// conjunction of B over the elements of S in order: an element can assign the variables not
     /// assigned yet, and once B only reads what is assigned, it is a test for the remaining
@@ -4287,6 +4480,8 @@ impl<'a> Gen<'a> {
     /// The assignment target (x' in Next, x in Init), if it is not yet assigned
     fn target(&self, e: &Expr, env: &Env) -> Option<String> {
         let n = match (e.strip(), env.init) {
+            // Bound by its name while computing ENABLED (see gen_phantom)
+            (Expr::Prime(x), false) if env.phantom && crate::ast::subvar_of(x).is_some() => return None,
             (Expr::Prime(x), false) => match x.strip() {
                 Expr::Ident(n) => n.clone(),
                 _ => return None,
@@ -4449,6 +4644,23 @@ impl<'a> Gen<'a> {
                         }
                         cur = c.as_ref().clone();
                     }
+                    // A function over part of a type: a key outside its domain leaves it
+                    // unchanged, as in TLC (as in the EXCEPT that builds a new value)
+                    (Path::Idx(i), Ty::PFun(d, c)) => {
+                        let ic = self.gen_as(i, env, d)?;
+                        let iv = self.fresh("i");
+                        if is_sparse_fun(&cur) {
+                            writeln!(out, "let {iv} = {ic};").unwrap();
+                            conds.push(format!("({p}).find(&{iv}).is_ok()"));
+                            p = format!("{p}.items[({p}).find(&{iv}).unwrap()].1");
+                        } else {
+                            let did = self.ty_id(d)?;
+                            writeln!(out, "let {iv} = enc_{did}({ic});").unwrap();
+                            conds.push(format!("{iv} != u64::MAX && {p}[{iv} as usize].0"));
+                            p = format!("{p}[{iv} as usize].1");
+                        }
+                        cur = c.as_ref().clone();
+                    }
                     (Path::Field(k), Ty::Rec(fs)) => {
                         let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
                         match &fs[i].1 {
@@ -4568,6 +4780,15 @@ impl<'a> Gen<'a> {
     /// Environment for computing whether an action is enabled (for fairness)
     pub fn env_enabled(mut env: Env) -> Env {
         env.enabled = true;
+        env
+    }
+
+    /// Environment for whether `<<A>>_v` is enabled, for WF_v(A) / SF_v(A): as TLC computes
+    /// ENABLED, a successor may leave variables undetermined (reading one fails)
+    pub fn env_fair(env: Env, action: &Expr) -> Env {
+        let mut env = Self::env_enabled(env);
+        env.partial = true;
+        env.phantom = matches!(action, Expr::Label(n, ..) if n == crate::ast::ENINST);
         env
     }
 
@@ -4763,6 +4984,24 @@ impl<'a> Gen<'a> {
                     }
                     _ => unreachable!(),
                 };
+                // Records of different fields: numbered in TLC's order (see Ty::tlc_perm)
+                let (enc_body, dec_body) = match t.tlc_perm() {
+                    Some(perm) => {
+                        let mut inv = vec![0u32; perm.len()];
+                        for (k, &r) in perm.iter().enumerate() {
+                            inv[r as usize] = k as u32;
+                        }
+                        let list = |v: &[u32]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                        (
+                            format!(
+                                "const P: [u32; {n}] = [{}]; let m = (|| -> u64 {{ {enc_body} }})(); if m == u64::MAX {{ m }} else {{ P[m as usize] as u64 }}",
+                                list(&perm)
+                            ),
+                            format!("const Q: [u32; {n}] = [{}]; let i = Q[i as usize] as u64; {dec_body}", list(&inv)),
+                        )
+                    }
+                    None => (enc_body, dec_body),
+                };
                 writeln!(s, "#[inline] fn enc_{i}(v: {r}) -> u64 {{ {enc_body} }}").unwrap();
                 writeln!(s, "#[inline] fn dec_{i}(i: u64) -> {r} {{ {dec_body} }}").unwrap();
                 writeln!(
@@ -4859,6 +5098,13 @@ impl<'a> Gen<'a> {
                     let mut b = String::from("let mut ps: Vec<String> = vec![]; ");
                     for (k, (name, ft)) in fs.iter().enumerate() {
                         let fp = rec_field(fs.len(), k);
+                        if name == crate::types::ATOM_FIELD {
+                            // A model value (see types::ATOM_FIELD)
+                            let Ty::Opt(inner) = ft else { unreachable!() };
+                            let fid = self.ty_id(inner)?;
+                            write!(b, "if v{fp}.0 {{ return fmt_{fid}(&v{fp}.1); }} ").unwrap();
+                            continue;
+                        }
                         match ft {
                             Ty::Opt(inner) => {
                                 let fid = self.ty_id(inner)?;
@@ -4876,6 +5122,8 @@ impl<'a> Gen<'a> {
                     let fid = self.ty_id(inner)?;
                     format!("if v.0 {{ fmt_{fid}(&v.1) }} else {{ \"<none>\".into() }}")
                 }
+                // The function over the empty set (TLC's spelling for an empty function)
+                Ty::Fun(d, _) if d.size() == Some(0) => "\"<< >>\".to_string()".into(),
                 Ty::Fun(d, c) => {
                     let (did, cid) = (self.ty_id(d)?, self.ty_id(c)?);
                     if let Ty::Int(1, _) = d.as_ref() {
@@ -5564,6 +5812,8 @@ fn needs_tlc_order(t: &Ty) -> bool {
     match t {
         Ty::Bag(_) | Ty::PFun(..) => true,
         Ty::Set(_) => !is_sparse(t),
+        // Records of different fields: TLC compares the number of fields first
+        Ty::Rec(fs) if !is_tuple_fields(fs) && fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) => true,
         Ty::Rec(fs) => fs.iter().any(|(_, t)| needs_tlc_order(t)),
         Ty::Fun(_, c) | Ty::Seq(c) => needs_tlc_order(c),
         _ => false,

@@ -142,7 +142,7 @@ pub fn tla(e: &Expr) -> Result<String, String> {
         BoxAction(a, v) => format!("[{}]_{}", tla(a)?, sub(v)?),
         Fair(w, v, a) => format!("{}_{}({})", if *w { "WF" } else { "SF" }, sub(v)?, tla(a)?),
         // Labels change nothing in what a formula means
-        Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() || n.ends_with("::") => tla(b)?,
+        Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() || n.ends_with("::") || n.starts_with(crate::ast::SUBVAR) || n == crate::ast::ENINST => tla(b)?,
         Label(n, _, b) if n == crate::parser::INFIX_JUNCTION => tla(b)?,
         _ => return Err(format!("cannot write out {}", crate::codegen::short(e))),
     })
@@ -159,6 +159,9 @@ pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> Str
         // SYMMETRY are left out: the lasso is checked as a behavior of the spec itself)
         let mut mvs: Vec<String> = vec![];
         for (_, v) in &cfg.constants {
+            model_values(v, &mut mvs);
+        }
+        for (_, _, v) in &cfg.mod_values {
             model_values(v, &mut mvs);
         }
         mvs.retain(|n| !m.constants.contains(n));
@@ -181,6 +184,9 @@ pub fn template(m: &Module, cfg: &Cfg, written: &Result<Written, String>) -> Str
         let mut c = String::from("CONSTANTS\n");
         for (n, v) in &cfg.constants {
             c += &format!("  {n} = {}\n", tla(v)?);
+        }
+        for (n, mm, v) in &cfg.mod_values {
+            c += &format!("  {n} = [{mm}] {}\n", tla(v)?);
         }
         for (n, module, d) in &cfg.substs {
             match module {
