@@ -100,9 +100,15 @@ pub struct Gen<'a> {
     /// Function name -> its code (the latest version)
     rec_code: std::collections::BTreeMap<String, String>,
     /// Functions for recursive operators that assign variables, per key (`rec_action_fn`): the
-    /// name, the sets of variables assigned when it returns (bit masks over `vars`), and whether
-    /// these are settled
-    ract: HashMap<String, (String, BTreeSet<u64>, bool)>,
+    /// name, the sets of variables assigned when it returns (numbers of `assigned_sets`), and
+    /// whether these are settled
+    ract: HashMap<String, (String, BTreeSet<u32>, bool)>,
+    /// The sets of variables (indexes into `vars`) a function of `gen_rec_action` may have
+    /// assigned when it returns a state, numbered in the order found: the function returns each
+    /// state with the number of its set
+    assigned_sets: Vec<Vec<usize>>,
+    /// The recursive operators made for `\A x \in S : B` in actions (see `forall_rec`), by x and B
+    forall_recs: HashMap<String, usize>,
     ract_progress: Vec<String>,
     /// The position of each definition's body (from its POS label), for a recursive operator
     /// unrolled while splitting the next-state relation
@@ -154,6 +160,8 @@ impl<'a> Gen<'a> {
             rec_names: HashMap::new(),
             rec_code: std::collections::BTreeMap::new(),
             ract: HashMap::new(),
+            assigned_sets: vec![],
+            forall_recs: HashMap::new(),
             ract_progress: vec![],
             def_pos: HashMap::new(),
             inst_prefixes: vec![],
@@ -2303,6 +2311,15 @@ impl<'a> Gen<'a> {
             },
             Call(f, args) => match (f.as_str(), args.as_slice()) {
                 ("TLCEval", [x]) => self.gen(x, env, want)?,
+                (FORALL_NTH, [s, k]) => {
+                    let (it, et, ix) = self.iter_of_indexed(s, env)?;
+                    let kc = self.gen_as(k, env, &Ty::Int(1, BIG))?;
+                    let val = match ix {
+                        Some(_) => format!("dec_{}(__e)", self.ty_id(&et)?),
+                        None => "__e".into(),
+                    };
+                    (format!("{{ let __e = {it}.nth(({kc} - 1) as usize).unwrap(); {val} }}"), et)
+                }
                 // An unbounded quantifier or CHOOSE: TLC stops when it evaluates one
                 (f, []) if crate::parser::unbounded_error(f).is_some() => {
                     let t = want.cloned().unwrap_or(if f.contains("CHOOSE") { Ty::Enum(vec![]) } else { Ty::Bool });
@@ -4513,9 +4530,6 @@ impl<'a> Gen<'a> {
             RecCall(i, args) if open && self.rec_assigns(*i, env) => {
                 let vals: Option<Vec<Value>> = args.iter().map(|a| self.try_const(a, env)).collect();
                 let Some(vals) = vals else {
-                    if env.init {
-                        return Err(format!("unsupported action form (a recursive operator whose arguments are not constant, in Init): {}", short(h)));
-                    }
                     return self.gen_rec_action(*i, args, rest, env, out);
                 };
                 if self.unroll >= 2000 {
@@ -4544,7 +4558,7 @@ impl<'a> Gen<'a> {
             }
             // The elements of `\A x \in S : B` (S from the state) from the i-th on (gen_forall)
             Call(f, a) if f == FORALL_REST => {
-                let [Ident(key), Ident(x), b, Num(i)] = a.as_slice() else { unreachable!() };
+                let [Ident(key), Ident(x), b, Num(i), set] = a.as_slice() else { unreachable!() };
                 let (els, et) = env.locals[key].clone();
                 if self.only_reads_assigned(b, env) {
                     // Nothing left to assign: B holds for each remaining element
@@ -4565,12 +4579,13 @@ impl<'a> Gen<'a> {
                     Some(n) if *i as u64 >= n => return self.gen_action(rest, env, out),
                     _ if *i == 0 => {}
                     Some(n) if n <= 16 => {}
-                    _ => {
-                        return Err(format!(
-                            "unsupported action form (\\A over a set from the state whose body assigns a variable for some elements only): {}",
-                            short(b)
-                        ))
+                    // A set that can hold more: the remaining elements are walked at run time
+                    _ if self.infer.is_none() => {
+                        let id = self.forall_rec(x, b);
+                        let call = RecCall(id, vec![set.clone(), Num(i + 1)]);
+                        return self.gen_action(&with(vec![call]), env, out);
                     }
+                    _ => return self.gen_action(rest, env, out),
                 }
                 writeln!(out, "if {els}.len() <= {i} {{").unwrap();
                 let env0 = self.renew_work(env, out);
@@ -4580,7 +4595,7 @@ impl<'a> Gen<'a> {
                 let e = self.fresh("e");
                 writeln!(out, "let {e} = {els}[{i}];").unwrap();
                 env2.bind(x, e, et);
-                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1)]);
+                let next = Call(FORALL_REST.into(), vec![Ident(key.clone()), Ident(x.clone()), b.clone(), Num(i + 1), set.clone()]);
                 self.gen_action(&with(vec![b.clone(), next]), &env2, out)?;
                 out.push_str("}\n");
                 return Ok(());
@@ -4846,7 +4861,7 @@ impl<'a> Gen<'a> {
         let mut env2 = env.clone();
         let key = self.fresh("#els");
         env2.bind(&key, els, et);
-        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0)]);
+        let first = Expr::Call(FORALL_REST.into(), vec![Expr::Ident(key), Expr::Ident(x.clone()), inner, Expr::Num(0), s.clone()]);
         let work: Vec<Expr> = std::iter::once(first).chain(rest.iter().cloned()).collect();
         self.gen_action(&work, &env2, out)
     }
@@ -4876,9 +4891,6 @@ impl<'a> Gen<'a> {
             self.unroll -= 1;
             return r;
         }
-        if self.vars.len() > 64 {
-            return Err(format!("recursive operator `{}` assigns variables of a spec with more than 64 variables", rd.name));
-        }
         let mut codes = vec![];
         let mut tys = vec![];
         for a in args {
@@ -4894,20 +4906,23 @@ impl<'a> Gen<'a> {
             codes.push(c);
             tys.push(t);
         }
-        let mask_in = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
-        let (name, masks) = self.rec_action_fn(i, &rd, &free, &tys, mask_in)?;
-        let w0 = env.work.clone().unwrap_or("*s".into());
+        let mask_in = self.assigned_id(env);
+        let (name, masks) = self.rec_action_fn(i, &rd, &free, &tys, mask_in, env.init)?;
+        // In Init the state under construction holds what is assigned so far, which is all the
+        // function reads of the variables
+        let mut env1 = env.clone();
+        let w0 = if env.init { self.work_var(&mut env1, out) } else { env.work.clone().unwrap_or("*s".into()) };
+        let s0 = if env.init { format!("&{w0}") } else { "s".into() };
         let (w, m) = (self.fresh("w"), self.fresh("m"));
-        writeln!(out, "for (mut {w}, {m}) in {name}(s, {w0}, {}) {{ match {m} {{", codes.join(", ")).unwrap();
+        writeln!(out, "for (mut {w}, {m}) in {name}({s0}, {w0}, {}) {{ match {m} {{", codes.join(", ")).unwrap();
         for mask in masks {
-            writeln!(out, "{mask}u64 => {{").unwrap();
+            writeln!(out, "{mask}u32 => {{").unwrap();
             let mut env2 = env.clone();
             env2.work = Some(w.clone());
             env2.primed = HashMap::new();
-            for (k, (v, t)) in self.vars.iter().enumerate() {
-                if mask >> k & 1 == 1 {
-                    env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t.clone()));
-                }
+            for &k in &self.assigned_sets[mask as usize] {
+                let (v, t) = self.vars[k].clone();
+                env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t));
             }
             self.gen_action(rest, &env2, out)?;
             out.push_str("}\n");
@@ -4921,8 +4936,44 @@ impl<'a> Gen<'a> {
     /// variables in `mask_in` assigned: its name and the sets of variables assigned when it
     /// returns. A call of itself inside uses the sets found so far, so the body is generated again
     /// until they settle.
-    fn rec_action_fn(&mut self, i: usize, rd: &crate::expand::RecDef, free: &[String], tys: &[Ty], mask_in: u64) -> R<(String, BTreeSet<u64>)> {
-        let key = format!("{i}|{tys:?}|{mask_in}");
+    /// A recursive operator for the elements of `\A x \in S : B` from the k-th on (in the order
+    /// the quantifier takes them), called as `F(S, k)`: IF k > Cardinality(S) THEN TRUE ELSE B with
+    /// x the k-th element /\ F(S, k + 1). An action calling it with arguments from the state is a
+    /// function that returns the states B builds (`gen_rec_action`), so the size of the generated
+    /// code does not grow with the number of elements
+    fn forall_rec(&mut self, x: &str, b: &Expr) -> usize {
+        use Expr::*;
+        let key = format!("{x}|{b:?}");
+        if let Some(&id) = self.forall_recs.get(&key) {
+            return id;
+        }
+        let n = self.forall_recs.len();
+        let (sp, kp) = (format!("#forall_s{n}"), format!("#forall_k{n}"));
+        let rd = |body| crate::expand::RecDef { name: "\\A".into(), params: vec![sp.clone(), kp.clone()], body };
+        let id = crate::expand::add_rec_def(rd(Bool(true)));
+        let elem = Call(FORALL_NTH.into(), vec![Ident(sp.clone()), Ident(kp.clone())]);
+        let next = RecCall(id, vec![Ident(sp.clone()), Bin(BOp::Add, Ident(kp.clone()).b(), Num(1).b())]);
+        let more = And(vec![replace_expr(b, &Ident(x.to_string()), &elem), next]);
+        let done = Bin(BOp::Gt, Ident(kp.clone()).b(), Call("Cardinality".into(), vec![Ident(sp.clone())]).b());
+        crate::expand::set_rec_def(id, rd(If(done.b(), Bool(true).b(), more.b())));
+        self.forall_recs.insert(key, id);
+        id
+    }
+
+    /// The number of the set of variables `env` has assigned (see `assigned_sets`)
+    fn assigned_id(&mut self, env: &Env) -> u32 {
+        let set: Vec<usize> = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).map(|(k, _)| k).collect();
+        match self.assigned_sets.iter().position(|m| *m == set) {
+            Some(i) => i as u32,
+            None => {
+                self.assigned_sets.push(set);
+                (self.assigned_sets.len() - 1) as u32
+            }
+        }
+    }
+
+    fn rec_action_fn(&mut self, i: usize, rd: &crate::expand::RecDef, free: &[String], tys: &[Ty], mask_in: u32, init: bool) -> R<(String, BTreeSet<u32>)> {
+        let key = format!("{i}|{tys:?}|{mask_in}|{init}");
         if let Some((n, ms, done)) = self.ract.get(&key) {
             if *done || self.ract_progress.contains(&key) {
                 return Ok((n.clone(), ms.clone()));
@@ -4942,11 +4993,11 @@ impl<'a> Gen<'a> {
             env.locals.insert(x.to_string(), (format!("a{k}"), t.clone()));
             write!(sig, "a{k}: {}, ", t.repr()).unwrap();
         }
-        for (k, (v, t)) in self.vars.iter().enumerate() {
-            if mask_in >> k & 1 == 1 {
-                env.primed.insert(v.clone(), (format!("__w.v_{v}"), t.clone()));
-            }
+        for &k in &self.assigned_sets[mask_in as usize] {
+            let (v, t) = &self.vars[k];
+            env.primed.insert(v.clone(), (format!("__w.v_{v}"), t.clone()));
         }
+        env.init = init;
         env.work = Some("__w".into());
         env.sink = Some(key.clone());
         loop {
@@ -4957,7 +5008,7 @@ impl<'a> Gen<'a> {
             self.ract_progress.pop();
             r?;
             let f = format!(
-                "#[allow(unused_mut, unused_variables)]\nfn {name}({sig}) -> Vec<(State, u64)> {{ rec_enter({:?}); let mut __res: Vec<(State, u64)> = Vec::new(); {{ {body} }} rec_leave(); __res }}\n",
+                "#[allow(unused_mut, unused_variables)]\nfn {name}({sig}) -> Vec<(State, u32)> {{ rec_enter({:?}); let mut __res: Vec<(State, u32)> = Vec::new(); {{ {body} }} rec_leave(); __res }}\n",
                 rd.name
             );
             self.rec_code.insert(name.clone(), f);
@@ -5235,10 +5286,10 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_state(&mut self, env: &Env, out: &mut String) -> R<()> {
-        if let Some(key) = &env.sink {
-            let mask = self.vars.iter().enumerate().filter(|(_, (v, _))| env.primed.contains_key(v)).fold(0u64, |m, (k, _)| m | 1 << k);
-            self.ract.get_mut(key).unwrap().1.insert(mask);
-            writeln!(out, "__res.push(({}, {mask}u64));", env.work.as_ref().unwrap()).unwrap();
+        if let Some(key) = env.sink.clone() {
+            let mask = self.assigned_id(env);
+            self.ract.get_mut(&key).unwrap().1.insert(mask);
+            writeln!(out, "__res.push(({}, {mask}u32));", env.work.as_ref().unwrap()).unwrap();
             return Ok(());
         }
         let mut unassigned: Vec<&str> =
@@ -6299,6 +6350,8 @@ fn disordered_ty(t: &Ty) -> Option<(String, String)> {
 
 /// The conjunct standing for the elements after the first in `Gen::gen_forall`
 const FORALL_REST: &str = "#forall-rest";
+/// `#forall-nth(S, k)`: the k-th element of S in the order `\A` takes them (see `Gen::forall_rec`)
+const FORALL_NTH: &str = "#forall-nth";
 
 /// A boolean expression that stops with an evaluation error when it is evaluated (TLC stops only
 /// when it evaluates the comparison, so a branch never taken must not be an error)

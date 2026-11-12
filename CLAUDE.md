@@ -370,12 +370,16 @@ operator as its body with the arguments bound; either can assign variables (`tes
 counts match TLC). Over a constant set or with constant arguments, tla2rs unrolls them at compile time. Otherwise:
 
 - `\A`: the checker collects the elements when it evaluates the quantifier. While B can still assign a variable, each
-  element is one level of generated code, up to the number of values of the set's element type (refused beyond 16);
-  once B only reads what is assigned, the remaining elements are a test (`Gen::gen_forall`)
+  element is one level of generated code, up to the number of values of the set's element type when that is at most
+  16; once B only reads what is assigned, the remaining elements are a test (`Gen::gen_forall`). Over a larger type,
+  the elements after the first are walked at run time by a recursive operator made for the quantifier, `F(S, k) == IF
+  k > Cardinality(S) THEN TRUE ELSE B(k-th element) /\ F(S, k + 1)` (`Gen::forall_rec`; `tests/tlc/ForallLarge`)
 - A recursive operator becomes a Rust function that evaluates its body as an action and returns each state it builds
-  with the bit mask of the variables assigned by then (at most 64 variables). The action continues from each returned
-  state, once per mask. A call of the operator in its own body uses the masks found so far, and the body is generated
-  again until they settle (`Gen::gen_rec_action`, `rec_action_fn`). In Init, arguments must still be constant
+  with the number of the set of variables assigned by then (`Gen::assigned_sets`, so any number of variables:
+  `RecManyVars`). The action continues from each returned state, once per set. A call of the operator in its own body
+  uses the sets found so far, and the body is generated again until they settle (`Gen::gen_rec_action`,
+  `rec_action_fn`). In Init the function starts from the state under construction, whose assigned variables are all
+  it reads of the variables (`RecInit`)
 
 ### State graphs
 

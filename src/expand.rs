@@ -28,6 +28,20 @@ pub fn rec_def(i: usize) -> RecDef {
     REC_DEFS.with(|r| r.borrow()[i].clone())
 }
 
+/// Adds a recursive definition that code generation makes (see `Gen::forall_rec`), and returns
+/// its index
+pub fn add_rec_def(d: RecDef) -> usize {
+    REC_DEFS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.push(d);
+        r.len() - 1
+    })
+}
+
+pub fn set_rec_def(i: usize, d: RecDef) {
+    REC_DEFS.with(|r| r.borrow_mut()[i] = d);
+}
+
 pub struct Expander<'a> {
     defs: HashMap<&'a str, &'a Def>,
     fresh: usize,

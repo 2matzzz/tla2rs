@@ -176,10 +176,8 @@ memory.
   `-batched`
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
   reason), sets that may hold both strings and integers (a set of strings compared with a set of integers is
-  supported: unequal when the sizes differ, an evaluation error otherwise, as in TLC), `Name <- [Module] Def` for a CONSTANT (TLC rejects it too),
-  `Op!@`, and a recursive operator that assigns variables called in Init with arguments that are not constant. `\A`
-  over a set from the state whose body assigns a variable for some elements only needs the set's element type to have
-  at most 16 values
+  supported: unequal when the sizes differ, an evaluation error otherwise, as in TLC), `Name <- [Module] Def` for a
+  CONSTANT (TLC rejects it too), and `Op!@`
 - Specs that SANY refuses stop with exit 150, as in TLC, for these reasons: operators of overlapping precedence next
   to each other without parentheses, also prefix and postfix ones (`a /\ b \/ c`, `a = b = c`, `[]x = 1`, `ENABLED
   x' = 1`, `a * -b`, `DOMAIN f + 1`, `UNCHANGED x'`); a name used where nothing declares or defines it before, in
