@@ -860,8 +860,25 @@ impl<'a> Gen<'a> {
         }
         let mut last_err = String::new();
         // The type of a call not resolved yet: a body that iterates over the result of its
-        // recursive call (a set built from smaller ones) needs a set
-        for seed in [Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool, Ty::Set(Ty::Enum(vec![]).into())] {
+        // recursive call (a set built from smaller ones) needs a set, and one that applies it (a
+        // function built from the one at a smaller argument) a function over the domain the body
+        // builds its value on
+        let mut seeds = vec![Ty::Enum(vec![]), Ty::Int(0, 0), Ty::Bool, Ty::Set(Ty::Enum(vec![]).into())];
+        let mut value = &rd.body;
+        loop {
+            match value {
+                Expr::Label(_, _, b) | Expr::If(_, b, _) => value = b,
+                _ => break,
+            }
+        }
+        if let Expr::FunCons(_, dom, _) = value {
+            if let Ok((_, Ty::Set(dt))) = self.gen(dom, &env, None) {
+                for c in [Ty::Bool, Ty::Int(0, 0), Ty::Enum(vec![])] {
+                    seeds.push(Ty::Fun(dt.clone(), c.into()));
+                }
+            }
+        }
+        for seed in seeds {
             let mut ret = seed;
             for round in 0..30 {
                 self.rec_progress.push((key.clone(), ret.clone()));
@@ -2924,13 +2941,13 @@ impl<'a> Gen<'a> {
                 if let Ident(n) = x.strip() {
                     if let Some((t, iv)) = env.idx.get(n) {
                         if *t == *d {
-                            return Ok((format!("{fc}[{iv} as usize]"), *c));
+                            return Ok((format!("({fc})[{iv} as usize]"), *c));
                         }
                     }
                 }
                 let did = self.ty_id(&d)?;
                 let xc = self.gen_as(x, env, &d)?;
-                (format!("{fc}[idx_{did}({xc})]"), *c)
+                (format!("({fc})[idx_{did}({xc})]"), *c)
             }
             Field(r, k) => {
                 let (rc, rt) = self.gen(r, env, None)?;

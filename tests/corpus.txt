@@ -206,7 +206,7 @@ skip specifications/detector_chan96/EnvironmentController.tla specifications/det
 gap specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg # Next: type mismatch, a set where an element is expected
 skip specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg # TLC 2.19 took 62 s with one worker
 skip specifications/diskpaxos/MC_HDiskSynod.tla specifications/diskpaxos/MC_HDiskSynod.cfg # TLC 2.19 took 60 s with one worker
-gap specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg # compile error: a recursive operator applied as a function (invariant)
+check specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg
 skip specifications/ewd426/APTokenRing.tla specifications/ewd426/APTokenRing.cfg # symbolic mode: checked with Apalache
 skip specifications/ewd426/SimTokenRing.tla specifications/ewd426/SimTokenRing.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/ewd426/TokenRing.tla specifications/ewd426/TokenRing.cfg # TLC 2.19 refuses the cfg: it reads ALIAS as the name of a property, which is not defined
