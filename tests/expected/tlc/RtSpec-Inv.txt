@@ -1,8 +1,8 @@
-key b18bc38007ddaecdc8e27c922897e35cfd9c195b8e86788c29a225d1a6a06076
+key 0e9ca8e15fc3a306454de40809ff20de31b9aaf5f82d908ce21a43a9cae33348
 tlc Version 2.19
 rc 12
 Invariant Inv is violated
 7 states generated 6 distinct states found
-trace=3
+trace 3 ca2f013677fd70d67076c8ce4df48d7fb4533a54b3825e927439338d6853270d
 states 6 89ef0f0e2eac49523d188bb1bb94e192e8f36ac1384046af19765b5b8bb0f7e6
 edges 6 f8159a8cdbb3e10f8f188ee0a2ee7b4ba14100c8e4b570e1f1eef976fe568231

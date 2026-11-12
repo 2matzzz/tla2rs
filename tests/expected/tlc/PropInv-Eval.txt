@@ -1,8 +1,8 @@
-key e8aa77e32fa2b19741c5d6e3726085951cd95fad8dd266fd90993497d07f2ed6
+key e55b404afb6aa6cff03590cfdc2917295448dc99342021a312cef65041998eab
 tlc Version 2.19
 rc 76
 Evaluating invariant SmallEval failed
 3 states generated 3 distinct states found
-trace=3
+trace 3 85e86d2b93aeea84c342f6e4b4f12761e4ce4150dc77d01b3ef3fe6d12122eeb
 states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
 edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
