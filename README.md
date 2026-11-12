@@ -59,6 +59,10 @@ cargo build --release
   evaluate), 11 = deadlock, 12 = invariant, 13 = temporal or action property. An evaluation error exits with 76 in an
   invariant, 75 in the initial states, and otherwise 255 for a failed arithmetic operation (such as `\div` by zero) and
   75 for the rest
+- When a module holds a PlusCal algorithm whose translation line records checksums (`\* BEGIN TRANSLATION
+  (chksum(pcal) = ... /\ chksum(tla) = ...)`), the checker warns, as TLC does, that the algorithm or its translation
+  changed since the translator wrote them. tla2rs computes TLC's PlusCal checksum for algorithms without procedures,
+  macros or PlusCal options; for the others it prints a note instead (see Limitations)
 
 ## Speed
 
@@ -170,6 +174,9 @@ memory.
   to each other without parentheses (`a /\ b \/ c`, `a = b = c`), a bound variable, parameter or LET definition named
   like a CONSTANT, VARIABLE, earlier definition or enclosing bound variable, unary minus without `Integers`, `:>` / `@@`
   without `TLC`, and invalid string escapes. SANY's other checks are not repeated; tla2rs may accept such a spec
+- TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
+  procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
+  labels it would add; for the others tla2rs prints a note on stderr and no warning
 - Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
   body; 50,000 levels at compile time). TLC overflows its JVM stack much earlier (500 to 900 levels for small
   bodies), so a recursion between the two depths passes here where TLC reports a stack overflow
@@ -238,8 +245,8 @@ written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model 
 selected (the exhaustive searches that TLC 2.19 finishes, with only `tla2tools.jar`, in 60 seconds or less with one
 worker) and, for each of the others, why it is skipped. A selected model that tla2rs does not match yet is listed as
 a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost. Of the 98 selected models,
-93 match TLC (6 of them on everything but the generated count, which TLC counts once per `\/` branch); the 5 gaps
-and their reasons are in `tests/corpus.txt` and CLAUDE.md.
+95 match TLC (6 of them on everything but the generated count, which TLC counts once per `\/` branch); the 3 gaps,
+none of them run for now, and their reasons are in `tests/corpus.txt` and CLAUDE.md.
 
 | Example | What it is |
 |---|---|
