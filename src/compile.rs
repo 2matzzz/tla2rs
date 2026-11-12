@@ -355,8 +355,8 @@ fn find_module(name: &str, how: &str, dir: &std::path::Path, warnings: &mut Vec<
 fn community_module(name: &str, src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
     let mut m = load_module(src, dir, warnings, depth)?;
     for &(module, op, why) in crate::community::UNSUPPORTED.iter().filter(|u| u.0 == name) {
-        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{module}!{op}: not defined"))?;
-        d.body = Expr::Call(format!("{module}!{op} of the CommunityModules, which tla2rs does not support: {why}"), vec![]);
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
+        d.body = Expr::Call(format!("{op} of the CommunityModules' {module}, which tla2rs does not support: {why}"), vec![]);
     }
     Ok(m)
 }
