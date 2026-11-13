@@ -597,9 +597,13 @@ How TLC words an evaluation error depends on where it happens, measured on the `
   of the properties (the same on every run; `tests/tlc/LiveErr-Fair`, `LiveOrder`), so an error in
   both is reported from ENABLED. Between the state and the action predicates of the properties its
   order changes from run to run (three runs each of a property `[]<><<A>>_v \/ []<>Q` and of two
-  properties gave both orders); the checker evaluates the state predicates first. Not followed: TLC
-  stops computing ENABLED at the first successor it finds, while the checker computes them all, so
-  an error in a later successor stops the checker only
+  properties gave both orders); the checker evaluates the state predicates first
+- TLC stops computing whether an action is enabled (ENABLED, and the fair actions in the liveness
+  checks) at the first successor it finds, in the order it computes successors, so an error that
+  only a later successor would raise is not reached (`tests/tlc/EnFirst*`: a later disjunct, `x'
+  \in S` taken in TLC's order of S, `\E` over a constant set or one from the state, a recursive
+  operator). The checker leaves the block of such a computation at its first successor
+  (`Env::en_exit`)
 
 TLC prints a warning only when it has not printed the same text before, and its first warning of
 a run carries the note `(Use the -nowarning option to disable this warning.)`, so the same warning

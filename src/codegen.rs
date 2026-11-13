@@ -46,6 +46,9 @@ pub struct Env {
     /// Inside the function of a recursive operator that assigns variables (`rec_action_fn`, by
     /// its key): the end of the action returns the state built so far instead of emitting it
     sink: Option<String>,
+    /// Computing whether an action is enabled: the label of the block that the first successor
+    /// leaves with `true`, since TLC stops at the first successor it finds
+    pub en_exit: Option<String>,
 }
 
 pub struct Gen<'a> {
@@ -2987,9 +2990,11 @@ impl<'a> Gen<'a> {
                 inner.partial = true;
                 inner.enabled = true;
                 inner.phantom = matches!(x.as_ref(), Label(n, ..) if n == crate::ast::ENINST);
+                let exit = self.fresh("en");
+                inner.en_exit = Some(exit.clone());
                 let mut code = String::new();
                 self.gen_action(&[x.as_ref().clone()], &inner, &mut code)?;
-                (format!("{{ let mut buf_en: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf_en; {code} }} !buf_en.is_empty() }}"), Ty::Bool)
+                (format!("('{exit}: {{ {code} false }})"), Ty::Bool)
             }
             Un(UOp::Neg, x) => {
                 let (c, (lo, hi)) = self.gen_int_of("Neg", true, false, x, env).map_err(|_| "negation of a non-integer".to_string())?;
@@ -5654,6 +5659,11 @@ impl<'a> Gen<'a> {
             writeln!(out, "__res.push(({}, {mask}u32));", env.work.as_ref().unwrap()).unwrap();
             return Ok(());
         }
+        if let Some(exit) = &env.en_exit {
+            // Enabled: TLC stops at the first successor, so what the rest would raise is not reached
+            writeln!(out, "break '{exit} true;").unwrap();
+            return Ok(());
+        }
         let mut unassigned: Vec<&str> =
             self.vars.iter().map(|(v, _)| v.as_str()).filter(|v| !env.partial && !env.primed.contains_key(*v)).collect();
         if !unassigned.is_empty() {
@@ -5722,8 +5732,9 @@ impl<'a> Gen<'a> {
 
     /// Environment for whether `<<A>>_v` is enabled, for WF_v(A) / SF_v(A): as TLC computes
     /// ENABLED, a successor may leave variables undetermined (reading one fails)
-    pub fn env_fair(env: Env, action: &Expr) -> Env {
+    pub fn env_fair(&mut self, env: Env, action: &Expr) -> Env {
         let mut env = Self::env_enabled(env);
+        env.en_exit = Some(self.fresh("en"));
         env.partial = true;
         env.phantom = matches!(action, Expr::Label(n, ..) if n == crate::ast::ENINST);
         env

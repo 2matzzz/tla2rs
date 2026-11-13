@@ -768,12 +768,14 @@ pub fn compile(
             // Whether <<A>>_v is enabled, as for WF in a property: v changes in a successor of A
             let mut succ = String::new();
             let step = Expr::And(vec![f.action.clone(), changed(&f.sub)]);
-            g.gen_action(&[step], &Gen::env_fair(genv.clone(), &f.action), &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
+            let fenv = g.env_fair(genv.clone(), &f.action);
+            let exit = fenv.en_exit.clone().unwrap();
+            g.gen_action(&[step], &fenv, &mut succ).map_err(|m| format!("{what}: {m}\n  in: {}", short(&f.action)))?;
             writeln!(src, "#[allow(unused_variables)]\nfn fchg_{i}(s: &State, t: &State) -> bool {{ {chg} }}").unwrap();
             writeln!(src, "#[allow(unused_variables)]\nfn fstep_{i}(s: &State, t: &State) -> bool {{ ({act}) && fchg_{i}(s, t) }}").unwrap();
             writeln!(
                 src,
-                "fn fen_{i}(s: &State) -> bool {{ let mut buf: Vec<(State, u32)> = Vec::new(); {{ let out = &mut buf; {succ} }} !buf.is_empty() }}"
+                "#[allow(unreachable_code)]\nfn fen_{i}(s: &State) -> bool {{ '{exit}: {{ {succ} false }} }}"
             )
             .unwrap();
             fairs.push(format!("({}, fen_{i} as fn(&State) -> bool, fstep_{i} as fn(&State, &State) -> bool)", f.weak));
