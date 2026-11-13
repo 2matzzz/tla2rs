@@ -52,6 +52,15 @@ It has no crate dependencies.
   at the commit pinned in `tests/corpus.txt`, against TLC's results in `tests/expected/corpus/` (see "The
   corpus"). It is separate from `all.sh`, which it does not slow down. `scripts/expected.sh -corpus` writes
   those results; `JOBS` defaults to 2 for both
+- `scripts/bench.sh` measures speed against TLC on every configuration in `examples/` and `tests/tlc/`
+  (`-corpus`: the corpus's selected models, `-norun` adds those marked norun): TLC with one worker, and tla2rs
+  split into generation, a build from scratch (no build cache) and the checker alone with one worker, each with
+  its peak memory, and the size of the generated code (`-auto` adds TLC's `-workers auto` and the checker's
+  default workers). One row per configuration goes to `target/bench/results.tsv`, and `target/bench/summary.txt`
+  lists, by ratio, those where tla2rs's check, or its total with the build, is slower than TLC. Rows are kept in
+  `target/bench/rows/` and skipped by the next run (`-force` measures again). `JOBS` defaults to 1 for accurate
+  times; with `JOBS=N`, `-serial` still runs the measured steps one at a time. It writes nothing outside
+  `target/bench/` (and `target/community/`)
 
 ## Layout
 
