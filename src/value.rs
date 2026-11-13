@@ -950,6 +950,22 @@ impl ConstEval<'_> {
                 };
                 Value::Bool(inside == matches!(op, BOp::In))
             }
+            // An integer in lo..hi: compared with the bounds, without building the interval
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(&*shape(set), Bin(BOp::Range, ..)) => {
+                let v = self.eval(x, env)?;
+                let set = shape(set);
+                let Bin(_, lo, hi) = &*set else { unreachable!() };
+                let (lo, hi) = (self.eval(lo, env)?, self.eval(hi, env)?);
+                match (&v, &lo, &hi) {
+                    (Value::Int(i), Value::Int(l), Value::Int(h)) if (*h as i128 - *l as i128) <= ENUM_LIMIT as i128 => {
+                        Value::Bool((l <= i && i <= h) == matches!(op, BOp::In))
+                    }
+                    _ => {
+                        let s = self.bin(BOp::Range, lo, hi)?;
+                        self.bin(*op, v, s)?
+                    }
+                }
+            }
             Bin(op, a, b) => {
                 let a = self.eval(a, env)?;
                 let b = self.eval(b, env)?;
