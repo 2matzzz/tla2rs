@@ -1,0 +1,10 @@
+key 7183adf4edd67f7003be9b6327e998b2d8cd77096718d5fb8a5b82f8333ab8ff
+tlc Version 2.19
+rc 12
+Invariant Smaller is violated
+3 states generated 3 distinct states found 0 states left on queue
+trace 3 befadee37606733c1ce6ba408a3d2afff5abcdd8b5d7962180631cdd2a6606c8
+states 3 173e23c6735b9cf71dd24da434a2109ece73d32db30ad5fe111e69872c5c1f78
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 2 24b912df1e29c61acc35eac7d7a2d64375056d2c87488c5a7e23791cd0a4c3ad
+errors 2 24b912df1e29c61acc35eac7d7a2d64375056d2c87488c5a7e23791cd0a4c3ad
