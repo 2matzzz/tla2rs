@@ -17,8 +17,35 @@
 //! `CONST_ONLY` are refused on values from the state. The modules not here (files, reals,
 //! animation) are listed with the reason in CLAUDE.md, "CommunityModules".
 
+thread_local! {
+    /// The operators of the modules read from here (see `defines`)
+    static DEFINED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
+}
+
+/// Whether n is an operator of a module read from here. TLC computes many of them with Java
+/// overrides of its own, which build values in forms of their own (see `value::Form`)
+pub fn defines(n: &str) -> bool {
+    DEFINED.with(|d| d.borrow().contains(n))
+}
+
 /// The source of each module, by name
 pub fn source(name: &str) -> Option<&'static str> {
+    let src = source_of(name)?;
+    DEFINED.with(|d| {
+        let mut d = d.borrow_mut();
+        for line in src.lines() {
+            let l = line.strip_prefix("LOCAL ").unwrap_or(line);
+            let n: String = l.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let rest = l[n.len()..].trim_start();
+            if n.starts_with(|c: char| c.is_alphabetic()) && (rest.starts_with('(') || rest.starts_with("==") || rest.starts_with('[')) {
+                d.insert(n);
+            }
+        }
+    });
+    Some(src)
+}
+
+fn source_of(name: &str) -> Option<&'static str> {
     Some(match name {
         "Folds" => FOLDS,
         "Functions" => FUNCTIONS,
