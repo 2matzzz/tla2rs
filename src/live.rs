@@ -236,12 +236,15 @@ pub struct Rejected(pub String, pub i32);
 
 /// TLC's form of a temporal formula (tlc2.tool.liveness.LiveExprNode), used to decide what TLC
 /// accepts and when it evaluates each predicate. Atoms are indices into `Atoms` (state from 0,
-/// action from ACTION_BASE); FAIR is a fairness atom, which is only classified.
-#[derive(Clone, Debug)]
+/// action from ACTION_BASE); FAIR is a fairness atom, which is only classified. The second field
+/// tells the occurrences apart: TLC numbers each predicate it makes from the formula
+/// (LiveExprNode.tagExpr) and two predicates are equal only when their numbers are, also when they
+/// are written alike.
+#[derive(Clone, Debug, PartialEq)]
 enum TExpr {
     Bool(bool),
-    State(usize),
-    Action(usize),
+    State(usize, u32),
+    Action(usize, u32),
     Neg(Box<TExpr>),
     Conj(Vec<TExpr>),
     Disj(Vec<TExpr>),
@@ -251,12 +254,18 @@ enum TExpr {
 
 const FAIR: usize = usize::MAX;
 
+/// A new number for a predicate made from the formula (see TExpr)
+fn tag() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl TExpr {
     fn level(&self) -> u8 {
         match self {
             TExpr::Bool(_) => 0,
-            TExpr::State(_) => 1,
-            TExpr::Action(_) => 2,
+            TExpr::State(..) => 1,
+            TExpr::Action(..) => 2,
             TExpr::Neg(b) => b.level(),
             TExpr::Conj(xs) | TExpr::Disj(xs) => xs.iter().map(|x| x.level()).max().unwrap_or(0),
             TExpr::All(_) | TExpr::Even(_) => 3,
@@ -265,8 +274,8 @@ impl TExpr {
 
     fn has_action(&self) -> bool {
         match self {
-            TExpr::Action(_) => true,
-            TExpr::Bool(_) | TExpr::State(_) => false,
+            TExpr::Action(..) => true,
+            TExpr::Bool(_) | TExpr::State(..) => false,
             TExpr::Neg(b) | TExpr::All(b) | TExpr::Even(b) => b.has_action(),
             TExpr::Conj(xs) | TExpr::Disj(xs) => xs.iter().any(|x| x.has_action()),
         }
@@ -293,7 +302,7 @@ impl TExpr {
     fn push_neg(self, neg: bool) -> TExpr {
         match self {
             TExpr::Bool(b) => TExpr::Bool(b != neg),
-            a @ (TExpr::State(_) | TExpr::Action(_)) => {
+            a @ (TExpr::State(..) | TExpr::Action(..)) => {
                 if neg { TExpr::Neg(a.into()) } else { a }
             }
             TExpr::Neg(b) => b.push_neg(!neg),
@@ -312,7 +321,7 @@ impl TExpr {
     fn negate(self) -> TExpr {
         match self {
             TExpr::Bool(b) => TExpr::Bool(!b),
-            a @ (TExpr::State(_) | TExpr::Action(_)) => TExpr::Neg(a.into()),
+            a @ (TExpr::State(..) | TExpr::Action(..)) => TExpr::Neg(a.into()),
             TExpr::Neg(b) => *b,
             TExpr::Conj(xs) => TExpr::junction(xs.into_iter().map(|x| x.negate()), false),
             TExpr::Disj(xs) => TExpr::junction(xs.into_iter().map(|x| x.negate()), true),
@@ -449,7 +458,7 @@ impl TExpr {
                 TExpr::Disj(res)
             }
             TExpr::Neg(b) => match *b {
-                a @ (TExpr::State(_) | TExpr::Action(_)) => TExpr::Neg(a.into()),
+                a @ (TExpr::State(..) | TExpr::Action(..)) => TExpr::Neg(a.into()),
                 b => b.negate().to_dnf(),
             },
             e => e,
@@ -502,7 +511,7 @@ impl TExpr {
     fn to_ltl(&self) -> Ltl {
         match self {
             TExpr::Bool(b) => Ltl::Bool(*b),
-            TExpr::State(i) | TExpr::Action(i) => Ltl::Atom(*i, true),
+            TExpr::State(i, _) | TExpr::Action(i, _) => Ltl::Atom(*i, true),
             TExpr::Neg(b) => b.to_ltl().not(),
             TExpr::Conj(xs) => Ltl::And(xs.iter().map(|x| x.to_ltl()).collect()),
             TExpr::Disj(xs) => Ltl::Or(xs.iter().map(|x| x.to_ltl()).collect()),
@@ -513,7 +522,7 @@ impl TExpr {
 
     fn state_atoms(&self, out: &mut u64) {
         match self {
-            TExpr::State(i) if *i != FAIR => *out |= 1 << i,
+            TExpr::State(i, _) if *i != FAIR => *out |= 1 << i,
             TExpr::Neg(b) | TExpr::All(b) | TExpr::Even(b) => b.state_atoms(out),
             TExpr::Conj(xs) | TExpr::Disj(xs) => xs.iter().for_each(|x| x.state_atoms(out)),
             _ => {}
@@ -571,9 +580,9 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             }
         }
         return Ok(Ok(if action_level(e) {
-            TExpr::Action(atoms.action(g, &box_to_or(e), env)?)
+            TExpr::Action(atoms.action(g, &box_to_or(e), env)?, tag())
         } else {
-            TExpr::State(atoms.state(g, e, env)?)
+            TExpr::State(atoms.state(g, e, env)?, tag())
         }));
     }
     macro_rules! sub {
@@ -615,8 +624,8 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
                 Label(n, ..) if n == crate::ast::ENINST => Label(n.clone(), vec![], step.clone().b()),
                 _ => step.clone(),
             };
-            let en = TExpr::Neg(TExpr::State(atoms.state(g, &Un(UOp::Enabled, en_step.b()), env)?).into());
-            let act = TExpr::Action(atoms.action(g, &step, env)?);
+            let en = TExpr::Neg(TExpr::State(atoms.state(g, &Un(UOp::Enabled, en_step.b()), env)?, tag()).into());
+            let act = TExpr::Action(atoms.action(g, &step, env)?, tag());
             if *weak {
                 TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
             } else {
@@ -715,8 +724,8 @@ fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<S
 }
 /// TLC's fairness conditions in its form; their atoms are only classified
 fn fair_texpr(f: &FairDef) -> TExpr {
-    let en = TExpr::Neg(TExpr::State(FAIR).into());
-    let act = TExpr::Action(FAIR);
+    let en = TExpr::Neg(TExpr::State(FAIR, tag()).into());
+    let act = TExpr::Action(FAIR, tag());
     if f.weak {
         TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
     } else {
@@ -785,10 +794,10 @@ const FAIR_STEP: usize = 1 << 41;
 fn lp_src(e: &TExpr) -> String {
     match e {
         TExpr::Bool(b) => format!("LP::B({b})"),
-        TExpr::State(i) if *i >= FAIR_EN => format!("LP::FE({})", i - FAIR_EN),
-        TExpr::State(i) => format!("LP::S({i})"),
-        TExpr::Action(i) if *i >= FAIR_STEP => format!("LP::FS({})", i - FAIR_STEP),
-        TExpr::Action(i) => format!("LP::A({})", i - ACTION_BASE),
+        TExpr::State(i, _) if *i >= FAIR_EN => format!("LP::FE({})", i - FAIR_EN),
+        TExpr::State(i, _) => format!("LP::S({i})"),
+        TExpr::Action(i, _) if *i >= FAIR_STEP => format!("LP::FS({})", i - FAIR_STEP),
+        TExpr::Action(i, _) => format!("LP::A({})", i - ACTION_BASE),
         TExpr::Neg(b) => format!("LP::Not(&{})", lp_src(b)),
         TExpr::Conj(xs) => format!("LP::And(&[{}])", xs.iter().map(lp_src).collect::<Vec<_>>().join(", ")),
         TExpr::Disj(xs) => format!("LP::Or(&[{}])", xs.iter().map(lp_src).collect::<Vec<_>>().join(", ")),
@@ -796,12 +805,287 @@ fn lp_src(e: &TExpr) -> String {
     }
 }
 
+/// A formula in TLC's tableau (tlc2.tool.liveness: LiveExprNode with LNNext), its state predicates
+/// equal when they come from the same occurrence (see TExpr)
+#[derive(Clone, Debug, PartialEq)]
+enum LN {
+    Bool(bool),
+    State(usize, u32),
+    Neg(Box<LN>),
+    Conj(Vec<LN>),
+    Disj(Vec<LN>),
+    Even(Box<LN>),
+    All(Box<LN>),
+    Next(Box<LN>),
+}
+
+impl LN {
+    /// None for a formula with an action, which TLC refuses in its tableau
+    fn of(t: &TExpr) -> Option<LN> {
+        Some(match t {
+            TExpr::Bool(b) => LN::Bool(*b),
+            TExpr::State(i, k) => LN::State(*i, *k),
+            TExpr::Action(..) => return None,
+            TExpr::Neg(b) => LN::Neg(LN::of(b)?.into()),
+            TExpr::Conj(xs) => LN::Conj(xs.iter().map(LN::of).collect::<Option<_>>()?),
+            TExpr::Disj(xs) => LN::Disj(xs.iter().map(LN::of).collect::<Option<_>>()?),
+            TExpr::All(b) => LN::All(LN::of(b)?.into()),
+            TExpr::Even(b) => LN::Even(LN::of(b)?.into()),
+        })
+    }
+
+    /// makeBinary: a junction split into halves until each has two parts
+    fn binary(self) -> LN {
+        fn junction(xs: Vec<LN>, conj: bool) -> LN {
+            if xs.len() == 1 {
+                return xs.into_iter().next().unwrap().binary();
+            }
+            let h = xs.len() / 2;
+            let (mut a, mut b) = (vec![], vec![]);
+            for (i, x) in xs.into_iter().enumerate() {
+                let v = if i < h { &mut a } else { &mut b };
+                // addConj / addDisj splice a junction of the same kind
+                match x {
+                    LN::Conj(ys) if conj => v.extend(ys),
+                    LN::Disj(ys) if !conj => v.extend(ys),
+                    x => v.push(x),
+                }
+            }
+            let two = vec![junction(a, conj), junction(b, conj)];
+            if conj { LN::Conj(two) } else { LN::Disj(two) }
+        }
+        match self {
+            LN::Conj(xs) => junction(xs, true),
+            LN::Disj(xs) => junction(xs, false),
+            LN::Neg(b) => LN::Neg(b.binary().into()),
+            LN::Even(b) => LN::Even(b.binary().into()),
+            LN::All(b) => LN::All(b.binary().into()),
+            e => e,
+        }
+    }
+
+    /// extractPromises: the <> subformulas, each once, in the order met
+    fn promises(&self, out: &mut Vec<LN>) {
+        match self {
+            LN::Even(b) => {
+                if !out.contains(self) {
+                    out.push(self.clone());
+                }
+                b.promises(out);
+            }
+            LN::Conj(xs) | LN::Disj(xs) => xs.iter().take(2).for_each(|x| x.promises(out)),
+            LN::Neg(b) | LN::All(b) => b.promises(out),
+            _ => {}
+        }
+    }
+
+    /// The two parts an alpha (/\, []) or beta (\/, <>) rule splits a formula into
+    fn split(&self, alpha: bool) -> Option<(LN, LN)> {
+        match self {
+            LN::All(b) if alpha => Some(((**b).clone(), LN::Next(self.clone().into()))),
+            LN::Conj(xs) if alpha => Some((xs[0].clone(), xs[1].clone())),
+            LN::Even(b) if !alpha => Some(((**b).clone(), LN::Next(self.clone().into()))),
+            LN::Disj(xs) if !alpha => Some((xs[0].clone(), xs[1].clone())),
+            _ => None,
+        }
+    }
+}
+
+/// TLC's tableau of a formula (TBPar, TBGraph): its particles in TLC's order, the first `init` of
+/// them those of the formula, each with the particles that can follow it
+struct Tableau {
+    pars: Vec<Vec<LN>>,
+    nexts: Vec<Vec<usize>>,
+    init: usize,
+}
+
+/// TBPar.isLocallyConsistent: no state predicate both in a particle and negated in it
+fn tb_consistent(p: &[LN]) -> bool {
+    let neg: Vec<&LN> = p
+        .iter()
+        .filter_map(|x| match x {
+            LN::Neg(b) if matches!(b.as_ref(), LN::State(..)) => Some(b.as_ref()),
+            _ => None,
+        })
+        .collect();
+    !p.iter().any(|x| matches!(x, LN::State(..)) && neg.contains(&x))
+}
+
+/// TBPar.equals: the same formulas
+fn tb_equal(p: &[LN], q: &[LN]) -> bool {
+    p.iter().all(|x| q.contains(x)) && q.iter().all(|x| p.contains(x))
+}
+
+/// A formula and the two parts of its alpha or beta rule (TBTriple)
+type Triple = (LN, LN, LN);
+
+/// TBPar.particleClosure: the particles of a set of formulas, in TLC's order
+fn tb_particles(terms: Vec<LN>) -> Vec<Vec<LN>> {
+    // positiveClosure (a worklist taken from its end), then the rules of its formulas
+    let mut list = terms.clone();
+    let mut pc = vec![];
+    while let Some(ln) = list.pop() {
+        match &ln {
+            LN::Neg(b) => list.push((**b).clone()),
+            LN::Next(b) => {
+                list.push((**b).clone());
+                pc.push(ln);
+            }
+            LN::Even(b) | LN::All(b) => {
+                list.push((**b).clone());
+                pc.push(ln.clone());
+                pc.push(LN::Next(ln.into()));
+            }
+            LN::Conj(xs) | LN::Disj(xs) => {
+                list.extend(xs.iter().cloned());
+                pc.push(ln);
+            }
+            LN::State(..) | LN::Bool(_) => pc.push(ln),
+        }
+    }
+    let rules = |alpha: bool| -> Vec<Triple> {
+        pc.iter().filter_map(|x| x.split(alpha).map(|(b, c)| (x.clone(), b, c))).collect()
+    };
+    let (alphas, betas) = (rules(true), rules(false));
+    tb_closure(terms, &alphas, &betas)
+}
+
+fn tb_closure(terms: Vec<LN>, alphas: &[Triple], betas: &[Triple]) -> Vec<Vec<LN>> {
+    if !tb_consistent(&terms) {
+        return vec![];
+    }
+    let mut t1 = terms.clone();
+    let mut i = 0;
+    while i < t1.len() {
+        if let Some((k1, k2)) = t1[i].split(true) {
+            match (t1.contains(&k1), t1.contains(&k2)) {
+                (true, true) => {}
+                (true, false) => t1.push(k2),
+                (false, true) => t1.push(k1),
+                (false, false) => {
+                    t1.push(k1);
+                    t1.push(k2);
+                }
+            }
+        }
+        i += 1;
+    }
+    loop {
+        let mut done = true;
+        for (a, b, c) in alphas {
+            if t1.contains(b) && t1.contains(c) && !t1.contains(a) {
+                t1.push(a.clone());
+                done = false;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    if t1.len() > terms.len() && !tb_consistent(&t1) {
+        return vec![];
+    }
+    // particleClosureBeta
+    for x in &t1 {
+        if let Some((k1, k2)) = x.split(false) {
+            if !t1.contains(&k1) && !t1.contains(&k2) {
+                let mut a = t1.clone();
+                a.push(k1);
+                let mut b = t1.clone();
+                b.push(k2);
+                let r1 = tb_closure(a, alphas, betas);
+                let r2 = tb_closure(b, alphas, betas);
+                // TBParVec.union: those of the first not in the second, then the second
+                let mut r: Vec<Vec<LN>> = r1.into_iter().filter(|p| !r2.iter().any(|q| tb_equal(q, p))).collect();
+                r.extend(r2);
+                return r;
+            }
+        }
+    }
+    for (a, b, c) in betas {
+        if (t1.contains(b) || t1.contains(c)) && !t1.contains(a) {
+            let mut t2 = t1.clone();
+            t2.push(a.clone());
+            return tb_closure(t2, alphas, betas);
+        }
+    }
+    vec![t1]
+}
+
+/// The most particles a tableau may have
+const MAX_TABLEAU: usize = 4096;
+
+/// TBGraph's constructor: the particles of the formula, then those that follow each particle
+/// (of its implied successors, the bodies of its ()-formulas), each new one appended
+fn tableau(tf: &LN) -> Option<Tableau> {
+    let mut pars = tb_particles(vec![tf.clone()]);
+    let init = pars.len();
+    let mut nexts = vec![];
+    let mut i = 0;
+    while i < pars.len() {
+        let imp: Vec<LN> = pars[i].iter().filter_map(|x| if let LN::Next(b) = x { Some((**b).clone()) } else { None }).collect();
+        let mut ns = vec![];
+        for p in tb_particles(imp) {
+            let j = match pars.iter().position(|q| tb_equal(&p, q)) {
+                Some(j) => j,
+                None => {
+                    pars.push(p);
+                    pars.len() - 1
+                }
+            };
+            ns.push(j);
+        }
+        nexts.push(ns);
+        if pars.len() > MAX_TABLEAU {
+            return None;
+        }
+        i += 1;
+    }
+    Some(Tableau { pars, nexts, init })
+}
+
+/// The tableau of an order of solution as the runtime's `TTab` fields: each particle's state
+/// predicates (TBGraphNode.statePreds: the state atom and whether it holds), the particles that can
+/// follow it, and the promises it fulfils (TBPar.isFulfilling: <>P not in it, or P in it)
+fn tableau_src(tf: &TExpr) -> Result<String, &'static str> {
+    let tf = LN::of(tf).ok_or("an action in the tableau")?.binary();
+    let mut proms = vec![];
+    tf.promises(&mut proms);
+    if proms.len() > 64 {
+        return Err("more than 64 promises");
+    }
+    let t = tableau(&tf).ok_or("a tableau of more than 4096 particles")?;
+    let mut nodes = vec![];
+    for (p, ns) in t.pars.iter().zip(&t.nexts) {
+        let preds: Vec<String> = p
+            .iter()
+            .filter_map(|x| match x {
+                LN::State(i, _) => Some(format!("({i}, true)")),
+                LN::Neg(b) => match b.as_ref() {
+                    LN::State(i, _) => Some(format!("({i}, false)")),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut ful = 0u64;
+        for (k, pr) in proms.iter().enumerate() {
+            let LN::Even(body) = pr else { unreachable!() };
+            if !p.contains(pr) || p.contains(body) {
+                ful |= 1 << k;
+            }
+        }
+        nodes.push(format!("TNode {{ preds: &[{}], nexts: &{ns:?}, fulfils: {ful} }}", preds.join(", ")));
+    }
+    Ok(format!("tableau: Some(&[{}]), init_cnt: {}, promises: {}", nodes.join(", "), t.init, proms.len()))
+}
+
 /// TLC's plan for finding a counterexample (tlc2.tool.liveness.Liveness.processLiveness), as the
 /// runtime's `TLC_LIVE`, which follows TLC's search on the state graph to print the counterexample
 /// TLC prints: the normal form of fairness /\ ~(the properties), each disjunct a possible error
-/// model of <>[]A (EAAction), []<>S (AEState) and []<>A (AEAction) parts, with the predicates
-/// numbered in TLC's order. A disjunct with another part needs TLC's tableau, which the runtime
-/// does not follow; it then gets the reason.
+/// model of <>[]A (EAAction), []<>S (AEState) and []<>A (AEAction) parts, and the rest of it a
+/// formula for a tableau. The disjuncts with the same rest make an order of solution, in the order
+/// first met, with its tableau and the predicates of its models numbered in TLC's order.
 fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
     let none = |why: &str| format!("type TBits = u64;\nstatic TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
     if props.is_empty() {
@@ -809,8 +1093,8 @@ fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
     }
     let mut conj = vec![];
     for (i, f) in fair.iter().enumerate() {
-        let en = TExpr::Neg(TExpr::State(FAIR_EN + i).into());
-        let act = TExpr::Action(FAIR_STEP + i);
+        let en = TExpr::Neg(TExpr::State(FAIR_EN + i, tag()).into());
+        let act = TExpr::Action(FAIR_STEP + i, tag());
         let t = if f.weak {
             TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
         } else {
@@ -837,26 +1121,15 @@ fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
         TExpr::Disj(d) => d,
         e => vec![e],
     };
-    // The predicates, numbered as TLC's checkState and checkAction (equal ones once)
-    let mut sbin: Vec<(String, TExpr)> = vec![];
-    let mut abin: Vec<(String, TExpr)> = vec![];
-    let bin = |b: &mut Vec<(String, TExpr)>, x: &TExpr| -> usize {
-        let k = format!("{x:?}");
-        match b.iter().position(|(y, _)| *y == k) {
-            Some(i) => i,
-            None => {
-                b.push((k, x.clone()));
-                b.len() - 1
-            }
-        }
-    };
-    let mut pems = vec![];
+    // Each disjunct's tableau formula and model (AEAction, AEState, EAAction parts)
+    #[allow(clippy::type_complexity)]
+    let mut tfbin: Vec<(Option<TExpr>, Vec<(Vec<TExpr>, Vec<TExpr>, Vec<TExpr>)>)> = vec![];
     for d in dnf {
         let items = match d.flatten() {
             TExpr::Conj(xs) => xs,
             e => vec![e],
         };
-        let (mut ea, mut aes, mut aea) = (vec![], vec![], vec![]);
+        let (mut ea, mut aes, mut aea, mut tfs) = (vec![], vec![], vec![], vec![]);
         for ln in items {
             match &ln {
                 TExpr::Even(b) if matches!(b.as_ref(), TExpr::All(c) if c.level() < 3) => {
@@ -867,28 +1140,65 @@ fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
                     let TExpr::Even(c) = b.as_ref() else { unreachable!() };
                     if c.level() <= 1 { aes.push(c.as_ref().clone()) } else { aea.push(c.as_ref().clone()) }
                 }
-                _ => return none("a property TLC checks with its tableau"),
+                _ => tfs.push(ln),
             }
         }
-        // PossibleErrorModel(AEAction, AEState, EAAction): the bins are filled in that order
-        let aea: Vec<usize> = aea.iter().map(|x| bin(&mut abin, x)).collect();
-        let aes: Vec<usize> = aes.iter().map(|x| bin(&mut sbin, x)).collect();
-        let ea: Vec<usize> = ea.iter().map(|x| bin(&mut abin, x)).collect();
-        pems.push(format!("TPem {{ ae_state: &{aes:?}, ae_action: &{aea:?}, ea_action: &{ea:?} }}"));
+        let tf = match tfs.len() {
+            0 => None,
+            1 => tfs.pop(),
+            _ => Some(TExpr::junction(tfs, true)),
+        };
+        match tfbin.iter_mut().find(|x| x.0 == tf) {
+            Some(x) => x.1.push((aea, aes, ea)),
+            None => tfbin.push((tf, vec![(aea, aes, ea)])),
+        }
     }
-    if sbin.len() > 128 || abin.len() > 128 {
-        return none("more than 128 predicates");
+    // The predicates of an order of solution, numbered as TLC's checkState and checkAction (equal
+    // ones once)
+    let bin = |b: &mut Vec<TExpr>, x: &TExpr| -> usize {
+        match b.iter().position(|y| y == x) {
+            Some(i) => i,
+            None => {
+                b.push(x.clone());
+                b.len() - 1
+            }
+        }
+    };
+    let mut wide = false;
+    let mut oss = vec![];
+    for (tf, models) in &tfbin {
+        let tab = match tf {
+            None => "tableau: None, init_cnt: 0, promises: 0".to_string(),
+            Some(tf) => match tableau_src(tf) {
+                Ok(s) => s,
+                Err(m) => return none(m),
+            },
+        };
+        let (mut sbin, mut abin) = (vec![], vec![]);
+        let mut pems = vec![];
+        for (aea, aes, ea) in models {
+            // PossibleErrorModel(AEAction, AEState, EAAction): the bins are filled in that order
+            let aea: Vec<usize> = aea.iter().map(|x| bin(&mut abin, x)).collect();
+            let aes: Vec<usize> = aes.iter().map(|x| bin(&mut sbin, x)).collect();
+            let ea: Vec<usize> = ea.iter().map(|x| bin(&mut abin, x)).collect();
+            pems.push(format!("TPem {{ ae_state: &{aes:?}, ae_action: &{aea:?}, ea_action: &{ea:?} }}"));
+        }
+        if sbin.len() > 128 || abin.len() > 128 {
+            return none("more than 128 predicates");
+        }
+        wide |= sbin.len() > 64 || abin.len() > 64;
+        let cs: Vec<String> = sbin.iter().map(lp_src).collect();
+        let ca: Vec<String> = abin.iter().map(lp_src).collect();
+        oss.push(format!(
+            "TOos {{ {tab}, check_state: &[{}], check_action: &[{}], pems: &[{}] }}",
+            cs.join(", "),
+            ca.join(", "),
+            pems.join(", ")
+        ));
     }
-    let cs: Vec<String> = sbin.iter().map(|(_, x)| lp_src(x)).collect();
-    let ca: Vec<String> = abin.iter().map(|(_, x)| lp_src(x)).collect();
     // The predicates of a state or step as a bit mask (wider only when needed)
-    let bits = if sbin.len() > 64 || abin.len() > 64 { "u128" } else { "u64" };
-    format!(
-        "type TBits = {bits};\nstatic TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ check_state: &[{}], check_action: &[{}], pems: &[{}] }});\n",
-        cs.join(", "),
-        ca.join(", "),
-        pems.join(", ")
-    )
+    let bits = if wide { "u128" } else { "u64" };
+    format!("type TBits = {bits};\nstatic TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ oos: &[{}] }});\n", oss.join(", "))
 }
 
 /// The most states an automaton may have
