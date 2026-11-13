@@ -1345,12 +1345,14 @@ impl<'a> Gen<'a> {
     /// An EXCEPT step `[i]` into a tuple with i not constant: `!p[i] ... = v` becomes
     /// `!p = CASE i = 1 -> [@ EXCEPT ![1] ... = v] [] ... [] OTHER -> @`, since each element of a
     /// tuple may have its own type (an index outside the tuple leaves it unchanged, as in TLC)
-    /// `warn` is where the value is written, for TLC's warning about an index outside the tuple
+    /// `warn` is where the value is written, for TLC's warning about an index outside the tuple.
+    /// A constant index outside the tuple is split the same way, into that warning
     fn split_dynamic_index(&mut self, t: &Ty, path: &[Path], val: &Expr, env: &Env, warn: Option<&str>) -> (Vec<Path>, Expr) {
         let mut cur = Some(t.clone());
         for (j, p) in path.iter().enumerate() {
             if let (Path::Idx(i), Some(Ty::Rec(fs))) = (p, &cur) {
-                if is_tuple_fields(fs) && self.try_const(i, env).is_none() {
+                let inside = matches!(self.try_const(i, env), Some(Value::Int(k)) if k >= 1 && k as u64 <= fs.len() as u64);
+                if is_tuple_fields(fs) && !inside {
                     self.tmp += 1;
                     let at = format!("@dyn{}", self.tmp);
                     let base = Expr::Ident(at.clone(), NOPOS);
