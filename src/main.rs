@@ -16,6 +16,7 @@ mod ast;
 mod cfg;
 mod codegen;
 mod community;
+mod community_modules;
 mod compile;
 mod expand;
 mod graph;
