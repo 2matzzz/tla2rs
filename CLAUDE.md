@@ -589,8 +589,9 @@ the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What 
   action that yields it. The lasso ends `Stuttering` when it ends on the start, otherwise `Back to state N`, N the
   number of the start
 
-The checker follows this when there is no tableau, no VIEW or SYMMETRY, no model value in the states and at most 64
-predicates, and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own, not
+The checker follows this when there is no tableau, no VIEW or SYMMETRY, no model value in the states, at most 64
+predicates and no `-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's `args`
+choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own, not
 TLC's", with the reason). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
 after `MATCH` (`lasso confirmed instead: <reason>`). Of the 44 liveness violations of `examples/` and `tests/tlc/`, 20
 follow TLC's search. Of the 24 others, 13 print a lasso equal to TLC's anyway, and 11 differ: 5 need a tableau

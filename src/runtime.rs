@@ -1850,6 +1850,7 @@ fn main() {
         f.store(args.iter().any(|x| x == a), std::sync::atomic::Ordering::Relaxed);
     }
     DUMP_LABELS.store(args.iter().any(|x| x == "-dumplabels"), std::sync::atomic::Ordering::Relaxed);
+    OTHER_FP.store(args.iter().any(|x| x == "-tlcfp"), std::sync::atomic::Ordering::Relaxed);
     DUMP_ATTRS.store(args.iter().any(|x| x == "-dumplabels" || x == "-dumpattrs"), std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = args.iter().position(|a| a == "-dumpgraph").and_then(|i| args.get(i + 1)) {
         dump_open(std::path::Path::new(p), false);
@@ -4250,6 +4251,9 @@ struct TLive {
 /// TLC's fingerprint polynomial for `-fp 0` (tlc2.util.FP64.Polys[0])
 const FP64_POLY: u64 = 0x911498AE0E66BAD6;
 
+/// TLC's `-fp` chose another polynomial
+static OTHER_FP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn fp64_table() -> &'static [u64; 256] {
     static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
@@ -4503,6 +4507,9 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     };
     if HAS_VIEW || !PERMS.is_empty() {
         return Err("VIEW or SYMMETRY");
+    }
+    if flag(&OTHER_FP) {
+        return Err("a fingerprint polynomial other than that of -fp 0");
     }
     let n = g.states.len();
     let mut tfp = Vec::with_capacity(n);
@@ -4841,9 +4848,8 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
         let mut texts = vec![];
         for (i, (s, l)) in out.iter().enumerate() {
-            let t = show(s);
-            println!("State {}: <{}>\n{t}\n", i + 1, name(*l));
-            texts.push(t);
+            print_step(&format!("State {}: <{}>", i + 1, name(*l)), s, (i > 0).then(|| &out[i - 1].0));
+            texts.push(show(s));
         }
         match back {
             None => {
