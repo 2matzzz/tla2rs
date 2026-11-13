@@ -1862,6 +1862,15 @@ impl<'a> Gen<'a> {
             let inner = self.s_has(&v, &jst, x, xt)?;
             return Ok(format!("{{ let {v} = {cc}; {inner} }}"));
         }
+        // x has fields the elements lack (records of other fields, model values beside records):
+        // compare in x's type
+        if self.coerce_soft(x.to_string(), xt, &et).is_err() && join(xt, &et).ok().as_ref() == Some(xt) {
+            let xst = Ty::Set(xt.clone().into());
+            let cc = self.coerce(c.to_string(), st, &xst)?;
+            let v = self.fresh("s");
+            let inner = self.s_has(&v, &xst, x, xt)?;
+            return Ok(format!("{{ let {v} = {cc}; {inner} }}"));
+        }
         if is_sparse(st) {
             let Ok(xc) = self.coerce_soft(x.to_string(), xt, &et) else { return Ok("false".into()) };
             return Ok(format!("({c}).contains(&{xc})"));
@@ -4632,6 +4641,31 @@ impl<'a> Gen<'a> {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
                 fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
+                // Records of different fields (or model values beside records) in one type: x is
+                // in the set when it has the set's fields and no other
+                if xf.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) {
+                    if fs.iter().any(|(n, _)| !xf.iter().any(|(m, _)| m == n)) {
+                        return Ok("false".into());
+                    }
+                    let mut parts = vec![];
+                    for (i, (n, ft)) in xf.iter().enumerate() {
+                        let f = format!("{x}{}", rec_field(xf.len(), i));
+                        let e = self.fresh("e");
+                        match (fs.iter().find(|(m, _)| m == n), ft) {
+                            (Some((_, se)), Ty::Opt(t)) => {
+                                let inner = self.gen_member(&e, t, se, env)?;
+                                parts.push(format!("({f}.0 && {{ let {e} = {f}.1; {inner} }})"));
+                            }
+                            (Some((_, se)), t) => {
+                                let inner = self.gen_member(&e, t, se, env)?;
+                                parts.push(format!("{{ let {e} = {f}; {inner} }}"));
+                            }
+                            (None, Ty::Opt(_)) => parts.push(format!("!{f}.0")),
+                            (None, _) => return Ok("false".into()),
+                        }
+                    }
+                    return Ok(format!("({})", parts.join(" && ")));
+                }
                 if fs.len() != xf.len() || fs.iter().zip(xf).any(|(a, b)| a.0 != b.0) {
                     return Ok("false".into());
                 }
