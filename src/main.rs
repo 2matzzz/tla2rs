@@ -182,6 +182,10 @@ fn main() {
     let mut made: Vec<String> = vec![];
     let mut order_runs = 0;
     let order_file = dir.join("strings-made.txt");
+    // How many elements the value that outgrew its capacity needs, at least (see
+    // `capacity_exceeded` in runtime.rs), and how many times each kind has grown
+    let need_file = dir.join("capacity-needed.txt");
+    let mut grown = [0u32; 2];
     let mut first = true;
     loop {
         let t0 = Instant::now();
@@ -210,7 +214,8 @@ fn main() {
         let (scap, qcap) = output.caps;
         let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).collect();
         let mut cmd = Command::new(bin);
-        cmd.args(&pass).env("TLA2RS_GROW", grow);
+        cmd.args(&pass).env("TLA2RS_GROW", grow).env("TLA2RS_NEED", &need_file);
+        let _ = std::fs::remove_file(&need_file);
         if order_runs < ORDER_RUNS {
             cmd.env("TLA2RS_ORDER", &order_file);
         }
@@ -227,11 +232,18 @@ fn main() {
             first = false;
             continue;
         }
-        let (what, old, new) = match code {
-            CAP_EXIT_SET => ("a set", scap, (scap * 2).min(types::MAX_CAP)),
-            CAP_EXIT_SEQ => ("a sequence", qcap, (qcap * 2).clamp(8, types::MAX_CAP)),
+        let (what, old) = match code {
+            CAP_EXIT_SET => ("a set", scap),
+            CAP_EXIT_SEQ => ("a sequence", qcap),
             _ => exit(code),
         };
+        // Twice the room the first time a kind grows, four times after that: a value that outgrew
+        // its capacity twice is likely far beyond it, and each build costs seconds. Never less
+        // than the value needs
+        let kind = (code - CAP_EXIT_SET) as usize;
+        grown[kind] += 1;
+        let need = std::fs::read_to_string(&need_file).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(old + 1);
+        let new = (old * if grown[kind] == 1 { 2 } else { 4 }).max(need).clamp(8, types::MAX_CAP);
         if code == CAP_EXIT_SET {
             setcap = new;
         } else {

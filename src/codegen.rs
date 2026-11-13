@@ -1895,7 +1895,7 @@ impl<'a> Gen<'a> {
             let ts: Vec<Ty> = ts.into_iter().cloned().collect();
             let n = ts.len();
             // Converted, a tuple longer than the sequences' capacity stops for a larger one
-            let mut parts = vec![format!("({n} > QCAP && seq_too_long(QCAP))"), format!("({x}).len == {n}")];
+            let mut parts = vec![format!("({n} > QCAP && seq_too_long(QCAP, {n}))"), format!("({x}).len == {n}")];
             for (k, t) in ts.iter().enumerate() {
                 parts.push(self.eq_into(&format!("({e}){}", rec_field(n, k)), t, &format!("({x}).items[{k}]"), se)?);
             }
@@ -6916,8 +6916,8 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> PartialOrd for Sq<T, N> {
     }
 }
 #[cold]
-fn seq_too_long(n: usize) -> ! {
-    capacity_exceeded(CAP_SEQ, format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
+fn seq_too_long(n: usize, need: usize) -> ! {
+    capacity_exceeded(CAP_SEQ, need, format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
 }
 impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     fn new() -> Self {
@@ -6931,6 +6931,9 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     }
     fn from_slice(xs: &[T]) -> Self {
         let mut s = Self::new();
+        if xs.len() > N {
+            seq_too_long(N, xs.len())
+        }
         for &x in xs {
             s.push(x);
         }
@@ -6938,7 +6941,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     }
     fn push(&mut self, x: T) {
         if self.len as usize == N {
-            seq_too_long(N)
+            seq_too_long(N, N + 1)
         }
         self.items[self.len as usize] = x;
         self.len += 1;
@@ -6963,6 +6966,9 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     }
     fn concat(&self, o: &Self) -> Self {
         let mut s = *self;
+        if self.len as usize + o.len as usize > N {
+            seq_too_long(N, self.len as usize + o.len as usize)
+        }
         for x in o.iter() {
             s.push(x);
         }
