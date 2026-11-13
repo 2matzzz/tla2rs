@@ -3057,6 +3057,15 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             dump_node(&mut buf, &id, &s, true);
             dump_write(&mut buf);
         }
+        // An initial state that does not pack cannot be evaluated reliably (a test decided by the
+        // types assumes its values are in them): without the type invariant to check first, it
+        // stops the search before its invariants (see Limitations in README.md)
+        if w.is_none() && in_model && !TYPE_INV_SUBSUMED {
+            let e = EvalErr::Type("an initial state".into());
+            report_eval(&e);
+            println!("{}", show(&s));
+            exit(eval_code(&e));
+        }
         // An initial state that does not pack violates the type invariant, which TLC checks where
         // the cfg lists it
         let out_of_type = w.is_none() && TYPE_INV_SUBSUMED && !flag(&CONTINUE);
@@ -3231,8 +3240,12 @@ fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
     SFound::new(sfp, Some((t, l)), msg)
 }
 fn pack_failed_msg(t: &State) -> SMsg {
-    let checked = if TYPE_INV_SUBSUMED { eval_invariants_before_type(t) } else { eval_invariants(t) };
-    match checked {
+    // Its invariants are evaluated only before the type invariant TLC checks too (see
+    // initial_states)
+    if !TYPE_INV_SUBSUMED {
+        return SMsg::OutOfType;
+    }
+    match eval_invariants_before_type(t) {
         Ok(Some(inv)) => SMsg::Inv(inv),
         Err((inv, e)) => SMsg::InvEval(inv, e),
         Ok(None) => SMsg::OutOfType,
