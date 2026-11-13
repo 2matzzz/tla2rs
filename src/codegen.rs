@@ -103,6 +103,11 @@ pub struct Gen<'a> {
     pub split_warns: Vec<String>,
     /// The strings TLC makes then, in the order made
     pub split_strs: Vec<u32>,
+    /// The variables whose sets of integers TLC may hold as intervals, with their first bit in
+    /// the state's shape and their number of bits (see `plan_shapes`)
+    pub shaped: std::collections::BTreeMap<String, (u32, u32)>,
+    /// The types a value is printed of with its shape (`fmtsh_` functions)
+    pub fmtsh_need: BTreeSet<Ty>,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
     /// Maximum length of a sequence (QCAP); 0 while no bound is known
@@ -179,6 +184,8 @@ impl<'a> Gen<'a> {
             split_warning: None,
             split_warns: vec![],
             split_strs: vec![],
+            shaped: std::collections::BTreeMap::new(),
+            fmtsh_need: BTreeSet::new(),
             scap: 8,
             qcap: 0,
             infer: None,
@@ -2647,6 +2654,16 @@ impl<'a> Gen<'a> {
                             (s, id)
                         })
                         .collect();
+                    // A set of integers TLC holds as an interval prints as one (see `shape_of`)
+                    let sh = if Self::shape_slots(&t) > 0 { self.shape_of(x, &t, env) } else { "0".into() };
+                    if sh != "0" {
+                        for v in &vals {
+                            for s in shown_forms(self.atoms, v, &t).into_iter().skip(1) {
+                                let id = self.atoms.intern(false, &s);
+                                table.push((s, id));
+                            }
+                        }
+                    }
                     table.sort();
                     table.dedup();
                     let mut res: Vec<u32> = table.iter().map(|(_, i)| *i).collect();
@@ -2654,10 +2671,16 @@ impl<'a> Gen<'a> {
                     res.dedup();
                     let rows: Vec<String> = table.iter().map(|(s, i)| format!("({s:?}, {i})")).collect();
                     let code = format!(
-                        "{{ static T: [(&str, u16); {}] = [{}]; let __k = fmt_{tid}(&{c}); match T.binary_search_by(|(s, _)| (*s).cmp(__k.as_str())) {{ \
+                        "{{ static T: [(&str, u16); {}] = [{}]; let __k = {}; match T.binary_search_by(|(s, _)| (*s).cmp(__k.as_str())) {{ \
                          Ok(__i) => T[__i].1, Err(_) => eval_error(format!(\"ToString of {{__k}}: TLC prints this value in a way that depends on how it was built (an empty function prints as << >> or <<>>)\")) }} }}",
                         rows.len(),
-                        rows.join(", ")
+                        rows.join(", "),
+                        if sh != "0" {
+                            self.fmtsh_need.insert(t.clone());
+                            format!("{{ let __x = {c}; fmtsh_{tid}(&__x, {sh}) }}")
+                        } else {
+                            format!("fmt_{tid}(&{c})")
+                        }
                     );
                     (self.note_made(code, &res), Ty::Enum(res))
                 }
@@ -2761,16 +2784,16 @@ impl<'a> Gen<'a> {
                 }
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
-                    let id = self.ty_id(&t)?;
-                    (format!("{{ tlc_print(ppr(&fmt_{id}(&{c}))); true }}"), Ty::Bool)
+                    let shown = self.fmt_shaped(x, "__x", &t, env)?;
+                    (format!("{{ let __x = {c}; tlc_print(ppr(&{shown})); true }}"), Ty::Bool)
                 }
                 // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
                     let (c, t) = self.gen(x, env, None)?;
-                    let id = self.ty_id(&t)?;
+                    let shown = self.fmt_shaped(x, "__x", &t, env)?;
                     let (vc, vt) = self.gen(v, env, want)?;
-                    let vid = self.ty_id(&vt)?;
-                    (format!("{{ let __x = {c}; let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr(&fmt_{id}(&__x)), ppr(&fmt_{vid}(&__v)))); __v }}"), vt)
+                    let vshown = self.fmt_shaped(v, "__v", &vt, env)?;
+                    (format!("{{ let __x = {c}; let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr(&{shown}), ppr(&{vshown}))); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int_of("Expt", false, false, a, env)?;
@@ -3115,7 +3138,7 @@ impl<'a> Gen<'a> {
                         inner.primed.clear();
                         inner.work = None;
                         let (c, _) = self.gen(&Un(UOp::Enabled, x.clone()), &inner, None)?;
-                        (format!("{{ let __st = State {{ {} }}; let s = &__st; {c} }}", fields.join(", ")), Ty::Bool)
+                        (format!("{{ let __st = State {{ {}{} }}; let s = &__st; {c} }}", fields.join(", "), self.sh_field("Sh(0)")), Ty::Bool)
                     }
                 }
             }
@@ -3836,7 +3859,7 @@ impl<'a> Gen<'a> {
                             return Err(format!("recursive operator `{}` evaluates ENABLED in Init before {v} is assigned", rd.name));
                         }
                         let fields: Vec<String> = self.vars.iter().map(|(v, _)| format!("v_{v}: {}", env.primed[v].0)).collect();
-                        format!("&State {{ {} }}, ", fields.join(", "))
+                        format!("&State {{ {}{} }}, ", fields.join(", "), self.sh_field("Sh(0)"))
                     } else {
                         "s, ".into()
                     };
@@ -5311,6 +5334,7 @@ impl<'a> Gen<'a> {
                             }
                         },
                     }
+                    self.shape_set(&v, &w, Some(rhs), env, out);
                     env2.primed.insert(v, (place, t));
                     return self.gen_action(rest, &env2, out);
                 }
@@ -5351,6 +5375,7 @@ impl<'a> Gen<'a> {
                     let mut env2 = self.renew_work(env, out);
                     let w = self.work_var(&mut env2, out);
                     writeln!(out, "{w}.v_{v} = {p};").unwrap();
+                    self.shape_set(&v, &w, None, &env2, out);
                     let place = format!("{w}.v_{v}");
                     env2.primed.insert(v, (place, t));
                     self.gen_action(rest, &env2, out)?;
@@ -5916,7 +5941,7 @@ impl<'a> Gen<'a> {
             // An initial state has no predecessor, so start from default values
             let fields: Vec<String> =
                 self.vars.iter().map(|(v, t)| format!("v_{v}: {}", Self::default_code(t))).collect();
-            writeln!(out, "let mut {w} = State {{ {} }};", fields.join(", ")).unwrap();
+            writeln!(out, "let mut {w} = State {{ {}{} }};", fields.join(", "), self.sh_field("Sh(0)")).unwrap();
         } else {
             writeln!(out, "let mut {w} = *s;").unwrap();
         }
@@ -5953,7 +5978,7 @@ impl<'a> Gen<'a> {
                             format!("v_{v}: {val}")
                         })
                         .collect();
-                    format!("State {{ {} }}", fields.join(", "))
+                    format!("State {{ {}{} }}", fields.join(", "), self.sh_field(if env.init { "Sh(0)" } else { "s.sh" }))
                 }
             };
             unassigned.sort_unstable();
@@ -5974,7 +5999,7 @@ impl<'a> Gen<'a> {
                     .iter()
                     .map(|(v, _)| format!("v_{v}: {}", env.primed.get(v).map_or(format!("s.v_{v}"), |p| p.0.clone())))
                     .collect();
-                format!("State {{ {} }}", fields.join(", "))
+                format!("State {{ {}{} }}", fields.join(", "), self.sh_field(if env.init { "Sh(0)" } else { "s.sh" }))
             }
         };
         if env.init {
@@ -6734,11 +6759,17 @@ impl<'a> Gen<'a> {
         }
         // If the offset stayed constant, p is unused; omit it to avoid an unused-variable warning
         let pack_p = if at.is_some() { "" } else { "let mut p = 0u32; " };
-        let words = total.div_ceil(64).max(1);
+        let mut words = total.div_ceil(64).max(1);
         let mut at = Some(0u32);
         let mut un = String::from("State { ");
         for (v, t) in self.vars.clone() {
             write!(un, "v_{v}: {}, ", self.unpack_value(&t, &mut at)?).unwrap();
+        }
+        // The shape, in a word of its own after the state, which fingerprints leave out
+        if !self.shaped.is_empty() {
+            words += 1;
+            body += "w[WORDS - 1] = s.sh.0; ";
+            un += "sh: Sh(w[WORDS - 1]), ";
         }
         un += "}";
         let unpack_p = if at.is_some() { "" } else { "let mut p = 0u32; " };
@@ -6851,7 +6882,7 @@ impl<'a> Gen<'a> {
         for (v, t) in self.vars.clone() {
             fields.push(format!("v_{v}: {}", self.perm_code(&format!("s.v_{v}"), &t)?));
         }
-        writeln!(s, "fn perm_state(s: &State, pm: &[u16]) -> State {{ State {{ {} }} }}", fields.join(", ")).unwrap();
+        writeln!(s, "fn perm_state(s: &State, pm: &[u16]) -> State {{ State {{ {}{} }} }}", fields.join(", "), self.sh_field("s.sh")).unwrap();
         // TLC's order of states: the variables in the order it prints them, each in its order of
         // values (with a VIEW, the smallest permuted state is the one whose view is taken)
         let mut cmp = String::from("std::cmp::Ordering::Equal");
@@ -7341,5 +7372,418 @@ pub fn short(e: &Expr) -> String {
         format!("{}…", &s[..s.char_indices().nth(200).map(|x| x.0).unwrap_or(s.len())])
     } else {
         s
+    }
+}
+
+// ---------------------------------------------------------------- Intervals
+//
+// TLC holds the value of `a..b` as an interval and prints it as `a..b` (`{}` when empty) until an
+// operation makes another set of it, so the same set prints `1..3` or `{1, 2, 3}` depending on how
+// it was built (`tests/tlc/IntervalShow`). A checker whose variables may hold such sets keeps,
+// beside each state, a shape: one bit per set of integers in those variables (also in the fields
+// of a record or tuple), set when TLC holds that set as an interval. It is not part of the
+// fingerprint, and the queue keeps it in a word of its own after the state (`gen_pack`).
+
+/// The texts TLC may print for v of type t: as enumerated sets first, then with some sets of
+/// integers held as intervals (at most 64 forms; beyond, the first only)
+pub fn shown_forms(atoms: &Atoms, v: &Value, t: &Ty) -> Vec<String> {
+    let plain = crate::compile::show_value(atoms, v);
+    let mut out = match (t, v) {
+        (Ty::Set(_), _) => interval_text(v).into_iter().collect(),
+        (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) && fs.len() == xs.len() && Gen::shape_slots(t) > 0 => {
+            let parts: Vec<Vec<String>> = fs.iter().zip(xs).map(|((_, ft), x)| shown_forms(atoms, x, ft)).collect();
+            product(&parts).into_iter().map(|p| format!("<<{}>>", p.join(", "))).collect()
+        }
+        (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) && fs.len() == m.len() && Gen::shape_slots(t) > 0 => {
+            let parts: Option<Vec<Vec<String>>> =
+                fs.iter().map(|(f, ft)| m.get(f).map(|x| shown_forms(atoms, x, ft).into_iter().map(|y| format!("{f} |-> {y}")).collect())).collect();
+            parts.map_or(vec![], |ps| product(&ps).into_iter().map(|p| format!("[{}]", p.join(", "))).collect())
+        }
+        _ => vec![],
+    };
+    out.retain(|x| *x != plain);
+    out.insert(0, plain);
+    out.dedup();
+    out
+}
+
+/// Every choice of one string from each part, while there are at most 64
+fn product(parts: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![vec![]];
+    for p in parts {
+        if out.len() * p.len() > 64 {
+            return vec![];
+        }
+        out = out.iter().flat_map(|o| p.iter().map(move |x| [o.clone(), vec![x.clone()]].concat())).collect();
+    }
+    out
+}
+
+/// A set of integers as TLC prints an interval, if it is one: `a..b`
+pub fn interval_text(v: &Value) -> Option<String> {
+    let Value::Set(xs) = v else { return None };
+    let (Some(Value::Int(lo)), Some(Value::Int(hi))) = (xs.first(), xs.last()) else { return None };
+    let (lo, hi) = (*lo, *hi);
+    (hi - lo + 1 == xs.len() as i64).then(|| format!("{lo}..{hi}"))
+}
+
+impl Gen<'_> {
+    /// The bits of shape a value of type t has: one for a set of integers, and those of the fields
+    /// of a record or tuple
+    pub fn shape_slots(t: &Ty) -> u32 {
+        let n = match t {
+            Ty::Set(e) if matches!(**e, Ty::Int(..)) => 1,
+            Ty::Rec(fs) if !fs.is_empty() && fs.iter().all(|(n, f)| !matches!(f, Ty::Opt(_)) && n != ATOM_FIELD && n != VAL_FIELD) => {
+                fs.iter().map(|(_, f)| Self::shape_slots(f)).sum()
+            }
+            _ => 0,
+        };
+        if n > 64 {
+            0
+        } else {
+            n
+        }
+    }
+
+    fn int_set(t: &Ty) -> bool {
+        matches!(t, Ty::Set(e) if matches!(**e, Ty::Int(..)))
+    }
+
+    /// `, sh: <x>` for a state built field by field, when states have a shape
+    fn sh_field(&self, x: &str) -> String {
+        if self.shaped.is_empty() {
+            String::new()
+        } else {
+            format!(", sh: {x}")
+        }
+    }
+
+    /// After `v` is assigned in the state under construction `w`: its shape, from how `rhs` builds
+    /// the value (None: an element of a set, which TLC holds as it was built; 0 here)
+    fn shape_set(&mut self, v: &str, w: &str, rhs: Option<&Expr>, env: &Env, out: &mut String) {
+        if self.infer.is_some() || !self.shaped.contains_key(v) {
+            return;
+        }
+        let t = self.var_ty(v);
+        let code = rhs.map_or("0".into(), |e| self.shape_of(e, &t, env));
+        writeln!(out, "shs_{v}(&mut {w}, {code});").unwrap();
+    }
+
+    /// The shape of a variable read in `e` (x or x'), as code, with its type
+    fn var_shape(&self, e: &Expr, env: &Env) -> Option<(String, Ty)> {
+        let (v, primed) = match e.strip() {
+            Expr::Ident(v, _) => (v, env.init),
+            Expr::Prime(x) => match x.strip() {
+                Expr::Ident(v, _) => (v, true),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if env.locals.contains_key(v) || !self.shaped.contains_key(v) {
+            return None;
+        }
+        let code = if self.infer.is_some() {
+            // While inferring types, only whether there is a shape matters
+            format!("shg_{v}(s)")
+        } else if primed {
+            let (place, _) = env.primed.get(v)?;
+            format!("shg_{v}(&{})", place.strip_suffix(&format!(".v_{v}"))?)
+        } else {
+            format!("shg_{v}(s)")
+        };
+        Some((code, self.var_ty(v)))
+    }
+
+    /// The shape of the value `e` builds, of type t, as code (bits as `shape_slots` lays them
+    /// out). TLC holds `a..b` and DOMAIN of a tuple or sequence as intervals; a variable keeps the
+    /// shape of its value; a tuple, record or EXCEPT keeps those of its parts. Anything else is
+    /// taken as an enumerated set (0): another set operation, and also what is not followed here
+    /// (a branch of IF or CASE that differs from the others, CHOOSE, an element of a set or a
+    /// function's value)
+    pub fn shape_of(&mut self, e: &Expr, t: &Ty, env: &Env) -> String {
+        let n = Self::shape_slots(t);
+        if n == 0 {
+            return "0".into();
+        }
+        let fields = |t: &Ty| -> Vec<(String, Ty, u32)> {
+            let Ty::Rec(fs) = t else { return vec![] };
+            let mut at = 0;
+            fs.iter()
+                .map(|(f, ft)| {
+                    let k = Self::shape_slots(ft);
+                    at += k;
+                    (f.clone(), ft.clone(), at - k)
+                })
+                .collect()
+        };
+        let same = |a: &Ty, b: &Ty| a == b || Self::int_set(a) && Self::int_set(b);
+        let mask = |k: u32| if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+        match e.strip() {
+            Expr::Bin(BOp::Range, ..) if Self::int_set(t) => "1".into(),
+            Expr::Un(UOp::Domain, x) if Self::int_set(t) => {
+                if matches!(x.strip(), Expr::Tuple(_)) || self.is_seq_or_tuple(x) {
+                    "1".into()
+                } else {
+                    "0".into()
+                }
+            }
+            Expr::Ident(..) | Expr::Prime(_) => match self.var_shape(e, env) {
+                Some((c, vt)) if same(&vt, t) => c,
+                _ => "0".into(),
+            },
+            Expr::If(c, a, b) => {
+                let (sa, sb) = (self.shape_of(a, t, env), self.shape_of(b, t, env));
+                if sa == sb {
+                    return sa;
+                }
+                // The condition again, when evaluating it twice changes nothing TLC shows
+                let shows = c.any(&|y| matches!(y, Expr::Call(n, _) if ["Print", "PrintT", "ToString", "Assert"].contains(&n.as_str())));
+                match self.gen(c, env, Some(&Ty::Bool)) {
+                    Ok((cc, Ty::Bool)) if !shows => format!("(if {cc} {{ {sa} }} else {{ {sb} }})"),
+                    _ => "0".into(),
+                }
+            }
+            Expr::Tuple(xs) if matches!(t, Ty::Rec(fs) if is_tuple_fields(fs) && fs.len() == xs.len()) => {
+                let parts: Vec<String> = fields(t)
+                    .iter()
+                    .zip(xs)
+                    .filter_map(|((_, ft, at), x)| {
+                        let c = self.shape_of(x, ft, env);
+                        (c != "0").then(|| format!("(({c}) << {at})"))
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    "0".into()
+                } else {
+                    parts.join(" | ")
+                }
+            }
+            // [x \in D |-> e] over the indices of a tuple: e's shape for each
+            Expr::FunCons(_, _, body) if matches!(t, Ty::Rec(fs) if is_tuple_fields(fs)) => {
+                let parts: Vec<String> = fields(t)
+                    .iter()
+                    .filter_map(|(_, ft, at)| {
+                        let c = self.shape_of(body, ft, env);
+                        (c != "0").then(|| format!("(({c}) << {at})"))
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    "0".into()
+                } else {
+                    parts.join(" | ")
+                }
+            }
+            Expr::RecLit(xs) if matches!(t, Ty::Rec(fs) if !is_tuple_fields(fs)) => {
+                let parts: Vec<String> = fields(t)
+                    .iter()
+                    .filter_map(|(f, ft, at)| {
+                        let x = xs.iter().find(|(g, _)| g == f)?;
+                        let c = self.shape_of(&x.1, ft, env);
+                        (c != "0").then(|| format!("(({c}) << {at})"))
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    "0".into()
+                } else {
+                    parts.join(" | ")
+                }
+            }
+            Expr::Except(base, ups) if matches!(t, Ty::Rec(_)) => {
+                let mut c = self.shape_of(base, t, env);
+                let fs = fields(t);
+                for (path, val) in ups {
+                    // Expansion names each EXCEPT's @ in a last field of its own
+                    let path = match path.split_last() {
+                        Some((Path::Field(a), p)) if a.starts_with('@') => p,
+                        _ => path.as_slice(),
+                    };
+                    let f = match path {
+                        [Path::Field(f)] => fs.iter().find(|x| x.0 == *f),
+                        [Path::Idx(i)] => match i.strip() {
+                            Expr::Num(k) if *k >= 1 && is_tuple_fields(&fs.iter().map(|x| (x.0.clone(), x.1.clone())).collect::<Vec<_>>()) => {
+                                fs.get(*k as usize - 1)
+                            }
+                            _ => return "0".into(),
+                        },
+                        _ => return "0".into(),
+                    };
+                    let Some((_, ft, at)) = f.cloned() else { return "0".into() };
+                    let k = Self::shape_slots(&ft);
+                    if k == 0 {
+                        continue;
+                    }
+                    let vc = self.shape_of(val, &ft, env);
+                    c = format!("((({c}) & !({}u64 << {at})) | (({vc}) << {at}))", mask(k));
+                }
+                c
+            }
+            Expr::Field(base, f) => match self.var_shape(base, env) {
+                Some((c, bt)) => match fields(&bt).into_iter().find(|x| x.0 == *f) {
+                    Some((_, ft, at)) if same(&ft, t) => format!("((({c}) >> {at}) & {}u64)", mask(n)),
+                    _ => "0".into(),
+                },
+                None => "0".into(),
+            },
+            Expr::App(base, i) => match (self.var_shape(base, env), i.strip()) {
+                (Some((c, bt)), Expr::Num(k)) if matches!(&bt, Ty::Rec(fs) if is_tuple_fields(fs)) && *k >= 1 => {
+                    match fields(&bt).into_iter().nth(*k as usize - 1) {
+                        Some((_, ft, at)) if same(&ft, t) => format!("((({c}) >> {at}) & {}u64)", mask(n)),
+                        _ => "0".into(),
+                    }
+                }
+                _ => "0".into(),
+            },
+            _ => "0".into(),
+        }
+    }
+
+    /// Whether `x` is a variable holding a tuple or a sequence (DOMAIN of which TLC holds as 1..n)
+    fn is_seq_or_tuple(&self, x: &Expr) -> bool {
+        let v = match x.strip() {
+            Expr::Ident(v, _) => v,
+            Expr::Prime(y) => match y.strip() {
+                Expr::Ident(v, _) => v,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        self.is_var(v)
+            && match self.var_ty(v) {
+                Ty::Seq(_) => true,
+                Ty::Rec(fs) => is_tuple_fields(&fs),
+                _ => false,
+            }
+    }
+
+    /// Code printing the value `place` that `e` builds, of type t, with its shape
+    fn fmt_shaped(&mut self, e: &Expr, place: &str, t: &Ty, env: &Env) -> R<String> {
+        let id = self.ty_id(t)?;
+        let sh = self.shape_of(e, t, env);
+        if sh == "0" {
+            return Ok(format!("fmt_{id}(&{place})"));
+        }
+        self.fmtsh_need.insert(t.clone());
+        Ok(format!("fmtsh_{id}(&{place}, {sh})"))
+    }
+
+    /// Which variables need a shape: those that some assignment in Init or Next may give a value
+    /// TLC holds as an interval, directly or from another such variable
+    pub fn plan_shapes(&mut self, init: &Expr, next: &Expr) {
+        let mut assigns: Vec<(String, Expr)> = vec![];
+        fn walk(e: &Expr, init: bool, vars: &[(String, Ty)], out: &mut Vec<(String, Expr)>) {
+            if let Expr::Bin(BOp::Eq, l, r) = e {
+                let v = match l.strip() {
+                    Expr::Ident(v, _) if init => Some(v),
+                    Expr::Prime(x) => match x.strip() {
+                        Expr::Ident(v, _) => Some(v),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(v) = v.filter(|v| vars.iter().any(|(w, _)| w == *v)) {
+                    out.push((v.clone(), r.as_ref().clone()));
+                }
+            }
+            for c in e.children() {
+                walk(c, init, vars, out);
+            }
+        }
+        walk(init, true, &self.vars, &mut assigns);
+        walk(next, false, &self.vars, &mut assigns);
+        // Whether e may build a value TLC holds as an interval (mirrors `shape_of`)
+        fn may(e: &Expr, on: &BTreeSet<String>) -> bool {
+            match e.strip() {
+                Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) => true,
+                Expr::Ident(v, _) => on.contains(v),
+                Expr::Prime(x) => may(x, on),
+                Expr::If(_, a, b) => may(a, on) && may(b, on),
+                Expr::Tuple(xs) => xs.iter().any(|x| may(x, on)),
+                Expr::FunCons(_, _, b) => may(b, on),
+                Expr::RecLit(xs) => xs.iter().any(|(_, x)| may(x, on)),
+                Expr::Except(b, ups) => may(b, on) || ups.iter().any(|(_, x)| may(x, on)),
+                Expr::Field(b, _) | Expr::App(b, _) => may(b, on),
+                _ => false,
+            }
+        }
+        let mut on: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let before = on.len();
+            for (v, rhs) in &assigns {
+                if !on.contains(v) && Self::shape_slots(&self.var_ty(v)) > 0 && may(rhs, &on) {
+                    on.insert(v.clone());
+                }
+            }
+            if on.len() == before {
+                break;
+            }
+        }
+        let mut at = 0;
+        for (v, t) in self.vars.clone() {
+            let n = Self::shape_slots(&t);
+            if on.contains(&v) && at + n <= 64 {
+                self.shaped.insert(v, (at, n));
+                at += n;
+            }
+        }
+    }
+
+    /// The shape's type and accessors, and the functions printing values with their shape
+    pub fn shape_code(&mut self) -> R<String> {
+        let mut s = String::new();
+        if !self.shaped.is_empty() {
+            s += "/// The shape of a state (which of its sets of integers TLC holds as intervals): not part of the state's value\n\
+                  #[derive(Clone, Copy, Default)] struct Sh(u64);\n\
+                  impl PartialEq for Sh { fn eq(&self, _: &Sh) -> bool { true } }\nimpl Eq for Sh {}\n\
+                  impl std::hash::Hash for Sh { fn hash<H: std::hash::Hasher>(&self, _: &mut H) {} }\n";
+            for (v, (at, n)) in self.shaped.clone() {
+                let m = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+                writeln!(s, "#[inline] fn shg_{v}(s: &State) -> u64 {{ (s.sh.0 >> {at}) & {m}u64 }}").unwrap();
+                writeln!(s, "#[inline] fn shs_{v}(s: &mut State, b: u64) {{ s.sh.0 = (s.sh.0 & !({m}u64 << {at})) | ((b & {m}u64) << {at}); }}").unwrap();
+                self.fmtsh_need.insert(self.var_ty(&v));
+            }
+        }
+        let mut done: BTreeSet<Ty> = BTreeSet::new();
+        while let Some(t) = self.fmtsh_need.iter().find(|t| !done.contains(*t)).cloned() {
+            done.insert(t.clone());
+            let id = self.ty_id(&t)?;
+            let r = t.repr();
+            let body = match &t {
+                Ty::Set(e) => {
+                    let eid = self.ty_id(e)?;
+                    let it = self.s_iter("*v", &t)?;
+                    format!(
+                        "if b & 1 == 0 {{ return fmt_{id}(v); }} let xs: Vec<i64> = {it}.collect(); match (xs.iter().min(), xs.iter().max()) {{ \
+                         (Some(a), Some(z)) => format!(\"{{}}..{{}}\", fmt_{eid}(a), fmt_{eid}(z)), _ => fmt_{id}(v) }}"
+                    )
+                }
+                Ty::Rec(fs) => {
+                    let tuple = is_tuple_fields(fs);
+                    let mut parts = vec![];
+                    let mut at = 0;
+                    for (k, (name, ft)) in fs.iter().enumerate() {
+                        let fid = self.ty_id(ft)?;
+                        let path = rec_field(fs.len(), k);
+                        let n = Self::shape_slots(ft);
+                        let shown = if n == 0 {
+                            format!("fmt_{fid}(&v{path})")
+                        } else {
+                            self.fmtsh_need.insert(ft.clone());
+                            let m = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+                            format!("fmtsh_{fid}(&v{path}, (b >> {at}) & {m}u64)")
+                        };
+                        at += n;
+                        parts.push(if tuple { shown } else { format!("format!(\"{name} |-> {{}}\", {shown})") });
+                    }
+                    if tuple {
+                        format!("format!(\"<<{{}}>>\", [{}].join(\", \"))", parts.join(", "))
+                    } else {
+                        format!("format!(\"[{{}}]\", [{}].join(\", \"))", parts.join(", "))
+                    }
+                }
+                _ => format!("fmt_{id}(v)"),
+            };
+            writeln!(s, "fn fmtsh_{id}(v: &{r}, b: u64) -> String {{ {body} }}").unwrap();
+        }
+        Ok(s)
     }
 }
