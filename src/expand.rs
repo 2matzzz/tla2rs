@@ -54,8 +54,9 @@ pub struct Expander<'a> {
     /// Keep the POS labels (see `ast::POS`), for the next-state relation; otherwise they are
     /// dropped
     pub keep_pos: bool,
-    /// Bind arguments and LET definitions to names (see `expand_def_bound`)
-    bind: bool,
+    /// Bind arguments and LET definitions to names: for the constant evaluator
+    /// (`expand_def_bound`, BIND_CONST) or for code generation (`expand_def_code`, BIND_CODE)
+    bind: u8,
     /// The counter for fresh names while binding, apart from `fresh`, so that the names of what is
     /// expanded for code generation stay as they are
     bind_fresh: usize,
@@ -74,7 +75,7 @@ impl<'a> Expander<'a> {
             stack: vec![],
             rec_ids: HashMap::new(),
             keep_pos: false,
-            bind: false,
+            bind: 0,
             bind_fresh: 1 << 40,
             variables: m.variables.iter().cloned().collect(),
         }
@@ -97,7 +98,7 @@ impl<'a> Expander<'a> {
 
     fn bound<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let saved = (self.bind, self.fresh);
-        self.bind = true;
+        self.bind = BIND_CONST;
         self.fresh = self.bind_fresh;
         let r = f(self);
         self.bind_fresh = self.fresh;
@@ -105,15 +106,48 @@ impl<'a> Expander<'a> {
         r
     }
 
+    /// Like `expand_def`, for code generation: an argument of a call that is not a name or
+    /// literal and reads no primed variable, and a LET definition without arguments, are expanded
+    /// once and bound to a name (`ast::BIND`), which code generation evaluates where it is first
+    /// used and keeps for the evaluation of the body, as TLC does (`Gen::gen_bind`)
+    /// `action` tells whether TLC evaluates the definition as an action (Init and Next), see
+    /// `float_binds`
+    pub fn expand_def_code(&mut self, name: &str, action: bool) -> R<Expr> {
+        self.code_bound(action, |s| s.expand_def(name))
+    }
+
+    /// `expand_top` with bindings for code generation, as `expand_def_code`
+    pub fn expand_top_code(&mut self, e: &Expr, action: bool) -> R<Expr> {
+        self.code_bound(action, |s| s.expand_top(e))
+    }
+
+    fn code_bound(&mut self, action: bool, f: impl FnOnce(&mut Self) -> R<Expr>) -> R<Expr> {
+        let saved = self.bind;
+        self.bind = BIND_CODE;
+        let first = REC_DEFS.with(|r| r.borrow().len());
+        let r = f(self);
+        self.bind = saved;
+        // The recursive definitions expanded with bindings for code generation are kept apart
+        // (see `call`), so all of them were made by this call
+        let last = REC_DEFS.with(|r| r.borrow().len());
+        for i in first..last {
+            let mut d = rec_def(i);
+            d.body = float_binds(&d.body, false);
+            set_rec_def(i, d);
+        }
+        Ok(float_binds(&r?, action))
+    }
+
     /// Whether the expanded argument `a` is bound to a name while binding: not a name or literal
-    /// (those cost nothing to write out), and of constant level, so that only the constant
-    /// evaluator meets the name (a variable, prime or temporal operator stays written out, for
-    /// the checks of levels and of what is constant)
+    /// (those cost nothing to write out). For the constant evaluator, of constant level, so that
+    /// only the constant evaluator meets the name (a variable, prime or temporal operator stays
+    /// written out, for the checks of levels and of what is constant); for code generation, of
+    /// state level (what TLC evaluates in the state at hand, not in the step)
     fn bindable(&self, a: &Expr) -> bool {
-        self.bind
+        self.bind != 0
             && !matches!(a, Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Ident(..))
             && !a.any(&|x| match x {
-                Expr::Ident(v, _) => self.variables.contains(v),
+                Expr::Ident(v, _) => self.bind == BIND_CONST && self.variables.contains(v),
                 Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => true,
                 Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) | Expr::Lambda(..) | Expr::At => true,
                 Expr::Label(n, ..) => n.starts_with(SUBVAR) || n == ENINST,
@@ -162,7 +196,11 @@ impl<'a> Expander<'a> {
             // Operator arguments are bound in the definition, which is expanded once for each
             // combination of operators passed to it
             // Expanded with bindings, the definition is another one
-            let mut key = if self.bind { format!("{}{BIND}", d.name) } else { d.name.clone() };
+            let mut key = match self.bind {
+                BIND_CONST => format!("{}{BIND}", d.name),
+                BIND_CODE => format!("{}{BIND}code", d.name),
+                _ => d.name.clone(),
+            };
             let mut args = vec![];
             for (i, (p, a)) in d.params.iter().zip(raw).enumerate() {
                 if d.arity.get(i).copied().unwrap_or(0) > 0 {
@@ -193,7 +231,10 @@ impl<'a> Expander<'a> {
                 let a = self.expand(a, caller)?;
                 if self.bindable(&a) {
                     let n = self.bind(p, &mut env);
-                    args.push(Expr::Ident(n.clone(), NOPOS));
+                    // For code generation the call site keeps the argument as written out, which
+                    // it reads to name actions (`Gen::gen_split`)
+                    args.push(if self.bind == BIND_CODE { a.clone() } else { Expr::Ident(n.clone(), NOPOS) });
+
                     binds.extend([Expr::Ident(n, NOPOS), a]);
                 } else {
                     env.subst.insert(p.clone(), a.clone());
@@ -465,7 +506,7 @@ impl<'a> Expander<'a> {
                     // use would expand it (not a function `f[x \in S]`, whose applications call
                     // `f#app`); one that does not expand is left to its uses, as otherwise
                     let app = format!("{}#app", d.name);
-                    if self.bind && d.params.is_empty() && !defs.iter().any(|x| x.name == app) {
+                    if self.bind != 0 && d.params.is_empty() && !defs.iter().any(|x| x.name == app) {
                         let denv = with_self(&d.name, &unique, snapshot.clone());
                         let (depth, stack, rec_ids) = (self.depth, self.stack.len(), self.rec_ids.clone());
                         match self.call(&d.name, &unique, denv, &[], &inner) {
@@ -769,7 +810,11 @@ pub(crate) fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)
     }
 }
 
+const BIND_CONST: u8 = 1;
+const BIND_CODE: u8 = 2;
+
 /// `body` under a BIND label for the names and expressions in `binds`, if any
+
 fn with_binds(binds: Vec<Expr>, body: Expr) -> Expr {
     if binds.is_empty() { body } else { Expr::Label(BIND.into(), binds, body.b()) }
 }
@@ -784,7 +829,205 @@ fn with_self(n: &str, d: &Def, mut denv: Env) -> Env {
     denv
 }
 
+/// e with the BIND labels made for code generation moved up to where code generation evaluates
+/// their names. TLC evaluates a LET definition or an argument where it is first used, and keeps
+/// the value for the rest of the evaluation of the LET or the call when it evaluates an
+/// expression; when it computes the successors of an action (Init and Next, while some variable
+/// is still unassigned) it evaluates one again at each use (measured, `tests/tlc/LazyAction`).
+/// So where TLC goes through an action (`action`: a conjunction, disjunction, `\E`, IF, CASE, a
+/// call), a label stays where it is and is renamed BIND_ACT; inside an expression, it moves up
+/// past every part evaluated once (an operator applied, a set or tuple built, IF, ...), and not
+/// past one evaluated per value of a bound variable (a quantifier, CHOOSE, a set or function
+/// constructor, the values of an EXCEPT), nor past a prime, ENABLED or a temporal operator.
+/// The names are evaluated where they are first used, so moving a label changes nothing that is
+/// evaluated. Then a name not used is dropped, and one used once, not in a part evaluated per
+/// value of a bound variable, is written out where it is used
+pub fn float_binds(e: &Expr, action: bool) -> Expr {
+    use Expr::*;
+    if action {
+        let act = |x: &Expr| float_binds(x, true);
+        let val = |x: &Expr| float_binds(x, false);
+        return match e {
+            Label(n, pairs, body) if n == BIND => {
+                let pairs: Vec<Expr> = pairs.iter().enumerate().map(|(i, x)| if i % 2 == 0 { x.clone() } else { val(x) }).collect();
+                match with_binds_code(pairs.chunks(2).map(|p| p.to_vec()).collect(), act(body)) {
+                    Label(n, pairs, body) if n == BIND => Label(BIND_ACT.into(), pairs, body),
+                    e => e,
+                }
+            }
+            And(xs) => And(xs.iter().map(act).collect()),
+            Or(xs) => Or(xs.iter().map(act).collect()),
+            Quant(q, bs, b) => Quant(*q, bs.iter().map(|(x, s)| (x.clone(), val(s))).collect(), act(b).b()),
+            If(c, a, b) => If(val(c).b(), act(a).b(), act(b).b()),
+            Case(arms, o) => Case(arms.iter().map(|(p, v)| (val(p), act(v))).collect(), o.as_ref().map(|x| act(x).b())),
+            Label(n, a, b) => Label(n.clone(), a.clone(), act(b).b()),
+            Un(UOp::Enabled, _) => crate::codegen::map_children(e, &act),
+            e => val(e),
+        };
+    }
+    let (pairs, e) = float(e);
+    with_binds_code(pairs.chunks(2).map(|p| p.to_vec()).collect(), e)
+}
+
+fn float(e: &Expr) -> (Vec<Expr>, Expr) {
+    use Expr::*;
+    let out = std::cell::RefCell::new(vec![]);
+    let fl = |x: &Expr| {
+        let (p, x) = float(x);
+        out.borrow_mut().extend(p);
+        x
+    };
+    let root = |x: &Expr| float_binds(x, false);
+    let e2 = match e {
+        Label(n, pairs, body) if n == BIND => {
+            let mut all: Vec<Expr> = pairs.iter().enumerate().map(|(i, x)| if i % 2 == 0 { x.clone() } else { root(x) }).collect();
+            let b = fl(body);
+            all.extend(out.into_inner());
+            return (all, b);
+        }
+        Num(_) | Str(_) | Bool(_) | Ident(..) | At => return (vec![], e.clone()),
+        Un(UOp::Enabled, _) => return (vec![], crate::codegen::map_children(e, &|x| float_binds(x, true))),
+        Prime(_) | Un(UOp::Unchanged | UOp::Always | UOp::Eventually, _) | BoxAction(..) | Fair(..) | Lambda(..) | Let(..) | Bin(BOp::LeadsTo, ..) => {
+            return (vec![], crate::codegen::map_children(e, &root));
+        }
+        _ if e.is_action() => return (vec![], crate::codegen::map_children(e, &root)),
+        Quant(q, bs, b) => Quant(*q, bs.iter().map(|(x, s)| (x.clone(), fl(s))).collect(), root(b).b()),
+        SetMap(f, bs) => {
+            let bs = bs.iter().map(|(x, s)| (x.clone(), fl(s))).collect();
+            SetMap(root(f).b(), bs)
+        }
+        Choose(x, s, p) => Choose(x.clone(), fl(s).b(), root(p).b()),
+        SetFilter(x, s, p) => SetFilter(x.clone(), fl(s).b(), root(p).b()),
+        FunCons(x, s, p) => FunCons(x.clone(), fl(s).b(), root(p).b()),
+        Except(f, ups) => {
+            let ups = ups
+                .iter()
+                .map(|(path, v)| {
+                    let path = path
+                        .iter()
+                        .map(|p| match p {
+                            Path::Idx(i) => Path::Idx(root(i)),
+                            Path::Field(k) => Path::Field(k.clone()),
+                        })
+                        .collect();
+                    (path, root(v))
+                })
+                .collect();
+            Except(fl(f).b(), ups)
+        }
+        // The arguments of a call site are only a trace
+        Label(n, a, b) => Label(n.clone(), a.clone(), fl(b).b()),
+        _ => crate::codegen::map_children(e, &fl),
+    };
+    (out.into_inner(), e2)
+}
+
+/// `body` under a BIND label for the pairs of names and expressions in `pairs`, without the
+/// names not used, and with a name used once (not in a part evaluated per value of a bound
+/// variable) written out where it is used
+fn with_binds_code(pairs: Vec<Vec<Expr>>, mut body: Expr) -> Expr {
+    let mut pairs: Vec<(String, Expr)> = pairs
+        .iter()
+        .map(|p| match p.as_slice() {
+            [Expr::Ident(n, _), x] => (n.clone(), x.clone()),
+            _ => unreachable!(),
+        })
+        .collect();
+    let mut k = 0;
+    while k < pairs.len() {
+        let n = pairs[k].0.clone();
+        let (mut count, mut under) = (0, false);
+        for (_, x) in &pairs[k + 1..] {
+            uses(x, &n, false, &mut count, &mut under);
+        }
+        uses(&body, &n, false, &mut count, &mut under);
+        if count == 0 {
+            pairs.remove(k);
+        } else if count == 1 && !under {
+            let (_, x) = pairs.remove(k);
+            for p in &mut pairs[k..] {
+                p.1 = subst_ident(&p.1, &n, &x);
+            }
+            body = subst_ident(&body, &n, &x);
+        } else {
+            k += 1;
+        }
+    }
+    with_binds(pairs.into_iter().flat_map(|(n, x)| [Expr::Ident(n, NOPOS), x]).collect(), body)
+}
+
+/// Counts the uses of the name n in e, noting whether one is in a part evaluated per value of a
+/// bound variable
+fn uses(e: &Expr, n: &str, under: bool, count: &mut usize, flag: &mut bool) {
+    use Expr::*;
+    match e {
+        Ident(m, _) if m == n => {
+            *count += 1;
+            *flag |= under;
+        }
+        Quant(_, bs, b) => {
+            bs.iter().for_each(|(_, s)| uses(s, n, under, count, flag));
+            uses(b, n, true, count, flag);
+        }
+        SetMap(f, bs) => {
+            bs.iter().for_each(|(_, s)| uses(s, n, under, count, flag));
+            uses(f, n, true, count, flag);
+        }
+        Choose(_, s, p) | SetFilter(_, s, p) | FunCons(_, s, p) => {
+            uses(s, n, under, count, flag);
+            uses(p, n, true, count, flag);
+        }
+        Lambda(_, b) => uses(b, n, true, count, flag),
+        Except(f, ups) => {
+            uses(f, n, under, count, flag);
+            for c in Except(Bool(true).b(), ups.clone()).children().into_iter().skip(1) {
+                uses(c, n, true, count, flag);
+            }
+        }
+        // A recursive operator's body is evaluated per call, and reads the names bound outside
+        // it from there (`Gen::rec_free`)
+        RecCall(i, args) => {
+            args.iter().for_each(|a| uses(a, n, under, count, flag));
+            if rec_reads(*i, n, &mut std::collections::HashSet::new()) {
+                *count += 2;
+                *flag = true;
+            }
+        }
+        e => e.children().into_iter().for_each(|c| uses(c, n, under, count, flag)),
+    }
+}
+
+/// Whether the body of the recursive definition i, or of one it calls, reads the name n
+fn rec_reads(i: usize, n: &str, seen: &mut std::collections::HashSet<usize>) -> bool {
+    if !seen.insert(i) {
+        return false;
+    }
+    let body = rec_def(i).body;
+    body.any(&|e| matches!(e, Expr::Ident(m, _) if m == n)) || {
+        let calls = std::cell::RefCell::new(vec![]);
+        body.any(&|e| {
+            if let Expr::RecCall(j, _) = e {
+                calls.borrow_mut().push(*j);
+            }
+            false
+        });
+        calls.into_inner().into_iter().any(|j| rec_reads(j, n, seen))
+
+    }
+}
+
+/// e with the identifier n replaced by x (names are unique after expansion, so nothing is
+
+/// captured)
+pub fn subst_ident(e: &Expr, n: &str, x: &Expr) -> Expr {
+    match e {
+        Expr::Ident(m, _) if m == n => x.clone(),
+        _ => crate::codegen::map_children(e, &|c| subst_ident(c, n, x)),
+    }
+}
+
 /// Replaces @ in e (except inside the values of nested EXCEPTs) with the identifier name
+
 fn replace_at(e: &Expr, name: &str) -> Expr {
     match e {
         Expr::At => Expr::Ident(name.to_string(), NOPOS),

@@ -159,6 +159,18 @@ impl Walk<'_> {
                 },
             },
             At => *env.get("@")?,
+            // The lengths of the names a BIND label binds (a name whose lengths are unknown is
+            // unknown where it is used)
+            Label(n, pairs, b) if is_bind(n) => {
+                for p in pairs.chunks(2) {
+                    if let [Ident(x, _), v] = p {
+                        if let Some(l) = self.len(v, &env2, facts, init) {
+                            env2.insert(x.clone(), l);
+                        }
+                    }
+                }
+                self.len(b, &env2, facts, init)?
+            }
             Label(_, _, b) => self.len(b, env, facts, init)?,
             Prime(x) => self.len(x, env, facts, init)?,
             Tuple(xs) => {

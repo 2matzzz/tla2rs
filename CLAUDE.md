@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 728 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 733 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -69,10 +69,10 @@ It has no crate dependencies.
 | `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also SANY's precedence checks and string escapes (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150. The statements of a module are kept in the order written (`Module::units`). The positions TLC names actions by are kept in POS labels (`ast::POS`, see "Counterexamples") |
 | `src/sany.rs` | SANY's checks of names (see "What SANY refuses"): what is in scope at each statement, what each module exports, labels and LAMBDA. Run on each module read from a file once the modules it extends and instantiates are loaded (`compile::load_parsed`), and on the modules nested in it. It collects every error of the module; when there are any, the module is parsed again with the positions SANY reports (`parser::parse_module_sany`) and checked again for SANY's report |
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
-| `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments. For the constant evaluator only, `expand_def_bound` binds arguments and LET definitions to names instead (see "Arguments written out at each use") |
+| `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments. For the constant evaluator (`expand_def_bound`) and for code generation (`expand_def_code`), arguments and LET definitions are bound to names instead (see "Arguments written out at each use") |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first). The names a BIND label binds are evaluated where first used and kept (`register_bound`, `eval_bound`) |
 | `src/types.rs` | Finite types `Ty`. A set whose element type has at most 128 values is a `u128` bitmask; otherwise it is an `SSet` (sorted fixed-size array). `Opt` is an optional field of a record whose variants have different fields. A value that is a record or a model value (`[op : S] \cup {NoVal}`) is a record type whose fields are all optional, with the model values in a field of its own (`ATOM_FIELD`); a type invariant giving such a type is checked on every state, since packing does not check which records it lists. A value that is a model value or a value of another kind (a sequence, tuple, set, function, bag or boolean: `Seq(S) \cup {NoVal}`, `SUBSET P \cup P`) is such a record type too, with that value in a field of its own (`VAL_FIELD`, named to sort before `ATOM_FIELD`, so model values come first as in TLC); an operation that takes the value apart (application, DOMAIN, iteration, set operations, Cardinality, the sequence operators) takes it out of that field (`Gen::gen_val`), and fails on a model value. A record type with optional fields of at most 4096 values is numbered in TLC's order of records (`tlc_perm`: the number of fields first), so sets of such records print, CHOOSE and enumerate as in TLC. A record's fields are kept in TLC's order of names (`field_cmp`: the order TLC first creates each name, from `compile::tlc_string_ranks`), which is how TLC compares and prints records. A tuple is a `Rec` with fields `#00001`, `#00002`, ... (`tuple_ty`); a record of more than 12 fields is held as nested groups of 12 (`rec_build`, `rec_field`), since Rust tuples implement `Eq`/`Hash`/`Ord` only up to 12 elements. `IntAtom` holds integers and atoms (model values, also strings) in one `i64` (atom a is `i64::MIN + a`). `Seq` is a sequence (`Sq`, at most QCAP elements; `seq_cap` derives QCAP, from `src/seqlen.rs` when no bound is written). An `SSet` holds at most SCAP elements, and never more than its element type has values (`set_cap`); both capacities grow at run time (see "Capacities"). `Bag` is a bag, a count per element (packed as a function to 0..BIG). `PFun` is a function over part of a type (an optional value per element); functions over different domains (other than 1..n, which are sequences) join into one. Over a domain type of more than `DENSE_MAX` (65536) values, or one that is not enumerable, both are sparse (`is_sparse_fun`): an `SSet` of <<key, value>> tuples (`fun_pairs`), which sorts by key, so lookups are binary searches and packing, SYMMETRY and equality are those of sparse sets. `BIG` is an unbounded integer |
-| `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`). A constant set of more than 1024 elements built from `[D -> R]`, `\X`, `[f : S]` and SUBSET is enumerated from its parts where the checker iterates over it (`big_set_iter`, see "Large constant sets"), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
+| `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`). A constant set of more than 1024 elements built from `[D -> R]`, `\X`, `[f : S]` and SUBSET is enumerated from its parts where the checker iterates over it (`big_set_iter`, see "Large constant sets"), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`). A name a BIND label binds is a `OnceCell` computed on first use (`gen_bind`) |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). When the types from TypeOK fail in Init or Next (a module that extends another and adds a record field its type invariant lacks), the spec is compiled again with every type inferred (`INFER_ALL`). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). A name a definition binds (a parameter, bound variable or LET definition) stays its own where the module defines the same name later, and a parameter named like a name the substitutions read, or like a parameter of the instance, is renamed in the visible definition (`InstRename`; `tests/tlc/InstShadow`, `InstShadowParam`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
 | `src/community.rs` | The modules of the CommunityModules tla2rs provides (see "CommunityModules"): TLA+ source written for tla2rs, loaded by `compile::find_module` when no module of that name is next to the spec |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does; and where SANY places each definition they export (`STD_DEFS`), for its report of a name that clashes with one |
@@ -739,14 +739,48 @@ come in the same order), and kept for the values of the names it depends on (`va
 whose computation printed is not kept, so Print and PrintT print at each use as before. Where the evaluator reads
 how a set or function is written (`x \in Nat`, `[x \in S |-> e][k]`, `Seq(S)`, a lazy function printed), it reads
 the bound expression (`value::shape`). Fresh names while binding come from a counter of their own, and the
-recursive definitions expanded while binding are kept apart from those code generation uses.
+recursive definitions expanded while binding are kept apart from those code generation uses. `tests/tlc/ArgShare` (an
+argument used twice through 24 calls), `LetShare` (24 LET definitions each used twice by the next) and `RecShare` (a
+recursion whose result a definition reads per element of a set) show it: before, the first two went past 3 GB within
+5 s and the third took 22 s; now each takes well under a second.
 
-Code generation still gets arguments written out (its folding of constant parts, the strings it notes and the
-shapes it reads depend on them), so such definitions stay slow in Init, the actions and the invariants:
-`HTMLAttribute("color", "blue")` in Init took 36 s to compile. `tests/tlc/ArgShare` (an argument used twice through
-24 calls), `LetShare` (24 LET definitions each used twice by the next) and `RecShare` (a recursion whose result a
-definition reads per element of a set) show it: before, the first two went past 3 GB within 5 s and the third took
-22 s; now each takes well under a second.
+Code generation reads Init, Next, the invariants and the constraints expanded with `Expander::expand_def_code`, which
+binds in the same way an argument of state level (without a prime, ENABLED or a temporal operator) that is not a name
+or literal, and a LET definition without arguments. A call site keeps the argument written out as its trace, which
+`Gen::gen_split` reads to name actions. `expand::float_binds` then moves each BIND label to where code generation
+evaluates its names, drops a name not used, and writes out a name used once outside a part evaluated per value of a
+bound variable. What TLC does, measured on TLC 2.19 with PrintT (`tests/tlc/LazyLet`, `LazyArg`, `LazyAction`):
+
+- In an expression (an invariant, the value assigned to a primed variable, the condition of an IF, and the rest of an
+  action once every variable is assigned), TLC evaluates a LET definition or an argument where it is first used and
+  keeps the value for the rest of the LET or the call; one never used is never evaluated, nor fails, and what it
+  prints or fails on comes where it is first used. `Gen::gen_bind` makes each name a `OnceCell` and a closure that
+  computes the value on first use
+- Where TLC computes the successors of an action and some variable is still unassigned (in Init too), a LET or a call
+  it goes through (a conjunct, a disjunct, the body of `\E`, a branch of IF or CASE) evaluates its names again at each
+  use: there `LET d == PrintT(1) IN d /\ d` prints twice. Such a label stays where it is, renamed BIND_ACT, and code
+  generation writes its names out as before
+
+A name is also written out where it is used when its value is constant (code generation folds it there), when TLC
+keeps the value unevaluated so that only what is used is computed (`codegen::lazy_value`: a function constructor, a
+range, SUBSET, UNION, a set of functions, records, sequences or tuples), in Init while a variable it reads is still
+unassigned (the closure would hold the state being built), and when code generation cannot generate its value on its
+own (a set only tested for membership). A name the body of a recursive operator reads from outside the operator is
+passed to its Rust function as a value, computed at the call (`Gen::rec_free`). The constant evaluator keeps with
+each bound value the strings its computation made and notes them again at each later use, since code generation
+notes the strings a constant part makes where it folds the part (`value::eval_bound`). The checks made on every
+definition when TLC starts (the levels of temporal formulas, which definitions are of constant level) read the
+expansion for code generation as well, which does not write out arguments of state level either.
+
+Not followed: a LET definition or an argument that reads a primed variable is still written out at each use (once
+every variable is assigned, `LET d == PrintT(x') IN d /\ d` prints once in TLC and twice in tla2rs).
+
+Measured on a machine with 32 cores, before and after: generating the checker of the corpus's `TLCSailfish1` went from
+100 s and 17 GB to 0.15 s and 18 MB, the generated code from 3.5 MB to 245 KB, and the call sites of `Descendants`'s
+functions from 652 to 8; building each checker from 3.7 minutes to about 4.5 s; the search no longer stalls at
+level 8 and finishes in 45 s (tla2rs takes 74 s in all, building the checker 4 times as its sets
+grow from 8 to 64 elements; TLC takes 37 s with one worker). A spec with `HTMLAttribute("color", "blue")` in Init and
+`HTMLAttribute("color", "red")` in an action took 209 s to generate and now 0.3 s.
 
 ### Large constant sets
 
@@ -782,17 +816,16 @@ match is listed as `gap` with the reason measured; `corpus.sh` still runs it and
 fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
 below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 105 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 105 match, of which 7 with `distinct-only`. Only the generated count differs in those 7: TLC generates the same successor of a state
 more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
 with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
 states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
 4682 distinct edges; `MCCheckpointCoordinationFailure` has 1297994 and 1297595 edges, and the same 611225 distinct
 edges. The graph hashes compare the distinct edges, so the state space and transitions match. `StaleViewShrink` (4) is
-not measured this way. 1 is a gap, `norun` (run once on a machine with 64 GB):
-
-| Gap | Model |
-|---|---|
-| `norun`: tla2rs no longer stops at depth 3 (BlockDag's `Linearize(dag, l)` read the definition `dag` the instantiating module writes after it instead of its parameter; `InstShadow`), but it did not finish level 8 of the search in 20 minutes, where TLC takes 37 s with one worker. Code generation writes LET definitions and arguments out at each use (see "Arguments written out at each use"): `Descendants` is called at 641 places in the generated code, and a profile puts the time there. Generating the checker takes 100 s and 17 GB, and each of its 3 builds (sets growing from 8 to 32 elements) about 3.5 minutes | `TLCSailfish1` |
+not measured this way. `TLCSailfish1` generates 314144 states in TLC and 300492 in tla2rs, with the same 109604
+distinct states and 300491 distinct edges; with its three `\/` lists of conditions (a branch of IF, and the right of
+`=>`) rewritten as `IF A THEN TRUE ELSE B` in a copy, TLC generates 300492 too (see "TLC counts generated states per
+`\/` branch"). No selected model is a gap.
 
 Forms the corpus showed, each with a test in `tests/tlc/`: the CommunityModules (`CmFun`, `CmSet`, `CmSeq`,
 `CmGraph`, `CmBits`, and since then `CmSeqSub`, `CmRel`, `CmDigraph`, `CmBag`, `CmMisc`; see "CommunityModules"),
@@ -853,7 +886,7 @@ stops on in their definitions: an unbounded CHOOSE (`JsonDeserialize`, `ndJsonDe
 `QuorumSystem` is the set of sets of subsets that meet pairwise and are closed under supersets (`CmQuorum`). `HTML`
 fills templates by replacing each `%key%` in turn, the first occurrence in the text replaced so far, and joins parts
 with a separator left out while the text built so far is empty, as the module's definitions do (`CmHtml`, in the
-constant definitions and ASSUMEs; in Init or an action it compiles slowly, see "Arguments written out at each use").
+constant definitions and ASSUMEs; in Init or an action too, see "Arguments written out at each use").
 
 TLC gives the position of a CASE without OTHER when none of its conditions holds, and for a CASE in a module of the
 release that is a position in the release's file, which tla2rs's module does not have. `community::CASE_AT` holds the
