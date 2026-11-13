@@ -3526,6 +3526,10 @@ impl<'a> Gen<'a> {
             }
             FunCons(x, s, body) => {
                 let dv = self.ce.eval(s, &HashMap::new()).map_err(|m| format!("function domain must be constant: {m}"))?;
+                // Over the empty set (`1..0`): the empty function, which is the empty sequence
+                if dv.as_set()?.is_empty() {
+                    return self.gen(&Tuple(vec![]), env, want);
+                }
                 let dt = elem_ty_of_domain(dv.as_set()?)?;
                 let did = self.ty_id(&dt)?;
                 let wc = match want {
