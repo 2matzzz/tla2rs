@@ -98,6 +98,11 @@ impl Pos {
         self.line > 0
     }
 
+    /// `text`, or nothing for a position not known
+    pub fn text_if_known(&self) -> String {
+        if self.known() { self.text() } else { String::new() }
+    }
+
     /// As TLC prints a position: `line 3, col 9 to line 3, col 9 of module M`
     pub fn text(&self) -> String {
         let m = MODULE_NAMES.with(|ns| ns.borrow().get(self.module as usize).cloned().unwrap_or_default());
@@ -188,6 +193,10 @@ pub struct Module {
     pub inst_prefixes: Vec<(String, String, usize)>,
     /// The module's statements in the order written, for SANY's scoping (see `sany.rs`)
     pub units: Vec<Unit>,
+    /// For each of `units`, the position SANY gives what it declares (the name of a CONSTANT or
+    /// VARIABLE, a whole definition with LOCAL, `F(_)` of a RECURSIVE declaration) and the number
+    /// of its parameters, for SANY's reports
+    pub unit_at: Vec<(String, usize)>,
 }
 
 /// A statement of a module, in the order written. SANY resolves a name only against what is

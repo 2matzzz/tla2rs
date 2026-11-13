@@ -1,6 +1,6 @@
 //! The checks of names that SANY (the parser TLC runs first) makes and tla2rs repeats, so that a
-//! spec SANY refuses stops with exit 150 as in TLC. Measured on SANY 2.19 (`tests/tlc/RejSany*`,
-//! `tests/tlc/SanyScope*`):
+//! spec SANY refuses stops with exit 150 as in TLC, with SANY's report. Measured on SANY 2.19
+//! (`tests/tlc/RejSany*`, `tests/tlc/SanyScope*`):
 //!
 //! - A name is in scope after the statement that declares or defines it, never before: an
 //!   operator parameter may be named like a VARIABLE, CONSTANT or definition that comes later in
@@ -11,27 +11,40 @@
 //!   exporting them); `N == INSTANCE M` brings only N. A RECURSIVE declaration puts the name in
 //!   scope. A nested module sees what is in scope where it starts
 //! - Every name used must be in scope (`Unknown operator`), also operator symbols such as `+`,
-//!   unary minus (`-.`) and `\o`, and also in definitions nothing uses
-//! - A declaration, definition, operator parameter, LET definition, bound variable or LAMBDA
-//!   parameter may not reuse a name in scope (`Multiply-defined symbol`). A definition's own name
-//!   is in scope in its parameters (`F(F) == ...` is refused) but not in its body (`F == \E F \in
-//!   S : P` is fine) unless it is a function definition `f[x \in S] == e` or declared RECURSIVE.
-//!   The sets of `\E x \in S, y \in T` are read outside the quantifier (T cannot use x). The same
-//!   definition reached twice (a module extended along two paths, or extended and instantiated
-//!   when it has no CONSTANT or VARIABLE) is one symbol; two different definitions of one name in
-//!   two extended modules are only a warning for SANY, and are not refused here
+//!   unary minus (`-.`) and `\o`, and also in definitions nothing uses. SANY does not look at the
+//!   arguments of an operator it cannot find. An operator that takes arguments, named without
+//!   them where it is not an argument, is refused (`The operator F requires 1 arguments.`)
+//! - A declaration, operator parameter or bound variable may not reuse a name in scope
+//!   (`Multiply-defined symbol`, with where the other one is). A definition named like something
+//!   in scope or like one of its own parameters is refused (`Operator F already defined or
+//!   declared.`, `Function name ...` for `f[x \in S] == e`); after its body, the clash with a
+//!   definition of as many parameters is only a warning, any other a second error. A definition's
+//!   own name is not in scope in its body (`F == \E F \in S : P` is fine) unless it is a function
+//!   definition or declared RECURSIVE. The sets of `\E x \in S, y \in T` are read outside the
+//!   quantifier (T cannot use x). The same definition reached twice (a module extended along two
+//!   paths, or extended and instantiated when it has no CONSTANT or VARIABLE) is one symbol; two
+//!   different definitions of one name in two extended modules are only a warning for SANY, and
+//!   are not refused here
 //! - A label `l(p, q) :: e` must list exactly the bound variables introduced between it and the
 //!   enclosing label or definition (a LET definition starts afresh; operator parameters and LET
 //!   names do not count), each once
+//!
+//! SANY reports every error of a module, in the order it meets them, and then its warnings. The
+//! check runs on the module as parsed for compiling, where most positions are not kept; when it
+//! finds errors, the module is parsed again with them (`parser::parse_module_sany`) and checked
+//! again for the report
 
 use crate::ast::*;
 use crate::lexer::{R, SANY};
+use crate::parser::{NAME_AT, OP_AT};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// A name in scope and the statement that introduced it (the module and name of the definition,
-/// or a unique tag for an INSTANCE with substitutions). `decl` marks a CONSTANT or VARIABLE
-#[derive(Clone, Debug, PartialEq)]
+/// or a unique tag for an INSTANCE with substitutions). `decl` marks a CONSTANT or VARIABLE.
+/// `at` (where SANY places the statement) and `arity` (its number of parameters) take no part in
+/// comparing two symbols
+#[derive(Clone, Debug)]
 struct Sym {
     name: String,
     origin: String,
@@ -39,6 +52,22 @@ struct Sym {
     /// Defined in a module without constants or variables: an INSTANCE gives the same
     /// definition, not a new one
     fixed: bool,
+    at: String,
+    arity: usize,
+}
+
+impl PartialEq for Sym {
+    fn eq(&self, o: &Sym) -> bool {
+        self.name == o.name && self.origin == o.origin && self.decl == o.decl && self.fixed == o.fixed
+    }
+}
+
+/// Errors and warnings of the module being checked: the position SANY gives each (empty when not
+/// known) and the message
+#[derive(Default)]
+struct Diag {
+    errors: Vec<(String, String)>,
+    warnings: Vec<(String, String)>,
 }
 
 thread_local! {
@@ -48,7 +77,31 @@ thread_local! {
     /// The keys SANY puts in each module's context (see `Ctx`), `None` when a module it reads is
     /// not known
     static CONTEXTS: RefCell<HashMap<String, Option<Ctx>>> = RefCell::new(HashMap::new());
+    static DIAG: RefCell<Diag> = RefCell::new(Diag::default());
+    /// The text of each module read from a file, by name, to parse again for a report
+    static SOURCES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
+
+fn error(at: &str, msg: String) {
+    DIAG.with(|d| d.borrow_mut().errors.push((at.to_string(), msg)));
+}
+
+fn warning(at: &str, msg: String) {
+    DIAG.with(|d| d.borrow_mut().warnings.push((at.to_string(), msg)));
+}
+
+/// Keeps the text of module `name` (see SOURCES)
+pub fn remember_source(name: &str, src: &str) {
+    SOURCES.with(|s| s.borrow_mut().insert(name.to_string(), src.to_string()));
+}
+
+/// A name from `parser::parse_module_sany` without its position, and the position
+fn untag(n: &str) -> (&str, &str) {
+    n.split_once(NAME_AT).unwrap_or((n, ""))
+}
+
+/// Where SANY places the definitions built into TLA+
+const BUILTINS_AT: &str = "In module --TLA+ BUILTINS--";
 
 /// What a key of a module's context names
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -171,9 +224,21 @@ fn std_exports(m: &str) -> Option<Vec<Sym>> {
         "Randomization" => &[("Randomization", &["RandomSubset", "RandomSetOfSubsets", "TestRandomSetOfSubsets"])],
         _ => return None,
     };
+    let place = |o: &str, n: &str| {
+        crate::std_modules::STD_DEFS
+            .iter()
+            .find(|d| d.0 == o && d.1 == n)
+            .map(|&(_, _, l1, c1, l2, c2, k)| (format!("line {l1}, col {c1} to line {l2}, col {c2} of module {o}"), k))
+            .unwrap_or_default()
+    };
     Some(
         own.iter()
-            .flat_map(|(o, ns)| ns.iter().map(move |n| Sym { name: n.to_string(), origin: o.to_string(), decl: *n == "now", fixed: *n != "now" }))
+            .flat_map(|(o, ns)| {
+                ns.iter().map(move |n| {
+                    let (at, arity) = place(o, n);
+                    Sym { name: n.to_string(), origin: o.to_string(), decl: *n == "now", fixed: *n != "now", at, arity }
+                })
+            })
             .collect(),
     )
 }
@@ -204,25 +269,59 @@ fn sany_name(n: &str) -> &str {
     }
 }
 
-/// After SANY: a semantic error, `#sem ` followed by the position SANY gives it (or nothing when
-/// it is not known), a line break and the message
+/// After SANY: SANY's report of semantic errors, from `Semantic errors:` to the empty lines after
+/// the last error or warning
 pub const SEMANTIC: &str = "#sem ";
 
-/// A semantic error at `at` (see SEMANTIC)
-fn sem(at: &str, msg: &str) -> String {
-    format!("{SANY}{SEMANTIC}{at}\n{msg}")
+/// SANY's report of the errors and warnings in d: each with its position (when known), an empty
+/// line and the message, then two empty lines
+fn report(d: &Diag) -> String {
+    let item = |(at, msg): &(String, String)| if at.is_empty() { format!("{msg}\n\n\n") } else { format!("{at}\n\n{msg}\n\n\n") };
+    let mut s = format!("Semantic errors:\n\n*** Errors: {}\n\n", d.errors.len());
+    s.extend(d.errors.iter().map(item));
+    if !d.warnings.is_empty() {
+        s += &format!("*** Warnings: {}\n\n", d.warnings.len());
+        s.extend(d.warnings.iter().map(item));
+    }
+    s
 }
 
-fn clash(x: &str) -> String {
-    format!("{SANY}Multiply-defined symbol '{x}': this definition or declaration conflicts with another one in scope.")
+/// A semantic error at `at` (see SEMANTIC)
+pub fn report_one(at: &str, msg: &str) -> String {
+    format!("{SANY}{SEMANTIC}{}", report(&Diag { errors: vec![(at.to_string(), msg.to_string())], warnings: vec![] }))
+}
+
+fn clash(x: &str, other: &str) -> String {
+    format!("Multiply-defined symbol '{x}': this definition or declaration conflicts \nwith the one at {other}.")
+}
+
+fn duplicate(x: &str, other: &str) -> String {
+    format!("Multiple declarations or definitions for symbol {x}.  \nThis duplicates the one at {other}.")
 }
 
 /// Checks module `m` (a module read from a file, after the modules it extends and instantiates
 /// have been loaded) and the modules nested in it, and records what they export
 pub fn check(m: &Module) -> R<()> {
-    let ex = module(m, vec![], true)?;
+    DIAG.with(|d| *d.borrow_mut() = Diag::default());
+    let ex = module(m, vec![], true);
     EXPORTS.with(|e| e.borrow_mut().insert(m.name.clone(), ex));
-    Ok(())
+    let take = || DIAG.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    let d = take();
+    if d.errors.is_empty() {
+        return Ok(());
+    }
+    // The same checks on the module parsed with the positions SANY reports (the same errors are
+    // expected; if not, they are reported without positions)
+    let src = SOURCES.with(|s| s.borrow().get(&m.name).cloned());
+    let again = src.and_then(|src| crate::parser::parse_module_sany(&src).ok()).map(|m| {
+        module(&m, vec![], true);
+        take()
+    });
+    let d = match again {
+        Some(again) if again.errors.len() == d.errors.len() && again.warnings.len() == d.warnings.len() => again,
+        _ => d,
+    };
+    Err(format!("{SANY}{SEMANTIC}{}", report(&d)))
 }
 
 /// The names in scope at a point of a module
@@ -243,12 +342,37 @@ impl Scope {
         self.names.insert(s.name.clone());
         self.syms.push(s);
     }
+    /// Where the symbol n in scope is declared or defined, and whether it is a definition (not a
+    /// CONSTANT, VARIABLE or built-in name), with its number of parameters
+    fn place(&self, n: &str) -> Option<(String, bool, usize)> {
+        match self.get(n) {
+            Some(s) => Some((s.at.clone(), !s.decl, s.arity)),
+            None if builtin(n) => Some((BUILTINS_AT.to_string(), false, 0)),
+            None => None,
+        }
+    }
 }
 
-/// Checks a module whose scope starts as `base` (what is in scope where a nested module starts)
-/// and returns what it exports. `known` is whether every name in scope is known: not when the
-/// module (or the one it is nested in) extends one tla2rs does not read
-fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
+/// After a definition named like a symbol in scope (`place`): a warning when that is a definition
+/// with as many parameters, an error otherwise. Whether the definition is then in scope (not after
+/// an error)
+fn redefined(name: &str, at: &str, arity: usize, place: Option<(String, bool, usize)>) -> bool {
+    match place {
+        Some((other, true, k)) if k == arity => warning(at, duplicate(name, &other)),
+        Some((other, _, _)) => {
+            error(at, clash(name, &other));
+            return false;
+        }
+        None => {}
+    }
+    true
+}
+
+/// Checks a module whose scope starts as `base` (what is in scope where a nested module starts),
+/// recording its errors (see DIAG), and returns what it exports. `known` is whether every name in
+/// scope is known: not when the module (or the one it is nested in) extends one tla2rs does not
+/// read
+fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
     let mut scope = Scope::default();
     for s in base {
         scope.push(s);
@@ -275,17 +399,27 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
             _ => known = false,
         }
     }
-    let own = |n: &str, decl: bool| Sym { name: n.to_string(), origin: format!("{}.{n}", m.name), decl, fixed: false };
-    let mut pending_rec: Vec<String> = vec![];
+    let own = |n: &str, decl: bool, at: &str, arity: usize| Sym {
+        name: n.to_string(),
+        origin: format!("{}.{n}", m.name),
+        decl,
+        fixed: false,
+        at: at.to_string(),
+        arity,
+    };
+    // The RECURSIVE declarations not defined yet, with their positions
+    let mut pending_rec: Vec<(String, String)> = vec![];
     // The name of a recursive function whose body was checked with its `#app` definition
     let mut checked_body: Option<String> = None;
-    for u in &m.units {
+    for (k, u) in m.units.iter().enumerate() {
+        let (at, arity) = m.unit_at.get(k).map(|(a, n)| (a.as_str(), *n)).unwrap_or(("", 0));
         match u {
             Unit::Decl(n) | Unit::Theorem(n) => {
-                if scope.has(n) {
-                    return Err(clash(n));
+                if let Some((other, _, _)) = scope.place(n) {
+                    error(at, clash(n, &other));
+                    continue;
                 }
-                let s = own(n, matches!(u, Unit::Decl(_)));
+                let s = own(n, matches!(u, Unit::Decl(_)), at, arity);
                 scope.push(s.clone());
                 out.push(s);
                 let k = match u {
@@ -296,66 +430,68 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                 ctx.add(n, k, true);
             }
             Unit::Recursive(n) => {
-                if scope.has(n) {
-                    return Err(clash(n));
+                pending_rec.push((n.clone(), at.to_string()));
+                if let Some((other, _, _)) = scope.place(n) {
+                    error(at, clash(n, &other));
+                    continue;
                 }
-                pending_rec.push(n.clone());
                 ctx.add(n, Kind::Def, true);
                 // Exported even when the definition is LOCAL (measured: a module that extends
                 // one with `RECURSIVE F(_)` and `LOCAL F(n) == ...` may not define F)
-                scope.push(own(n, false));
-                out.push(own(n, false));
+                scope.push(own(n, false, at, arity));
+                out.push(own(n, false, at, arity));
             }
-            Unit::Assume(i) => Walker::new(&scope, known, &m.recursive).expr(&m.assumes[*i].expr)?,
+            Unit::Assume(i) => Walker::new(&scope, known, &m.recursive).expr(&m.assumes[*i].expr),
             Unit::Def(i, fun) => {
                 let d = &m.defs[*i];
                 if let Some(f) = d.name.strip_suffix("#app") {
-                    // `f[x \in S] == e` that refers to f: f is in scope in S and e
-                    if scope.has(f) {
-                        return Err(clash(f));
-                    }
-                    let mut sc = scope.clone();
-                    sc.push(own(f, false));
-                    let mut w = Walker::new(&sc, known, &m.recursive);
+                    // `f[x \in S] == e` that refers to f: f is in scope in S and e, after the
+                    // bound variables
+                    let mut w = Walker::new(&scope, known, &m.recursive);
                     for p in &d.params {
-                        w.bind_var(p)?;
+                        w.bind_var(p);
                     }
-                    w.expr(&d.body)?;
+                    w.fun_name(f, at);
+                    w.expr(&d.body);
                     checked_body = Some(f.to_string());
                     continue;
                 }
                 if d.name.contains('#') {
                     continue;
                 }
-                match pending_rec.iter().position(|r| *r == d.name) {
+                let rec = match pending_rec.iter().position(|(r, _)| *r == d.name) {
                     Some(k) => {
                         pending_rec.remove(k);
-                    }
-                    None if scope.has(&d.name) => {
-                        return Err(match scope.get(&d.name) {
-                            Some(s) if !s.decl => format!("{SANY}Multiple declarations or definitions for symbol {}.", d.name),
-                            _ => clash(&d.name),
-                        })
-                    }
-                    None => {}
-                }
-                if checked_body.take().as_deref() != Some(d.name.as_str()) {
-                    let mut sc = scope.clone();
-                    if *fun {
-                        sc.push(own(&d.name, false));
-                    }
-                    let mut w = Walker::new(&sc, known, &m.recursive);
-                    for p in &d.params {
-                        if *p == d.name {
-                            return Err(format!("{SANY}Operator {p} already defined or declared."));
+                        // SANY places the symbol at its definition from now on
+                        for s in scope.syms.iter_mut().chain(out.iter_mut()).filter(|s| s.name == d.name && s.origin == format!("{}.{}", m.name, d.name)) {
+                            s.at = at.to_string();
                         }
-                        w.bind(p)?;
+                        true
                     }
-                    w.expr(&d.body)?;
+                    None => false,
+                };
+                let mut added = true;
+                if checked_body.take().as_deref() != Some(d.name.as_str()) {
+                    let mut w = Walker::new(&scope, known, &m.recursive);
+                    if *fun {
+                        // Checked once its bound variables are in scope
+                        w.fun_def = Some((d.name.clone(), at.to_string()));
+                    } else {
+                        for (p, k) in d.params.iter().zip(d.arity.iter().chain(std::iter::repeat(&0))) {
+                            w.bind(p, *k);
+                        }
+                        if !rec && w.has(&d.name) {
+                            error(at, format!("Operator {} already defined or declared.", d.name));
+                        }
+                    }
+                    w.expr(&d.body);
+                    if !rec && !*fun {
+                        added = redefined(&d.name, at, d.params.len(), scope.place(&d.name));
+                    }
                 }
                 ctx.add(&d.name, Kind::Def, !m.local_defs.contains(&d.name));
-                let s = own(&d.name, false);
-                if !scope.syms.contains(&s) {
+                let s = own(&d.name, false, at, d.params.len());
+                if added && !scope.syms.contains(&s) {
                     scope.push(s.clone());
                 }
                 if !m.local_defs.contains(&d.name) && !out.contains(&s) {
@@ -380,20 +516,18 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                 }
                 match &inst.name {
                     Some(n) => {
-                        if scope.has(n) {
-                            return Err(clash(n));
-                        }
                         let mut w = Walker::new(&scope, known, &m.recursive);
                         for p in &inst.params {
-                            if p == n {
-                                return Err(format!("{SANY}Operator {p} already defined or declared."));
-                            }
-                            w.bind(p)?;
+                            w.bind(p, 0);
+                        }
+                        if w.has(n) {
+                            error(at, format!("Operator {n} already defined or declared."));
                         }
                         for (_, e) in &inst.subs {
-                            w.arg(e)?;
+                            w.arg(e);
                         }
-                        let s = own(n, false);
+                        redefined(n, at, inst.params.len(), scope.place(n));
+                        let s = own(n, false, at, inst.params.len());
                         scope.push(s.clone());
                         if !local {
                             out.push(s);
@@ -402,7 +536,7 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                     None => {
                         let mut w = Walker::new(&scope, known, &m.recursive);
                         for (_, e) in &inst.subs {
-                            w.arg(e)?;
+                            w.arg(e);
                         }
                         let Some(Some(syms)) = exports(&inst.module) else {
                             known = false;
@@ -417,8 +551,8 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
                             }
                             match scope.get(&s.name) {
                                 Some(old) if *old == s => {}
-                                Some(_) => return Err(format!("{SANY}Multiple declarations or definitions for symbol {}.", s.name)),
-                                None if builtin(&s.name) => return Err(clash(&s.name)),
+                                Some(old) => error(at, duplicate(&s.name, &old.at)),
+                                None if builtin(&s.name) => error(at, clash(&s.name, BUILTINS_AT)),
                                 None => {
                                     scope.push(s.clone());
                                     if !local {
@@ -432,11 +566,14 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
             }
             Unit::Nested(i) => {
                 let inner = &m.nested[*i];
-                let ex = module(inner, scope.syms.clone(), known)?;
+                let ex = module(inner, scope.syms.clone(), known);
                 EXPORTS.with(|e| e.borrow_mut().insert(inner.name.clone(), ex));
                 ctx.add(&inner.name, Kind::Module, true);
             }
         }
+    }
+    for (n, at) in pending_rec {
+        error(&at, format!("Symbol {n} declared in RECURSIVE statement but not defined."));
     }
     CONTEXTS.with(|c| c.borrow_mut().insert(m.name.clone(), ctx_known.then_some(ctx)));
     // The module's own definitions are fixed when nothing in it is a constant or variable
@@ -446,7 +583,16 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> R<Option<Vec<Sym>>> {
             s.fixed = true;
         }
     }
-    Ok(known.then_some(out))
+    known.then_some(out)
+}
+
+/// A parameter, bound variable or LET definition in scope: where SANY places it, its number of
+/// parameters and whether it is a definition
+struct Local {
+    name: String,
+    at: String,
+    arity: usize,
+    def: bool,
 }
 
 /// Checks the names in the expressions of one definition (or ASSUME, or INSTANCE)
@@ -457,111 +603,173 @@ struct Walker<'a> {
     /// The names declared RECURSIVE (also in LET)
     recursive: &'a [String],
     /// Parameters, bound variables and LET definitions in scope, innermost last
-    locals: Vec<String>,
+    locals: Vec<Local>,
     /// The bound variables introduced since the enclosing label or definition
     label_bound: Vec<String>,
     /// The position of the label being entered, from the AT label the parser puts around it
     label_at: Option<String>,
+    /// The positions of the operator applied in the expression being entered, from an OP_AT label
+    op_at: Option<(String, String)>,
+    /// A function definition `f[x \in S] == e` being checked, with its position: its name is
+    /// checked once its bound variables are in scope
+    fun_def: Option<(String, String)>,
 }
 
 impl<'a> Walker<'a> {
     fn new(scope: &'a Scope, known: bool, recursive: &'a [String]) -> Self {
-        Walker { scope, known, recursive, locals: vec![], label_bound: vec![], label_at: None }
+        Walker { scope, known, recursive, locals: vec![], label_bound: vec![], label_at: None, op_at: None, fun_def: None }
     }
 
     fn has(&self, n: &str) -> bool {
-        self.scope.has(n) || self.locals.iter().any(|l| l == n)
+        self.scope.has(n) || self.locals.iter().any(|l| l.name == n)
     }
 
-    /// Puts x in scope, refusing a name already there
-    fn bind(&mut self, x: &str) -> R<()> {
-        if !x.contains('#') && self.has(x) {
-            return Err(clash(x));
+    /// See `Scope::place`, for locals too
+    fn place(&self, n: &str) -> Option<(String, bool, usize)> {
+        match self.locals.iter().rev().find(|l| l.name == n) {
+            Some(l) => Some((l.at.clone(), l.def, l.arity)),
+            None => self.scope.place(n),
         }
-        self.locals.push(x.to_string());
-        Ok(())
+    }
+
+    /// Puts x (a name with its position, see `untag`) in scope, with `arity` parameters, refusing
+    /// a name already there (which then stays what it was). Whether it was put in scope
+    fn bind(&mut self, x: &str, arity: usize) -> bool {
+        let (n, at) = untag(x);
+        if !n.contains('#') {
+            if let Some((other, _, _)) = self.place(n) {
+                error(at, clash(n, &other));
+                return false;
+            }
+        }
+        self.locals.push(Local { name: n.to_string(), at: at.to_string(), arity, def: false });
+        true
     }
 
     /// Like `bind`, for a bound variable (which a label inside must list)
-    fn bind_var(&mut self, x: &str) -> R<()> {
-        self.bind(x)?;
-        if !x.contains('#') {
-            self.label_bound.push(x.to_string());
+    fn bind_var(&mut self, x: &str) {
+        let n = untag(x).0;
+        if self.bind(x, 0) && !n.contains('#') {
+            self.label_bound.push(n.to_string());
         }
-        Ok(())
     }
 
-    fn resolve(&self, n: &str, at: &Pos) -> R<()> {
-        if !self.known || n.contains('#') || n.starts_with('@') {
-            return Ok(());
+    /// The name f of a function definition at `at`, once its bound variables are in scope
+    fn fun_name(&mut self, f: &str, at: &str) {
+        if self.has(f) {
+            error(at, format!("Function name `{f}' already defined or declared."));
+        } else {
+            self.locals.push(Local { name: f.to_string(), at: at.to_string(), arity: 0, def: true });
+        }
+    }
+
+    /// Whether name n is in scope, recording SANY's error if not. An operator with parameters
+    /// named alone, where it is not an argument (`arg`), is refused too
+    fn resolve(&self, n: &str, at: &str, arg: bool) -> bool {
+        // `@` names made for EXCEPT, not the operator `@@`
+        if !self.known || n.contains('#') || (n.starts_with('@') && n != "@@") {
+            return true;
         }
         // `N!Op` (an instance's operator) and `Op!lab` (a label) need N and Op (`!!` is an
         // operator symbol)
         let word = n.starts_with(|c: char| c.is_alphanumeric() || c == '_');
         let base = sany_name(if word { n.split('!').next().unwrap_or(n) } else { n });
-        if self.has(base) {
-            return Ok(());
+        match self.place(base) {
+            Some((_, _, k)) => {
+                if word && !arg && k > 0 && !n.contains('!') {
+                    error(at, format!("The operator {base} requires {k} arguments."));
+                }
+                true
+            }
+            None if word => {
+                error(at, format!("Unknown operator: `{base}'."));
+                false
+            }
+            None => {
+                error(at, format!("Could not find declaration or definition of symbol '{base}'."));
+                false
+            }
         }
-        if word && at.known() {
-            Err(sem(&at.text(), &format!("Unknown operator: `{base}'.")))
-        } else if word {
-            Err(format!("{SANY}Unknown operator: `{base}'."))
-        } else {
-            Err(format!("{SANY}Could not find declaration or definition of symbol '{base}'."))
+    }
+
+    /// Whether the operator symbol `sym` applied at `at` (see `op_at`) is in scope; if not,
+    /// SANY's two errors, the second naming it an operator of `kind` (infix, prefix)
+    fn resolve_sym(&self, sym: &str, kind: &str, at: Option<(String, String)>) -> bool {
+        let (at_sym, at_all) = at.unwrap_or_default();
+        if !self.resolve(sym, &at_sym, false) {
+            error(&at_all, format!("Couldn't resolve {kind} operator symbol `{sym}'."));
+            return false;
         }
+        true
     }
 
     /// Runs f with the scope restored afterwards
-    fn scoped(&mut self, f: impl FnOnce(&mut Self) -> R<()>) -> R<()> {
+    fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
         let (l, b) = (self.locals.len(), self.label_bound.len());
-        let r = f(self);
+        f(self);
         self.locals.truncate(l);
         self.label_bound.truncate(b);
-        r
     }
 
     /// An argument of an operator, which may be a LAMBDA (only there, or in a WITH substitution)
-    fn arg(&mut self, e: &Expr) -> R<()> {
+    /// or an operator's name
+    fn arg(&mut self, e: &Expr) {
         match e {
             Expr::Lambda(ps, body) => self.scoped(|w| {
                 for p in ps {
-                    w.bind(p)?;
+                    w.bind(p, 0);
                 }
                 w.expr(body)
             }),
+            Expr::Ident(n, at) => {
+                self.resolve(untag(n).0, &at.text_if_known(), true);
+            }
             e => self.expr(e),
         }
     }
 
-    fn expr(&mut self, e: &Expr) -> R<()> {
+    fn expr(&mut self, e: &Expr) {
         use Expr::*;
+        let op_at = self.op_at.take();
         match e {
-            Num(_) | Str(_) | Bool(_) | At | RecCall(..) => Ok(()),
-            Ident(n, at) => self.resolve(n, at),
+            Num(_) | Str(_) | Bool(_) | At | RecCall(..) => {}
+            Ident(n, at) => {
+                self.resolve(untag(n).0, &at.text_if_known(), false);
+            }
             Call(n, args) => {
                 if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA" {
                     // Their bound variables are not kept
-                    return Ok(());
+                    return;
                 }
-                if n == crate::parser::SUBEXPR {
+                if n.starts_with(crate::parser::SUBEXPR) {
                     for (k, a) in args.iter().enumerate() {
                         match a {
                             Ident(x, _) if k > 0 && ["<<", ">>", ":", "@"].contains(&x.as_str()) => {}
-                            Call(l, la) if l.starts_with("#label") => la.iter().try_for_each(|x| self.expr(x))?,
-                            Tuple(vs) if k > 0 => vs.iter().try_for_each(|x| self.expr(x))?,
-                            a => self.expr(a)?,
+                            Call(l, la) if l.starts_with("#label") => la.iter().for_each(|x| self.expr(x)),
+                            Tuple(vs) if k > 0 => vs.iter().for_each(|x| self.expr(x)),
+                            Ident(x, at) if k == 0 => {
+                                self.resolve(untag(x).0, &at.text_if_known(), true);
+                            }
+                            a => self.expr(a),
                         }
                     }
-                    return Ok(());
+                    return;
                 }
-                self.resolve(n, &NOPOS)?;
-                args.iter().try_for_each(|a| self.arg(a))
+                let word = n.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+                let found = if word || args.len() != 2 {
+                    self.resolve(n, &op_at.map(|a| a.0).unwrap_or_default(), true)
+                } else {
+                    self.resolve_sym(n, "infix", op_at)
+                };
+                // SANY does not look at the arguments of an operator it cannot find
+                if found {
+                    args.iter().for_each(|a| self.arg(a));
+                }
             }
             Un(op, x) => {
-                if *op == UOp::Neg {
-                    self.resolve("-.", &NOPOS)?;
+                if *op != UOp::Neg || self.resolve_sym("-.", "prefix", op_at) {
+                    self.expr(x)
                 }
-                self.expr(x)
             }
             Bin(op, a, b) => {
                 let sym = match op {
@@ -577,60 +785,66 @@ impl<'a> Walker<'a> {
                     BOp::Range => Some(".."),
                     _ => None,
                 };
-                if let Some(s) = sym {
-                    self.resolve(s, &NOPOS)?;
+                if sym.map_or(true, |s| self.resolve_sym(s, "infix", op_at)) {
+                    self.expr(a);
+                    self.expr(b);
                 }
-                self.expr(a)?;
-                self.expr(b)
             }
             Quant(_, bs, body) | SetMap(body, bs) => {
                 for (_, s) in bs {
-                    self.expr(s)?;
+                    self.expr(s);
                 }
                 self.scoped(|w| {
                     for (x, _) in bs {
-                        w.bind_var(x)?;
+                        w.bind_var(x);
                     }
                     w.expr(body)
                 })
             }
             Choose(x, s, p) | SetFilter(x, s, p) | FunCons(x, s, p) => {
-                self.expr(s)?;
+                let fun = if matches!(e, FunCons(..)) { self.fun_def.take() } else { None };
+                self.expr(s);
                 self.scoped(|w| {
-                    w.bind_var(x)?;
+                    w.bind_var(x);
+                    match fun {
+                        // `f[<<a, b>> \in S] == e`: the names are bound by a LET inside
+                        Some(f) if x.starts_with('#') => w.fun_def = Some(f),
+                        Some((f, at)) => w.fun_name(&f, &at),
+                        None => {}
+                    }
                     w.expr(p)
                 })
             }
-            Lambda(..) => Err(format!("{SANY}LAMBDA expression used where an expression is required.")),
+            Lambda(..) => error("", "LAMBDA expression used where an expression is required.".into()),
             Let(defs, body) => self.scoped(|w| {
+                let fun = w.fun_def.take();
                 let mut checked_body: Option<&str> = None;
                 for d in defs {
                     // `<<x, y>> \in S` binds x and y as `x == t[1]`, `y == t[2]`
                     let pattern = matches!(&d.body, App(t, i) if matches!(t.as_ref(), Ident(n, _) if n.starts_with('#')) && matches!(i.as_ref(), Num(_)));
                     if pattern {
-                        w.bind_var(&d.name)?;
+                        w.bind_var(&d.name);
                         continue;
                     }
-                    let fun_app = d.name.strip_suffix("#app");
-                    let name = fun_app.unwrap_or(&d.name);
+                    let (dname, at) = untag(&d.name);
+                    let fun_app = dname.strip_suffix("#app");
+                    let name = fun_app.unwrap_or(dname);
                     if fun_app.is_none() && checked_body == Some(name) {
                         // The function of a recursive function definition, checked with it
                         continue;
                     }
-                    if w.has(name) {
-                        return Err(clash(name));
-                    }
-                    let rec = fun_app.is_some() || w.recursive.contains(&d.name);
+                    let rec = fun_app.is_some() || w.recursive.iter().any(|r| r == dname);
                     let saved = std::mem::take(&mut w.label_bound);
-                    let r = w.scoped(|w| {
-                        if rec {
-                            w.locals.push(name.to_string());
+                    w.scoped(|w| {
+                        for (p, k) in d.params.iter().zip(d.arity.iter().chain(std::iter::repeat(&0))) {
+                            if fun_app.is_some() { w.bind_var(p) } else { w.bind(p, *k); }
                         }
-                        for p in &d.params {
-                            if *p == d.name {
-                                return Err(format!("{SANY}Operator {p} already defined or declared."));
-                            }
-                            if fun_app.is_some() { w.bind_var(p)? } else { w.bind(p)? }
+                        if fun_app.is_some() {
+                            w.fun_name(name, at);
+                        } else if rec {
+                            w.locals.push(Local { name: name.to_string(), at: at.to_string(), arity: d.params.len(), def: true });
+                        } else if w.has(name) {
+                            error(at, format!("Operator {name} already defined or declared."));
                         }
                         // The parameters of a LET definition are not listed by its labels
                         if fun_app.is_none() {
@@ -639,17 +853,28 @@ impl<'a> Walker<'a> {
                         w.expr(&d.body)
                     });
                     w.label_bound = saved;
-                    r?;
                     if fun_app.is_some() {
                         checked_body = Some(name);
                     }
-                    w.locals.push(name.to_string());
+                    // A function takes no parameters, unlike the `#app` operator it is checked with
+                    let arity = if fun_app.is_some() { 0 } else { d.params.len() };
+                    if rec || redefined(name, at, arity, w.place(name)) {
+                        w.locals.push(Local { name: name.to_string(), at: at.to_string(), arity, def: true });
+                    }
+                }
+                if let Some((f, at)) = fun {
+                    w.fun_name(&f, &at);
                 }
                 w.expr(body)
             }),
+            Label(n, _, body) if n.starts_with(OP_AT) => {
+                let (s, all) = n[OP_AT.len()..].split_once('\u{1}').unwrap_or_default();
+                self.op_at = Some((s.to_string(), all.to_string()));
+                self.expr(body)
+            }
             Label(n, args, body) => {
                 for a in args {
-                    self.expr(a)?;
+                    self.expr(a);
                 }
                 if let Some(at) = err_pos_of(n) {
                     if body.is_user_label() {
@@ -658,7 +883,7 @@ impl<'a> Walker<'a> {
                     }
                 }
                 let Some(head) = n.strip_suffix("::") else { return self.expr(body) };
-                let at = self.label_at.take();
+                let at = self.label_at.take().unwrap_or_default();
                 let ps: Vec<&str> = match head.split_once('(') {
                     Some((_, rest)) => rest.trim_end_matches(')').split(',').filter(|p| !p.is_empty()).collect(),
                     None => vec![],
@@ -666,25 +891,20 @@ impl<'a> Walker<'a> {
                 let l = head.split('(').next().unwrap_or(head);
                 for (k, p) in ps.iter().enumerate() {
                     if ps[..k].contains(p) {
-                        return Err(format!("{SANY}Repeated formal parameter {p} in label `{l}'."));
+                        return error("", format!("Repeated formal parameter {p} in label `{l}'."));
                     }
                     if !self.label_bound.iter().any(|x| x == p) {
-                        return Err(format!("{SANY}Illegal parameter {p} of label `{l}'."));
+                        return error("", format!("Illegal parameter {p} of label `{l}'."));
                     }
                 }
                 if let Some(x) = self.label_bound.iter().find(|x| !ps.contains(&x.as_str())) {
-                    let msg = format!("Label {l} must contain formal parameter `{x}'.");
-                    return Err(match at {
-                        Some(at) => sem(&at, &msg),
-                        None => format!("{SANY}{msg}"),
-                    });
+                    return error(&at, format!("Label {l} must contain formal parameter `{x}'."));
                 }
                 let saved = std::mem::take(&mut self.label_bound);
-                let r = self.expr(body);
+                self.expr(body);
                 self.label_bound = saved;
-                r
             }
-            e => e.children().into_iter().try_for_each(|c| self.expr(c)),
+            e => e.children().into_iter().for_each(|c| self.expr(c)),
         }
     }
 }

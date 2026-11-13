@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 706 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 712 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -58,7 +58,7 @@ It has no crate dependencies.
 | File | Role |
 |---|---|
 | `src/lexer.rs` `src/parser.rs` | Lexing and parsing. `/\` and `\/` bullet lists are delimited by column. Also SANY's precedence checks and string escapes (see "What SANY refuses"); an error marked with `lexer::SANY` makes the compiler stop with exit 150. The statements of a module are kept in the order written (`Module::units`). The positions TLC names actions by are kept in POS labels (`ast::POS`, see "Counterexamples") |
-| `src/sany.rs` | SANY's checks of names (see "What SANY refuses"): what is in scope at each statement, what each module exports, labels and LAMBDA. Run on each module read from a file once the modules it extends and instantiates are loaded (`compile::load_parsed`), and on the modules nested in it |
+| `src/sany.rs` | SANY's checks of names (see "What SANY refuses"): what is in scope at each statement, what each module exports, labels and LAMBDA. Run on each module read from a file once the modules it extends and instantiates are loaded (`compile::load_parsed`), and on the modules nested in it. It collects every error of the module; when there are any, the module is parsed again with the positions SANY reports (`parser::parse_module_sany`) and checked again for SANY's report |
 | `src/cfg.rs` | `.cfg` files (SPECIFICATION / INIT / NEXT / CONSTANT, including `<-` / INVARIANT / PROPERTY / CONSTRAINT / ACTION_CONSTRAINT / VIEW / SYMMETRY / CHECK_DEADLOCK; TYPE / TYPE_CONSTRAINT are ignored as in TLC) |
 | `src/expand.rs` | Inlines every operator definition. Bound variables are renamed, and each EXCEPT's `@` gets a unique name too. Call sites are kept as `Expr::Label`. A subexpression named by label or position (`Op!lab`, `Op!1`, `Op!(e)`) is found in the definition as written and expanded as a definition with the bound variables and label parameters on the way as extra parameters (`subexpr`). Operator parameters are bound to the operator (or LAMBDA) passed, with its environment. A RECURSIVE operator called again inside its own expansion becomes `Expr::RecCall`, evaluated at compile time or compiled into a Rust function (`Gen::rec_fn`, which takes the variables it reads, primed or not, as arguments); it is expanded once per combination of operator arguments. For the constant evaluator only, `expand_def_bound` binds arguments and LET definitions to names instead (see "Arguments written out at each use") |
 | `src/value.rs` | Compile-time values and constant evaluation (set order follows TLC: smaller sets first). The names a BIND label binds are evaluated where first used and kept (`register_bound`, `eval_bound`) |
@@ -66,7 +66,7 @@ It has no crate dependencies.
 | `src/codegen.rs` | Rust generation. Actions are continuation-passing, threading "the remaining conjuncts". The next-state relation is first split into actions as TLC splits it, which names the successors in traces (`gen_split`). As in TLC, `\/` and `\E` branch while some variable is still unassigned. `\A` over a set from the state walks the elements at run time (`gen_forall`), and a recursive operator that assigns variables, called with arguments from the state, becomes a Rust function returning the states its body builds (`gen_rec_action`) |
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). When the types from TypeOK fail in Init or Next (a module that extends another and adds a record field its type invariant lacks), the spec is compiled again with every type inferred (`INFER_ALL`). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). A name a definition binds (a parameter, bound variable or LET definition) stays its own where the module defines the same name later, and a parameter named like a name the substitutions read, or like a parameter of the instance, is renamed in the visible definition (`InstRename`; `tests/tlc/InstShadow`, `InstShadowParam`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
 | `src/community.rs` | The modules of the CommunityModules tla2rs provides (see "CommunityModules"): TLA+ source written for tla2rs, loaded by `compile::find_module` when no module of that name is next to the spec |
-| `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does |
+| `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does; and where SANY places each definition they export (`STD_DEFS`), for its report of a name that clashes with one |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
 | `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
@@ -309,8 +309,8 @@ the spec does not load Integers (or Reals), tla2rs follows Naturals: `tla_div_na
 
 ### What SANY refuses
 
-TLC stops with exit 150 before checking anything when SANY refuses a spec (its report on a parse error
-or a level error is reproduced word for word, see "Messages and printed lines"). tla2rs repeats these of SANY's checks
+TLC stops with exit 150 before checking anything when SANY refuses a spec (its report on a parse error,
+a level error or semantic errors is reproduced word for word, see "Messages and printed lines"). tla2rs repeats these of SANY's checks
 (measured on SANY 2.19 with small specs; `tests/tlc/RejSany*`, `SanyScope*`):
 
 - Scope (`sany.rs`). A name is in scope only after the statement that declares or defines it: an operator
@@ -323,10 +323,16 @@ or a level error is reproduced word for word, see "Messages and printed lines").
   declaration puts its name in scope, and is exported even when the definition is LOCAL. A nested module sees what is in scope where it starts
 - Every name used must be in scope (`Unknown operator`, `Could not find declaration or definition of symbol`),
   in every definition, used or not; this covers the operators of standard modules not extended (`Len`, `+`, unary
-  minus as `-.`, `:>`). The sets of `\E x \in S, y \in T` are read outside the quantifier, so T cannot use x
+  minus as `-.`, `:>`). SANY does not look at the arguments of an operator it cannot find (`(1 :> 0) @@ (2 :> 0)`
+  without TLC reports `@@` only). The sets of `\E x \in S, y \in T` are read outside the quantifier, so T cannot
+  use x. An operator that takes arguments, named without them, is refused (`The operator F requires 1 arguments.`),
+  except as an argument; a RECURSIVE declaration needs a definition
 - No declaration, definition, parameter, LET definition, bound variable or LAMBDA parameter may reuse a name in
-  scope. A definition's own name is in scope in its parameters (`F(F)` is refused) but not in its body (`F == \E F
-  \in S : P` is accepted), unless it is a function definition `f[x \in S] == e` or declared RECURSIVE. The same
+  scope. A definition is checked once its parameters are in scope (`F(F)` is refused: `Operator F already defined
+  or declared.`, and `f[f \in S] == e` gives `Function name`), then its body; after the body, a clash with a
+  definition of as many parameters is only a warning, any other a second error (`Multiply-defined symbol`, not for a
+  function definition), and the definition is then not in scope. A definition's own name is not in its body (`F ==
+  \E F \in S : P` is accepted), unless it is a function definition `f[x \in S] == e` or declared RECURSIVE. The same
   definition reached twice is one symbol: a module extended along two paths, or a module without constants or
   variables both extended and instantiated (or instantiated twice). An INSTANCE of a module with constants or
   variables gives new definitions, so instantiating it twice without names is refused. Two different definitions
@@ -353,8 +359,10 @@ in scope in the module that reads it, which may define the same name (`tests/tlc
 
 Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
 (their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
-a LET definition; and SANY's checks of other kinds (operator arities, levels outside temporal formulas, the
-warning for two definitions of one name in two extended modules).
+a LET definition; and SANY's checks of other kinds (the number of arguments of a call, an operator passed where a
+parameter takes none, `Op!1` of an operator that takes arguments, levels outside temporal formulas, the warning for
+two definitions of one name in two extended modules). Two declarations of one name (`VARIABLE x, x`) are refused,
+where SANY only warns.
 
 ### Quantifiers and CHOOSE without a set
 
@@ -689,20 +697,20 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   with `lexer::SANY_ABORT`). A level error of a temporal formula gives the position of the innermost
   operator whose arguments break the rules, infix junctions read as binary and to the left, and a
   bulleted list is a `Conjunction list` or `Disjunction list`: the root module is parsed again with
-  SPAN labels (`parser::parse_module_spans`) and the definition checked as written. A semantic
-  error comes under `Semantic errors:` and `*** Errors: 1`; an unknown name (`Unknown operator:
-  `x'.`) and a label that leaves out a bound variable give the position of the name, or from the
-  label's name to the end of its body (`sany::SEMANTIC`). The other semantic errors are reported
-  without a position, in tla2rs's words where SANY's need more than the one error
+  SPAN labels (`parser::parse_module_spans`) and the definition checked as written. Semantic
+  errors come under `Semantic errors:` and `*** Errors: N`, each with its position, in the order
+  SANY meets them, then `*** Warnings: N` (`sany::SEMANTIC`): the position of a name, a bound
+  variable or a parameter; of a whole definition or declaration (LOCAL included, `F(_)` of a
+  RECURSIVE declaration); of an operator's symbol and then of the whole expression (`Couldn't
+  resolve infix operator symbol`); of a subexpression selector. A clash names the other
+  declaration, also in a standard module as SANY reads the jar's file (`std_modules::STD_DEFS`:
+  Sequences' `Len` is at line 25, col 1 to 44) or `In module --TLA+ BUILTINS--`, after `conflicts `
+  and a line break
 
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
-compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 17
-configurations, all for one reason:
-
-| Reason | Configurations |
-|---|---|
-| SANY's semantic errors give the position of each name involved, and tla2rs keeps positions only of identifiers in expressions (`ast::Pos`): not of bound variables, parameters, declarations and definitions (whose position is the whole statement, LOCAL included), operator symbols, operators called with arguments or selectors of subexpression names. SANY also gives the position of the declaration a name clashes with (in a standard module as SANY reads the jar's file, such as Sequences' `Len` at line 25, col 1 to 44, or `In module --TLA+ BUILTINS--`), breaks the line of a clash after `conflicts `, and adds follow-on errors (an operator's arity at its use, `Couldn't resolve infix operator symbol` with the whole expression, where it then leaves the operands unchecked: `RejSanyTlcOps` reports `@@` and not the `:>` inside) and warnings (`*** Warnings:` after the errors, for a definition repeated). tla2rs stops at its first error, worded without positions | 17: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-LocalRec`, `-Minus`, `-OwnParam`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `SubexprBad` |
+compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). No
+configuration needs it now.
 
 ### Arguments written out at each use
 

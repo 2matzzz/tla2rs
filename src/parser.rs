@@ -26,6 +26,9 @@ pub struct Parser {
     /// The groups of bound variables `binders_pat` read last, as TLC prints them in a function
     /// (`<<a, b>>`, or the first name of `a, c \in S`), each with the index of its first binding
     last_binders: Vec<(String, usize)>,
+    /// The positions of the names `ident_list` and `ident_list_arity` read last (with the
+    /// parameters `(_, _)` after a name)
+    names_at: Vec<String>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -56,7 +59,7 @@ pub fn parse_module(src: &str) -> R<Module> {
     // reads them: binary and left-associative. Only then are they kept so (see INFIX_JUNCTION)
     let positional = toks.windows(2).any(|w| matches!(&w[0].tok, Tok::Sym(b) if b == "!") && is_selector(&w[1].tok));
     NEST_JUNCTIONS.with(|n| n.set(positional));
-    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new(), postfix_guard: None, last_binders: vec![] };
+    let mut p = Parser { toks, pos: 0, limits: vec![], recursive: vec![], tuple_binders: 0, let_instances: vec![], module: String::new(), postfix_guard: None, last_binders: vec![], names_at: vec![] };
     let r = p.module();
     NEST_JUNCTIONS.with(|n| n.set(false));
     r
@@ -70,7 +73,34 @@ fn is_selector(t: &Tok) -> bool {
 thread_local! {
     static NEST_JUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SANY_POS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// `parse_module` with the positions SANY gives in its semantic errors, for `sany.rs` to report
+/// them: each bound variable, operator parameter and LET definition carries its position after
+/// NAME_AT, and each operator applied (an infix or prefix operator other than a built-in one, or
+/// an operator called with arguments) is in an OP_AT label. Only for reporting the errors of a
+/// module `sany.rs` refused, since the labels change the tree
+pub fn parse_module_sany(src: &str) -> R<Module> {
+    SANY_POS.with(|s| s.set(true));
+    let r = parse_module(src);
+    SANY_POS.with(|s| s.set(false));
+    r
+}
+
+fn sany_pos() -> bool {
+    SANY_POS.with(|s| s.get())
+}
+
+/// After a name in a tree from `parse_module_sany`: the position of the name follows
+pub const NAME_AT: char = '\u{5}';
+
+/// The label around an operator applied, in a tree from `parse_module_sany`: `#opat `, the
+/// position of the operator's symbol or name, `\u{1}` and the position of the whole expression
+pub const OP_AT: &str = "#opat ";
+
+/// The infix operators built into TLA+, which SANY does not look up
+const BUILTIN_INFIX: &[&str] = &["/\\", "\\/", "=>", "<=>", "~>", "=", "#", "/=", "\\in", "\\notin", "\\subseteq", "\\cup", "\\cap", "\\", "\\X", "-+->"];
 
 /// `parse_module` with SPAN labels (see `ast::SPAN`) around `[]`, `<>` and the infix operators
 /// `/\`, `\/`, `=>`, `<=>` and `~>`, which then nest as SANY reads them (binary, to the left). Only
@@ -96,8 +126,14 @@ pub const INFIX_JUNCTION: &str = "#infix";
 
 /// The call a positional subexpression name becomes: the operator (Ident or Call) and then the
 /// selectors: Num(n) for `!n`, Ident("<<" / ">>" / ":" / "@"), Tuple(args) for `!(args)`, and a
-/// call of `#label<name>` for a label
+/// call of `#label<name>` for a label. The name of the call is followed by the position of each
+/// selector, each after `\u{1}`, for SANY's errors (see `subexpr_at`)
 pub const SUBEXPR: &str = "#subexpr";
+
+/// The positions of the selectors of a SUBEXPR call named n
+pub fn subexpr_at(n: &str) -> Vec<&str> {
+    n.split('\u{1}').skip(1).collect()
+}
 
 /// Infix operators without a built-in meaning, which a spec may define (`a ++ b == ...`), with
 /// their precedence (the lower end of the range in the TLA+ table). `:>` and `@@` are defined by
@@ -438,6 +474,18 @@ impl Parser {
         Pos { line: s.line as u32, col: s.col as u32 + 1, end_line: e.line as u32, end_col: e.end as u32, module: module_id(&self.module) }
     }
 
+    /// The name read at token `at`, with its position in a tree from `parse_module_sany`
+    fn tagged(&self, name: String, at: usize) -> String {
+        if sany_pos() { format!("{name}{NAME_AT}{}", self.span_text(at, at)) } else { name }
+    }
+
+    /// The operator applied in `e`, whose symbol or name is the token at `op` and which was
+    /// parsed from the token at `start` to the last one consumed, in an OP_AT label in a tree from
+    /// `parse_module_sany`
+    fn op_at(&self, op: usize, start: usize, e: Expr) -> Expr {
+        if sany_pos() { Expr::Label(format!("{OP_AT}{}\u{1}{}", self.span_text(op, op), self.span_text(start, self.pos - 1)), vec![], e.b()) } else { e }
+    }
+
     /// `e`, parsed from the token at `start` to the last one consumed, in a SPAN label
     fn span(&self, start: usize, e: Expr) -> Expr {
         Expr::Label(format!("{}{}", crate::ast::SPAN, self.span_text(start, self.pos - 1)), vec![], e.b())
@@ -533,6 +581,7 @@ impl Parser {
                 Tok::Ident(k) if k == "MODULE" => {
                     let inner = self.module()?;
                     m.units.push(Unit::Nested(m.nested.len()));
+                    m.unit_at.push((String::new(), 0));
                     m.nested.push(inner);
                 }
                 Tok::Ident(k) if k == "EXTENDS" => {
@@ -541,11 +590,12 @@ impl Parser {
                 }
                 Tok::Ident(k) if k == "CONSTANT" || k == "CONSTANTS" => {
                     self.pos += 1;
-                    for (c, n) in self.ident_list_arity()? {
+                    for ((c, n), at) in self.ident_list_arity()?.into_iter().zip(std::mem::take(&mut self.names_at)) {
                         if n > 0 {
                             m.op_constants.push((c.clone(), n));
                         }
                         m.units.push(Unit::Decl(c.clone()));
+                        m.unit_at.push((at, n));
                         m.constants.push(c);
                     }
                 }
@@ -553,6 +603,7 @@ impl Parser {
                     self.pos += 1;
                     let vs = self.ident_list()?;
                     m.units.extend(vs.iter().map(|v| Unit::Decl(v.clone())));
+                    m.unit_at.extend(std::mem::take(&mut self.names_at).into_iter().map(|at| (at, 0)));
                     m.variables.extend(vs);
                 }
                 // TLC checks ASSUME and ASSUMPTION, and skips THEOREM and AXIOM
@@ -576,6 +627,7 @@ impl Parser {
                     } else {
                         m.units.push(Unit::Assume(m.assumes.len()));
                     }
+                    m.unit_at.push((String::new(), 0));
                     m.assumes.push(Assume { module: m.name.clone(), expr, span });
                 }
                 Tok::Ident(k) if PROOF_UNITS.contains(&k.as_str()) => {
@@ -585,6 +637,7 @@ impl Parser {
                         if let (Tok::Ident(n), Tok::Sym(eq)) = (at(self, 1), at(self, 2)) {
                             if eq == "==" {
                                 m.units.push(Unit::Theorem(n.clone()));
+                                m.unit_at.push((String::new(), 0));
                                 let save = self.pos;
                                 self.pos += 3;
                                 if let Ok(e) = self.expr(0) {
@@ -603,6 +656,7 @@ impl Parser {
                     inst.at = self.span_text(start, self.pos - 1);
                     let local = start > 0 && matches!(&self.toks[start - 1].tok, Tok::Ident(l) if l == "LOCAL");
                     m.units.push(Unit::Inst(m.instances.len(), local));
+                    m.unit_at.push((inst.at.clone(), 0));
                     m.instances.push(inst);
                 }
                 Tok::Ident(k) if k == "LOCAL" => {
@@ -615,23 +669,29 @@ impl Parser {
                 }
                 Tok::Ident(k) if k == "RECURSIVE" => {
                     self.pos += 1;
-                    for (n, _) in self.ident_list_arity()? {
+                    for ((n, k), at) in self.ident_list_arity()?.into_iter().zip(std::mem::take(&mut self.names_at)) {
                         m.units.push(Unit::Recursive(n.clone()));
+                        m.unit_at.push((at, k));
                         self.recursive.push(n);
                     }
                 }
                 Tok::Ident(_) => {
                     let fun = matches!(self.peek2(), Tok::Sym(b) if b == "[");
                     let local = self.pos > 0 && matches!(&self.toks[self.pos - 1].tok, Tok::Ident(l) if l == "LOCAL");
+                    // SANY gives a definition the position of the whole statement, LOCAL included
+                    let start = if local { self.pos - 1 } else { self.pos };
                     match self.def()? {
                         Ok(d) => {
+                            let at = self.span_text(start, self.pos - 1);
                             for d in d {
                                 m.units.push(Unit::Def(m.defs.len(), fun));
+                                m.unit_at.push((at.clone(), d.params.len()));
                                 m.defs.push(d);
                             }
                         }
                         Err(inst) => {
                             m.units.push(Unit::Inst(m.instances.len(), local));
+                            m.unit_at.push((inst.at.clone(), inst.params.len()));
                             m.instances.push(inst);
                         }
                     }
@@ -648,13 +708,16 @@ impl Parser {
     /// Names with optional parameter lists `F(_, _)`, and the number of parameters of each
     fn ident_list_arity(&mut self) -> R<Vec<(String, usize)>> {
         let mut v = vec![];
+        self.names_at.clear();
         loop {
+            let first = self.pos;
             // An infix operator constant `_ ** _`
             if matches!(self.peek(), Tok::Ident(u) if u == "_") {
                 if let Some((_, _, op)) = infix(self.peek2()) {
                     if matches!(&self.toks[self.pos + 2].tok, Tok::Ident(u) if u == "_") {
                         self.pos += 3;
                         v.push((op.to_string(), 2));
+                        self.names_at.push(self.span_text(first, self.pos - 1));
                         if self.is(",") {
                             self.pos += 1;
                             continue;
@@ -682,6 +745,7 @@ impl Parser {
                 self.expect(")")?;
             }
             v.push((name, n));
+            self.names_at.push(self.span_text(first, self.pos - 1));
             if self.is(",") {
                 self.pos += 1;
             } else {
@@ -691,6 +755,7 @@ impl Parser {
     }
 
     fn ident_list(&mut self) -> R<Vec<String>> {
+        self.names_at = vec![self.span_text(self.pos, self.pos)];
         let mut v = vec![self.ident()?];
         // For CONSTANT F(_, _), skip the parameter list
         if self.is("(") {
@@ -701,6 +766,7 @@ impl Parser {
         }
         while self.is(",") {
             self.pos += 1;
+            self.names_at.push(self.span_text(self.pos, self.pos));
             v.push(self.ident()?);
             if self.is("(") {
                 while !self.is(")") {
@@ -798,6 +864,7 @@ impl Parser {
     fn def(&mut self) -> R<Result<Vec<Def>, Instance>> {
         let def_start = self.pos;
         let name = self.ident()?;
+        let name_tok = self.pos - 1;
         // A postfix operator definition `a ^+ == e`
         if let Some(op) = ["^+", "^*", "^#"].iter().find(|o| self.is(o)) {
             self.pos += 1;
@@ -805,16 +872,19 @@ impl Parser {
             let start = self.pos;
             let body = self.expr(0)?;
             let body = self.at(start, body);
+            let name = self.tagged(name, name_tok);
             return Ok(Ok(vec![Def { name: op.to_string(), params: vec![name], arity: vec![0], body }]));
         }
         // An infix operator definition `a ++ b == e`
         if let Some((_, op)) = user_infix(self.peek()) {
             self.pos += 1;
             let b = self.ident()?;
+            let b = self.tagged(b, self.pos - 1);
             self.expect("==")?;
             let start = self.pos;
             let body = self.expr(0)?;
             let body = self.at(start, body);
+            let name = self.tagged(name, name_tok);
             return Ok(Ok(vec![Def { name: op.to_string(), params: vec![name, b], arity: vec![0, 0], body }]));
         }
         let mut params = vec![];
@@ -822,7 +892,8 @@ impl Parser {
         if self.is("(") {
             self.pos += 1;
             loop {
-                params.push(self.ident()?);
+                let p = self.ident()?;
+                params.push(self.tagged(p, self.pos - 1));
                 // An operator parameter F(_, _)
                 let mut n = 0;
                 if self.is("(") {
@@ -933,6 +1004,7 @@ impl Parser {
                 return self.precedence_err(other, at, op);
             }
             prev = Some((op, self.pos));
+            let op_tok = self.pos;
             self.pos += 1;
             if op == "\\X" {
                 // A \X B \X C is the set of triples, not of pairs whose first element is a pair
@@ -955,6 +1027,9 @@ impl Parser {
             let rhs = if op == "\\/" { self.at(rhs_start, rhs) } else { rhs };
             chain_or = op == "\\/";
             lhs = bin(op, lhs, rhs);
+            if !BUILTIN_INFIX.contains(&op) {
+                lhs = self.op_at(op_tok, lhs_start, lhs);
+            }
             if spans() && ["/\\", "\\/", "=>", "<=>", "~>"].contains(&op) {
                 lhs = self.span(lhs_start, lhs);
             }
@@ -1054,9 +1129,11 @@ impl Parser {
                 break;
             }
             let mut names = vec![self.ident()?];
+            names[0] = self.tagged(std::mem::take(&mut names[0]), self.pos - 1);
             while self.is(",") {
                 self.pos += 1;
-                names.push(self.ident()?);
+                let n = self.ident()?;
+                names.push(self.tagged(n, self.pos - 1));
             }
             self.expect("\\in")?;
             groups.push((names[0].clone(), out.len()));
@@ -1163,8 +1240,10 @@ impl Parser {
                 if let Some((p, at)) = parent.filter(|(p, _)| sany_range(p).is_some_and(|(lo, _, _)| lo > 12)) {
                     return self.precedence_err(p, at, "-.");
                 }
+                let start = self.pos;
                 self.pos += 1;
-                Ok(Expr::Un(UOp::Neg, self.prefix_operand("-.", 12)?.b()))
+                let e = Expr::Un(UOp::Neg, self.prefix_operand("-.", 12)?.b());
+                Ok(self.op_at(start, start, e))
             }
             // In an AT label: TLC names a part of a property, such as `[]P` checked as an
             // invariant, by its position
@@ -1272,7 +1351,12 @@ impl Parser {
                             }
                             continue;
                         }
+                        let def_start = self.pos;
                         match self.def()? {
+                            Ok(d) if sany_pos() => {
+                                let at = self.span_text(def_start, self.pos - 1);
+                                defs.extend(d.into_iter().map(|d| Def { name: format!("{}{NAME_AT}{at}", d.name), ..d }));
+                            }
                             Ok(d) => defs.extend(d),
                             Err(inst) => renames.push(self.let_instance(inst)),
                         }
@@ -1332,6 +1416,7 @@ impl Parser {
                         Some(_) => self.fresh_tuple_name(),
                         None => {
                             let x = self.ident()?;
+                            let x = self.tagged(x, self.pos - 1);
                             self.expect("\\in")?;
                             x
                         }
@@ -1528,11 +1613,13 @@ impl Parser {
                 // A positional subexpression name: `Op!1!2`, `Op!<<`, `Op!(e)`, `Op!:`, also
                 // followed by labels
                 if !(self.is("!") && is_selector(self.peek2())) {
-                    return Ok(base);
+                    return Ok(if call { self.op_at(id_tok, id_tok, base) } else { base });
                 }
                 let mut parts = vec![base];
+                let mut call = SUBEXPR.to_string();
                 while self.is("!") {
                     let next = self.peek2().clone();
+                    call += &format!("\u{1}{}", self.span_text(self.pos + 1, self.pos + 1));
                     self.pos += 2;
                     parts.push(match next {
                         Tok::Num(n) => Expr::Num(n),
@@ -1552,7 +1639,7 @@ impl Parser {
                         }
                     });
                 }
-                Ok(Expr::Call(SUBEXPR.into(), parts))
+                Ok(Expr::Call(call, parts))
             }
             Tok::Sym(s) => match s.as_str() {
                 "(" => {
@@ -1625,10 +1712,11 @@ impl Parser {
         if self.is(":") {
             self.pos += 1;
             if let (true, Expr::Bin(BOp::In, x, s)) = (filter_shape, &first) {
-                if let Expr::Ident(x, _) = x.as_ref() {
+                if let Expr::Ident(x, at) = x.as_ref() {
+                    let x = if sany_pos() { format!("{x}{NAME_AT}{}", at.text()) } else { x.clone() };
                     let p = self.expr(0)?;
                     self.expect("}")?;
-                    return Ok(Expr::SetFilter(x.clone(), s.clone(), p.b()));
+                    return Ok(Expr::SetFilter(x, s.clone(), p.b()));
                 }
             }
             let (bs, lets) = self.binders_pat()?;
@@ -1730,7 +1818,8 @@ impl Parser {
         }
         if self.is("|->") {
             if let Expr::Bin(BOp::In, x, s) = &e {
-                if let Expr::Ident(x, _) = x.as_ref() {
+                if let Expr::Ident(x, at) = x.as_ref() {
+                    let x = &if sany_pos() { format!("{x}{NAME_AT}{}", at.text()) } else { x.clone() };
                     self.pos += 1;
                     let b0 = self.pos;
                     let body = self.expr(0)?;

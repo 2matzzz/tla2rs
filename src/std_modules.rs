@@ -1,6 +1,7 @@
 //! TLC's standard modules (from tla2tools.jar, TLC 2.19) as TLC reads them: for each, the
 //! modules it extends or instantiates, its identifiers, keywords and numbers (as written) in order of first appearance, and its strings.
-//! Used to order strings as TLC does (see `compile::tlc_string_ranks`).
+//! Used to order strings as TLC does (see `compile::tlc_string_ranks`). Also where SANY places what they
+//! export (`STD_DEFS`).
 
 pub const STD_MODULES: &[(&str, &[&str], &[&str], &[&str])] = &[
     ("Naturals", &[], &["Naturals", "Nat", "a", "b", "CHOOSE", "n", "TRUE"], &[]),
@@ -13,4 +14,75 @@ pub const STD_MODULES: &[(&str, &[&str], &[&str], &[&str])] = &[
     ("RealTime", &["Reals"], &["RealTime", "EXTENDS", "Reals", "VARIABLE", "now", "RTBound", "A", "v", "D", "E", "LET", "TNext", "t", "IF", "_v", "ENABLED", "THEN", "0", "ELSE", "Timer", "MaxTime", "MinTime", "IN", "RTnow", "NowNext", "r", "Real", "UNCHANGED", "_now", "WF_now"], &[]),
     ("Toolbox", &["Naturals", "FiniteSets", "TLC"], &["Toolbox", "LOCAL", "INSTANCE", "Naturals", "FiniteSets", "TLC", "_TETrace", "CHOOSE", "f", "Nat", "0", "STRING", "TRUE", "_TETraceLength", "Cardinality", "DOMAIN", "_TEPosition", "IF", "TLCGet", "THEN", "ELSE", "1"], &["level"]),
     ("Randomization", &["Naturals", "FiniteSets"], &["Randomization", "LOCAL", "INSTANCE", "Naturals", "FiniteSets", "RandomSubset", "k", "S", "CHOOSE", "T", "SUBSET", "Cardinality", "RandomSetOfSubsets", "n", "TestRandomSetOfSubsets", "i", "1", "5"], &[]),
+];
+
+/// The definitions and declarations the standard modules export, where SANY places them (the line
+/// and column of the first and of the last character of the whole statement, a tab moving to the
+/// next multiple of 8 columns) and the number of their parameters, for SANY's report of a name
+/// that clashes with one of them (see `sany.rs`). Generated from the module files in tla2tools.jar
+/// (TLC 2.19): a statement runs from a token in column 1 to the last token before the next one.
+/// Checked against SANY's report for each
+pub const STD_DEFS: &[(&str, &str, u32, u32, u32, u32, usize)] = &[
+    ("Naturals", "Nat", 14, 1, 14, 16, 0),
+    ("Naturals", "+", 15, 1, 15, 19, 2),
+    ("Naturals", "-", 17, 1, 17, 33, 2),
+    ("Naturals", "*", 18, 1, 18, 17, 2),
+    ("Naturals", "^", 19, 1, 19, 19, 2),
+    ("Naturals", "<", 20, 1, 20, 19, 2),
+    ("Naturals", ">", 21, 1, 21, 19, 2),
+    ("Naturals", "\\leq", 22, 1, 22, 19, 2),
+    ("Naturals", "\\geq", 23, 1, 23, 19, 2),
+    ("Naturals", "%", 33, 1, 33, 20, 2),
+    ("Naturals", "\\div", 34, 1, 34, 20, 2),
+    ("Naturals", "..", 35, 1, 35, 20, 2),
+    ("Integers", "Int", 18, 1, 18, 12, 0),
+    ("Integers", "-.", 22, 1, 22, 13, 1),
+    ("Reals", "Real", 15, 1, 15, 16, 0),
+    ("Reals", "/", 16, 1, 16, 38, 2),
+    ("Reals", "Infinity", 17, 1, 17, 65, 0),
+    ("RealTime", "now", 8, 10, 8, 12, 0),
+    ("RealTime", "RTBound", 10, 1, 20, 49, 4),
+    ("RealTime", "RTnow", 22, 1, 26, 62, 1),
+    ("Sequences", "Seq", 20, 1, 20, 41, 1),
+    ("Sequences", "Len", 25, 1, 25, 44, 1),
+    ("Sequences", "\\o", 30, 1, 31, 76, 2),
+    ("Sequences", "Append", 36, 1, 36, 26, 2),
+    ("Sequences", "Head", 41, 1, 41, 15, 1),
+    ("Sequences", "Tail", 42, 1, 42, 61, 1),
+    ("Sequences", "SubSeq", 48, 1, 48, 50, 3),
+    ("Sequences", "SelectSeq", 53, 1, 65, 14, 2),
+    ("FiniteSets", "IsFiniteSet", 14, 1, 19, 68, 1),
+    ("FiniteSets", "Cardinality", 21, 1, 27, 11, 1),
+    ("TLC", "Print", 17, 1, 17, 22, 2),
+    ("TLC", "PrintT", 18, 1, 18, 19, 1),
+    ("TLC", "Assert", 24, 1, 25, 54, 2),
+    ("TLC", "JavaTime", 26, 1, 26, 32, 0),
+    ("TLC", "TLCGet", 75, 1, 75, 28, 1),
+    ("TLC", "TLCSet", 76, 1, 76, 20, 2),
+    ("TLC", ":>", 78, 1, 78, 27, 2),
+    ("TLC", "@@", 79, 1, 80, 50, 2),
+    ("TLC", "Permutations", 81, 1, 82, 54, 1),
+    ("TLC", "SortSeq", 88, 1, 92, 40, 2),
+    ("TLC", "RandomElement", 110, 1, 110, 41, 1),
+    ("TLC", "Any", 119, 1, 119, 22, 0),
+    ("TLC", "ToString", 121, 1, 121, 58, 1),
+    ("TLC", "TLCEval", 145, 1, 145, 15, 1),
+    ("Bags", "IsABag", 21, 1, 25, 41, 1),
+    ("Bags", "BagToSet", 27, 1, 27, 23, 1),
+    ("Bags", "SetToBag", 32, 1, 32, 30, 1),
+    ("Bags", "BagIn", 37, 1, 37, 31, 2),
+    ("Bags", "EmptyBag", 42, 1, 42, 24, 0),
+    ("Bags", "\\oplus", 44, 1, 50, 46, 2),
+    ("Bags", "\\ominus", 52, 1, 61, 50, 2),
+    ("Bags", "BagUnion", 75, 1, 80, 58, 1),
+    ("Bags", "\\sqsubseteq", 82, 1, 88, 42, 2),
+    ("Bags", "SubBag", 90, 1, 111, 11, 1),
+    ("Bags", "BagOfAll", 123, 1, 131, 66, 2),
+    ("Bags", "BagCardinality", 133, 1, 139, 8, 1),
+    ("Bags", "CopiesIn", 141, 1, 146, 33, 2),
+    ("Toolbox", "_TETrace", 13, 1, 14, 49, 0),
+    ("Toolbox", "_TEPosition", 18, 1, 21, 31, 0),
+    ("Randomization", "RandomSubset", 30, 1, 30, 64, 2),
+    ("Randomization", "RandomSetOfSubsets", 48, 1, 49, 111, 3),
+    ("Randomization", "TestRandomSetOfSubsets", 61, 1, 62, 71, 3),
 ];

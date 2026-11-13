@@ -336,7 +336,9 @@ fn override_defs(m: &mut Module, cfg: &Cfg, warnings: &mut Vec<String>) -> R<Vec
 /// Loads the EXTENDS'd modules whose .tla files sit in the same directory and merges them into one.
 /// Definitions loaded later (from the extending module) take precedence.
 fn load_module(src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
-    load_parsed(parse_module(src)?, dir, warnings, depth)
+    let m = parse_module(src)?;
+    crate::sany::remember_source(&m.name, src);
+    load_parsed(m, dir, warnings, depth)
 }
 
 thread_local! {
@@ -1003,15 +1005,12 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
                     "{report}\n\nFatal errors while parsing TLA+ spec in file {}\n\n*** Abort messages: 1\n\nIn module {module}\n\nCould not parse module {module} from file {module}.tla\n\nError: Parsing or semantic analysis failed.",
                     crate::lexer::module_name(tla)
                 ),
-                // A semantic error, with its position when it is known (see `sany::SEMANTIC`)
-                None => {
-                    let msg = match msg.strip_prefix(crate::sany::SEMANTIC).and_then(|m| m.split_once('\n')) {
-                        Some(("", m)) => m.to_string(),
-                        Some((at, m)) => format!("{at}\n\n{m}"),
-                        None => msg,
-                    };
-                    format!("Semantic errors:\n\n*** Errors: 1\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.")
-                }
+                // SANY's report of semantic errors (see `sany::SEMANTIC`), or one error in tla2rs's
+                // words
+                None => match msg.strip_prefix(crate::sany::SEMANTIC) {
+                    Some(report) => format!("{report}\nError: Parsing or semantic analysis failed."),
+                    None => format!("Semantic errors:\n\n*** Errors: 1\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed."),
+                },
             };
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));

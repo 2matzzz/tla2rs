@@ -13,8 +13,9 @@ published sources.
 
 `src/std_modules.rs` lists, for each of TLC's standard modules (`tla2sany/StandardModules/*.tla` in
 tla2tools.jar), the modules it reads, its identifiers, keywords and numbers in the order they first appear, and its
-strings, so that tla2rs orders strings as TLC does. It is generated from those module files; nothing else of their
-text is copied.
+strings, so that tla2rs orders strings as TLC does; and for each definition and declaration it exports, its name,
+where it starts and ends and its number of parameters, so that tla2rs reports a name that clashes with one as SANY
+does. It is generated from those module files; nothing else of their text is copied.
 
 Some rules of `src/sany.rs` (`var_order`: the names SANY's context of a module holds, which decide the order TLC
 prints variables in), `src/runtime.rs` (`fresh_fp`: the state whose VIEW TLC fingerprints under SYMMETRY) and
