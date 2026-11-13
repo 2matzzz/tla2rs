@@ -699,6 +699,14 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
         (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) | (Ty::Fun(d2, c2), Ty::PFun(d1, c1)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
         (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if fs.is_empty() => Ty::PFun(d.clone(), c.clone()),
+        // A tuple is a function over 1..n (`tests/tlc/PFunTuple`)
+        (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if is_tuple_fields(fs) => {
+            let mut e = c.as_ref().clone();
+            for (_, t) in fs {
+                e = join(&e, t)?;
+            }
+            Ty::PFun(join(d, &Ty::Int(1, fs.len() as i64))?.into(), e.into())
+        }
         // <<>> is the empty function, so also the empty bag
         (Ty::Bag(x), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Bag(x)) if fs.is_empty() => Ty::Bag(x.clone()),
         // A bag over 1..n is a tuple of counts (SetToBag({1}) = <<1>>)

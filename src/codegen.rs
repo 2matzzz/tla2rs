@@ -2294,6 +2294,19 @@ impl<'a> Gen<'a> {
                 }
                 Ok(s + "__o }")
             }
+            // A tuple as a function over part of a type (1..n in it)
+            (Ty::Rec(fs), Ty::PFun(d, c)) if is_tuple_fields(fs) && !is_sparse_fun(to) => {
+                let did = self.ty_id(d)?;
+                let r = self.fresh("r");
+                let mut s = format!("{{ let {r} = {code}; let mut __o = {}; ", Self::default_code(to));
+                for (k, (_, ft)) in fs.iter().enumerate() {
+                    let n = k as i64 + 1;
+                    let kc = self.coerce(format!("{n}i64"), &Ty::Int(n, n), d)?;
+                    let vc = self.coerce(format!("{r}{}", rec_field(fs.len(), k)), ft, c)?;
+                    s += &format!("__o[idx_{did}({kc})] = (true, {vc}); ");
+                }
+                Ok(s + "__o }")
+            }
             // A function over all of a type as one over part of it, and between partial functions
             (Ty::Fun(d1, c1), Ty::PFun(d2, c2)) if d1 != d2 => {
                 let mid = Ty::PFun(d1.clone(), c2.clone());
