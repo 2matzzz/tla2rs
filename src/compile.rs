@@ -1104,6 +1104,35 @@ fn constant_level(e: &Expr, m: &Module) -> bool {
     })
 }
 
+/// Whether TLC's bound on the level of definition `name` (Tool.getLevelBound, which decides the
+/// definitions it evaluates when it starts) is above constant: a variable, prime, ENABLED or
+/// temporal operator anywhere in its body, in the definitions it calls and in their LET
+/// definitions, used or not (`tests/tlc/ConstLetVar`)
+fn bound_reads_state(name: &str, m: &Module) -> bool {
+    fn walk<'a>(e: &'a Expr, m: &'a Module, seen: &mut HashSet<&'a str>) -> bool {
+        match e {
+            Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => return true,
+            Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) => return true,
+            x if x.is_unchecked_temporal() => return true,
+            Expr::Ident(n, _) | Expr::Call(n, _) => {
+                if m.variables.contains(n) {
+                    return true;
+                }
+                if let Some(d) = m.defs.iter().find(|d| d.name == *n) {
+                    if seen.insert(&d.name) && walk(&d.body, m, seen) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        e.children().into_iter().any(|c| walk(c, m, seen))
+    }
+    let mut seen = HashSet::new();
+    seen.insert(name);
+    m.defs.iter().find(|d| d.name == name).is_some_and(|d| walk(&d.body, m, &mut seen))
+}
+
 /// Whether evaluating e can make a string: ToString, or a sequence operator (`\o`, Append, Head,
 /// Tail, SubSeq) where e has a string, or a constant whose value has one
 fn makes_strings(e: &Expr, constants: &HashMap<String, Value>, atoms: &Atoms) -> bool {
@@ -1335,7 +1364,7 @@ fn compile_inner(
         for n in names {
             // Whether it is of constant level, from the expansion for code generation, which does
             // not write out the arguments of state level at each use
-            if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) {
+            if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) || bound_reads_state(&n, &m) {
                 continue;
             }
             let Ok(e) = ex.expand_def_bound(&n) else { continue };
@@ -1362,7 +1391,7 @@ fn compile_inner(
         let named = named.chain(cfg.constraints.iter().map(|n| ("constraint", n)));
         let named = named.chain(cfg.action_constraints.iter().map(|n| ("action constraint", n)));
         for (what, name) in named {
-            if !constant_level(&ex.expand_def_code(name, false)?, &m) {
+            if !constant_level(&ex.expand_def_code(name, false)?, &m) || bound_reads_state(name, &m) {
                 continue;
             }
             let e = ex.expand_def_bound(name)?;
