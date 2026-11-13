@@ -112,17 +112,7 @@ impl Ord for Value {
             (Fun(a), Fun(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
             // As TLC: by the number of fields, then name and value pair by pair, in TLC's order of
             // field names
-            (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| {
-                let fa = crate::types::sorted_fields(a.iter().map(|(k, v)| (k.clone(), v)).collect());
-                let fb = crate::types::sorted_fields(b.iter().map(|(k, v)| (k.clone(), v)).collect());
-                for ((ka, va), (kb, vb)) in fa.iter().zip(&fb) {
-                    let c = crate::types::field_cmp(ka, kb).then_with(|| va.cmp(vb));
-                    if c.is_ne() {
-                        return c;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            }),
+            (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| crate::types::rec_cmp(a, b)),
             (Tuple(a), Tuple(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
             _ => self.rank().cmp(&o.rank()),
         }

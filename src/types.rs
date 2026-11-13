@@ -71,6 +71,42 @@ pub fn disordered_error(a: &str, b: &str) -> String {
     )
 }
 
+/// Compares two records of as many fields as TLC does: name and value pair by pair, in TLC's
+/// order of field names (`field_cmp`). Records of the same fields (the usual case) differ first
+/// at the field that comes first in that order among those whose values differ, so only the ranks
+/// of those are read; otherwise each name's rank is read once
+pub fn rec_cmp<V: Ord>(a: &std::collections::BTreeMap<String, V>, b: &std::collections::BTreeMap<String, V>) -> std::cmp::Ordering {
+    if a.keys().eq(b.keys()) {
+        let mut first: Option<(usize, &str, std::cmp::Ordering)> = None;
+        for ((k, va), vb) in a.iter().zip(b.values()) {
+            let c = va.cmp(vb);
+            if c.is_ne() {
+                let r = FIELD_RANKS.with(|f| f.borrow().get(k.as_str()).copied().unwrap_or(usize::MAX));
+                if first.is_none_or(|(fr, fk, _)| (r, k.as_str()) < (fr, fk)) {
+                    first = Some((r, k.as_str(), c));
+                }
+            }
+        }
+        return first.map_or(std::cmp::Ordering::Equal, |(_, _, c)| c);
+    }
+    fn ranked<'a, V>(f: &HashMap<String, usize>, m: &'a std::collections::BTreeMap<String, V>) -> Vec<(usize, &'a str, &'a V)> {
+        m.iter().map(|(k, v)| (f.get(k.as_str()).copied().unwrap_or(usize::MAX), k.as_str(), v)).collect()
+    }
+    let (mut fa, mut fb) = FIELD_RANKS.with(|f| {
+        let f = f.borrow();
+        (ranked(&f, a), ranked(&f, b))
+    });
+    fa.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    fb.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    for ((ra, ka, va), (rb, kb, vb)) in fa.iter().zip(&fb) {
+        let c = (ra, ka).cmp(&(rb, kb)).then_with(|| va.cmp(vb));
+        if c.is_ne() {
+            return c;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// A record's fields in TLC's order
 pub fn sorted_fields<T>(mut fs: Vec<(String, T)>) -> Vec<(String, T)> {
     fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
