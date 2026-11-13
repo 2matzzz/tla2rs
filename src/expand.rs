@@ -325,14 +325,14 @@ impl<'a> Expander<'a> {
                 } else if let Some(d) = self.defs.get(n.as_str()).copied() {
                     self.call(n, d, Env::default(), &[], env)?
                 } else if n.contains('!') && self.label_path(n, env).is_some() {
-                    self.subexpr(e, &[], env)?
+                    self.subexpr("", e, &[], env)?
                 } else {
                     e.clone()
                 }
             }
-            Call(n, parts) if n == crate::parser::SUBEXPR => self.subexpr(&parts[0], &parts[1..], env)?,
+            Call(n, parts) if n.starts_with(crate::parser::SUBEXPR) => self.subexpr(n, &parts[0], &parts[1..], env)?,
             Call(n, args) if n.contains('!') && !env.locals.contains_key(n) && !self.defs.contains_key(n.as_str()) && self.label_path(n, env).is_some() => {
-                self.subexpr(e, &[], env)?
+                self.subexpr("", e, &[], env)?
             }
             Call(n, args) => {
                 if let Some((d, denv)) = env.locals.get(n) {
@@ -532,8 +532,8 @@ impl<'a> Expander<'a> {
     /// with its bound variables set to e, and labels after these), as SANY names them. It is
     /// expanded as a definition whose parameters are those of Op, followed by the bound variables
     /// and label parameters set along the way.
-    fn subexpr(&mut self, base: &Expr, sels: &[Expr], env: &Env) -> R<Expr> {
-        let (name, sub, denv, args) = self.subexpr_def(base, sels, env)?;
+    fn subexpr(&mut self, call: &str, base: &Expr, sels: &[Expr], env: &Env) -> R<Expr> {
+        let (name, sub, denv, args) = self.subexpr_def(call, base, sels, env)?;
         self.call(&name, &sub, denv, &args, env)
     }
 
@@ -542,10 +542,10 @@ impl<'a> Expander<'a> {
     pub fn check_subexprs(&self, e: &Expr) -> R<()> {
         let env = Env::default();
         let r = match e {
-            Expr::Call(n, parts) if n == crate::parser::SUBEXPR => Some(self.subexpr_def(&parts[0], &parts[1..], &env)),
+            Expr::Call(n, parts) if n.starts_with(crate::parser::SUBEXPR) => Some(self.subexpr_def(n, &parts[0], &parts[1..], &env)),
             // `Op!lab`
             Expr::Ident(n, _) | Expr::Call(n, _) if n.contains('!') && !self.defs.contains_key(n.as_str()) && self.label_path(n, &env).is_some() => {
-                Some(self.subexpr_def(e, &[], &env))
+                Some(self.subexpr_def("", e, &[], &env))
             }
             _ => None,
         };
@@ -557,9 +557,10 @@ impl<'a> Expander<'a> {
         e.children().into_iter().try_for_each(|c| self.check_subexprs(c))
     }
 
-    /// The definition a subexpression name stands for (see `subexpr`): the name, the definition,
-    /// its environment and the arguments
-    fn subexpr_def(&self, base: &Expr, sels: &[Expr], env: &Env) -> R<(String, Def, Env, Vec<Expr>)> {
+    /// The definition a subexpression name stands for (see `subexpr`; `call` is the name of the
+    /// SUBEXPR call, with the positions of the selectors): the name, the definition, its
+    /// environment and the arguments
+    fn subexpr_def(&self, call: &str, base: &Expr, sels: &[Expr], env: &Env) -> R<(String, Def, Env, Vec<Expr>)> {
         use Expr::*;
         let (name, mut args) = match base {
             Ident(n, _) => (n.clone(), vec![]),
@@ -581,17 +582,18 @@ impl<'a> Expander<'a> {
         }
         let mut extra = args.split_off(d.params.len());
         extra.reverse();
-        let mut steps: Vec<Expr> = labels
+        let sel_at = crate::parser::subexpr_at(call);
+        let mut steps: Vec<(Expr, &str)> = labels
             .into_iter()
-            .map(|l| Call(format!("#label{l}"), vec![]))
-            .chain(sels.iter().cloned())
+            .map(|l| (Call(format!("#label{l}"), vec![]), ""))
+            .chain(sels.iter().cloned().enumerate().map(|(k, s)| (s, sel_at.get(k).copied().unwrap_or(""))))
             .collect();
         let mut params = d.params.clone();
         let mut arity = d.arity.clone();
         let mut lets: Vec<Vec<Def>> = vec![];
         let mut cur = d.body.clone();
         steps.reverse();
-        while let Some(sel) = steps.pop() {
+        while let Some((sel, sel_at)) = steps.pop() {
             match sel {
                 Num(_) | Ident(_, _) => {
                     let k = match &sel {
@@ -610,7 +612,7 @@ impl<'a> Expander<'a> {
                     };
                     if let Case(arms, other) = strip_labels(&cur) {
                         // !i!j: the condition (j = 1) or the value (j = 2) of the i-th arm
-                        let Some(Num(j)) = steps.pop() else { return Err(format!("{SANY}`{name}`: a subexpression of CASE is named !i!j")) };
+                        let Some((Num(j), _)) = steps.pop() else { return Err(crate::sany::report_one(sel_at, "Subexpression of CASE must have form !i!j.")) };
                         let arm = match arms.get(k - 1) {
                             Some((p, v)) => [p.clone(), v.clone()],
                             None if k == arms.len() + 1 && other.is_some() => [Bool(true), other.as_ref().unwrap().as_ref().clone()],
@@ -628,7 +630,7 @@ impl<'a> Expander<'a> {
                         continue;
                     }
                     let parts = operands(&cur).ok_or(format!("`{name}`: cannot name a subexpression of {}", crate::codegen::short(&cur)))?;
-                    cur = parts.get(k.wrapping_sub(1)).cloned().ok_or(format!("{SANY}`{name}`: there is no subexpression {k}"))?;
+                    cur = parts.get(k.wrapping_sub(1)).cloned().ok_or_else(|| crate::sany::report_one(sel_at, &format!("Nonexistent operand specified by `argument selector {k}'.")))?;
                 }
                 // !(e, ...): the body of a quantifier (CHOOSE, set or function constructor) with its
                 // bound variables set to e, ...

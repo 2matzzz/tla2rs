@@ -204,14 +204,14 @@ memory.
   unary minus); a declaration, definition, parameter, LET definition or bound variable named like something in
   scope at that point (also a definition of an extended or instantiated module, or of a standard module extended);
   labels that do not list the bound variables around them; LAMBDA anywhere but as an argument; wrong positional
-  subexpression names, also in definitions nothing uses; invalid string escapes. Parse errors (precedence, string
-  escapes, LAMBDA), the level errors of temporal formulas, an unknown name and a label that leaves out a bound
-  variable are reported in SANY's words with its positions; for the other checks the wording and positions differ
-  from SANY's (SANY also gives the position of the declaration a name clashes with, and adds follow-on errors and
-  warnings). A name is in scope only after the
-  statement that introduces it, as in SANY: an operator parameter may be named like a VARIABLE declared later. Not
-  repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and `\AA`; positional names of LET
-  definitions; and SANY's other checks (see CLAUDE.md, "What SANY refuses")
+  subexpression names, also in definitions nothing uses; an operator used with another number of arguments than it
+  takes; invalid string escapes. These are reported in SANY's words with its positions: parse errors (precedence,
+  string escapes, LAMBDA), the level errors of temporal formulas, and the semantic errors, all of a module in SANY's
+  order with the position of the declaration a name clashes with (also in a standard module), then SANY's warnings.
+  A name is in scope only after the statement that introduces it, as in SANY: an operator parameter may be named
+  like a VARIABLE declared later. Not repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and
+  `\AA`; positional names of LET definitions; an operator passed where a parameter takes none; and SANY's other
+  checks (see CLAUDE.md, "What SANY refuses")
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning
@@ -262,8 +262,8 @@ on every run). A liveness counterexample depends on TLC's random fingerprint pol
 spec `-lassocheck` writes, and must confirm that tla2rs's lasso is a fair behavior of the spec that violates the
 properties. The messages are TLC's error and warning lines and what the spec prints with Print and PrintT, in order,
 without the progress lines and with the parts that are TLC's internals left out (the stack of nested expressions
-TLC was evaluating, Java class names); where tla2rs cannot print all of TLC's text (a position it does not keep,
-a message TLC prints by an internal rule), the cfg says why and only the error lines are compared. Where the graph
+TLC was evaluating, Java class names); where tla2rs cannot print all of TLC's text, the cfg can say why, and then
+only the error lines are compared (no configuration needs this now). Where the graph
 cannot be compared as a whole (TLC stops before ending its graph file when it stops in
 the initial states; a successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied;
 CLAUDE.md lists them. `scripts/all.sh` does this for every
