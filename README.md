@@ -61,6 +61,50 @@ cargo build --release
   changed since the translator wrote them. tla2rs computes TLC's PlusCal checksum for algorithms without procedures,
   macros or PlusCal options; for the others it prints a note instead (see Limitations)
 
+### TLC's options
+
+tla2rs takes TLC 2.19's command-line options that mean something for an exhaustive, deterministic search, with
+TLC's meaning, output and exit codes (each is cross-checked against TLC by a configuration in `tests/tlc/Opt*`):
+
+| | Options |
+|---|---|
+| Supported from the start | `-config FILE`, `-deadlock`, `-workers N` (`auto` and the default both use every CPU; TLC's default is 1) |
+| Supported now | `-continue`, `-difftrace`, `-view`, `-nowarning`, `-dump FILE`, `-dump dot[,actionlabels][,snapshot] FILE` |
+| Accepted with no effect | `-cleanup`, `-gzip`, `-metadir DIR`, `-checkpoint N`, `-fp N`, `-fpbits N`, `-fpmem X`, `-lncheck S`, `-modelcheck` |
+| Not supported (refused) | `-simulate`, `-depth`, `-seed`, `-aril`, `-dfid`, `-generateSpecTE`, `-tool`, `-debug`, `-recover`, `-coverage`, `-terse`, `-maxSetSize`, `-userFile`, `-dump dot,colorize` |
+
+- `-continue` reports every state that violates an invariant (the first invariant it violates, in the order of the
+  cfg) and every step that violates an action property, each with its behavior, and searches on. As in TLC, the run
+  then ends with `No error has been found` and exit 0; a deadlock or an evaluation error still stops it, and a
+  failed invariant stops it with TLC's "unexpected exception" and exit 255. Temporal properties are checked at the end
+- `-difftrace` prints, for each state of a behavior after the first, only the variables that changed. TLC 2.19
+  prints the last state of a behavior of three states or more in full, and so does tla2rs
+- `-view` prints the `VIEW` of each state of a behavior instead of the state, without the empty line after it, and
+  labels the nodes of `-dump dot` with it, as TLC does. Without a `VIEW` it changes nothing
+- `-nowarning` leaves out TLC's own warnings (an EXCEPT on a missing argument, SYMMETRY or constraints with temporal
+  properties). The parser's warnings and the PlusCal checksum warning stay, as in TLC
+- `-dump FILE` writes the distinct states in the order found (`State N:` and the state); `-dump dot FILE` writes the
+  state graph (as `-dumpgraph`), `actionlabels` labels each edge with its action, and `snapshot` gives the edges the
+  attributes TLC then writes (TLC's snapshots during the run are not written). As in TLC, `.dump` or `.dot` is added
+  to a name without it. With one worker the order of `-dump FILE` is TLC's; `-dump FILE` and `-continue` run without
+  `-batched`
+- The options accepted with no effect change only TLC's files on disk (`-cleanup`, `-gzip`, `-metadir`,
+  `-checkpoint`; TLC also prints a line at each checkpoint, every 30 minutes by default, which tla2rs does not),
+  its fingerprints and their memory (`-fp`, `-fpbits`, `-fpmem`; tla2rs has fingerprints of its own), or when it
+  checks temporal properties (`-lncheck`; tla2rs checks them at the end, as TLC's `final`). `-modelcheck` is the
+  default mode
+- Not supported, and why: `-simulate`, `-depth`, `-seed` and `-aril` belong to random simulation, which is not an
+  exhaustive search. `-dfid` searches depth-first with iterative deepening, which reaches states in another order
+  and reports other counts and counterexamples; tla2rs searches breadth-first only. `-generateSpecTE` and `-tool`
+  serve the Toolbox and its trace explorer (a SpecTE module, output wrapped in message codes). `-debug` is TLC's own
+  debugging output. `-recover` resumes from a checkpoint in TLC's own format, which tla2rs does not write.
+  `-coverage` counts how often TLC's interpreter evaluated each subexpression; a compiled checker evaluates
+  constants once and fuses expressions, so the counts depend on TLC's evaluator. `-terse` prints sets in the lazy
+  form TLC holds them in (`SUBSET S`, `[S -> T]`), which a compiled checker does not keep (as with intervals, see
+  Limitations). `-maxSetSize` bounds the sets TLC's interpreter enumerates, and where its error appears depends on
+  where the interpreter enumerates. `-userFile` (the spec's printed lines to a file) and `-dump dot,colorize`
+  (colors per action and a legend in the order of a Java hash map) are not done yet
+
 ## Speed
 
 Measured on a MacBook Pro (Apple silicon, 10 cores, 16 GB). TLC ran with `-workers auto`, tla2rs with its default thread
@@ -275,7 +319,9 @@ TLC was evaluating, Java class names); where tla2rs cannot print all of TLC's te
 only the error lines are compared (no configuration needs this now). Where the graph
 cannot be compared as a whole (TLC stops before ending its graph file when it stops in
 the initial states; a successor tla2rs cannot represent), less is compared, and `all.sh` says which rule applied;
-CLAUDE.md lists them. `scripts/all.sh` does this for every
+CLAUDE.md lists them. A cfg line `\* crosscheck: args -continue` passes those of TLC's options to both TLC and tla2rs;
+with `-dump` the file it names is compared instead of the state graph, through `tla2rs --dump FILE` (see
+`src/options.rs`). `scripts/all.sh` does this for every
 configuration in `examples/` and `tests/tlc/`, passing extra arguments such as `-batched` on to each run. Point
 `TLA_TOOLS` at `tla2tools.jar` (default `~/.tla/tla2tools.jar`). A spec that names a module of the CommunityModules
 in EXTENDS or INSTANCE needs, for TLC, the release `scripts/crosscheck.sh` pins (202611060952, sha256

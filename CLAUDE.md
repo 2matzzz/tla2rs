@@ -170,7 +170,7 @@ states where both A and B held.
 
 A line `\* crosscheck: distinct-only` in a cfg makes `scripts/crosscheck.sh` skip the generated-count comparison
 (`tests/tlc/OrDup.cfg` is an example). A line like `\* crosscheck: rsargs -memlimit 0` passes extra arguments to
-tla2rs only. The default stays strict: generated-count mismatches have caught real bugs before (a difference in when
+tla2rs only, and `\* crosscheck: args -continue` passes TLC's options to both (see "TLC's options"). The default stays strict: generated-count mismatches have caught real bugs before (a difference in when
 `\/` and `\E` branch), so mark only configurations whose gap is understood.
 
 ### The order of strings
@@ -1030,6 +1030,31 @@ representative of the orbit gives the same count.
 With VIEW (in particular together with CONSTRAINT) and several workers, the distinct count can vary slightly from run
 to run, for TLC as well as tla2rs, because which state becomes the representative depends on search order. With one
 worker the counts are stable and match TLC.
+
+### TLC's options
+
+`main.rs` takes TLC's options and passes them on to the checker (README.md lists which are supported and why the
+others are not). Measured on TLC 2.19 (`tests/tlc/Opt*`):
+
+- `-continue`: TLC reports the first invariant a new state violates (cfg order), with the behavior, and queues the
+  state; a violation by an initial state is reported once (`INITS_REPORTED`: `initial_states` also runs to rebuild
+  behaviors). A step violating an action property is reported after its successor is added and checked
+  (`SWork::acts`, reported in `insert_candidates` in successor order) and the search goes on. The run ends as a run
+  without errors (exit 0). A deadlock stops it as before; a failed invariant is reported as before and then as an
+  unexpected exception, exit 255 (`continued_inv_eval`). `-batched` is not used with it
+- `-difftrace`: each state after the first shows the conjuncts that differ from the previous state (`trace_text`),
+  except that TLC prints the last state of a behavior of three states or more in full (`diff_prev`); a behavior of
+  two states has its second state diffed
+- `-view`: a behavior shows `show_view` (the VIEW printed with TLC's pretty printer) and no empty line after it, and
+  `-dump dot` labels nodes with it. `trace.rs` cannot read such a behavior (a state would run on to the statistics,
+  which hold times), so `crosscheck.sh` reads it with `tla2rs --trace-view` (`options.rs`), keyed into the expected
+  file only for those configurations, so the other keys stay as they were
+- `-nowarning`: the warnings marked `WARNING_MARK` go (`put_line`, `STARTUP_PRINTS_NOWARN`); SANY's and the PlusCal
+  warning stay
+- `-dump FILE`: `State N:` per distinct state, numbered when written (TLC's order with one worker, so not with
+  `-batched`). `-dump dot,...`: with any option TLC gives each edge `[label="...",color="black",fontcolor="black"]`
+  (empty label without `actionlabels`) and adds `{rank = same; ...}` lines, which the comparison ignores. TLC takes
+  only one `-dump`, so `crosscheck.sh` leaves out its own and compares the cfg's file with `tla2rs --dump`
 
 ## Verification rules
 
