@@ -2270,8 +2270,17 @@ fn main() {
     }
     str_order_start(opt.workers);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // A spec without [][Next]_v: TLC computes and checks the initial states, then stops
-        if NO_NEXT {
+        // A spec without [][Next]_v: TLC computes and checks the initial states, then stops; when
+        // there are none, it finishes as a search of no states does (`tests/tlc/NoActions-NoInit`).
+        // What Init prints is dropped here: the search computes the initial states again
+        let no_inits = NO_NEXT && {
+            let cap = Capturing::start();
+            let mut raw = Vec::new();
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut raw))).is_ok();
+            drop(cap.finish());
+            ok && raw.is_empty()
+        };
+        if NO_NEXT && !no_inits {
             let (inits, _) = initial_states();
             println!("Finished computing initial states: {} distinct states generated.", inits.len());
             println!("Error: No next state actions defined to generate successor states from.");
