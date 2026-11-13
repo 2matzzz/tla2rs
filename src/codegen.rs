@@ -1481,15 +1481,18 @@ impl<'a> Gen<'a> {
     /// representation.
     /// A record whose fields are all present (code `c` of type `t`) as the function over strings
     /// it is: a function over part of the type of its names. Any other value is left as it is
+    /// A tuple likewise, as the function over 1..n it is (`1 :> a` is the tuple <<a>>)
     fn rec_as_fun(&mut self, c: String, t: Ty, env: &Env) -> R<(String, Ty)> {
         let Ty::Rec(fs) = &t else { return Ok((c, t)) };
-        if fs.is_empty() || fs.iter().any(|(n, ft)| !crate::compile::field_name(n) || matches!(ft, Ty::Opt(_))) {
+        let tuple = crate::types::is_tuple_fields(fs);
+        if fs.is_empty() || fs.iter().any(|(n, ft)| !(tuple || crate::compile::field_name(n)) || matches!(ft, Ty::Opt(_))) {
             return Ok((c, t));
         }
         let mut keys = vec![];
         let (mut dt, mut ct) = (Ty::Enum(vec![]), fs[0].1.clone());
-        for (n, ft) in fs {
-            let (kc, kt) = self.gen(&Expr::Str(n.clone()), env, None)?;
+        for (i, (n, ft)) in fs.iter().enumerate() {
+            let key = if tuple { Expr::Num(i as i64 + 1) } else { Expr::Str(n.clone()) };
+            let (kc, kt) = self.gen(&key, env, None)?;
             dt = join(&dt, &kt)?;
             ct = join(&ct, ft)?;
             keys.push((kc, kt));
@@ -2268,6 +2271,16 @@ impl<'a> Gen<'a> {
             (Ty::Fun(d1, c1), Ty::PFun(d2, c2)) if d1 == d2 => {
                 let inner = self.coerce("__x".into(), c1, c2)?;
                 Ok(format!("{{ let __f = {code}; let __o: {} = std::array::from_fn(|__i| {{ let __x = __f[__i]; (true, {inner}) }}); __o }}", to.repr()))
+            }
+            // A function over part of a type as one over all of it (`(1 :> a) @@ (2 :> b)` as a
+            // function over 1..2): a value not defined everywhere leaves the type
+            (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) if !is_sparse_fun(from) && !is_sparse_fun(to) => {
+                let mid = Ty::PFun(d2.clone(), c2.clone());
+                let c = if d1 == d2 && c1 == c2 { code } else { self.coerce(code, from, &mid)? };
+                Ok(format!(
+                    "{{ let __f = {c}; let __o: {} = std::array::from_fn(|__i| {{ let (__p, __x) = __f[__i]; if !__p {{ type_error(\"a function\", \"\") }} __x }}); __o }}",
+                    to.repr()
+                ))
             }
             (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => {
                 let (aid, bid) = (self.ty_id(d1)?, self.ty_id(d2)?);
