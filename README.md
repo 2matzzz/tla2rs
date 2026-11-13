@@ -295,11 +295,14 @@ memory.
   checker keeps the order it was built with; the characters of a string taken apart into a tuple (`SelectSeq`,
   `SortSeq`, a string compared with a tuple) keep the order tla2rs meets them in. A string made by a constant
   expression that tla2rs evaluates while it compiles counts where TLC evaluates it (as a value, a set, the condition
-  of an IF or of an action, ...)
-- A set that TLC holds as an interval (`x = 1..3`) prints as `1..3`, as in TLC, where tla2rs follows how the value
-  was built: assigned to a variable, in a field of a record or tuple, and DOMAIN of a tuple or sequence. Taken from a
-  set, as a function's value, or inside a set of sets, it prints as `{1, 2, 3}` (see CLAUDE.md, "State graphs"), so
-  the comparison with TLC reads an interval as the set it denotes
+  of an IF or of an action, ...). When the strings made while exploring never go into a set, a bag or the domain of
+  a function, their order shows nowhere, and the checker is built once
+- A set that TLC holds as an interval (`x = 1..3`) prints as `1..3`, and an empty function built by `[x \in S |->
+  e]` as `<< >>` where an empty tuple prints `<<>>`, as in TLC, where tla2rs follows how the value was built: in what
+  the compiler evaluates (ASSUMEs, constants, also inside tuples, records, functions and sets), assigned to a
+  variable, in a field of a record or tuple, and taken from a constant set or a constant function. Inside a set,
+  function or sequence held in the state, or bound by `\E` and then assigned, it prints as `{1, 2, 3}` and `<<>>`
+  (see CLAUDE.md, "State graphs"), so the comparison of states with TLC reads an interval as the set it denotes
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
   it otherwise picks at random) when the properties need no tableau in TLC (`[]<>`, `<>[]` and fairness, after
   negation) and there is no `VIEW` (a model value is fingerprinted by the number TLC gives its name, and under
