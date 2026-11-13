@@ -608,6 +608,149 @@ fn fp_note(e: &EvalErr) {
 // each, and prints them in that order; it then expands in order without -batched, and rebuilds a
 // behavior as TLC does.
 
+// ---------------------------------------------------------------- TLCGet and TLCSet
+//
+// What TLC 2.19 gives with one worker (measured, `tests/tlc/TlcGet*`): `TLCGet("level")` is the
+// level of the state being expanded (an initial state's is 1), 0 in Init and in the checks of an
+// initial state; a successor's CONSTRAINT and invariants see the level of the state it comes from.
+// `"distinct"` counts the states added so far, a state counting from just before its invariants
+// are checked (and after its CONSTRAINT); `"queue"` the states waiting to be expanded: an initial
+// state is queued before its invariants are checked, a successor after. `"diameter"` is the
+// largest level of a state added so far, 1 before any. The registers `TLCSet(i, v)` / `TLCGet(i)`
+// are one store, which Init, the actions, the invariants, the constraints and the ASSUMEs share
+// (`REG_INIT` holds what the ASSUMEs set); reading one never set is an error. `TLCSet("exit",
+// TRUE)` ends the search, without an error, once the state being expanded (or Init) is done.
+// TLC handles each state as soon as Init or an action computes it, so with TLCGET the checker
+// does too (`pushed`, `expand_eager_one`). When it shows a behavior, the counts stay where the
+// search stopped, the level is that of the state each step starts from (0 for Init, and when the
+// failing step is evaluated once more), and the registers keep changing as TLC evaluates again.
+
+static TG_LEVEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TG_DIAMETER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static TG_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TG_QUEUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static TG_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TG_REGS: std::sync::Mutex<Option<std::collections::BTreeMap<i64, i64>>> = std::sync::Mutex::new(None);
+
+fn tg_level() -> i64 {
+    TG_LEVEL.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+fn tg_diameter() -> i64 {
+    TG_DIAMETER.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+fn tg_distinct() -> i64 {
+    TG_DISTINCT.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+fn tg_queue() -> i64 {
+    TG_QUEUE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn tg_set_level(l: u64) {
+    TG_LEVEL.store(l, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A new state added to the visited states (at the level after the one being expanded)
+fn tg_added() {
+    if TLCGET {
+        TG_DISTINCT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TG_DIAMETER.fetch_max(TG_LEVEL.load(std::sync::atomic::Ordering::Relaxed) + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A state queued (1) or taken off the queue (-1)
+fn tg_queued(d: i64) {
+    if TLCGET {
+        TG_QUEUE.fetch_add(d, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn tg_regs<R>(f: impl FnOnce(&mut std::collections::BTreeMap<i64, i64>) -> R) -> R {
+    let mut g = TG_REGS.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(|| REG_INIT.iter().copied().collect()))
+}
+
+fn tg_get(i: i64) -> i64 {
+    match tg_regs(|r| r.get(&i).copied()) {
+        Some(v) => v,
+        None => std::panic::panic_any(EvalErr::Arith(format!("TLCGet({i}) was undefined."))),
+    }
+}
+
+fn tg_set(i: i64, v: i64) -> bool {
+    tg_regs(|r| r.insert(i, v));
+    true
+}
+
+fn tg_exit(b: bool) -> bool {
+    TG_EXIT.store(b, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+fn tg_exiting() -> bool {
+    TLCGET && TG_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs f without changing the registers: for what the checker evaluates that TLC does not
+/// (rebuilding a behavior before showing it)
+fn tg_quiet<R>(f: impl FnOnce() -> R) -> R {
+    if !TLCGET {
+        return f();
+    }
+    let regs = tg_regs(|r| r.clone());
+    let exit = TG_EXIT.load(std::sync::atomic::Ordering::Relaxed);
+    let r = f();
+    *TG_REGS.lock().unwrap_or_else(|e| e.into_inner()) = Some(regs);
+    TG_EXIT.store(exit, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// Unwinds out of `init` or `next` when the search stops at a state they computed
+struct EagerStop;
+
+type PushHook = *mut (dyn FnMut(&State, u32) + 'static);
+
+thread_local! {
+    /// What handles each state as Init or an action computes it (TLCGET)
+    static PUSHED: std::cell::Cell<Option<PushHook>> = const { std::cell::Cell::new(None) };
+    /// Rebuilding a step: its action has yielded the next state, so the next action is not
+    /// evaluated
+    static STEP_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A state `init` (label u32::MAX) or `next` computed (TLCGET)
+#[inline]
+fn pushed(s: &State, l: u32) {
+    let Some(p) = PUSHED.with(|c| c.take()) else { return };
+    struct Back(PushHook);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            PUSHED.with(|c| c.set(Some(self.0)));
+        }
+    }
+    let _back = Back(p);
+    // SAFETY: the hook outlives this call (see `with_pushed`), and it is taken out of PUSHED
+    // while it runs, so it is not entered twice
+    unsafe { (*p)(s, l) }
+}
+
+/// Runs body with f handling each state computed
+fn with_pushed<R>(f: &mut dyn FnMut(&State, u32), body: impl FnOnce() -> R) -> R {
+    struct Reset(Option<PushHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PUSHED.with(|c| c.set(self.0));
+        }
+    }
+    let p: *mut (dyn FnMut(&State, u32) + '_) = f;
+    // SAFETY: only the lifetime is changed; the pointer is removed before f goes away
+    let p: PushHook = unsafe { std::mem::transmute(p) };
+    let _reset = Reset(PUSHED.with(|c| c.replace(Some(p))));
+    body()
+}
+
 /// Lines held while computing states (see above), and the strings made meanwhile (see "the
 /// order of strings made")
 #[derive(Default)]
@@ -756,6 +899,9 @@ fn mark_push() {
 fn mark_action() {
     if !PRINT_ORDER && !STR_ORDER {
         return;
+    }
+    if TLCGET && STEP_DONE.with(|d| d.get()) {
+        std::panic::panic_any(EagerStop);
     }
     CAPTURE.with(|c| {
         if let Some(c) = &mut *c.borrow_mut() {
@@ -934,15 +1080,30 @@ fn str_order_finish() {
 
 /// The step s -> t evaluated again as TLC does while showing a behavior: the actions in order up
 /// to the one that yields t, printing what they print
-fn step_prints(s: &State, t: &State) {
-    let cap = Capturing::start();
-    let mut buf = vec![];
-    let _ = successors(s, &mut buf, true);
-    let held = cap.finish();
+fn step_prints(s: &State, t: &State, level: usize) {
     let same = |x: &State| match (pack(x), pack(t)) {
         (Some(a), Some(b)) => state_fp(x, &a) == state_fp(t, &b),
         _ => x == t,
     };
+    if TLCGET {
+        // Printed as evaluated, and the actions after the one that yields t are not evaluated
+        tg_set_level(level as u64);
+        let mut hook = |x: &State, _: u32| {
+            if same(x) {
+                STEP_DONE.with(|d| d.set(true));
+            }
+        };
+        let mut buf = vec![];
+        with_pushed(&mut hook, || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, &mut buf)));
+        });
+        STEP_DONE.with(|d| d.set(false));
+        return;
+    }
+    let cap = Capturing::start();
+    let mut buf = vec![];
+    let _ = successors(s, &mut buf, true);
+    let held = cap.finish();
     let Some(j) = buf.iter().position(|(x, _)| same(x)) else { return };
     let last = held.cap.push_acts[j];
     for (_, a, l) in &held.cap.lines {
@@ -958,6 +1119,7 @@ fn eval_again_prints(s: &State, e: &EvalErr) {
     if !PRINT_ORDER || matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
         return;
     }
+    tg_set_level(0);
     let cap = Capturing::start();
     let mut buf = vec![];
     let _ = successors(s, &mut buf, true);
@@ -971,9 +1133,10 @@ fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)
     let state = |n: usize, (s, l): &(State, u32), prev: Option<&State>| print_step(&format!("State {n}: <{}>", name(*l)), s, prev);
     if k >= 2 {
         let mut v = vec![];
+        tg_set_level(0);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
         for i in 1..k - 1 {
-            step_prints(&trace[i - 1].0, &trace[i].0);
+            step_prints(&trace[i - 1].0, &trace[i].0, i);
         }
     }
     println!("Error: The behavior up to this point is:");
@@ -984,14 +1147,14 @@ fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)
     }
     for i in k.max(1) - 1..trace.len() {
         if i > 0 {
-            step_prints(&trace[i - 1].0, &trace[i].0);
+            step_prints(&trace[i - 1].0, &trace[i].0, i);
         }
         state(i + 1, &trace[i], prev(i));
     }
     let mut n = trace.len();
     if let Some(x) = extra {
         if let Some((last, _)) = trace.last() {
-            step_prints(last, &x.0);
+            step_prints(last, &x.0, trace.len());
         }
         n += 1;
         state(n, &x, diff_prev(n - 1, len, trace.last().map(|t| &t.0)));
@@ -1197,8 +1360,18 @@ fn check_invariants(s: &State) -> Option<&'static str> {
 
 /// `check_invariants`, with an evaluation error returned along with the invariant that raised it.
 fn eval_invariants(s: &State) -> Result<Option<&'static str>, (&'static str, EvalErr)> {
-    match std::panic::catch_unwind(|| check_invariants(s)) {
-        Ok(v) => Ok(v),
+    match std::panic::catch_unwind(|| if TLCGET { Err(()) } else { Ok(check_invariants(s)) }) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(())) => {
+            for (name, f) in INVARIANTS {
+                match std::panic::catch_unwind(|| f(s)) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Some(name)),
+                    Err(p) => return Err((name, describe_panic(p))),
+                }
+            }
+            Ok(None)
+        }
         // Evaluation is deterministic, so evaluating them one at a time again finds the one that
         // failed.
         Err(p) => {
@@ -1814,7 +1987,7 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
 /// `visited` tells whether a fingerprint was visited by the search.
 fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
     let mut buf = vec![];
-    let _ = successors(s, &mut buf, true);
+    let _ = tg_quiet(|| successors(s, &mut buf, true));
     let mut out = String::new();
     let mut added = std::collections::HashSet::new();
     for (t, l) in buf {
@@ -1879,7 +2052,7 @@ fn main() {
             .position(|a| a == "-workers")
             .and_then(|i| args.get(i + 1))
             .and_then(|w| w.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .unwrap_or_else(|| if TLCGET { 1 } else { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) })
             .max(1),
     };
     // Only when checking temporal properties is the whole state graph kept in memory (the SCC
@@ -1892,6 +2065,21 @@ fn main() {
     // Print and PrintT in the ASSUMEs
     for l in if flag(&NOWARN) { STARTUP_PRINTS_NOWARN } else { STARTUP_PRINTS } {
         println!("{l}");
+    }
+    if TLCGET {
+        // TLC's counts and registers are those of its workers' shared queue and threads, and its
+        // liveness checking evaluates the spec again in an order of its own
+        let refuse = if opt.workers > 1 && args.iter().any(|a| a == "-workers") {
+            Some("with several workers: TLC's values then depend on how its workers share the search (check with -workers 1)")
+        } else if LIVENESS {
+            Some("with temporal properties: TLC's liveness checking evaluates the spec again in an order of its own")
+        } else {
+            None
+        };
+        if let Some(why) = refuse {
+            eprintln!("tla2rs: TLCGet and TLCSet are not supported {why}");
+            std::process::exit(1);
+        }
     }
     str_order_start(opt.workers);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2099,16 +2287,20 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     let mut inits = Vec::new();
     // The states computed before an error are still checked first, as TLC checks each one as soon
     // as it is generated.
-    let cap = Capturing::start();
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err();
-    let mut held = cap.finish();
+    let mut failed = None;
+    let mut held = Held::default();
+    if !TLCGET {
+        let cap = Capturing::start();
+        failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err();
+        held = cap.finish();
+    }
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
     let mut generated = 0u64;
     // The first call writes the initial states to the graph; later ones rebuild traces
     let dump = dumping() && !DUMPED_INITS.swap(true, std::sync::atomic::Ordering::Relaxed);
     let mut buf = String::new();
-    for s in inits {
+    let mut handle = |s: State| {
         generated += 1;
         held.flush(generated as u32);
         let step = std::panic::catch_unwind(|| {
@@ -2123,9 +2315,11 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         };
         if let (Some(w), Some(fp)) = (w, fp) {
             if !seen.insert(fp) {
-                continue;
+                return;
             }
             out.push((s, w, fp));
+            tg_added();
+            tg_queued(1);
             if dump {
                 dump_node(&mut buf, &fp, &s, true);
                 dump_write(&mut buf);
@@ -2169,6 +2363,16 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             report_eval(&e);
             println!("{}", show(&s));
             exit(eval_code(&e));
+        }
+    };
+    if TLCGET {
+        // TLC handles each initial state as Init computes it (see TLCGET)
+        tg_set_level(0);
+        let mut hook = |s: &State, _: u32| handle(*s);
+        failed = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err());
+    } else {
+        for s in std::mem::take(&mut inits) {
+            handle(s);
         }
     }
     held.flush(u32::MAX);
@@ -2410,6 +2614,69 @@ fn expand_safety_one(
     }
 }
 
+/// `expand_safety_one` with TLCGET: each successor is handled as `next` computes it, as TLC does
+fn expand_eager_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+    let s = unpack(w);
+    tg_queued(-1);
+    let mut found: Option<SFound> = None;
+    let mut pushes = 0u64;
+    let mut out: Vec<(State, u32)> = vec![];
+    let failed = {
+        let mut hook = |t: &State, l: u32| {
+            pushes += 1;
+            if let Some(f) = eager_succ(&s, sfp, *t, l, seen, c, ws) {
+                found = Some(f);
+                std::panic::panic_any(EagerStop);
+            }
+        };
+        with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(&s, &mut out))).err())
+    };
+    if found.is_some() {
+        return found;
+    }
+    if let Some(p) = failed {
+        raise_next(p);
+    }
+    if pushes == 0 && opt.check_deadlock {
+        return Some(SFound::new(sfp, None, SMsg::Deadlock));
+    }
+    None
+}
+
+/// One successor handled as in `expand_safety_one`
+fn eager_succ(s: &State, sfp: Fp, t: State, l: u32, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+    ws.buf.clear();
+    ws.buf.push((t, l));
+    ws.cand.clear();
+    ws.acts.clear();
+    ws.dpend.clear();
+    let base = c.generated;
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fingerprint_successors(s, sfp, seen, c, ws)));
+    let examined = c.generated;
+    let found = insert_candidates(base, sfp, seen, c, ws);
+    for (_, e) in ws.dpend.drain(..) {
+        ws.dump += &e;
+    }
+    if found.is_some() {
+        return found;
+    }
+    c.generated = examined;
+    if let (Ok(Some(f)), Some(&(_, tfp, _))) = (&stopped, ws.cand.last()) {
+        let act = f.in_model && matches!(f.msg, SMsg::Action(_) | SMsg::ActionEval(..));
+        if act && c.next.last().is_some_and(|q| q.1 == tfp) {
+            c.next.pop();
+            tg_queued(-1);
+        }
+    }
+    match stopped {
+        Err(p) => match classify(p) {
+            (e, false) => Some(SFound::new(sfp, None, SMsg::Untraced(e))),
+            (e, true) => Some(SFound::new(sfp, None, SMsg::Eval(e))),
+        },
+        Ok(f) => f,
+    }
+}
+
 /// Fills ws.cand with the successors in ws.buf that may be new and prefetches the table line of
 /// each. Stops at a successor that is an error by itself and returns it.
 fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
@@ -2502,6 +2769,7 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
             return Some(pack_failed(sfp, *t, *l));
         };
         c.distinct += 1;
+        tg_added();
         ws.held.flush(i as u32 + 1);
         match eval_invariants(t) {
             Ok(None) => {}
@@ -2510,6 +2778,7 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
             Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
         c.next.push((tw, tfp));
+        tg_queued(1);
         acts(i + 1, ws);
     }
     None
@@ -2541,9 +2810,12 @@ fn expand_safety(
         let (w, sfp) = &frontier[i];
         let base = c.generated;
         c.expanded += 1;
-        let r = expand_caught(&mut c, |c| c.generated, |c, careful| {
-            expand_safety_one(w, *sfp, seen, opt, c, &mut ws, careful)
-        });
+        let r = if TLCGET {
+            // Not again on an error: evaluating sets registers and prints
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expand_eager_one(w, *sfp, seen, opt, &mut c, &mut ws)))
+        } else {
+            expand_caught(&mut c, |c| c.generated, |c, careful| expand_safety_one(w, *sfp, seen, opt, c, &mut ws, careful))
+        };
         if dumping() {
             // The successors examined up to the one that stopped the search, if any
             let n = (c.generated - base) as usize;
@@ -2565,6 +2837,10 @@ fn expand_safety(
         };
         if found.is_some() {
             c.found = found;
+            stop.store(true, Relaxed);
+            break;
+        }
+        if tg_exiting() {
             stop.store(true, Relaxed);
             break;
         }
@@ -2616,6 +2892,10 @@ fn fp_chain(seen: &dyn Visited, target: Fp) -> Option<Vec<Fp>> {
 
 /// Rebuilds the actual states by replaying a sequence of fingerprints from an initial state.
 fn replay(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
+    tg_quiet(|| replay_in(chain))
+}
+
+fn replay_in(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
     // With PRINT_ORDER, quietly: `print_states_tlc` prints what TLC prints meanwhile
     let _quiet = Capturing::start();
     let first = if PRINT_ORDER {
@@ -2708,7 +2988,11 @@ fn run_safety(opt: &Opt) {
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut depth = 1u32;
     let mut last = std::time::Instant::now();
+    if tg_exiting() {
+        return finish(opt, t0, generated, distinct, depth, frontier.len());
+    }
     while !frontier.is_empty() {
+        tg_set_level(depth as u64);
         let left_before = frontier.len();
         let mut nxt = Level::new(opt.mem_limit);
         let mut found: Option<SFound> = None;
@@ -2774,12 +3058,16 @@ fn run_safety(opt: &Opt) {
             // taken off the queue varies)
             report_and_exit(&seen, f, generated, distinct, nxt.len() + (left_before - expanded));
         }
+        if tg_exiting() {
+            let depth = depth + !nxt.is_empty() as u32;
+            return finish(opt, t0, generated, distinct, depth, nxt.len() + (left_before - expanded));
+        }
         frontier = nxt;
         if !frontier.is_empty() {
             depth += 1;
         }
     }
-    finish(opt, t0, generated, distinct, depth);
+    finish(opt, t0, generated, distinct, depth, 0);
 }
 
 /// Adds one worker's results to the totals and the next level. Chunks are merged in worker
@@ -2852,7 +3140,7 @@ fn continued_inv_eval(msg: &SMsg, in_model: bool) -> Option<i32> {
     Some(255)
 }
 
-fn finish(opt: &Opt, t0: std::time::Instant, generated: u64, distinct: u64, depth: u32) {
+fn finish(opt: &Opt, t0: std::time::Instant, generated: u64, distinct: u64, depth: u32, left: usize) {
     if std::env::var("TLA2RS_PHASES").is_ok() {
         let g = |i: usize| PH[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
         println!(
@@ -2863,7 +3151,7 @@ fn finish(opt: &Opt, t0: std::time::Instant, generated: u64, distinct: u64, dept
         );
     }
 
-    println!("{generated} states generated, {distinct} distinct states found, 0 states left on queue.");
+    println!("{generated} states generated, {distinct} distinct states found, {left} states left on queue.");
     println!("The depth of the complete state graph search is {depth}.");
     let spilled = SPILLED.load(std::sync::atomic::Ordering::Relaxed);
     if spilled > 0 {
@@ -3554,7 +3842,7 @@ fn run_safety_batched(opt: &Opt) {
             depth += 1;
         }
     }
-    finish(opt, t0, generated, distinct, depth);
+    finish(opt, t0, generated, distinct, depth, 0);
 }
 
 fn run_liveness(opt: &Opt) {

@@ -65,6 +65,9 @@ pub struct Gen<'a> {
     case_at: Option<String>,
     /// The module's definitions without arguments (TLC keeps the value of those of constant level)
     pub zero_defs: HashSet<String>,
+    /// The spec reads or writes TLC's search state (TLCGet, TLCSet): each state is handled as it
+    /// is computed (see TLCGET in the runtime)
+    pub tlcget: bool,
     /// How deep recursive operators are being unrolled in an action
     unroll: u32,
     pub atoms: &'a Atoms,
@@ -165,6 +168,7 @@ impl<'a> Gen<'a> {
             print_order: vec![],
             case_at: None,
             zero_defs: HashSet::new(),
+            tlcget: false,
             unroll: 0,
             atoms,
             ce: ConstEval { atoms, constants },
@@ -1240,6 +1244,8 @@ impl<'a> Gen<'a> {
             // constant level without arguments: TLC computes its value once, when it starts (and
             // prints then, see compile.rs)
             Expr::Call(n, _) if n == "PrintT" || n == "Print" => false,
+            // They read and write the search's state, each time they are evaluated
+            Expr::Call(n, _) if n == "TLCGet" || n == "TLCSet" => false,
             Expr::Label(n, a, b) if a.is_empty() && self.zero_defs.contains(n) => self.is_const_quiet(b, env),
             Expr::Label(n, a, b) if is_bind(n) => {
                 self.bind_const(a, env);
@@ -1280,6 +1286,7 @@ impl<'a> Gen<'a> {
     /// Whether e is constant, printing or not
     fn is_const_quiet(&self, e: &Expr, env: &Env) -> bool {
         match e {
+            Expr::Call(n, _) if n == "TLCGet" || n == "TLCSet" => false,
             Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
             Expr::Label(n, a, b) if is_bind(n) => {
                 self.bind_const(a, env);
@@ -2686,7 +2693,38 @@ impl<'a> Gen<'a> {
                 }
                 ("RandomElement", [SetLit(xs)]) if xs.len() == 1 => self.gen(&xs[0], env, want)?,
                 ("RandomElement", _) => return Err("RandomElement over a set from the state is not supported: TLC picks an element at random".into()),
-                ("TLCGet" | "TLCSet", _) => return Err(format!("{f} is not supported: it reads or writes TLC's search state")),
+                // TLC's search state as TLC 2.19 has it with one worker (see TLCGET in the runtime)
+                ("TLCGet", [x]) => match self.try_const(x, env) {
+                    Some(Value::Atom(a)) if !self.atoms.is_model(a) => match self.atoms.name(a).as_str() {
+                        k @ ("level" | "diameter" | "distinct" | "queue") => (format!("tg_{k}()"), Ty::Int(0, BIG)),
+                        "duration" => return Err("TLCGet(\"duration\") is not supported: it reads the clock, so no two runs agree".into()),
+                        k => return Err(format!("TLCGet(\"{k}\") is not supported: TLC 2.19 does not define it (TLCGet({k}) was undefined.)")),
+                    },
+                    _ => {
+                        let (c, t) = self.gen(x, env, None)?;
+                        if !matches!(t, Ty::Int(..)) {
+                            return Err(format!("TLCGet of {}: only the registers numbered by integers and the counts are supported", short(x)));
+                        }
+                        (format!("tg_get({c})"), Ty::Int(-BIG, BIG))
+                    }
+                },
+                ("TLCSet", [x, v]) => match self.try_const(x, env) {
+                    Some(Value::Atom(a)) if !self.atoms.is_model(a) && self.atoms.name(a) == "exit" => {
+                        let c = self.gen_as(v, env, &Ty::Bool)?;
+                        (format!("tg_exit({c})"), Ty::Bool)
+                    }
+                    Some(Value::Atom(a)) if !self.atoms.is_model(a) && self.atoms.name(a) == "pause" => {
+                        return Err("TLCSet(\"pause\", ...) is not supported: TLC waits for a key".into())
+                    }
+                    _ => {
+                        let (ic, it) = self.gen(x, env, None)?;
+                        let (vc, vt) = self.gen(v, env, None)?;
+                        if !matches!(it, Ty::Int(..)) || !matches!(vt, Ty::Int(..)) {
+                            return Err(format!("TLCSet({}, {}): only integers in registers numbered by integers are supported", short(x), short(v)));
+                        }
+                        (format!("tg_set({ic}, {vc})"), Ty::Bool)
+                    }
+                },
                 ("IsFiniteSet", [s]) => {
                     let (c, t) = self.gen(s, env, None)?;
                     if !matches!(t, Ty::Set(_)) {
@@ -6010,6 +6048,14 @@ impl<'a> Gen<'a> {
         // For the order of printed lines and of strings made (a no-op in a checker that follows
         // neither)
         writeln!(out, "mark_push();").unwrap();
+        // Each state handled as it is computed (see TLCGET in the runtime)
+        if self.tlcget {
+            if env.init {
+                writeln!(out, "pushed(&out[out.len() - 1], u32::MAX);").unwrap();
+            } else {
+                writeln!(out, "{{ let __p = out[out.len() - 1]; pushed(&__p.0, __p.1); }}").unwrap();
+            }
+        }
         Ok(())
     }
 

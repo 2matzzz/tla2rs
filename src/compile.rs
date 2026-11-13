@@ -1096,6 +1096,8 @@ fn strip_prints(e: &Expr) -> Expr {
 fn constant_level(e: &Expr, m: &Module) -> bool {
     !e.any(&|x| match x {
         Expr::Ident(v, _) => m.variables.contains(v),
+        // TLC evaluates them each time, also in a definition of constant level
+        Expr::Call(n, _) if n == "TLCGet" || n == "TLCSet" => true,
         Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => true,
         Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) => true,
         x => x.is_unchecked_temporal(),
@@ -1125,6 +1127,10 @@ fn makes_strings(e: &Expr, constants: &HashMap<String, Value>, atoms: &Atoms) ->
             Expr::Ident(n, _) => constants.get(n).is_some_and(|v| has_str(v, atoms)),
             _ => false,
         })
+}
+
+fn uses_tlc_state(e: &Expr) -> bool {
+    e.any(&|x| matches!(x, Expr::Call(n, _) if n == "TLCGet" || n == "TLCSet"))
 }
 
 fn has_prints(e: &Expr) -> bool {
@@ -1391,6 +1397,7 @@ fn compile_inner(
     // is false. An expression that cannot be evaluated is an error rather than silently passing.
     {
         let ce = ConstEval { atoms: &atoms, constants: &constants };
+        crate::value::TLC_REGS.with(|r| *r.borrow_mut() = Some(Default::default()));
         for a in &m.assumes {
             let (l1, c1, l2, c2) = a.span;
             let at = format!("line {l1}, col {c1} to line {l2}, col {c2} of module {}", a.module);
@@ -1418,6 +1425,8 @@ fn compile_inner(
             }
         }
     }
+
+    let reg_init = crate::value::TLC_REGS.with(|r| r.borrow_mut().take()).unwrap_or_default();
 
     // Each once, in the order first made; a string written in the spec was created when TLC parsed it
     let mut made_split_at = 0;
@@ -1567,9 +1576,14 @@ fn compile_inner(
 
     // Init / Next. When they or an invariant print (Print, PrintT), the checker follows TLC's
     // order of the lines printed (see PRINT_ORDER in the runtime)
+    let checked = cfg.invariants.iter().chain(&cfg.constraints).chain(&cfg.action_constraints);
+    g.tlcget = uses_tlc_state(&init)
+        || uses_tlc_state(&next_pos)
+        || checked.clone().any(|n| ex.expand_def_code(n, false).is_ok_and(|e| uses_tlc_state(&e)));
     let print_order = has_prints(&init)
         || has_prints(&next_pos)
-        || cfg.invariants.iter().any(|n| ex.expand_def_code(n, false).is_ok_and(|e| has_prints(&e)));
+        || cfg.invariants.iter().any(|n| ex.expand_def_code(n, false).is_ok_and(|e| has_prints(&e)))
+        || g.tlcget;
     g.plan_shapes(&init, &next_pos);
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
@@ -1798,6 +1812,10 @@ fn compile_inner(
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
     writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
+    writeln!(src, "const TLCGET: bool = {};", g.tlcget).unwrap();
+    // The registers the ASSUMEs set
+    let regs: Vec<String> = reg_init.iter().map(|(i, v)| format!("({i}, {v})")).collect();
+    writeln!(src, "static REG_INIT: &[(i64, i64)] = &[{}];", regs.join(", ")).unwrap();
     // The strings the checker may make while exploring, and which of them TLC created when it
     // parsed the spec (a name or number of a module), whose place is known
     writeln!(src, "const STR_ORDER: bool = {};", g.str_notes).unwrap();

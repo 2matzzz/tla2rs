@@ -123,7 +123,8 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 - 列挙できない集合（Nat・Int・STRING・`Seq(S)`）の上の関数は、引数に適用するとき（更新ごとに添字 1 つの EXCEPT の後でもよい）、`x \in DOMAIN f`、`ToString`・`Print`・`PrintT` で使える。TLC もそこでは定義域を列挙せずに評価する（表示は `[n \in Nat |-> <expression line 5, col 26 to line 5, col 30 of module M>]` のように、本体の位置を出す）。それ以外で値として使う（変数に入れる、比べる、ほかの値の中に入れる）と拒否する。TLC もそうした使い方の大半ではエラーで止まる
 - 状態にある集合の上の関数（`[x \in S |-> e]`・`[S -> T]`・`:>`・`@@`・`Permutations`）は型の一部を定義域にする関数として持つ。入れ子のモジュールを INSTANCE できる。仕様が定義する後置演算子（`^+`・`^*`・`^#`）と中置の `--`・`|-`・`??`・`!!`・`\bigcirc` も使える。`Print` / `PrintT` は TLC と同じく標準出力に書く。引数のない定数の層の定義と ASSUME の中のものは、検査器が始まったときに一度だけ書く
 - 初期述語・アクション・不変条件の中の `Print` / `PrintT` は、ワーカーが 1 つなら TLC と同じ順で書く。状態ごとに、その状態を調べる前に出た行を先に書き、探索を止めた状態より後の行は書かない。TLC が反例を組み立て直すときに Init やアクションを評価し直して出す行も、同じところに書く（CLAUDE.md の「Messages and printed lines」）。こうした仕様は `-batched` を付けても通常の探索で調べる
-- 未対応：2 要素以上の `RandomElement`、`JavaTime`、`TLCGet` / `TLCSet`（いずれも理由を添えて拒否する。TLC 2.19 にあるものは CLAUDE.md の「TLCGet and TLCSet」にまとめた）、文字列と整数を両方持ちうる集合（文字列の集合と整数の集合を比べるのは扱える。TLC と同じく、大きさが違えば等しくなく、同じなら評価エラーになる）、
+- `TLCGet` / `TLCSet` は、ワーカーが 1 つなら TLC 2.19 と同じ値を返す。使えるのは、整数を入れるレジスタの `TLCGet(i)` / `TLCSet(i, v)`、`TLCGet("level")`・`("diameter")`・`("distinct")`・`("queue")`、それに `TLCSet("exit", TRUE)` で、TLC が反例を組み立て直すときに評価し直した値も同じになる（CLAUDE.md の「TLCGet and TLCSet」）。これらを使う仕様では、ワーカーを複数にするのと時相の性質を調べるのは断る
+- 未対応：2 要素以上の `RandomElement`、`JavaTime`、`TLCGet("duration")`、TLC 2.19 にない `TLCGet` / `TLCSet` の形、`TLCSet("pause", ...)`（いずれも理由を添えて拒否する）、文字列と整数を両方持ちうる集合（文字列の集合と整数の集合を比べるのは扱える。TLC と同じく、大きさが違えば等しくなく、同じなら評価エラーになる）、
   CONSTANT への `Name <- [Module] Def`（TLC も受け付けない）、`Op!@`
 - SANY が受け付けない仕様は、次の理由のものなら TLC と同じく終了コード 150 で止まる：優先順位の範囲が重なる演算子を括弧なしで並べたもの
   （`a /\ b \/ c`・`a = b = c` のほか、前置・後置の演算子が絡む `[]x = 1`・`ENABLED x' = 1`・`a * -b`・`DOMAIN f + 1`・`UNCHANGED x'`）、
