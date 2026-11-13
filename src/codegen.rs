@@ -4134,7 +4134,12 @@ impl<'a> Gen<'a> {
             for x in set {
                 parts.push(self.lit(x, &et)?);
             }
-            return Ok((self.note_folded(format!("[{}].into_iter()", parts.join(", ")), &made), *et, None));
+            // rustc takes minutes over a temporary array of thousands of values, not over a static
+            let it = match parts.len() > LIT_TABLE && const_lit(&et) {
+                true => format!("{{ static __A: [{}; {}] = [{}]; __A.iter().copied() }}", et.repr(), parts.len(), parts.join(", ")),
+                false => format!("[{}].into_iter()", parts.join(", ")),
+            };
+            return Ok((self.note_folded(it, &made), *et, None));
         }
         // A product of sets that depend on the state, in TLC's order (the first element varies
         // slowest)
@@ -4807,8 +4812,20 @@ impl<'a> Gen<'a> {
             // Element by element, also for a set of more than 128 possible elements (records of
             // different fields), which would be an array of limited capacity
             if fits.len() <= 8 || !xt.is_scalar() || is_sparse(&st) {
-                let parts: Vec<String> =
-                    fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
+                let lits: Vec<String> = fits.iter().map(|e| self.lit(e, xt)).collect::<R<_>>()?;
+                // A chain of thousands of comparisons nests too deep for rustc: search a sorted copy
+                if lits.len() > LIT_TABLE {
+                    let tr = xt.repr();
+                    let v = match const_lit(xt) {
+                        true => format!("{{ static __A: [{tr}; {}] = [{}]; __A.to_vec() }}", lits.len(), lits.join(", ")),
+                        false => format!("vec![{}]", lits.join(", ")),
+                    };
+                    return Ok(format!(
+                        "{{ static __S: std::sync::OnceLock<Vec<{tr}>> = std::sync::OnceLock::new(); \
+                         __S.get_or_init(|| {{ let mut __v: Vec<{tr}> = {v}; __v.sort(); __v }}).binary_search(&{x}).is_ok() }}"
+                    ));
+                }
+                let parts: Vec<String> = lits.iter().map(|l| format!("{x} == {l}")).collect();
                 return Ok(format!("({})", parts.join(" || ")));
             }
             let mask = self.lit(&v, &st)?;
@@ -6892,6 +6909,24 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
 /// examples/ and tests/tlc/ and of the corpus but GameOfLife enumerated the same elements in the
 /// same order as written out (measured by comparing the two at run time)
 const BIG_SET: usize = 1024;
+
+/// A constant set of more elements than this, written out, is a table: a static where the
+/// elements are constant expressions (`const_lit`)
+const LIT_TABLE: usize = 64;
+
+/// Whether `Gen::lit` writes the values of type t as constant expressions: not those holding a
+/// sequence or a set held as an array, which it builds by calls
+fn const_lit(t: &Ty) -> bool {
+    match t {
+        Ty::Bool | Ty::Int(..) | Ty::IntAtom(..) | Ty::Enum(_) => true,
+        Ty::Rec(fs) => fs.iter().all(|(_, f)| const_lit(f)),
+        Ty::Opt(e) | Ty::Fun(_, e) => const_lit(e),
+        Ty::PFun(_, c) => !is_sparse_fun(t) && const_lit(c),
+        Ty::Bag(_) => !is_sparse_fun(t),
+        Ty::Set(_) => !is_sparse(t),
+        Ty::Seq(_) => false,
+    }
+}
 
 /// A constant set by its parts, enumerated by the checker (see `Gen::big_set_iter`). Its elements
 /// come in the order of the set's value: functions, tuples and records compare their values one
