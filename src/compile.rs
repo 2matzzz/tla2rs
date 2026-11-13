@@ -1213,7 +1213,7 @@ fn compile_inner(
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
     startup.sany = crate::sany::take_warnings();
     crate::value::NAT_DIV.with(|n| n.set(!INTEGERS.with(|i| i.get())));
-    let cfg = parse_cfg(cfg_src)?;
+    let mut cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
 
     // Strings and model values. Strings are numbered in the order TLC creates them (TLC orders
@@ -1390,6 +1390,9 @@ fn compile_inner(
         let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
         let named = named.chain(cfg.constraints.iter().map(|n| ("constraint", n)));
         let named = named.chain(cfg.action_constraints.iter().map(|n| ("action constraint", n)));
+        // A constraint that is TRUE is dropped: TLC keeps only those it has to evaluate on each
+        // state (and does not warn about constraints with liveness when none is left)
+        let mut dropped = vec![];
         for (what, name) in named {
             if !constant_level(&ex.expand_def_code(name, false)?, &m) || bound_reads_state(name, &m) {
                 continue;
@@ -1402,6 +1405,7 @@ fn compile_inner(
             startup.invs.extend(printed.into_iter().filter(|l| l.starts_with(crate::value::WARNING_MARK)));
             made_now.extend(atoms.log_end());
             match r {
+                Ok(Value::Bool(true)) if what.ends_with("constraint") => dropped.push(name.clone()),
                 Ok(Value::Bool(true)) | Err(_) => {}
                 Ok(v) => {
                     let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
@@ -1409,6 +1413,8 @@ fn compile_inner(
                 }
             }
         }
+        cfg.constraints.retain(|n| !dropped.contains(n));
+        cfg.action_constraints.retain(|n| !dropped.contains(n));
     }
     // A module without variables and a cfg without SPECIFICATION, INIT and NEXT (one that only checks
     // its ASSUMEs): TLC checks the constant-level invariants and properties, then finishes with no
