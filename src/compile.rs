@@ -2404,7 +2404,7 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, a
             let at = at.map(|a| a.to_string());
             // TLC names the invariant after P when P applies an operator without arguments (a
             // definition, TRUE or FALSE), whatever the property is called (`tests/tlc/BoxName`)
-            let (disp, at) = match zero_arity_name(p) {
+            let (disp, at) = match zero_arity_name(g, p) {
                 Some(n) if tag.is_empty() => (n, None),
                 _ => (disp, at),
             };
@@ -2427,10 +2427,11 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, a
 }
 
 /// The name of the operator e applies when it takes no arguments: a definition (a call site is a
-/// label) or TRUE / FALSE, through the labels of positions
-fn zero_arity_name(e: &Expr) -> Option<String> {
+/// label), a variable, or TRUE / FALSE, through the labels of positions
+fn zero_arity_name(g: &Gen, e: &Expr) -> Option<String> {
     match e {
-        Expr::Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() => zero_arity_name(b),
+        Expr::Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() => zero_arity_name(g, b),
+        Expr::Ident(n, _) if g.vars.iter().any(|(v, _)| v == n) => Some(n.clone()),
         Expr::Label(n, args, _) if !n.starts_with('#') && !e.is_user_label() => args.is_empty().then(|| n.clone()),
         Expr::Bool(b) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
         _ => None,
