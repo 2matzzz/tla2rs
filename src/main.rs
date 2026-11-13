@@ -237,13 +237,14 @@ fn main() {
             CAP_EXIT_SEQ => ("a sequence", qcap),
             _ => exit(code),
         };
-        // Twice the room the first time a kind grows, four times after that: a value that outgrew
-        // its capacity twice is likely far beyond it, and each build costs seconds. Never less
-        // than the value needs
+        // Twice the room the first time a kind grows, four times the second, eight times the third
+        // and so on: a value that keeps outgrowing its capacity is likely far beyond it, and each
+        // build costs seconds (`SimplifiedFastPaxos` `FastPaxos` needs more than 256: 3 rebuilds to
+        // 512 instead of 4 to 1024 at four times after the first). Never less than the value needs
         let kind = (code - CAP_EXIT_SET) as usize;
         grown[kind] += 1;
         let need = std::fs::read_to_string(&need_file).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(old + 1);
-        let new = (old * if grown[kind] == 1 { 2 } else { 4 }).max(need).clamp(8, types::MAX_CAP);
+        let new = old.saturating_mul(1 << grown[kind].min(12)).max(need).clamp(8, types::MAX_CAP);
         if code == CAP_EXIT_SET {
             setcap = new;
         } else {

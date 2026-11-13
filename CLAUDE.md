@@ -118,8 +118,8 @@ When a value outgrows its capacity (`capacity_exceeded` in the runtime, from `SS
 `seq_too_long`) and tla2rs runs the checker, the checker exits at once with 70 (sets) or 71 (sequences); tla2rs
 (`main.rs`) prints `tla2rs: a set grew beyond N elements; checking again from the start with room for M`, compiles
 with that capacity, builds (the build cache applies) and runs again from the start. M is twice N the first time a kind
-grows and four times N after that (a value that outgrew its capacity twice is usually far beyond it, and each build
-costs seconds), and at least what the value needs, which the checker writes to the file `TLA2RS_NEED` names: one more
+grows, four times N the second, eight times the third and so on (a value that keeps outgrowing its capacity is
+usually far beyond it, and each build costs seconds), and at least what the value needs, which the checker writes to the file `TLA2RS_NEED` names: one more
 than N, or the size of a whole union or concatenation. `TLA2RS_GROW` tells the
 checker which kinds may still grow (both stop at 65535, `types::MAX_CAP`); run directly, or at the maximum, the
 checker reports an evaluation error as before. Output before the line is repeated by the next run, so
@@ -135,9 +135,10 @@ Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and th
 | `MCCheckpointCoordinationFailure`, `ReadersWriters` `MC`, `AllocatorImplementation`, `AllocatorRefinement`, `SchedulingAllocator` | `-seqcap` 8, 6, 6, 6, 3 | No rebuild: sequences start at 8 |
 | `MCDisruptor_MPMC`, `-liveliness`, `MCDisruptor_SPMC` | `-seqcap 10` | 1 rebuild (16) |
 | `SlidingPuzzles` | `-setcap 64` | No rebuild: Init assigns a constant set of 10 |
-| `SimplifiedFastPaxos` `Paxos` | `-setcap 1024` | 5 rebuilds (256; its message set holds more than 128): about 30 s in all, but the search takes 0.5 s instead of 2.1 s with 1024 |
+| `SimplifiedFastPaxos` `Paxos` | `-setcap 1024` | 3 rebuilds (512; its message set holds more than 128): 14 s in all, the search 0.7 s (2.1 s with 1024) |
+| `SimplifiedFastPaxos` `FastPaxos` (skipped in the corpus) | | 3 rebuilds (512): 32 s in all with one worker (four builds of 7 s, the search 4.5 s), TLC 37 s; twice and then four times each time, it took 4 rebuilds to 1024 and 39 s |
 | `tests/tlc/SubBags` | `-setcap 32` | 1 rebuild (16) |
-| `tests/tlc/LongSeq` | `-seqcap 140 -setcap 140` | Sequences settle at 140 (`seqlen.rs`); `DOMAIN q` takes 5 rebuilds (sets of `1..140`, capped at 140) |
+| `tests/tlc/LongSeq` | `-seqcap 140 -setcap 140` | Sequences settle at 140 (`seqlen.rs`); `DOMAIN q` takes 3 rebuilds (sets of `1..140`, capped at 140) |
 | `tests/tlc/SeqCap` | `-seqcap 3` | No rebuild: lengths settle |
 
 Not done, measured: starting SCAP at |T| for `x \subseteq T` in TypeOK with T constant would have raised it for 15
