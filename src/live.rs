@@ -551,6 +551,10 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
     let e0 = e;
     let e = e.strip();
     if !temporal(e) {
+        if let Some(m) = live_const_error(g, e0, env) {
+            let m = format!("TLC threw an unexpected exception.\nThis was probably caused by an error in the spec or model.\nSee the User Output or TLC Console for clues to what happened.\n{m}");
+            return Ok(Err(Rejected(m, 255)));
+        }
         if let Bool(b) = e {
             return Ok(Ok(TExpr::Bool(*b)));
         }
@@ -671,6 +675,44 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
     }))
 }
 
+/// The error TLC stops with when it starts, converting a temporal formula: it goes through /\, \/,
+/// ~, =>, IF and LET (Liveness.astToLive) and evaluates each part of constant level, also a branch
+/// of an IF that the condition does not take (`tests/tlc/LiveConstErr`)
+fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<String> {
+    use Expr::*;
+    match e {
+        Label(n, pairs, b) if crate::ast::is_bind(n) => {
+            let mut body = b.as_ref().clone();
+            for p in pairs.chunks(2).rev() {
+                if let [Ident(name, _), x] = p {
+                    body = crate::expand::subst_ident(&body, name, x);
+                }
+            }
+            return live_const_error(g, &body, env);
+        }
+        Label(_, _, b) if matches!(b.as_ref(), Label(..) | And(_) | Or(_) | Un(UOp::Not, _) | Bin(BOp::Implies, ..) | If(..)) => {
+            return live_const_error(g, b, env);
+        }
+        And(xs) | Or(xs) => return xs.iter().find_map(|x| live_const_error(g, x, env)),
+        Un(UOp::Not, x) => return live_const_error(g, x, env),
+        Bin(BOp::Implies, a, b) => return [a, b].into_iter().find_map(|x| live_const_error(g, x, env)),
+        If(c, a, b) => return [c, a, b].into_iter().find_map(|x| live_const_error(g, x, env)),
+        _ => {}
+    }
+    let reads_state = e.any(&|x| match x {
+        Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
+        Prime(_) | Un(UOp::Enabled | UOp::Unchanged, _) => true,
+        _ => false,
+    });
+    if reads_state {
+        return None;
+    }
+    // Only TLC's own evaluation errors (the constant evaluator also fails on what it cannot do)
+    match g.ce.eval(e, env) {
+        Err(m) if m.starts_with("Attempted to") || m.starts_with("0^0") || m.starts_with("The second argument of ^") => Some(m),
+        _ => None,
+    }
+}
 /// TLC's fairness conditions in its form; their atoms are only classified
 fn fair_texpr(f: &FairDef) -> TExpr {
     let en = TExpr::Neg(TExpr::State(FAIR).into());
