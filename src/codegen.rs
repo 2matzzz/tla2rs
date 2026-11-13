@@ -2707,10 +2707,10 @@ impl<'a> Gen<'a> {
                         })
                         .collect();
                     // A set of integers TLC holds as an interval prints as one (see `shape_of`)
-                    let sh = if Self::shape_slots(&t) > 0 { self.shape_of(x, &t, env) } else { "0".into() };
+                    let sh = if self.shape_slots(&t) > 0 { self.shape_of(x, &t, env) } else { "0".into() };
                     if sh != "0" {
                         for v in &vals {
-                            for s in shown_forms(self.atoms, v, &t).into_iter().skip(1) {
+                            for s in self.shown_forms(v, &t).into_iter().skip(1) {
                                 let id = self.atoms.intern(false, &s);
                                 table.push((s, id));
                             }
@@ -5418,6 +5418,20 @@ impl<'a> Gen<'a> {
                     let place = format!("{w}.v_{v}");
                     // x' = [x EXCEPT ...] updates the state under construction in place
                     // (avoiding a copy out and back in)
+                    // An IF whose condition prints, with branches of different shapes: the
+                    // condition is evaluated once for the value and its shape
+                    if let (true, If(c, a, b)) = (self.infer.is_none() && self.shaped.contains_key(&v) && shows(rhs), rhs.strip()) {
+                        let (sa, sb) = (self.shape_of(a, &t, env), self.shape_of(b, &t, env));
+                        if shows(c) && sa != sb {
+                            let cv = self.fresh("c");
+                            let cc = self.gen_as(c, env, &Ty::Bool)?;
+                            let (ac, bc) = (self.gen_as(a, env, &t)?, self.gen_as(b, env, &t)?);
+                            writeln!(out, "let {cv} = {cc}; {place} = if {cv} {{ {ac} }} else {{ {bc} }};").unwrap();
+                            writeln!(out, "{{ let __sh: u64 = if {cv} {{ {sa} }} else {{ {sb} }}; shs_{v}(&mut {w}, __sh); }}").unwrap();
+                            env2.primed.insert(v, (place, t));
+                            return self.gen_action(rest, &env2, out);
+                        }
+                    }
                     match rhs.strip() {
                         Except(base, ups) if matches!(base.strip(), Ident(n, _) if *n == v) => {
                             self.gen_except_into(&place, ups, &t, &env2, except_pos(base), out)?;
@@ -7486,33 +7500,23 @@ pub fn short(e: &Expr) -> String {
 // TLC holds the value of `a..b` as an interval and prints it as `a..b` (`{}` when empty) until an
 // operation makes another set of it, so the same set prints `1..3` or `{1, 2, 3}` depending on how
 // it was built (`tests/tlc/IntervalShow`). A checker whose variables may hold such sets keeps,
-// beside each state, a shape: one bit per set of integers in those variables (also in the fields
-// of a record or tuple), set when TLC holds that set as an interval. It is not part of the
-// fingerprint, and the queue keeps it in a word of its own after the state (`gen_pack`).
+// beside each state, a shape: bits laid out by `shape_slots`, set where TLC holds a set of
+// integers as an interval or a sequence as a function, also inside the records, tuples,
+// sequences, functions and sets the variables hold. It is not part of the fingerprint, and the
+// queue keeps it in a word of its own after the state (`gen_pack`).
 
-/// The texts TLC may print for v of type t: as enumerated sets first, then with some sets of
-/// integers held as intervals (at most 64 forms; beyond, the first only)
-pub fn shown_forms(atoms: &Atoms, v: &Value, t: &Ty) -> Vec<String> {
-    let plain = crate::compile::show_value(atoms, v);
-    let mut out = match (t, v) {
-        (Ty::Set(_), _) => interval_text(v).into_iter().collect(),
-        (Ty::Seq(_), Value::Tuple(xs)) if xs.is_empty() => vec!["<< >>".into()],
-        (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) && fs.len() == xs.len() && Gen::shape_slots(t) > 0 => {
-            let parts: Vec<Vec<String>> = fs.iter().zip(xs).map(|((_, ft), x)| shown_forms(atoms, x, ft)).collect();
-            product(&parts).into_iter().map(|p| format!("<<{}>>", p.join(", "))).collect()
-        }
-        (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) && fs.len() == m.len() && Gen::shape_slots(t) > 0 => {
-            let parts: Option<Vec<Vec<String>>> =
-                fs.iter().map(|(f, ft)| m.get(f).map(|x| shown_forms(atoms, x, ft).into_iter().map(|y| format!("{f} |-> {y}")).collect())).collect();
-            parts.map_or(vec![], |ps| product(&ps).into_iter().map(|p| format!("[{}]", p.join(", "))).collect())
-        }
-        _ => vec![],
-    };
-    out.retain(|x| *x != plain);
-    out.insert(0, plain);
-    out.dedup();
-    out
-}
+/// The shape's helpers in a checker: a part of a shape and a part replaced (nothing past its 64
+/// bits); where the element at index i starts (k bits each, after `base`); the shape of a
+/// sequence of la elements followed by those of another; and the bit of the set of integers x
+/// held as a bitmask, when it is an interval: the interval of offsets i..j is bit j*(j+1)/2 + i
+/// (64 when x is no interval)
+const SHAPE_HELPERS: &str = "\
+#[inline] fn sh_get(b: u64, at: u64, m: u64) -> u64 { if at >= 64 { 0 } else { (b >> at) & m } }
+#[inline] fn sh_put(b: u64, at: u64, m: u64, v: u64) -> u64 { if at >= 64 { b } else { (b & !(m << at)) | ((v & m) << at) } }
+#[inline] fn sh_pos(i: i64, base: u64, k: u64) -> u64 { if i < 1 || i > 64 { 64 } else { base + (i as u64 - 1) * k } }
+#[inline] fn sh_cat(a: u64, la: usize, b: u64, k: u64) -> u64 { let at = 1 + la as u64 * k; if at >= 64 { a & !1 } else { (a & ((1u64 << at) - 1) & !1) | ((b >> 1) << at) } }
+#[inline] fn iv_bit(x: u128) -> u64 { if x == 0 { return 64; } let i = x.trailing_zeros(); let j = 127 - x.leading_zeros(); if (x >> i).count_ones() != j - i + 1 { return 64; } ((j * (j + 1) / 2 + i) as u64).min(64) }
+";
 
 /// Every choice of one string from each part, while there are at most 64
 fn product(parts: &[Vec<String>]) -> Vec<Vec<String>> {
@@ -7534,16 +7538,94 @@ pub fn interval_text(v: &Value) -> Option<String> {
     (hi - lo + 1 == xs.len() as i64).then(|| format!("{lo}..{hi}"))
 }
 
+/// Bits for k slots
+fn mask(k: u32) -> u64 {
+    if k >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << k) - 1
+    }
+}
+
+/// The value of a shape that is a number, not code
+fn lit_bits(c: &str) -> Option<u64> {
+    c.strip_suffix("u64").unwrap_or(c).parse().ok()
+}
+
+/// Whether evaluating e again prints or changes what TLC shows
+fn shows(e: &Expr) -> bool {
+    e.any(&|y| matches!(y, Expr::Call(n, _) if ["Print", "PrintT", "Assert", "TLCSet"].contains(&n.as_str())))
+}
+
 impl Gen<'_> {
-    /// The bits of shape a value of type t has: one for a set of integers, and those of the fields
-    /// of a record or tuple
-    pub fn shape_slots(t: &Ty) -> u32 {
+    /// The texts TLC may print for v of type t: as enumerated sets first, then with some sets of
+    /// integers held as intervals (at most 64 forms; beyond, the first only)
+    pub fn shown_forms(&self, v: &Value, t: &Ty) -> Vec<String> {
+        let plain = crate::compile::show_value(self.atoms, v);
+        let has = self.shape_slots(t) > 0;
+        let mut out = match (t, v) {
+            (Ty::Set(e), _) if matches!(**e, Ty::Int(..)) => interval_text(v).into_iter().collect(),
+            (Ty::Set(e), Value::Set(xs)) if has => {
+                let parts: Vec<Vec<String>> = xs.iter().map(|x| self.shown_forms(x, e)).collect();
+                product(&parts).into_iter().map(|p| format!("{{{}}}", p.join(", "))).collect()
+            }
+            (Ty::Seq(_), Value::Tuple(xs)) if xs.is_empty() => vec!["<< >>".into()],
+            (Ty::Seq(e) | Ty::Fun(_, e), Value::Tuple(xs)) if self.shape_slots(t) > 1 || matches!(t, Ty::Fun(..)) && has => {
+                let parts: Vec<Vec<String>> = xs.iter().map(|x| self.shown_forms(x, e)).collect();
+                product(&parts).into_iter().map(|p| format!("<<{}>>", p.join(", "))).collect()
+            }
+            (Ty::Fun(_, c), Value::Fun(m)) if has => {
+                let parts: Vec<Vec<String>> = m
+                    .iter()
+                    .map(|(k, x)| {
+                        let ks = crate::compile::show_value(self.atoms, k);
+                        self.shown_forms(x, c).into_iter().map(|y| format!("{ks} :> {y}")).collect()
+                    })
+                    .collect();
+                product(&parts).into_iter().map(|p| format!("({})", p.join(" @@ "))).collect()
+            }
+            (Ty::Rec(fs), Value::Tuple(xs)) if is_tuple_fields(fs) && fs.len() == xs.len() && has => {
+                let parts: Vec<Vec<String>> = fs.iter().zip(xs).map(|((_, ft), x)| self.shown_forms(x, ft)).collect();
+                product(&parts).into_iter().map(|p| format!("<<{}>>", p.join(", "))).collect()
+            }
+            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) && fs.len() == m.len() && has => {
+                let parts: Option<Vec<Vec<String>>> =
+                    fs.iter().map(|(f, ft)| m.get(f).map(|x| self.shown_forms(x, ft).into_iter().map(|y| format!("{f} |-> {y}")).collect())).collect();
+                parts.map_or(vec![], |ps| product(&ps).into_iter().map(|p| format!("[{}]", p.join(", "))).collect())
+            }
+            _ => vec![],
+        };
+        out.retain(|x| *x != plain);
+        out.insert(0, plain);
+        out.dedup();
+        out
+    }
+
+    /// The bits of shape a value of type t has: one for a set of integers; one per interval its
+    /// elements may be for a set of such sets; for a sequence, one for whether TLC holds it as a
+    /// function, then those of each element up to QCAP when they fit; those of each value of a
+    /// function over integers or model values; those of the fields of a record or tuple
+    pub fn shape_slots(&self, t: &Ty) -> u32 {
         let n = match t {
             Ty::Set(e) if matches!(**e, Ty::Int(..)) => 1,
-            // Whether TLC holds it as a function, which prints << >> when empty
-            Ty::Seq(_) => 1,
+            Ty::Set(e) => Self::iv_count(e),
+            Ty::Seq(e) => {
+                let k = self.shape_slots(e) as usize;
+                if k > 0 && 1 + self.qcap * k <= 64 {
+                    1 + (self.qcap * k) as u32
+                } else {
+                    1
+                }
+            }
+            Ty::Fun(d, c) if self.fun_shaped(d) => {
+                let k = self.shape_slots(c) as u64;
+                match d.size() {
+                    Some(m) if k > 0 && m * k <= 64 => (m * k) as u32,
+                    _ => 0,
+                }
+            }
             Ty::Rec(fs) if !fs.is_empty() && fs.iter().all(|(n, f)| !matches!(f, Ty::Opt(_)) && n != ATOM_FIELD && n != VAL_FIELD) => {
-                fs.iter().map(|(_, f)| Self::shape_slots(f)).sum()
+                fs.iter().map(|(_, f)| self.shape_slots(f)).sum()
             }
             _ => 0,
         };
@@ -7554,8 +7636,47 @@ impl Gen<'_> {
         }
     }
 
+    /// The number of intervals a set of integers of type e may be, when e is held as a bitmask
+    /// and they fit in 64 bits (otherwise 0)
+    fn iv_count(e: &Ty) -> u32 {
+        match e {
+            Ty::Set(i) => match **i {
+                Ty::Int(lo, hi) if hi >= lo && hi - lo < 10 => {
+                    let n = (hi - lo + 1) as u32;
+                    n * (n + 1) / 2
+                }
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// Whether a function over d prints value by value (`k :> v`, or as a tuple over 1..n), so the
+    /// shapes of its values can be followed: over integers or model values, not over strings,
+    /// which print as a record
+    fn fun_shaped(&self, d: &Ty) -> bool {
+        match d {
+            Ty::Int(..) => true,
+            Ty::Enum(ids) => !ids.is_empty() && ids.iter().all(|&a| self.atoms.is_model(a)),
+            _ => false,
+        }
+    }
+
     fn int_set(t: &Ty) -> bool {
         matches!(t, Ty::Set(e) if matches!(**e, Ty::Int(..)))
+    }
+
+    /// Whether shapes of types a and b are laid out alike
+    fn same_layout(&self, a: &Ty, b: &Ty) -> bool {
+        if a == b || Self::int_set(a) && Self::int_set(b) {
+            return true;
+        }
+        match (a, b) {
+            (Ty::Seq(x), Ty::Seq(y)) => self.shape_slots(a) == 1 && self.shape_slots(b) == 1 || self.shape_slots(a) == self.shape_slots(b) && self.same_layout(x, y),
+            (Ty::Fun(d, x), Ty::Fun(e, y)) => d == e && self.same_layout(x, y),
+            (Ty::Rec(f), Ty::Rec(g)) => f.len() == g.len() && f.iter().zip(g).all(|((n, x), (m, y))| n == m && self.same_layout(x, y)),
+            _ => false,
+        }
     }
 
     /// `, sh: <x>` for a state built field by field, when states have a shape
@@ -7574,8 +7695,34 @@ impl Gen<'_> {
             return;
         }
         let t = self.var_ty(v);
-        let code = rhs.map_or("0".into(), |e| self.shape_of(e, &t, env));
-        writeln!(out, "shs_{v}(&mut {w}, {code});").unwrap();
+        let code = match rhs {
+            None => "0".into(),
+            // The element CHOOSE takes from a set from the state keeps its shape there
+            Some(e) => match e.strip() {
+                Expr::Choose(_, s, _) => self.taken_shape(s, &format!("{w}.v_{v}"), &t, env).unwrap_or_else(|| self.shape_of(e, &t, env)),
+                _ => self.shape_of(e, &t, env),
+            },
+        };
+        if code.contains(w) {
+            writeln!(out, "{{ let __sh: u64 = {code}; shs_{v}(&mut {w}, __sh); }}").unwrap();
+        } else {
+            writeln!(out, "shs_{v}(&mut {w}, {code});").unwrap();
+        }
+    }
+
+    /// The shape of the element `p` (of type t) of the set s, when s holds sets of integers whose
+    /// shapes the state keeps
+    fn taken_shape(&mut self, s: &Expr, p: &str, t: &Ty, env: &Env) -> Option<String> {
+        if !Self::int_set(t) {
+            return None;
+        }
+        let (c, st) = self.part_shape(s, env)?;
+        let Ty::Set(e) = &st else { return None };
+        if Self::iv_count(e) == 0 {
+            return None;
+        }
+        let pc = self.coerce(p.to_string(), t, e).ok()?;
+        Some(format!("sh_get({c}, iv_bit({pc}), 1)"))
     }
 
     /// The shape of a variable read in `e` (x or x'), as code, with its type
@@ -7603,20 +7750,82 @@ impl Gen<'_> {
         Some((code, self.var_ty(v)))
     }
 
+    /// The part of a value of type t that `p` selects: where its shape starts (code), its number
+    /// of bits and its type. None when it cannot be followed (an index that prints, a field of a
+    /// record of variants)
+    fn part_at(&mut self, t: &Ty, p: &Path, env: &Env) -> Option<(String, u32, Ty)> {
+        let Ty::Rec(fs) = t else {
+            let Path::Idx(i) = p else { return None };
+            if shows(i) {
+                return None;
+            }
+            return match t {
+                Ty::Seq(e) => {
+                    let k = self.shape_slots(e);
+                    if self.shape_slots(t) <= 1 {
+                        return Some(("64".into(), 0, e.as_ref().clone()));
+                    }
+                    let (ic, _) = self.gen_int(i, env).ok()?;
+                    Some((format!("sh_pos({ic}, 1, {k})"), k, e.as_ref().clone()))
+                }
+                Ty::Fun(d, e) if self.shape_slots(t) > 0 => {
+                    let k = self.shape_slots(e);
+                    let kc = self.gen_as(i, env, d).ok()?;
+                    let did = self.ty_id(d).ok()?;
+                    Some((format!("(idx_{did}({kc}) as u64 * {k})"), k, e.as_ref().clone()))
+                }
+                _ => None,
+            };
+        };
+        if self.shape_slots(t) == 0 {
+            return None;
+        }
+        let k = match p {
+            Path::Field(f) if !is_tuple_fields(fs) => fs.iter().position(|(n, _)| n == f)?,
+            Path::Idx(i) if is_tuple_fields(fs) => match i.strip() {
+                Expr::Num(k) if *k >= 1 && (*k as usize) <= fs.len() => *k as usize - 1,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let at: u32 = fs[..k].iter().map(|(_, ft)| self.shape_slots(ft)).sum();
+        Some((at.to_string(), self.shape_slots(&fs[k].1), fs[k].1.clone()))
+    }
+
+    /// The shape of e as code, with its type, where e is a variable, a name bound to an element
+    /// whose shape is known, or a part of one taken by a field, an index or Head
+    fn part_shape(&mut self, e: &Expr, env: &Env) -> Option<(String, Ty)> {
+        let (b, p) = match e.strip() {
+            Expr::Ident(n, _) if env.shapes.contains_key(n) => return Some(env.shapes[n].clone()),
+            Expr::Ident(..) | Expr::Prime(_) => return self.var_shape(e, env),
+            Expr::Field(b, f) => (b.as_ref(), Path::Field(f.clone())),
+            Expr::App(b, i) => (b.as_ref(), Path::Idx(i.as_ref().clone())),
+            Expr::Call(n, xs) if n == "Head" && xs.len() == 1 => (&xs[0], Path::Idx(Expr::Num(1))),
+            _ => return None,
+        };
+        let (c, bt) = self.part_shape(b, env)?;
+        let (at, k, pt) = self.part_at(&bt, &p, env)?;
+        if k == 0 {
+            return None;
+        }
+        Some((format!("sh_get({c}, {at}, {}u64)", mask(k)), pt))
+    }
+
     /// The shape of the value `e` builds, of type t, as code (bits as `shape_slots` lays them
     /// out). TLC holds `a..b` and DOMAIN of a tuple or sequence as intervals, and a function it
     /// builds where a sequence is expected as a function; a variable keeps the shape of its value;
-    /// a tuple, record, IF or EXCEPT keeps those of its parts; a constant has the form the
+    /// a tuple, record, IF, CASE or EXCEPT keeps those of its parts, and so do the operators that
+    /// take elements out of a sequence or a set or put them in; a constant has the form the
     /// compiler finds (`const_form`). Anything else is taken as an enumerated set (0): another set
-    /// operation, and also what is not followed here (CASE, CHOOSE over a set from the state, a
-    /// value bound by `\E`, an element of a set or function from the state)
+    /// operation, and also what is not followed here (a value an operator of the CommunityModules
+    /// builds, an IF whose condition prints inside another value)
     pub fn shape_of(&mut self, e: &Expr, t: &Ty, env: &Env) -> String {
         let c = self.shape_of_built(e, t, env);
-        if c != "0" || Self::shape_slots(t) == 0 {
+        if c != "0" || self.shape_slots(t) == 0 {
             return c;
         }
         match self.const_form(e, env) {
-            Some((v, f)) if Self::form_bits(&v, &f, t) != 0 => format!("{}u64", Self::form_bits(&v, &f, t)),
+            Some((v, f)) if self.form_bits(&v, &f, t) != 0 => format!("{}u64", self.form_bits(&v, &f, t)),
             _ => c,
         }
     }
@@ -7632,22 +7841,76 @@ impl Gen<'_> {
         (f != Form::Plain).then_some((v, f))
     }
 
+    /// The bit of the set of integers x among the intervals over lo.. (see `iv_bit`), if x is a
+    /// non-empty interval
+    fn iv_index(x: &Value, lo: i64) -> Option<u32> {
+        let Value::Set(xs) = x else { return None };
+        let (Some(Value::Int(a)), Some(Value::Int(z))) = (xs.first(), xs.last()) else { return None };
+        if z - a + 1 != xs.len() as i64 || *a < lo {
+            return None;
+        }
+        let (i, j) = ((a - lo) as u32, (z - lo) as u32);
+        let k = j * (j + 1) / 2 + i;
+        (k < 64).then_some(k)
+    }
+
     /// The bits of shape (laid out as by `shape_slots`) of v of type t held in the form f
-    fn form_bits(v: &Value, f: &Form, t: &Ty) -> u64 {
+    fn form_bits(&self, v: &Value, f: &Form, t: &Ty) -> u64 {
         match t {
             _ if Self::int_set(t) => (*f == Form::Interval && matches!(v, Value::Set(s) if !s.is_empty())) as u64,
-            Ty::Seq(_) => (matches!(f, Form::Fcn(_)) && matches!(v, Value::Tuple(xs) if xs.is_empty())) as u64,
-            Ty::Rec(fs) if Self::shape_slots(t) > 0 => {
+            Ty::Set(e) if Self::iv_count(e) > 0 => {
+                let (Ty::Set(i), Value::Set(xs)) = (e.as_ref(), v) else { return 0 };
+                let Ty::Int(lo, _) = **i else { return 0 };
+                let mut b = 0u64;
+                for (p, x) in xs.iter().enumerate() {
+                    if f.part(p) == Form::Interval {
+                        if let Some(k) = Self::iv_index(x, lo) {
+                            b |= 1 << k;
+                        }
+                    }
+                }
+                b & mask(Self::iv_count(e))
+            }
+            Ty::Seq(e) => {
+                let mut b = (matches!(f, Form::Fcn(_)) && matches!(v, Value::Tuple(xs) if xs.is_empty())) as u64;
+                let k = self.shape_slots(e) as usize;
+                if let (true, Value::Tuple(xs)) = (self.shape_slots(t) > 1, v) {
+                    for (i, x) in xs.iter().enumerate() {
+                        if 1 + (i + 1) * k <= 64 {
+                            b |= self.form_bits(x, &f.part(i), e) << (1 + i * k);
+                        }
+                    }
+                }
+                b
+            }
+            Ty::Fun(d, c) if self.shape_slots(t) > 0 => {
+                let k = self.shape_slots(c) as u64;
+                let entries: Vec<(Value, &Value, Form)> = match v {
+                    Value::Fun(m) => m.iter().enumerate().map(|(i, (key, x))| (key.clone(), x, f.part(2 * i + 1))).collect(),
+                    Value::Tuple(xs) => xs.iter().enumerate().map(|(i, x)| (Value::Int(i as i64 + 1), x, f.part(i))).collect(),
+                    _ => vec![],
+                };
+                let mut b = 0u64;
+                for (key, x, xf) in entries {
+                    if let Some(at) = d.enc(&key) {
+                        if (at + 1) * k <= 64 {
+                            b |= self.form_bits(x, &xf, c) << (at * k);
+                        }
+                    }
+                }
+                b
+            }
+            Ty::Rec(fs) if self.shape_slots(t) > 0 => {
                 let (mut at, mut b) = (0, 0u64);
                 for (k, (name, ft)) in fs.iter().enumerate() {
-                    let n = Self::shape_slots(ft);
+                    let n = self.shape_slots(ft);
                     let (x, xf) = match v {
                         Value::Tuple(xs) => (xs.get(k), f.part(k)),
                         Value::Rec(m) => (m.get(name), m.keys().position(|g| g == name).map_or(Form::Plain, |i| f.part(i))),
                         _ => (None, Form::Plain),
                     };
                     if let (Some(x), true) = (x, n > 0) {
-                        b |= Self::form_bits(x, &xf, ft) << at;
+                        b |= self.form_bits(x, &xf, ft) << at;
                     }
                     at += n;
                 }
@@ -7657,17 +7920,34 @@ impl Gen<'_> {
         }
     }
 
-    /// The shape of the element `p` (of type t) of the constant set s, when TLC holds some of its
-    /// elements in a form of their own
+    /// The shape of the element `p` (of type t) of the set s, when TLC holds some of its
+    /// elements in a form of their own: s is a constant, or holds sets of integers whose shapes
+    /// the state keeps
     fn elem_shape(&mut self, s: &Expr, p: &str, t: &Ty, env: &Env) -> R<Option<String>> {
-        if self.infer.is_some() || self.shaped.is_empty() || Self::shape_slots(t) == 0 {
+        if self.infer.is_some() || self.shaped.is_empty() || self.shape_slots(t) == 0 {
             return Ok(None);
         }
-        let Some((sv @ Value::Set(_), sf)) = self.const_form(s, env) else { return Ok(None) };
+        let Some((sv @ Value::Set(_), sf)) = self.const_form(s, env) else {
+            // A set written element by element: the first element written that equals p, as TLC
+            // keeps it in the set
+            if let (Expr::SetLit(xs), false) = (s.strip(), shows(s)) {
+                let shapes: Vec<String> = xs.iter().map(|x| self.shape_of(x, t, env)).collect();
+                if shapes.iter().all(|c| c == "0") {
+                    return Ok(None);
+                }
+                let mut code = String::from("0");
+                for (x, c) in xs.iter().zip(shapes).rev() {
+                    let xc = self.gen_as(x, env, t)?;
+                    code = format!("if {p} == {xc} {{ {c} }} else {{ {code} }}");
+                }
+                return Ok(Some(code));
+            }
+            return Ok(self.taken_shape(s, p, t, env));
+        };
         let Value::Set(xs) = &sv else { unreachable!() };
         let mut code = None;
         for x in xs.iter().rev() {
-            let b = Self::form_bits(x, &elem_form(&sv, &sf, x), t);
+            let b = self.form_bits(x, &elem_form(&sv, &sf, x), t);
             if b != 0 {
                 let l = self.lit(x, t)?;
                 code = Some(format!("if {p} == {l} {{ {b}u64 }} else {{ {} }}", code.as_deref().unwrap_or("0")));
@@ -7677,8 +7957,8 @@ impl Gen<'_> {
     }
 
     /// After `v` is assigned the element `p` of the set s in the state under construction `w`:
-    /// the shape TLC holds that element in, when s is a constant or a set written element by
-    /// element (otherwise 0: an element of a set from the state is not followed)
+    /// the shape TLC holds that element in, when s is a constant, a set written element by
+    /// element, or a set of sets of integers whose shapes the state keeps (otherwise 0)
     fn shape_set_in(&mut self, v: &str, w: &str, s: &Expr, p: &str, env: &Env, out: &mut String) -> R<()> {
         if self.infer.is_some() || !self.shaped.contains_key(v) {
             return Ok(());
@@ -7688,7 +7968,7 @@ impl Gen<'_> {
         if let Some((sv @ Value::Set(_), sf)) = self.const_form(s, env) {
             let Value::Set(xs) = &sv else { unreachable!() };
             for x in xs.iter().rev() {
-                let b = Self::form_bits(x, &elem_form(&sv, &sf, x), &t);
+                let b = self.form_bits(x, &elem_form(&sv, &sf, x), &t);
                 if b != 0 {
                     let l = self.lit(x, &t)?;
                     code = format!("if {p} == {l} {{ {b}u64 }} else {{ {code} }}");
@@ -7704,70 +7984,160 @@ impl Gen<'_> {
                     code = format!("if {p} == {xc} {{ {c} }} else {{ {code} }}");
                 }
             }
+        } else if let Some(c) = self.taken_shape(s, p, &t, env) {
+            code = c;
         }
         writeln!(out, "shs_{v}(&mut {w}, {code});").unwrap();
         Ok(())
     }
 
+    /// The shape of an EXCEPT of `base` (of type t), as code
+    fn except_shape(&mut self, base: &Expr, ups: &[(Vec<Path>, Expr)], t: &Ty, env: &Env) -> String {
+        let mut c = self.shape_of(base, t, env);
+        for (path, val) in ups {
+            // Expansion names each EXCEPT's @ in a last field of its own
+            let (path, at_name) = match path.split_last() {
+                Some((Path::Field(a), p)) if a.starts_with('@') => (p, Some(a.clone())),
+                _ => (path.as_slice(), None),
+            };
+            match self.shape_update(&c, t, path, val, at_name.as_deref(), base, env) {
+                Some(n) => c = n,
+                None => return "0".into(),
+            }
+        }
+        c
+    }
+
+    /// The shape `c` of a value of type t after the part at `path` becomes `val` (in which @, named
+    /// `at_name`, is the part before, which `part` reads)
+    fn shape_update(&mut self, c: &str, t: &Ty, path: &[Path], val: &Expr, at_name: Option<&str>, part: &Expr, env: &Env) -> Option<String> {
+        let Some((first, rest)) = path.split_first() else {
+            let mut env2 = env.clone();
+            if let Some(a) = at_name {
+                env2.shapes.insert(a.to_string(), (c.to_string(), t.clone()));
+                if !shows(part) {
+                    if let Ok(x) = self.gen_val(part, env) {
+                        env2.locals.insert(a.to_string(), x);
+                    }
+                }
+            }
+            return Some(self.shape_of(val, t, &env2));
+        };
+        let (at, k, pt) = self.part_at(t, first, env)?;
+        if k == 0 {
+            return Some(c.to_string());
+        }
+        let m = mask(k);
+        let old = format!("sh_get({c}, {at}, {m}u64)");
+        let inner = match first {
+            Path::Field(f) => Expr::Field(Box::new(part.clone()), f.clone()),
+            Path::Idx(i) => Expr::App(Box::new(part.clone()), Box::new(i.clone())),
+        };
+        let new = self.shape_update(&old, &pt, rest, val, at_name, &inner, env)?;
+        if new == old {
+            return Some(c.to_string());
+        }
+        Some(format!("sh_put({c}, {at}, {m}u64, {new})"))
+    }
+
+    /// The shape `body` has for every element, when it is the same for all (not 0): it does not
+    /// depend on the bound variable, since code reading it is not generated here
+    fn same_for_all(&mut self, body: &Expr, t: &Ty, env: &Env) -> Option<String> {
+        Some(self.shape_of(body, t, env)).filter(|c| c != "0")
+    }
+
+    /// The shape x of k bits repeated n times from bit `from`, within 64 bits
+    fn repeat_shape(x: &str, k: usize, n: usize, from: usize) -> String {
+        let n = n.min((64 - from) / k.max(1));
+        match lit_bits(x) {
+            Some(b) => format!("{}u64", (0..n).fold(0u64, |a, i| a | b << (from + i * k))),
+            None => format!("{{ let __x: u64 = {x}; (0..{n}).fold(0u64, |a, i| a | __x << ({from} + i * {k})) }}"),
+        }
+    }
+
+    /// The fields of a record or tuple type: name, type and first bit of shape
+    fn shape_fields(&self, t: &Ty) -> Vec<(String, Ty, u32)> {
+        let Ty::Rec(fs) = t else { return vec![] };
+        let mut at = 0;
+        fs.iter()
+            .map(|(f, ft)| {
+                let k = self.shape_slots(ft);
+                at += k;
+                (f.clone(), ft.clone(), at - k)
+            })
+            .collect()
+    }
+
     /// `shape_of` for what is built from parts
     fn shape_of_built(&mut self, e: &Expr, t: &Ty, env: &Env) -> String {
-        let n = Self::shape_slots(t);
-        let n_slots = n;
+        let n = self.shape_slots(t);
         if n == 0 {
             return "0".into();
         }
-        let fields = |t: &Ty| -> Vec<(String, Ty, u32)> {
-            let Ty::Rec(fs) = t else { return vec![] };
-            let mut at = 0;
-            fs.iter()
-                .map(|(f, ft)| {
-                    let k = Self::shape_slots(ft);
-                    at += k;
-                    (f.clone(), ft.clone(), at - k)
-                })
-                .collect()
-        };
-        let same = |a: &Ty, b: &Ty| a == b || Self::int_set(a) && Self::int_set(b) || matches!((a, b), (Ty::Seq(_), Ty::Seq(_)));
-        let mask = |k: u32| if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
-        match e.strip() {
-            Expr::Bin(BOp::Range, ..) if Self::int_set(t) => "1".into(),
-            // A function TLC builds, held as one where a sequence is expected
-            Expr::FunCons(..) if matches!(t, Ty::Seq(_)) => "1".into(),
-            Expr::Except(base, _) if matches!(t, Ty::Seq(_)) => self.shape_of(base, t, env),
-            Expr::Un(UOp::Domain, x) if Self::int_set(t) => {
+        let join = |parts: Vec<String>| if parts.is_empty() { "0".to_string() } else { parts.join(" | ") };
+        if matches!(e.strip(), Expr::Ident(..) | Expr::Prime(_) | Expr::Field(..) | Expr::App(..)) || matches!(e.strip(), Expr::Call(h, _) if h == "Head") {
+            return match self.part_shape(e, env) {
+                Some((c, et)) if self.same_layout(&et, t) && self.shape_slots(&et) == n => c,
+                _ => "0".into(),
+            };
+        }
+        let iv_set = matches!(t, Ty::Set(e) if Self::iv_count(e) > 0);
+        match (e.strip(), t) {
+            (Expr::Bin(BOp::Range, ..), _) if Self::int_set(t) => "1".into(),
+            // A function TLC builds, held as one where a sequence is expected, and the shape of
+            // its values when the same for each
+            (Expr::FunCons(_, _, body), Ty::Seq(et)) => {
+                let k = self.shape_slots(et) as usize;
+                match (n > 1, self.same_for_all(body, et, env)) {
+                    (true, Some(x)) => format!("(1u64 | {})", Self::repeat_shape(&x, k, self.qcap, 1)),
+                    _ => "1u64".into(),
+                }
+            }
+            (Expr::FunCons(_, _, body), Ty::Fun(_, et)) => {
+                let k = self.shape_slots(et) as usize;
+                match self.same_for_all(body, et, env) {
+                    Some(x) => Self::repeat_shape(&x, k, n as usize / k, 0),
+                    None => "0".into(),
+                }
+            }
+            (Expr::Except(base, ups), Ty::Seq(_) | Ty::Fun(..) | Ty::Rec(_)) => self.except_shape(base, ups, t, env),
+            (Expr::Un(UOp::Domain, x), _) if Self::int_set(t) => {
                 if matches!(x.strip(), Expr::Tuple(_)) || self.is_seq_or_tuple(x) {
                     "1".into()
                 } else {
                     "0".into()
                 }
             }
-            Expr::Ident(n, _) if env.shapes.contains_key(n) => {
-                let (c, et) = &env.shapes[n];
-                if same(et, t) && Self::shape_slots(et) == n_slots {
-                    c.clone()
-                } else {
-                    "0".into()
-                }
-            }
-            Expr::Ident(..) | Expr::Prime(_) => match self.var_shape(e, env) {
-                Some((c, vt)) if same(&vt, t) => c,
-                _ => "0".into(),
-            },
-            Expr::If(c, a, b) => {
+            (Expr::If(c, a, b), _) => {
                 let (sa, sb) = (self.shape_of(a, t, env), self.shape_of(b, t, env));
                 if sa == sb {
                     return sa;
                 }
                 // The condition again, when evaluating it twice changes nothing TLC shows (a
                 // string it makes was made the first time)
-                let shows = c.any(&|y| matches!(y, Expr::Call(n, _) if ["Print", "PrintT", "Assert", "TLCSet"].contains(&n.as_str())));
                 match self.gen(c, env, Some(&Ty::Bool)) {
-                    Ok((cc, Ty::Bool)) if !shows => format!("(if {cc} {{ {sa} }} else {{ {sb} }})"),
+                    Ok((cc, Ty::Bool)) if !shows(c) => format!("(if {cc} {{ {sa} }} else {{ {sb} }})"),
                     _ => "0".into(),
                 }
             }
-            Expr::Tuple(xs) if matches!(t, Ty::Rec(fs) if is_tuple_fields(fs) && fs.len() == xs.len()) => {
-                let parts: Vec<String> = fields(t)
+            (Expr::Case(arms, other), _) => {
+                let mut shapes: Vec<String> = arms.iter().map(|(_, v)| self.shape_of(v, t, env)).collect();
+                let last = other.as_ref().map_or("0".into(), |o| self.shape_of(o, t, env));
+                if shapes.iter().all(|s| *s == last) {
+                    return last;
+                }
+                let mut code = last;
+                for (p, _) in arms.iter().rev() {
+                    let s = shapes.pop().unwrap();
+                    match self.gen(p, env, Some(&Ty::Bool)) {
+                        Ok((pc, Ty::Bool)) if !shows(p) => code = format!("(if {pc} {{ {s} }} else {{ {code} }})"),
+                        _ => return "0".into(),
+                    }
+                }
+                code
+            }
+            (Expr::Tuple(xs), Ty::Rec(fs)) if is_tuple_fields(fs) && fs.len() == xs.len() => {
+                let parts: Vec<String> = self.shape_fields(t)
                     .iter()
                     .zip(xs)
                     .filter_map(|((_, ft, at), x)| {
@@ -7775,29 +8145,34 @@ impl Gen<'_> {
                         (c != "0").then(|| format!("(({c}) << {at})"))
                     })
                     .collect();
-                if parts.is_empty() {
-                    "0".into()
-                } else {
-                    parts.join(" | ")
-                }
+                join(parts)
+            }
+            (Expr::Tuple(xs), Ty::Seq(et)) => {
+                let k = self.shape_slots(et) as usize;
+                let parts: Vec<String> = xs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| n > 1 && 1 + (i + 1) * k <= 64)
+                    .filter_map(|(i, x)| {
+                        let c = self.shape_of(x, et, env);
+                        (c != "0").then(|| format!("(({c}) << {})", 1 + i * k))
+                    })
+                    .collect();
+                join(parts)
             }
             // [x \in D |-> e] over the indices of a tuple: e's shape for each
-            Expr::FunCons(_, _, body) if matches!(t, Ty::Rec(fs) if is_tuple_fields(fs)) => {
-                let parts: Vec<String> = fields(t)
+            (Expr::FunCons(_, _, body), Ty::Rec(fs)) if is_tuple_fields(fs) => {
+                let parts: Vec<String> = self.shape_fields(t)
                     .iter()
                     .filter_map(|(_, ft, at)| {
                         let c = self.shape_of(body, ft, env);
                         (c != "0").then(|| format!("(({c}) << {at})"))
                     })
                     .collect();
-                if parts.is_empty() {
-                    "0".into()
-                } else {
-                    parts.join(" | ")
-                }
+                join(parts)
             }
-            Expr::RecLit(xs) if matches!(t, Ty::Rec(fs) if !is_tuple_fields(fs)) => {
-                let parts: Vec<String> = fields(t)
+            (Expr::RecLit(xs), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
+                let parts: Vec<String> = self.shape_fields(t)
                     .iter()
                     .filter_map(|(f, ft, at)| {
                         let x = xs.iter().find(|(g, _)| g == f)?;
@@ -7805,57 +8180,80 @@ impl Gen<'_> {
                         (c != "0").then(|| format!("(({c}) << {at})"))
                     })
                     .collect();
-                if parts.is_empty() {
-                    "0".into()
-                } else {
-                    parts.join(" | ")
-                }
+                join(parts)
             }
-            Expr::Except(base, ups) if matches!(t, Ty::Rec(_)) => {
-                let mut c = self.shape_of(base, t, env);
-                let fs = fields(t);
-                for (path, val) in ups {
-                    // Expansion names each EXCEPT's @ in a last field of its own
-                    let path = match path.split_last() {
-                        Some((Path::Field(a), p)) if a.starts_with('@') => p,
-                        _ => path.as_slice(),
-                    };
-                    let f = match path {
-                        [Path::Field(f)] => fs.iter().find(|x| x.0 == *f),
-                        [Path::Idx(i)] => match i.strip() {
-                            Expr::Num(k) if *k >= 1 && is_tuple_fields(&fs.iter().map(|x| (x.0.clone(), x.1.clone())).collect::<Vec<_>>()) => {
-                                fs.get(*k as usize - 1)
-                            }
-                            _ => return "0".into(),
-                        },
-                        _ => return "0".into(),
-                    };
-                    let Some((_, ft, at)) = f.cloned() else { return "0".into() };
-                    let k = Self::shape_slots(&ft);
-                    if k == 0 {
-                        continue;
-                    }
-                    let vc = self.shape_of(val, &ft, env);
-                    c = format!("((({c}) & !({}u64 << {at})) | (({vc}) << {at}))", mask(k));
+            // A set of sets of integers: each element keeps its shape, the first of equal ones
+            // written, and \cup keeps those of its left side
+            (Expr::SetLit(xs), Ty::Set(et)) if iv_set => {
+                if shows(e) {
+                    return "0".into();
                 }
-                c
+                let shapes: Vec<String> = xs.iter().map(|x| self.shape_of(x, et, env)).collect();
+                if shapes.iter().all(|c| c == "0") {
+                    return "0".into();
+                }
+                let mut code = String::from("{ let mut __b = 0u64; ");
+                for (x, c) in xs.iter().zip(shapes).rev() {
+                    let Ok(xc) = self.gen_as(x, env, et) else { return "0".into() };
+                    write!(code, "__b = sh_put(__b, iv_bit({xc}), 1, {c}); ").unwrap();
+                }
+                code + "__b }"
             }
-            Expr::Field(base, f) => match self.var_shape(base, env) {
-                Some((c, bt)) => match fields(&bt).into_iter().find(|x| x.0 == *f) {
-                    Some((_, ft, at)) if same(&ft, t) => format!("((({c}) >> {at}) & {}u64)", mask(n)),
-                    _ => "0".into(),
-                },
+            (Expr::Bin(BOp::Cup, a, b), _) if iv_set => {
+                let (sa, sb) = (self.shape_of(a, t, env), self.shape_of(b, t, env));
+                if sa == "0" && sb == "0" || shows(a) {
+                    return "0".into();
+                }
+                let Ok(ac) = self.gen_as(a, env, t) else { return "0".into() };
+                let Ok(it) = self.s_iter("__a", t) else { return "0".into() };
+                format!(
+                    "{{ let __a = {ac}; let mut __m = 0u64; for __x in {it} {{ let __k = iv_bit(__x); if __k < 64 {{ __m |= 1 << __k; }} }} \
+                     (({sa}) & __m) | (({sb}) & !__m) }}"
+                )
+            }
+            // CHOOSE from a set of sets of integers from the state, chosen again
+            (Expr::Choose(_, s, _), _) if Self::int_set(t) && !shows(e) => match self.gen_as(e, env, t) {
+                Ok(vc) => self.taken_shape(s, &format!("({vc})"), t, env).unwrap_or_else(|| "0".into()),
+                Err(_) => "0".into(),
+            },
+            (Expr::Bin(BOp::Cap | BOp::SetMinus, a, _) | Expr::SetFilter(_, a, _), _) if iv_set => self.shape_of(a, t, env),
+            (Expr::SetMap(body, _), Ty::Set(et)) if iv_set => match self.same_for_all(body, et, env).and_then(|c| lit_bits(&c)) {
+                Some(_) => format!("{}u64", mask(n)),
                 None => "0".into(),
             },
-            Expr::App(base, i) => match (self.var_shape(base, env), i.strip()) {
-                (Some((c, bt)), Expr::Num(k)) if matches!(&bt, Ty::Rec(fs) if is_tuple_fields(fs)) && *k >= 1 => {
-                    match fields(&bt).into_iter().nth(*k as usize - 1) {
-                        Some((_, ft, at)) if same(&ft, t) => format!("((({c}) >> {at}) & {}u64)", mask(n)),
-                        _ => "0".into(),
+            // The operators of Sequences keep the elements' shapes; what they build is a tuple
+            (Expr::Call(op, xs), Ty::Seq(et)) if n > 1 && ["Append", "Tail", "SubSeq", "\\o"].contains(&op.as_str()) => {
+                let k = self.shape_slots(et);
+                let sq = self.shape_of(&xs[0], t, env);
+                match (op.as_str(), xs.as_slice()) {
+                    ("Tail", [_]) if sq != "0" => format!("(sh_get({sq}, {}, u64::MAX) << 1)", 1 + k),
+                    ("SubSeq", [_, m, _]) if sq != "0" && !shows(m) => match self.gen_int(m, env) {
+                        Ok((mc, _)) => format!("(sh_get({sq}, sh_pos({mc}, 1, {k}), u64::MAX) << 1)"),
+                        Err(_) => "0".into(),
+                    },
+                    ("Append", [q, x]) => {
+                        let sx = self.shape_of(x, et, env);
+                        if sq == "0" && sx == "0" || shows(q) {
+                            return "0".into();
+                        }
+                        match self.as_seq(q, env, "Append") {
+                            Ok((qc, _)) => format!("sh_put({sq} & !1, sh_pos(({qc}).len as i64 + 1, 1, {k}), {}u64, {sx})", mask(k)),
+                            Err(_) => "0".into(),
+                        }
                     }
+                    ("\\o", [a, b]) => {
+                        let sb = self.shape_of(b, t, env);
+                        if sq == "0" && sb == "0" || shows(a) {
+                            return "0".into();
+                        }
+                        match self.as_seq(a, env, "\\o") {
+                            Ok((ac, _)) => format!("sh_cat({sq}, ({ac}).len as usize, {sb}, {k})"),
+                            Err(_) => "0".into(),
+                        }
+                    }
+                    _ => "0".into(),
                 }
-                _ => "0".into(),
-            },
+            }
             _ => "0".into(),
         }
     }
@@ -7886,6 +8284,19 @@ impl Gen<'_> {
         let id = self.ty_id(t)?;
         let sh = self.shape_of(e, t, env);
         if sh == "0" {
+            // A tuple or record written out, whose parts have more bits of shape than one value
+            // holds: part by part
+            if let (Ty::Rec(fs), Expr::Tuple(xs)) = (t, e.strip()) {
+                if is_tuple_fields(fs) && fs.len() == xs.len() && self.shape_slots(t) == 0 {
+                    let mut parts = vec![];
+                    for (k, (x, (_, ft))) in xs.iter().zip(fs).enumerate() {
+                        parts.push(self.fmt_shaped(x, &format!("{place}{}", rec_field(fs.len(), k)), ft, env)?);
+                    }
+                    if parts.iter().any(|p| p.starts_with("fmtsh_") || p.ends_with(".to_string()")) {
+                        return Ok(format!("format!(\"<<{{}}>>\", [{}].join(\", \"))", parts.join(", ")));
+                    }
+                }
+            }
             return Ok(format!("fmt_{id}(&{place})"));
         }
         self.fmtsh_need.insert(t.clone());
@@ -7940,6 +8351,12 @@ impl Gen<'_> {
                 }
             };
             let field = |t: &Ty, f: &str| fields(t).into_iter().find(|(n, _)| n == f).map_or(t.clone(), |x| x.1);
+            let elem = |t: &Ty| match t {
+                Ty::Set(e) | Ty::Seq(e) | Ty::Fun(_, e) => e.as_ref().clone(),
+                _ => t.clone(),
+            };
+            // A set of sets of integers, whose elements keep their shapes
+            let sets = matches!(t, Ty::Set(e) if Gen::iv_count(e) > 0);
             // TLC computes the operators of the CommunityModules in forms of their own (see
             // `community::defines`); only intervals are looked for there
             if let Expr::Label(n, _, b) = e {
@@ -7947,28 +8364,44 @@ impl Gen<'_> {
             }
             match e.strip() {
                 Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) => true,
-                // A name bound by \E over a constant set holding such values
+                // A name bound by \E over a constant set holding such values, or over a set from
+                // the state that may hold them
                 Expr::Ident(v, _) => {
                     on.contains(v)
                         || ex.get(v).is_some_and(|s| match g.const_form(s, &Env::default()) {
                             Some((sv @ Value::Set(_), f)) => {
                                 let Value::Set(xs) = &sv else { unreachable!() };
-                                xs.iter().any(|x| Gen::form_bits(x, &elem_form(&sv, &f, x), t) != 0)
+                                xs.iter().any(|x| g.form_bits(x, &elem_form(&sv, &f, x), t) != 0)
                             }
-                            _ => false,
+                            _ => match s.strip() {
+                                Expr::Ident(..) | Expr::Prime(_) => may(g, s, &Ty::Set(t.clone().into()), on, ex),
+                                Expr::SetLit(xs) => xs.iter().any(|x| may(g, x, t, on, ex)),
+                                _ => false,
+                            },
                         })
                 }
                 Expr::Prime(x) => may(g, x, t, on, ex),
                 Expr::If(_, a, b) => may(g, a, t, on, ex) || may(g, b, t, on, ex),
+                Expr::Case(arms, o) => arms.iter().any(|(_, v)| may(g, v, t, on, ex)) || o.as_ref().is_some_and(|o| may(g, o, t, on, ex)),
+                Expr::Choose(_, s, _) => matches!(s.strip(), Expr::Ident(..) | Expr::Prime(_)) && may(g, s, &Ty::Set(t.clone().into()), on, ex),
                 Expr::Tuple(xs) => {
                     let fs = fields(t);
-                    xs.iter().enumerate().any(|(i, x)| may(g, x, fs.get(i).map_or(t, |f| &f.1), on, ex))
+                    xs.iter().enumerate().any(|(i, x)| may(g, x, fs.get(i).map_or(&elem(t), |f| &f.1), on, ex))
                 }
+                Expr::SetLit(xs) if sets => xs.iter().any(|x| may(g, x, &elem(t), on, ex)),
+                Expr::Bin(BOp::Cup, a, b) if sets => may(g, a, t, on, ex) || may(g, b, t, on, ex),
+                Expr::Bin(BOp::Cap | BOp::SetMinus, a, _) | Expr::SetFilter(_, a, _) if sets => may(g, a, t, on, ex),
+                Expr::SetMap(b, _) if sets => may(g, b, &elem(t), on, ex),
+                Expr::Call(op, xs) if matches!(t, Ty::Seq(_)) && ["Append", "Tail", "SubSeq", "\\o"].contains(&op.as_str()) => {
+                    let et = elem(t);
+                    xs.iter().take(if op == "SubSeq" { 1 } else { 2 }).enumerate().any(|(i, x)| may(g, x, if op == "Append" && i == 1 { &et } else { t }, on, ex))
+                }
+                Expr::Call(op, xs) if op == "Head" && xs.len() == 1 => may(g, &xs[0], &Ty::Seq(t.clone().into()), on, ex),
                 // A function over a domain that may be empty prints << >> then, where a sequence is
                 // expected
                 Expr::FunCons(_, d, b) => {
                     let fs = fields(t);
-                    (if fs.is_empty() { may(g, b, t, on, ex) } else { fs.iter().any(|(_, ft)| may(g, b, ft, on, ex)) })
+                    (if fs.is_empty() { may(g, b, &elem(t), on, ex) } else { fs.iter().any(|(_, ft)| may(g, b, ft, on, ex)) })
                         || matches!(t, Ty::Seq(_))
                             && (!g.is_const(d, &Env::default()) || matches!(g.ce.eval_quiet(d, &HashMap::new()), Some(Value::Set(xs)) if xs.is_empty()))
                 }
@@ -7979,8 +8412,8 @@ impl Gen<'_> {
                             let ft = match path.as_slice() {
                                 [Path::Field(f), ..] if !f.starts_with('@') => field(t, f),
                                 [Path::Idx(i), ..] => match i.strip() {
-                                    Expr::Num(k) if *k >= 1 => fields(t).get(*k as usize - 1).map_or(t.clone(), |f| f.1.clone()),
-                                    _ => t.clone(),
+                                    Expr::Num(k) if *k >= 1 && !fields(t).is_empty() => fields(t).get(*k as usize - 1).map_or(t.clone(), |f| f.1.clone()),
+                                    _ => elem(t),
                                 },
                                 _ => t.clone(),
                             };
@@ -7997,7 +8430,7 @@ impl Gen<'_> {
             for (v, rhs, is_in) in &assigns {
                 // A constant, whose form is known (for x \in S, that of an element)
                 let t = self.var_ty(v);
-                let held = |x: &Value, f: &Form| Self::form_bits(x, f, &t) != 0;
+                let held = |x: &Value, f: &Form| self.form_bits(x, f, &t) != 0;
                 let known = || match self.const_form(rhs, &Env::default()) {
                     Some((sv @ Value::Set(_), f)) if *is_in => {
                         let Value::Set(xs) = &sv else { unreachable!() };
@@ -8009,9 +8442,11 @@ impl Gen<'_> {
                 let built = || match rhs.strip() {
                     _ if !*is_in => may(self, rhs, &t, &on, &exists) || known(),
                     Expr::SetLit(xs) => xs.iter().any(|x| may(self, x, &t, &on, &exists)) || known(),
+                    // An element of a set of sets from the state that may hold intervals
+                    Expr::Ident(..) | Expr::Prime(_) => may(self, rhs, &Ty::Set(t.clone().into()), &on, &exists) || known(),
                     _ => known(),
                 };
-                if !on.contains(v) && Self::shape_slots(&self.var_ty(v)) > 0 && built() {
+                if !on.contains(v) && self.shape_slots(&self.var_ty(v)) > 0 && built() {
                     on.insert(v.clone());
                 }
             }
@@ -8021,12 +8456,24 @@ impl Gen<'_> {
         }
         let mut at = 0;
         for (v, t) in self.vars.clone() {
-            let n = Self::shape_slots(&t);
+            let n = self.shape_slots(&t);
             if on.contains(&v) && at + n <= 64 {
                 self.shaped.insert(v, (at, n));
                 at += n;
             }
         }
+    }
+
+    /// Code printing the part x (of type pt) of a value whose shape is b, with its bits from at
+    fn fmt_part(&mut self, pt: &Ty, x: &str, at: &str) -> R<String> {
+        let pid = self.ty_id(pt)?;
+        let k = self.shape_slots(pt);
+        Ok(if k == 0 {
+            format!("fmt_{pid}({x})")
+        } else {
+            self.fmtsh_need.insert(pt.clone());
+            format!("fmtsh_{pid}({x}, sh_get(b, {at}, {}u64))", mask(k))
+        })
     }
 
     /// The shape's type and accessors, and the functions printing values with their shape
@@ -8038,11 +8485,14 @@ impl Gen<'_> {
                   impl PartialEq for Sh { fn eq(&self, _: &Sh) -> bool { true } }\nimpl Eq for Sh {}\n\
                   impl std::hash::Hash for Sh { fn hash<H: std::hash::Hasher>(&self, _: &mut H) {} }\n";
             for (v, (at, n)) in self.shaped.clone() {
-                let m = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+                let m = mask(n);
                 writeln!(s, "#[inline] fn shg_{v}(s: &State) -> u64 {{ (s.sh.0 >> {at}) & {m}u64 }}").unwrap();
                 writeln!(s, "#[inline] fn shs_{v}(s: &mut State, b: u64) {{ s.sh.0 = (s.sh.0 & !({m}u64 << {at})) | ((b & {m}u64) << {at}); }}").unwrap();
                 self.fmtsh_need.insert(self.var_ty(&v));
             }
+        }
+        if !self.fmtsh_need.is_empty() {
+            s += SHAPE_HELPERS;
         }
         let mut done: BTreeSet<Ty> = BTreeSet::new();
         while let Some(t) = self.fmtsh_need.iter().find(|t| !done.contains(*t)).cloned() {
@@ -8050,7 +8500,7 @@ impl Gen<'_> {
             let id = self.ty_id(&t)?;
             let r = t.repr();
             let body = match &t {
-                Ty::Set(e) => {
+                Ty::Set(e) if matches!(**e, Ty::Int(..)) => {
                     let eid = self.ty_id(e)?;
                     let it = self.s_iter("*v", &t)?;
                     format!(
@@ -8058,22 +8508,19 @@ impl Gen<'_> {
                          (Some(a), Some(z)) => format!(\"{{}}..{{}}\", fmt_{eid}(a), fmt_{eid}(z)), _ => fmt_{id}(v) }}"
                     )
                 }
+                Ty::Set(e) if Self::iv_count(e) > 0 => {
+                    let it = self.s_iter("*v", &t)?;
+                    let shown = self.fmt_part(e, "&x", "iv_bit(x)")?;
+                    format!("format!(\"{{{{{{}}}}}}\", {it}.map(|x| {shown}).collect::<Vec<_>>().join(\", \"))")
+                }
                 Ty::Rec(fs) => {
                     let tuple = is_tuple_fields(fs);
                     let mut parts = vec![];
                     let mut at = 0;
                     for (k, (name, ft)) in fs.iter().enumerate() {
-                        let fid = self.ty_id(ft)?;
                         let path = rec_field(fs.len(), k);
-                        let n = Self::shape_slots(ft);
-                        let shown = if n == 0 {
-                            format!("fmt_{fid}(&v{path})")
-                        } else {
-                            self.fmtsh_need.insert(ft.clone());
-                            let m = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
-                            format!("fmtsh_{fid}(&v{path}, (b >> {at}) & {m}u64)")
-                        };
-                        at += n;
+                        let shown = self.fmt_part(ft, &format!("&v{path}"), &at.to_string())?;
+                        at += self.shape_slots(ft);
                         parts.push(if tuple { shown } else { format!("format!(\"{name} |-> {{}}\", {shown})") });
                     }
                     if tuple {
@@ -8082,7 +8529,27 @@ impl Gen<'_> {
                         format!("format!(\"[{{}}]\", [{}].join(\", \"))", parts.join(", "))
                     }
                 }
+                Ty::Seq(e) if self.shape_slots(&t) > 1 => {
+                    let k = self.shape_slots(e);
+                    let shown = self.fmt_part(e, "&x", &format!("1 + j as u64 * {k}"))?;
+                    format!(
+                        "if b & 1 == 1 && v.len == 0 {{ return \"<< >>\".into(); }} \
+                         format!(\"<<{{}}>>\", v.iter().enumerate().map(|(j, x)| {shown}).collect::<Vec<_>>().join(\", \"))"
+                    )
+                }
                 Ty::Seq(_) => format!("if b & 1 == 1 && v.len == 0 {{ \"<< >>\".into() }} else {{ fmt_{id}(v) }}"),
+                Ty::Fun(d, c) => {
+                    let k = self.shape_slots(c);
+                    let did = self.ty_id(d)?;
+                    let shown = self.fmt_part(c, "x", &format!("j as u64 * {k}"))?;
+                    if let Ty::Int(1, _) = d.as_ref() {
+                        format!("format!(\"<<{{}}>>\", v.iter().enumerate().map(|(j, x)| {shown}).collect::<Vec<_>>().join(\", \"))")
+                    } else {
+                        format!(
+                            "format!(\"({{}})\", v.iter().enumerate().map(|(j, x)| format!(\"{{}} :> {{}}\", fmt_{did}(&dec_{did}(j as u64)), {shown})).collect::<Vec<_>>().join(\" @@ \"))"
+                        )
+                    }
+                }
                 _ => format!("fmt_{id}(v)"),
             };
             writeln!(s, "fn fmtsh_{id}(v: &{r}, b: u64) -> String {{ {body} }}").unwrap();
