@@ -2357,6 +2357,11 @@ fn expand(g: &Graph, lo: usize, hi: usize, seen: &Shards, stop: &std::sync::atom
                 (e, false) => Found::Live(SMsg::Untraced(e)),
             }),
         };
+        // Checking liveness, TLC writes a state to `-dump FILE` again after its new successors
+        // (`tests/tlc/OptDumpLive`)
+        if found.is_none() && flag(&DUMP_STATES) {
+            dump_node(&mut c.dump, &0, &g.state(head), false);
+        }
         if found.is_some() {
             c.found = found;
             stop.store(true, Relaxed);
