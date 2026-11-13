@@ -172,6 +172,11 @@ fn empty_seqs(text: &str) -> String {
 pub fn canon(dot: &str) -> Result<Canon, String> {
     let mut label: HashMap<&str, (String, bool)> = HashMap::new();
     let mut edges: Vec<(&str, &str)> = vec![];
+    let complete = dot.lines().rev().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim() == "}");
+    // TLC stopped before ending the file: it is not compared, and its last line can be cut off anywhere
+    if !complete {
+        return Ok(Canon { complete, states: vec![], edges: vec![] });
+    }
     for (no, line) in dot.lines().enumerate() {
         let Some((id, rest)) = line.split_once(' ') else { continue };
         if let Some(r) = rest.strip_prefix("-> ") {
@@ -214,7 +219,6 @@ pub fn canon(dot: &str) -> Result<Canon, String> {
     for (a, b) in edges {
         es.insert((at(a)?, at(b)?));
     }
-    let complete = dot.lines().rev().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim() == "}");
     Ok(Canon { complete, states, edges: es.into_iter().collect() })
 }
 
