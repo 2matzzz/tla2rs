@@ -112,7 +112,9 @@ cursor per node on its stack (`At`) instead of the node's successors; the BFS ke
 label of a step on the counterexample's prefix is found again from the parent's successors.
 
 The parts of a level beyond `-memlimit` spill to a temp file. The file is unlinked as soon as it is opened, so nothing is
-left behind even when the checker is killed. A failed read of the spilled queue is a fatal error: skipping it could turn
+left behind even when the checker is killed. Without `-tmpdir` it goes to the system's temp dir, or, when that is a
+tmpfs (`/tmp` on many Linux systems, where a file takes memory), to the directory of the checker's executable
+(`default_tmpdir`). A failed read of the spilled queue is a fatal error: skipping it could turn
 an incomplete search into "no error".
 
 ### Capacities

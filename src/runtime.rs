@@ -2513,6 +2513,33 @@ fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
     dump_write(&mut out);
 }
 
+/// Where the checker spills when `-tmpdir` is not given: the system's temp dir, unless it is a tmpfs
+/// (as `/tmp` is on many Linux systems), whose files take memory as much as the data they hold; then
+/// the directory of the checker's executable
+fn default_tmpdir() -> std::path::PathBuf {
+    let t = std::env::temp_dir();
+    if on_tmpfs(&t) {
+        if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            return d;
+        }
+    }
+    t
+}
+/// Whether p is on a tmpfs: the type of the mount with the longest mount point above it (Linux)
+fn on_tmpfs(p: &std::path::Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else { return false };
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mount = mounts
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(' ');
+            let (_, at, kind) = (f.next()?, f.next()?, f.next()?);
+            Some((at.replace("\\040", " "), kind))
+        })
+        .filter(|(at, _)| p.starts_with(at))
+        .max_by_key(|(at, _)| at.len());
+    mount.is_some_and(|(_, kind)| kind == "tmpfs")
+}
 fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().collect();
@@ -2543,7 +2570,7 @@ fn main() {
             .position(|a| a == "-tmpdir")
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir),
+            .unwrap_or_else(default_tmpdir),
         workers: args
             .iter()
             .position(|a| a == "-workers")

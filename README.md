@@ -32,7 +32,9 @@ cargo build --release
 - `-deadlock` / `CHECK_DEADLOCK FALSE` mean the same as in TLC: deadlock is not an error
 - `-workers N` sets the number of search threads (default: number of CPUs)
 - `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB), and with temporal properties how
-  much of the state graph does; the rest spills to temp files (`-tmpdir`)
+  much of the state graph does; the rest spills to temp files in `-tmpdir DIR`. By default that is the system's temp
+  dir, unless it is a tmpfs (as `/tmp` is on many Linux systems), whose files take memory like the data they hold;
+  then it is the directory of the generated checker's executable
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` and `-seqcap N` set where the capacity of sets held as arrays (and of the domains of functions and
   bags over large types) and the maximum length of sequences start. They are never needed: a value that outgrows
