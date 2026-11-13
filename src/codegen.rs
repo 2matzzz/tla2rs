@@ -6936,12 +6936,36 @@ impl<'a> Gen<'a> {
         let bits = self.pack_value("(*__v)", &vt, &mut body, &mut at)?;
         let vp = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let words = bits.div_ceil(64).max(1);
-        // The view as TLC prints it in a behavior with -view
+        // The view as TLC prints it in a behavior with -view. A tuple with one element per variable
+        // the view reads is printed as a state of those variables, the first element as the first
+        // of them in TLC's order, and so on (`tests/tlc/OptView-Vars`)
         let tid = self.ty_id(&vt)?;
+        let mut show = format!("ppr(&fmt_{tid}(__v))");
+        let mut tuple = view;
+        while let Expr::Label(n, _, b) = tuple {
+            if crate::ast::is_bind(n) {
+                break;
+            }
+            tuple = b;
+        }
+        if let Expr::Tuple(es) = tuple {
+            let read: Vec<String> =
+                self.print_order.iter().filter(|v| self.is_var(v) && view.any(&|x| matches!(x, Expr::Ident(n, _) if n == *v))).cloned().collect();
+            if read.len() == es.len() {
+                let bullet = if self.vars.len() == 1 { "" } else { "/\\\\ " };
+                let mut parts = vec![];
+                for (v, e) in read.iter().zip(es) {
+                    let (c, t) = self.gen(e, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
+                    let id = self.ty_id(&t)?;
+                    parts.push(format!("format!(\"{bullet}{v} = {{}}\", ppr(&fmt_{id}(&{{ {c} }})))"));
+                }
+                show = format!("{{ let _ = __v; [{}].join(\"\\n\") }}", parts.join(", "));
+            }
+        }
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
              fn key_of(s: &State) -> Option<Key> {{ let __v: &{} = &{{ {vc} }}; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn show_view(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; ppr(&fmt_{tid}(__v)) }}\n",
+             fn show_view(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; {show} }}\n",
             vt.repr(),
             vt.repr()
         ))

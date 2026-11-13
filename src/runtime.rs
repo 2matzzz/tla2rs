@@ -967,6 +967,11 @@ fn flag(f: &std::sync::atomic::AtomicBool) -> bool {
 /// workers find one at once
 static REPORTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The text of an initial state that violates an invariant or a property: its view with -view
+/// (and a VIEW), as in a behavior
+fn init_text(s: &State) -> String {
+    if flag(&VIEW_TRACE) && HAS_VIEW { show_view(s) } else { show(s) }
+}
 /// The text of a state in a behavior: its view with -view (and a VIEW), only the variables that
 /// changed since `prev` with -difftrace, otherwise the state. TLC prints a view without the empty
 /// line after it
@@ -3022,7 +3027,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         let out_of_type = w.is_none() && TYPE_INV_SUBSUMED && !flag(&CONTINUE);
         match if out_of_type { eval_invariants_before_type(&s) } else { eval_invariants(&s) } {
             Ok(None) if out_of_type => {
-                println!("Error: Invariant {TYPE_INVARIANT} is violated by the initial state:\n{}", show(&s));
+                println!("Error: Invariant {TYPE_INVARIANT} is violated by the initial state:\n{}", init_text(&s));
                 exit(12);
             }
             Ok(None) => {}
@@ -3031,10 +3036,10 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                 if flag(&CONTINUE) {
                     if !INITS_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
                         let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
-                        println!("Error: Invariant {inv} is violated by the initial state:\n{}\n", show(&s));
+                        println!("Error: Invariant {inv} is violated by the initial state:\n{}\n", init_text(&s));
                     }
                 } else {
-                    println!("Error: Invariant {inv} is violated by the initial state:\n{}", show(&s));
+                    println!("Error: Invariant {inv} is violated by the initial state:\n{}", init_text(&s));
                     exit(12);
                 }
             }
@@ -3047,7 +3052,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             match std::panic::catch_unwind(|| f(&s)) {
                 Ok(true) => {}
                 Ok(false) => {
-                    println!("Error: Property {name} is violated by the initial state:\n{}", show(&s));
+                    println!("Error: Property {name} is violated by the initial state:\n{}", init_text(&s));
                     exit(13);
                 }
                 Err(p) => stop(describe_panic(p), &format!("evaluating property {name} on an initial state"), Some(&s), generated, out.len()),
