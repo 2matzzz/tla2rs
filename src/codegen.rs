@@ -1957,6 +1957,18 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// A value of type t: the default where it is one, which it need not be (atom 0, integer 0)
+    fn some_code(t: &Ty) -> String {
+        match t {
+            Ty::Enum(v) if !v.is_empty() && !v.contains(&0) => format!("{}u16", v[0]),
+            Ty::Int(lo, hi) | Ty::IntAtom(lo, hi, _) if lo <= hi && (*lo > 0 || *hi < 0) => format!("{lo}i64"),
+            Ty::IntAtom(lo, hi, v) if lo > hi && !v.is_empty() => format!("(i64::MIN + {}i64)", v[0]),
+            Ty::Rec(fs) => rec_build(&fs.iter().map(|(_, f)| Self::some_code(f)).collect::<Vec<_>>()),
+            Ty::Fun(d, c) => format!("[{}; {}]", Self::some_code(c), d.size().unwrap_or(0)),
+            _ => Self::default_code(t),
+        }
+    }
+
     // ---------------------------------------------------------------- Value literals
 
     pub fn lit(&mut self, v: &Value, t: &Ty) -> R<String> {
@@ -6544,7 +6556,11 @@ impl<'a> Gen<'a> {
                     }
                     None => write!(out, "put(&mut w, &mut p, ({c}).0 as u128, 1); ").unwrap(),
                 }
-                1 + self.pack_value(&format!("({c}).1"), inner, out, at)?
+                // An absent value holds the default, which may lie outside the type (atom 0,
+                // integer 0): written as a value of the type, which unpacking turns back
+                let v = self.fresh("o");
+                write!(out, "let {v} = if ({c}).0 {{ ({c}).1 }} else {{ {} }}; ", Self::some_code(inner)).unwrap();
+                1 + self.pack_value(&v, inner, out, at)?
             }
             Ty::Fun(d, cod) => {
                 let n = d.size().unwrap();
@@ -6648,7 +6664,9 @@ impl<'a> Gen<'a> {
                     }
                     None => "get(w, &mut p, 1) == 1".into(),
                 };
-                format!("({flag}, {})", self.unpack_value(inner, at)?)
+                let (f, v) = (self.fresh("f"), self.fresh("o"));
+                let val = self.unpack_value(inner, at)?;
+                format!("{{ let {f} = {flag}; let {v} = {val}; ({f}, if {f} {{ {v} }} else {{ {} }}) }}", Self::default_code(inner))
             }
             Ty::Fun(d, cod) => {
                 let n = d.size().unwrap();
