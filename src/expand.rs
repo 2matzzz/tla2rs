@@ -9,6 +9,9 @@ use std::collections::HashMap;
 struct Env {
     subst: HashMap<String, Expr>,
     locals: HashMap<String, (Def, Env)>,
+    /// LET definitions bound to a name (their uses read `subst`), known only for the positional
+    /// names of their subexpressions (`M!1`). Shared, since each holds the environment before it
+    lets: HashMap<String, (Def, std::rc::Rc<Env>)>,
 }
 
 /// A recursive operator, expanded once with its parameters as fresh bound variables. Its calls
@@ -515,6 +518,8 @@ impl<'a> Expander<'a> {
                             Ok(b) if self.bindable(&b) => {
                                 let n = self.bind(&d.name, &mut inner);
                                 inner.locals.remove(&d.name);
+                                // A positional name `M!1` still finds the definition (`tests/tlc/SubLet`)
+                                inner.lets.insert(d.name.clone(), (unique.clone(), std::rc::Rc::new(snapshot)));
                                 binds.extend([Expr::Ident(n, NOPOS), b]);
                                 continue;
                             }
@@ -565,7 +570,7 @@ impl<'a> Expander<'a> {
         let parts: Vec<&str> = n.split('!').collect();
         (1..parts.len()).rev().find_map(|i| {
             let op = parts[..i].join("!");
-            (env.locals.contains_key(&op) || self.defs.contains_key(op.as_str()))
+            (env.locals.contains_key(&op) || env.lets.contains_key(&op) || self.defs.contains_key(op.as_str()))
                 .then(|| (op, parts[i..].iter().map(|l| l.to_string()).collect()))
         })
     }
@@ -611,14 +616,15 @@ impl<'a> Expander<'a> {
             _ => return Err("a subexpression name must start with an operator".into()),
         };
         // Labels written as part of the name (`Op!lab`) come first
-        let (op, labels) = if env.locals.contains_key(&name) || self.defs.contains_key(name.as_str()) {
+        let (op, labels) = if env.locals.contains_key(&name) || env.lets.contains_key(&name) || self.defs.contains_key(name.as_str()) {
             (name.clone(), vec![])
         } else {
             self.label_path(&name, env).ok_or(format!("unknown operator `{name}`"))?
         };
-        let (d, denv) = match env.locals.get(&op) {
-            Some((d, denv)) => (d.clone(), with_self(&op, d, denv.clone())),
-            None => ((*self.defs[op.as_str()]).clone(), Env::default()),
+        let (d, denv) = match (env.locals.get(&op), env.lets.get(&op)) {
+            (Some((d, denv)), _) => (d.clone(), with_self(&op, d, denv.clone())),
+            (None, Some((d, denv))) => (d.clone(), with_self(&op, d, (**denv).clone())),
+            (None, None) => ((*self.defs[op.as_str()]).clone(), Env::default()),
         };
         if args.len() < d.params.len() {
             return Err(format!("`{name}`: `{op}` expects {} arguments", d.params.len()));
