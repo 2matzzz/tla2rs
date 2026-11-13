@@ -1839,6 +1839,9 @@ fn compile_inner(
     src += &live_code;
     writeln!(src, "const TYPE_INVARIANT: &str = {tname:?};").unwrap();
     writeln!(src, "const TYPE_INV_SUBSUMED: bool = {type_inv_subsumed};").unwrap();
+    // Where TLC checks the type invariant among the others: the invariants listed before it
+    let type_inv_at = cfg.invariants.iter().take_while(|n| *n != tname).count();
+    writeln!(src, "const TYPE_INV_AT: usize = {type_inv_at};").unwrap();
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
