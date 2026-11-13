@@ -1345,12 +1345,14 @@ impl<'a> Gen<'a> {
     /// An EXCEPT step `[i]` into a tuple with i not constant: `!p[i] ... = v` becomes
     /// `!p = CASE i = 1 -> [@ EXCEPT ![1] ... = v] [] ... [] OTHER -> @`, since each element of a
     /// tuple may have its own type (an index outside the tuple leaves it unchanged, as in TLC)
-    /// `warn` is where the value is written, for TLC's warning about an index outside the tuple
+    /// `warn` is where the value is written, for TLC's warning about an index outside the tuple.
+    /// A constant index outside the tuple is split the same way, into that warning
     fn split_dynamic_index(&mut self, t: &Ty, path: &[Path], val: &Expr, env: &Env, warn: Option<&str>) -> (Vec<Path>, Expr) {
         let mut cur = Some(t.clone());
         for (j, p) in path.iter().enumerate() {
             if let (Path::Idx(i), Some(Ty::Rec(fs))) = (p, &cur) {
-                if is_tuple_fields(fs) && self.try_const(i, env).is_none() {
+                let inside = matches!(self.try_const(i, env), Some(Value::Int(k)) if k >= 1 && k as u64 <= fs.len() as u64);
+                if is_tuple_fields(fs) && !inside {
                     self.tmp += 1;
                     let at = format!("@dyn{}", self.tmp);
                     let base = Expr::Ident(at.clone(), NOPOS);
@@ -1481,15 +1483,18 @@ impl<'a> Gen<'a> {
     /// representation.
     /// A record whose fields are all present (code `c` of type `t`) as the function over strings
     /// it is: a function over part of the type of its names. Any other value is left as it is
+    /// A tuple likewise, as the function over 1..n it is (`1 :> a` is the tuple <<a>>)
     fn rec_as_fun(&mut self, c: String, t: Ty, env: &Env) -> R<(String, Ty)> {
         let Ty::Rec(fs) = &t else { return Ok((c, t)) };
-        if fs.is_empty() || fs.iter().any(|(n, ft)| !crate::compile::field_name(n) || matches!(ft, Ty::Opt(_))) {
+        let tuple = crate::types::is_tuple_fields(fs);
+        if fs.is_empty() || fs.iter().any(|(n, ft)| !(tuple || crate::compile::field_name(n)) || matches!(ft, Ty::Opt(_))) {
             return Ok((c, t));
         }
         let mut keys = vec![];
         let (mut dt, mut ct) = (Ty::Enum(vec![]), fs[0].1.clone());
-        for (n, ft) in fs {
-            let (kc, kt) = self.gen(&Expr::Str(n.clone()), env, None)?;
+        for (i, (n, ft)) in fs.iter().enumerate() {
+            let key = if tuple { Expr::Num(i as i64 + 1) } else { Expr::Str(n.clone()) };
+            let (kc, kt) = self.gen(&key, env, None)?;
             dt = join(&dt, &kt)?;
             ct = join(&ct, ft)?;
             keys.push((kc, kt));
@@ -2269,6 +2274,16 @@ impl<'a> Gen<'a> {
                 let inner = self.coerce("__x".into(), c1, c2)?;
                 Ok(format!("{{ let __f = {code}; let __o: {} = std::array::from_fn(|__i| {{ let __x = __f[__i]; (true, {inner}) }}); __o }}", to.repr()))
             }
+            // A function over part of a type as one over all of it (`(1 :> a) @@ (2 :> b)` as a
+            // function over 1..2): a value not defined everywhere leaves the type
+            (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) if !is_sparse_fun(from) && !is_sparse_fun(to) => {
+                let mid = Ty::PFun(d2.clone(), c2.clone());
+                let c = if d1 == d2 && c1 == c2 { code } else { self.coerce(code, from, &mid)? };
+                Ok(format!(
+                    "{{ let __f = {c}; let __o: {} = std::array::from_fn(|__i| {{ let (__p, __x) = __f[__i]; if !__p {{ type_error(\"a function\", \"\") }} __x }}); __o }}",
+                    to.repr()
+                ))
+            }
             (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => {
                 let (aid, bid) = (self.ty_id(d1)?, self.ty_id(d2)?);
                 let inner = self.coerce("__x".into(), c1, c2)?;
@@ -2842,7 +2857,8 @@ impl<'a> Gen<'a> {
                         _ => Ty::Int(-BIG, BIG),
                     };
                     (
-                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ arith_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => arith_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
+                        // TLC's messages (Naturals.Expt), and its overflow beyond 32 bits
+                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ arith_error(format!(\"The second argument of ^ should be a natural number, but instead it is:\\n{{}}\", __b)) }} if __b == 0 && __a == 0 {{ arith_error(\"0^0 is undefined.\".to_string()) }} match u32::try_from(__b).ok().and_then(|b| __a.checked_pow(b)).filter(|v| i32::try_from(*v).is_ok()) {{ Some(v) => v, None => arith_error(format!(\"Overflow when computing {{}}^{{}}\", __a, __b)) }} }}"),
                         t,
                     )
                 }
@@ -3510,6 +3526,10 @@ impl<'a> Gen<'a> {
             }
             FunCons(x, s, body) => {
                 let dv = self.ce.eval(s, &HashMap::new()).map_err(|m| format!("function domain must be constant: {m}"))?;
+                // Over the empty set (`1..0`): the empty function, which is the empty sequence
+                if dv.as_set()?.is_empty() {
+                    return self.gen(&Tuple(vec![]), env, want);
+                }
                 let dt = elem_ty_of_domain(dv.as_set()?)?;
                 let did = self.ty_id(&dt)?;
                 let wc = match want {
@@ -4683,14 +4703,18 @@ impl<'a> Gen<'a> {
                 }
                 return self.fun_set_member(x, xt, d, r, s, env);
             }
+            // A function over part of a type: defined exactly on D, which may also have elements
+            // outside the type (the domain of `(a :> 1) @@ (b :> 2)` has the type of a and b only),
+            // so the keys are counted too
             FunSet(d, r) if matches!(xt, Ty::PFun(..)) && !is_sparse_fun(xt) => {
                 let Ty::PFun(dt, ct) = xt else { unreachable!() };
                 let did = self.ty_id(dt)?;
                 let (e, k) = (self.fresh("e"), self.fresh("k"));
                 let in_d = self.gen_member(&k, dt, d, env)?;
                 let in_r = self.gen_member(&e, ct, r, env)?;
+                let (nd, _) = self.gen(&Call("Cardinality".into(), vec![d.as_ref().clone()]), env, None)?;
                 return Ok(format!(
-                    "{{ let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __p == {in_d} && (!__p || {in_r}) }}); __all }}"
+                    "{{ let mut __n = 0i64; let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __n += __p as i64; __p == {in_d} && (!__p || {in_r}) }}); __all && __n == ({nd}) as i64 }}"
                 ));
             }
             FunSet(d, r) => return self.fun_set_member(x, xt, d, r, s, env),
@@ -6215,7 +6239,9 @@ impl<'a> Gen<'a> {
             if cell {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
-                    write!(lets, "let {id} = std::cell::OnceCell::new(); let {id}f = || -> {} {{ {c} }}; ", t.repr()).unwrap();
+                    // Typed, as a use may be folded away (a comparison decided by the types)
+                    let r = t.repr();
+                    write!(lets, "let {id}: std::cell::OnceCell<{r}> = std::cell::OnceCell::new(); let {id}f = || -> {r} {{ {c} }}; ").unwrap();
                     // Every value type is Copy: read through the reference, so that a use that
                     // only reads a part (a field, an iteration) does not copy the whole value
                     env2.bind(&n, format!("(*{id}.get_or_init(&{id}f))"), t);

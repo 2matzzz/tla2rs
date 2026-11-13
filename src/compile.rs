@@ -1104,6 +1104,35 @@ fn constant_level(e: &Expr, m: &Module) -> bool {
     })
 }
 
+/// Whether TLC's bound on the level of definition `name` (Tool.getLevelBound, which decides the
+/// definitions it evaluates when it starts) is above constant: a variable, prime, ENABLED or
+/// temporal operator anywhere in its body, in the definitions it calls and in their LET
+/// definitions, used or not (`tests/tlc/ConstLetVar`)
+fn bound_reads_state(name: &str, m: &Module) -> bool {
+    fn walk<'a>(e: &'a Expr, m: &'a Module, seen: &mut HashSet<&'a str>) -> bool {
+        match e {
+            Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => return true,
+            Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) => return true,
+            x if x.is_unchecked_temporal() => return true,
+            Expr::Ident(n, _) | Expr::Call(n, _) => {
+                if m.variables.contains(n) {
+                    return true;
+                }
+                if let Some(d) = m.defs.iter().find(|d| d.name == *n) {
+                    if seen.insert(&d.name) && walk(&d.body, m, seen) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        e.children().into_iter().any(|c| walk(c, m, seen))
+    }
+    let mut seen = HashSet::new();
+    seen.insert(name);
+    m.defs.iter().find(|d| d.name == name).is_some_and(|d| walk(&d.body, m, &mut seen))
+}
+
 /// Whether evaluating e can make a string: ToString, or a sequence operator (`\o`, Append, Head,
 /// Tail, SubSeq) where e has a string, or a constant whose value has one
 fn makes_strings(e: &Expr, constants: &HashMap<String, Value>, atoms: &Atoms) -> bool {
@@ -1184,7 +1213,7 @@ fn compile_inner(
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
     startup.sany = crate::sany::take_warnings();
     crate::value::NAT_DIV.with(|n| n.set(!INTEGERS.with(|i| i.get())));
-    let cfg = parse_cfg(cfg_src)?;
+    let mut cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
 
     // Strings and model values. Strings are numbered in the order TLC creates them (TLC orders
@@ -1335,7 +1364,7 @@ fn compile_inner(
         for n in names {
             // Whether it is of constant level, from the expansion for code generation, which does
             // not write out the arguments of state level at each use
-            if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) {
+            if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) || bound_reads_state(&n, &m) {
                 continue;
             }
             let Ok(e) = ex.expand_def_bound(&n) else { continue };
@@ -1353,13 +1382,19 @@ fn compile_inner(
         made_now.extend(atoms.log_end());
     }
 
-    // TLC evaluates an invariant or property of constant level once, before exploring, and
-    // refuses one that is not TRUE (one it fails to evaluate is evaluated again on each state)
+    // TLC evaluates an invariant, property, constraint or action constraint of constant level
+    // once, before exploring, and refuses one that is not TRUE (one it fails to evaluate is
+    // evaluated again on each state)
     {
         let ce = ConstEval { atoms: &atoms, constants: &constants };
         let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
+        let named = named.chain(cfg.constraints.iter().map(|n| ("constraint", n)));
+        let named = named.chain(cfg.action_constraints.iter().map(|n| ("action constraint", n)));
+        // A constraint that is TRUE is dropped: TLC keeps only those it has to evaluate on each
+        // state (and does not warn about constraints with liveness when none is left)
+        let mut dropped = vec![];
         for (what, name) in named {
-            if !constant_level(&ex.expand_def_code(name, false)?, &m) {
+            if !constant_level(&ex.expand_def_code(name, false)?, &m) || bound_reads_state(name, &m) {
                 continue;
             }
             let e = ex.expand_def_bound(name)?;
@@ -1370,6 +1405,7 @@ fn compile_inner(
             startup.invs.extend(printed.into_iter().filter(|l| l.starts_with(crate::value::WARNING_MARK)));
             made_now.extend(atoms.log_end());
             match r {
+                Ok(Value::Bool(true)) if what.ends_with("constraint") => dropped.push(name.clone()),
                 Ok(Value::Bool(true)) | Err(_) => {}
                 Ok(v) => {
                     let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
@@ -1377,6 +1413,8 @@ fn compile_inner(
                 }
             }
         }
+        cfg.constraints.retain(|n| !dropped.contains(n));
+        cfg.action_constraints.retain(|n| !dropped.contains(n));
     }
     // A module without variables and a cfg without SPECIFICATION, INIT and NEXT (one that only checks
     // its ASSUMEs): TLC checks the constant-level invariants and properties, then finishes with no
@@ -1807,6 +1845,9 @@ fn compile_inner(
     src += &live_code;
     writeln!(src, "const TYPE_INVARIANT: &str = {tname:?};").unwrap();
     writeln!(src, "const TYPE_INV_SUBSUMED: bool = {type_inv_subsumed};").unwrap();
+    // Where TLC checks the type invariant among the others: the invariants listed before it
+    let type_inv_at = cfg.invariants.iter().take_while(|n| *n != tname).count();
+    writeln!(src, "const TYPE_INV_AT: usize = {type_inv_at};").unwrap();
     writeln!(src, "static ACTION_PROPS: &[(&str, fn(&State, &State) -> bool)] = &[{}];", aprop_list.join(", ")).unwrap();
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();

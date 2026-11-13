@@ -1559,10 +1559,25 @@ fn eval_invariants(s: &State) -> Result<Option<&'static str>, (&'static str, Eva
     }
 }
 
+/// For a state that does not pack when packing checks the type invariant (TYPE_INV_SUBSUMED), so
+/// that it violates that invariant: the invariants TLC checks before it, in the order listed
+fn eval_invariants_before_type(s: &State) -> Result<Option<&'static str>, (&'static str, EvalErr)> {
+    for (name, f) in &INVARIANTS[..TYPE_INV_AT.min(INVARIANTS.len())] {
+        match std::panic::catch_unwind(|| f(s)) {
+            Ok(true) => {}
+            Ok(false) => return Ok(Some(name)),
+            Err(p) => return Err((name, describe_panic(p))),
+        }
+    }
+    Ok(None)
+}
 /// TLC checks the invariants on a successor that violates the CONSTRAINT too (every time it is
 /// generated; it is counted as generated but never added or explored). Returns what stops the
 /// search, if anything.
 fn check_out_of_model(t: &State) -> Option<SMsg> {
+    if TYPE_INV_SUBSUMED && pack(t).is_none() {
+        return Some(pack_failed_msg(t));
+    }
     match eval_invariants(t) {
         Ok(Some(inv)) => Some(SMsg::Inv(inv)),
         Err((inv, e)) => Some(SMsg::InvEval(inv, e)),
@@ -2255,8 +2270,17 @@ fn main() {
     }
     str_order_start(opt.workers);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // A spec without [][Next]_v: TLC computes and checks the initial states, then stops
-        if NO_NEXT {
+        // A spec without [][Next]_v: TLC computes and checks the initial states, then stops; when
+        // there are none, it finishes as a search of no states does (`tests/tlc/NoActions-NoInit`).
+        // What Init prints is dropped here: the search computes the initial states again
+        let no_inits = NO_NEXT && {
+            let cap = Capturing::start();
+            let mut raw = Vec::new();
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut raw))).is_ok();
+            drop(cap.finish());
+            ok && raw.is_empty()
+        };
+        if NO_NEXT && !no_inits {
             let (inits, _) = initial_states();
             println!("Finished computing initial states: {} distinct states generated.", inits.len());
             println!("Error: No next state actions defined to generate successor states from.");
@@ -2501,7 +2525,14 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             dump_node(&mut buf, &id, &s, true);
             dump_write(&mut buf);
         }
-        match eval_invariants(&s) {
+        // An initial state that does not pack violates the type invariant, which TLC checks where
+        // the cfg lists it
+        let out_of_type = w.is_none() && TYPE_INV_SUBSUMED && !flag(&CONTINUE);
+        match if out_of_type { eval_invariants_before_type(&s) } else { eval_invariants(&s) } {
+            Ok(None) if out_of_type => {
+                println!("Error: Invariant {TYPE_INVARIANT} is violated by the initial state:\n{}", show(&s));
+                exit(12);
+            }
             Ok(None) => {}
             Ok(Some(inv)) => {
                 // With -continue, reported once (initial_states also runs to rebuild a behavior)
@@ -2654,12 +2685,16 @@ struct SChunk {
 /// A successor that does not fit the packed layout: an invariant it violates, else an out-of-type
 /// error
 fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
-    let msg = match eval_invariants(&t) {
+    let msg = pack_failed_msg(&t);
+    SFound::new(sfp, Some((t, l)), msg)
+}
+fn pack_failed_msg(t: &State) -> SMsg {
+    let checked = if TYPE_INV_SUBSUMED { eval_invariants_before_type(t) } else { eval_invariants(t) };
+    match checked {
         Ok(Some(inv)) => SMsg::Inv(inv),
         Err((inv, e)) => SMsg::InvEval(inv, e),
         Ok(None) => SMsg::OutOfType,
-    };
-    SFound::new(sfp, Some((t, l)), msg)
+    }
 }
 
 /// A successor outside the CONSTRAINT or the ACTION_CONSTRAINT that stops the search: its

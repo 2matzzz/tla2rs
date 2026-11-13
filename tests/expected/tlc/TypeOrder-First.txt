@@ -1,0 +1,10 @@
+key 83723ead98e8638a110cd3610379094bd3fd7f696d37157e08131ffa13b01ba2
+tlc Version 2.19
+rc 12
+Invariant TypeOK is violated
+3 states generated 3 distinct states found 0 states left on queue
+trace 3 c17379499643ec0320257757c767e5377b4a00054762fde6a42820974c42152b
+states 3 77792d8b63a72b8ca75e1734fd642c370feeacc608ebf94f8aaf6c701d05b823
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 2 d12dc7dd48d0f65dd49a1ab9b2fa50192b67dae1f495e8649c980d5fcc71dd72
+errors 2 d12dc7dd48d0f65dd49a1ab9b2fa50192b67dae1f495e8649c980d5fcc71dd72

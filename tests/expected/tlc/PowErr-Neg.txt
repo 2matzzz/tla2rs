@@ -1,0 +1,10 @@
+key 91ae58a6d0a2bd48e1b1e0e47e3c9440a5192267d0204f2a20fd78873706db1d
+tlc Version 2.19
+rc 76
+Evaluating invariant InvNeg failed
+3 states generated 3 distinct states found 0 states left on queue
+trace 3 93952759d5bf8e62544d82d54ed5805c59af7e25cd4034e6ea7995d0b17a947c
+states 3 50a78cd99f57b7a85b326cf2fa0309ae8b1170ed4fa0bbbf6055885b40f276be
+edges 2 7d2c7589efb24140d2be123a3433e8ff8c2f1e39f974de38dc1195bec929e9a3
+messages 4 a3e10c105585cca49ef5b1e393076274cf3a47b35486018049addcb4a59ab27c
+errors 2 612dd2f09f1e0c6b552f41c2f707d11ad8449e9509bf908a3a2588983f7ad732

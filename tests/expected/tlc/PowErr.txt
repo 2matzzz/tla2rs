@@ -1,0 +1,10 @@
+key 1159b5a920d4a52739688bb1665a41321249130ff241ba27f63edb141dc68107
+tlc Version 2.19
+rc 76
+Evaluating invariant InvZero failed
+3 states generated 3 distinct states found 0 states left on queue
+trace 3 93952759d5bf8e62544d82d54ed5805c59af7e25cd4034e6ea7995d0b17a947c
+states 3 50a78cd99f57b7a85b326cf2fa0309ae8b1170ed4fa0bbbf6055885b40f276be
+edges 2 7d2c7589efb24140d2be123a3433e8ff8c2f1e39f974de38dc1195bec929e9a3
+messages 3 79dcd3026616d76eccb3ea7fc91c6a09b168028f5a1272c5b3c3fcc3400d1abf
+errors 2 854fa6a2bae5273056706c92ef65684b272048cfce86aa806bce98442c935c45

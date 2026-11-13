@@ -618,10 +618,14 @@ impl ConstEval<'_> {
                 }
                 ("^", [a, b]) => {
                     let (a, b) = (self.eval(a, env)?.as_int()?, self.eval(b, env)?.as_int()?);
+                    // TLC's messages (Naturals.Expt), and its overflow beyond 32 bits
                     if b < 0 {
-                        return Err(format!("{a}^{b}: the exponent must be a natural number"));
+                        return Err(format!("The second argument of ^ should be a natural number, but instead it is:\n{b}"));
                     }
-                    Value::Int(int_pow(a, b).ok_or(format!("{a}^{b} overflows"))?)
+                    if a == 0 && b == 0 {
+                        return Err("0^0 is undefined.".into());
+                    }
+                    Value::Int(int_pow(a, b).filter(|v| i32::try_from(*v).is_ok()).ok_or(format!("Overflow when computing {a}^{b}"))?)
                 }
                 ("Assert", [p, m]) => {
                     if !self.eval(p, env)?.as_bool()? {
