@@ -43,6 +43,25 @@ if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*rsargs[
   read -r -a more <<< "${a#*rsargs}"
   rsonly+=("${more[@]}")
 fi
+# A cfg line like `\* crosscheck: args -continue` passes those of TLC's options to both TLC and
+# tla2rs (see "TLC's options" in README.md)
+if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*args[[:space:]].*' "$cfg"); then
+  read -r -a more <<< "${a#*args}"
+  extra+=("${more[@]}")
+fi
+# With TLC's `-dump [dot,...] FILE`, that file is compared instead of the state graph (TLC writes
+# only one dump), and with `-view` the counterexample is read as TLC prints it then (see
+# src/options.rs). TLC adds the extension .dump or .dot when the name lacks it
+user_dump=""; view=0
+for ((k = 0; k < ${#extra[@]}; k++)); do
+  case "${extra[k]}" in
+    -view) view=1 ;;
+    -dump)
+      v="${extra[k + 1]:-}"
+      if [[ "$v" == dot || "$v" == dot,* ]]; then user_dump="${extra[k + 2]:-}"; [[ "$user_dump" == *.dot ]] || user_dump="$user_dump.dot"
+      else user_dump="$v"; [[ "$user_dump" == *.dump ]] || user_dump="$user_dump.dump"; fi ;;
+  esac
+done
 # CROSSCHECK_RSARGS does the same (scripts/corpus.sh passes the rsargs= of tests/corpus.txt this way)
 if [[ -n "${CROSSCHECK_RSARGS:-}" ]]; then
   read -r -a more <<< "$CROSSCHECK_RSARGS"
@@ -105,8 +124,9 @@ summarize() {
   # one worker they are deterministic (see "Messages and printed lines" in CLAUDE.md)
   local counts
   counts=$(grep -oE '[0-9,]+ states generated, [0-9,]+ distinct states found(, [0-9,]+ states left on queue)?' "$f" | tail -1 | tr -d ',' || true)
-  local trace
-  trace=$("$bin" --trace "$f" || echo "trace unreadable")
+  local trace mode=--trace
+  [[ $view == 0 ]] || mode=--trace-view
+  trace=$("$bin" $mode "$f" || echo "trace unreadable")
   # A liveness counterexample (lasso) depends on TLC's random fingerprint polynomial, so it is not
   # compared with TLC's; check_lasso checks tla2rs's instead
   [[ $temporal == 1 ]] && trace="trace lasso"
@@ -126,6 +146,7 @@ summarize() {
 tlc_key() {
   { echo "v5 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
     [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
+    [[ -z "$user_dump" && $view == 0 ]] || shasum -a 256 "$root/src/options.rs" | cut -d' ' -f1
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
 }
 expected=""
@@ -165,9 +186,12 @@ run_tlc() {
   set_tlc_cp
   # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
   mkdir -p "$work/jtmp"
-  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 -dump dot tlc.dot -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  local dump=(-dump dot tlc.dot)
+  [[ -z "$user_dump" ]] || dump=()
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 ${dump[@]+"${dump[@]}"} -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  [[ -z "$user_dump" ]] || mv "$user_dump" tlc.userdump 2> /dev/null || true
   a="$(summarize tlc.out)
-$(graph tlc.dot)
+$(graphs tlc)
 $(messages tlc.out)"
 }
 # The state graph reduced to hashes of its states and its edges (see src/graph.rs).
@@ -175,6 +199,10 @@ $(messages tlc.out)"
 # prints them in canonical form, for diffing), and the outputs as DIR/<cfg name>.{tlc,rs}.out
 # (`tla2rs --messages-text` and `--trace-text` print their canonical forms).
 graph() { "$bin" --graph "$1" || echo "graph unreadable"; }
+# The state graph, or the file of the cfg's own -dump
+graphs() {
+  if [[ -n "$user_dump" ]]; then "$bin" --dump "$1.userdump" || echo "dump unreadable"; else graph "$1.dot"; fi
+}
 # The messages and printed lines, and the error lines among them, reduced to hashes (see
 # src/messages.rs)
 messages() { "$bin" --messages "$1" || echo "messages unreadable"; }
@@ -233,7 +261,10 @@ else
   run_tlc
 fi
 s1=$(date +%s.%N)
-"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 -dumpgraph rs.dot -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
+rs_dump=(-dumpgraph rs.dot)
+[[ -z "$user_dump" ]] || rs_dump=()
+"$bin" "$t" -config "$c" -o "$work/gen" -workers 1 ${rs_dump[@]+"${rs_dump[@]}"} -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
+[[ -z "$user_dump" ]] || mv "$user_dump" rs.userdump 2> /dev/null || true
 s2=$(date +%s.%N)
 # When a set or sequence outgrew the capacity the checker was built with, or the checker made
 # strings in another order than they were numbered in, tla2rs built it again and checked from the
@@ -257,7 +288,7 @@ fi
 
 keep_graph rs.dot rs
 b="$(summarize rs.out)
-$(graph rs.dot)
+$(graphs rs)
 $(messages rs.out)"
 # If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
 if [[ -z "$(echo "$a" | head -1)" ]]; then
@@ -313,7 +344,8 @@ if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
     echo "  LASSO NOT CHECKED: $(grep -m1 'lasso check is not written' rs.out || echo 'the checker wrote no lasso check')"
     exit 1
   fi
-  n_lasso=$(grep -cE '^State [0-9]+: <' rs.out || true)
+  # The states of the lasso (with -continue, the behaviors to violated invariants come before it)
+  n_lasso=$(sed -n '/^Error: Temporal propert/,$p' rs.out | grep -cE '^State [0-9]+: <' || true)
   # TLC's answer depends only on the jar, the generated check and the spec's modules, so a
   # confirmation is kept in target/crosscheck/lasso under a hash of those, and TLC runs again only
   # when tla2rs writes a different lasso (CROSSCHECK_NO_CACHE=1 always runs it)

@@ -1,10 +1,12 @@
 //! tla2rs: compiles a TLA+ spec into an explicit-state model checker in Rust, specialized to that
 //! spec.
 //!
-//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]
+//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-continue] [-difftrace] [-view] [-nowarning] [-dump [dot[,actionlabels]] FILE] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]
 //!   tla2rs --graph FILE | --graph-text FILE
 //!   tla2rs --trace FILE | --trace-text FILE
 //!   tla2rs --messages FILE | --messages-text FILE
+//!   tla2rs --dump FILE | --dump-text FILE
+//!   tla2rs --trace-view FILE | --trace-view-text FILE
 //!
 //! Builds the generated crate with `cargo build --release` and runs it. With --emit-only, it only
 //! writes the Rust code. `--graph` reduces a state graph written by `-dumpgraph` or by TLC's
@@ -27,6 +29,7 @@ mod std_modules;
 mod live;
 mod ltl;
 mod metal;
+mod options;
 mod parser;
 mod pcal;
 mod ppr;
@@ -71,10 +74,12 @@ fn build_key(dir: &Path) -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]");
+    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-continue] [-difftrace] [-view] [-nowarning] [-dump [dot[,actionlabels]] FILE] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]");
     eprintln!("       tla2rs --graph FILE | --graph-text FILE");
     eprintln!("       tla2rs --trace FILE | --trace-text FILE");
     eprintln!("       tla2rs --messages FILE | --messages-text FILE");
+    eprintln!("       tla2rs --dump FILE | --dump-text FILE");
+    eprintln!("       tla2rs --trace-view FILE | --trace-view-text FILE");
     eprintln!("       tla2rs --pcal-text FILE");
     exit(2)
 }
@@ -90,6 +95,12 @@ fn main() {
         }
         if mode == "--messages" || mode == "--messages-text" {
             exit(messages::main(mode, path));
+        }
+        if mode == "--dump" || mode == "--dump-text" {
+            exit(options::main(mode, path));
+        }
+        if mode == "--trace-view" || mode == "--trace-view-text" {
+            exit(options::trace_view(mode, path));
         }
         if mode == "--pcal-text" {
             exit(pcal::main(path));
@@ -142,6 +153,47 @@ fn main() {
                 pass.push(args.get(i).unwrap_or_else(|| usage()).clone());
             }
             "-notrace" => pass.push("-notrace".into()),
+            // TLC's options, with TLC's meaning and output (see README.md, "TLC's options")
+            "-continue" | "-difftrace" | "-view" | "-nowarning" => pass.push(args[i].clone()),
+            // TLC's `-dump FILE` lists the distinct states; `-dump dot[,options] FILE` writes the
+            // state graph. TLC adds the extension .dump or .dot when the name lacks it
+            "-dump" => {
+                i += 1;
+                let a = args.get(i).unwrap_or_else(|| usage());
+                let dot = a == "dot" || a.starts_with("dot,");
+                if dot {
+                    for o in a.split(',').skip(1) {
+                        match o {
+                            "actionlabels" => pass.push("-dumplabels".into()),
+                            // Snapshots of the graph written while the search runs: the final file
+                            // is the same, with the edges as with any option
+                            "snapshot" => pass.push("-dumpattrs".into()),
+                            _ => {
+                                eprintln!("tla2rs: -dump dot,{o} is not supported (only actionlabels and snapshot)");
+                                exit(2);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                let f = if dot { args.get(i).unwrap_or_else(|| usage()) } else { a };
+                let ext = if dot { ".dot" } else { ".dump" };
+                let f = if f.ends_with(ext) { f.clone() } else { format!("{f}{ext}") };
+                pass.push(if dot { "-dumpgraph" } else { "-dumpstates" }.into());
+                pass.push(f);
+            }
+            // TLC's options that change only its files on disk or its memory and fingerprint
+            // tuning, not what it reports: accepted and ignored
+            "-cleanup" | "-gzip" | "-modelcheck" => {}
+            "-metadir" | "-checkpoint" | "-fp" | "-fpbits" | "-fpmem" | "-lncheck" => {
+                i += 1;
+                args.get(i).unwrap_or_else(|| usage());
+            }
+            "-simulate" | "-seed" | "-aril" | "-depth" | "-dfid" | "-generateSpecTE" | "-tool" | "-debug" | "-recover"
+            | "-coverage" | "-terse" | "-userFile" | "-maxSetSize" => {
+                eprintln!("tla2rs: TLC's option {} is not supported (see README.md, \"TLC's options\")", args[i]);
+                exit(2);
+            }
             "-workers" => {
                 i += 1;
                 pass.push("-workers".into());
@@ -204,6 +256,9 @@ fn main() {
                 if let Some(f) = pass.iter().position(|a| a == "-dumpgraph").and_then(|i| pass.get(i + 1)) {
                     let empty = "strict digraph DiskGraph {\nnodesep=0.35;\nsubgraph cluster_graph {\ncolor=\"white\";\n}\n}";
                     std::fs::write(f, empty).expect("write the state graph");
+                }
+                if let Some(f) = pass.iter().position(|a| a == "-dumpstates").and_then(|i| pass.get(i + 1)) {
+                    std::fs::write(f, "").expect("write the states");
                 }
             }
             println!("{msg}");

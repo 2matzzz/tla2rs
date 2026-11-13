@@ -637,6 +637,63 @@ fn tlc_print(line: String) {
 /// What starts a held line that is one of TLC's warnings (see `put_line`)
 const WARNING_MARK: char = '\u{2}';
 
+// TLC's options that change what the checker prints or whether it stops (set in `main`):
+// -continue, -difftrace, -view, -nowarning
+static CONTINUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DIFFTRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NOWARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn flag(f: &std::sync::atomic::AtomicBool) -> bool {
+    f.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keeps the reports of violations found while the search goes on (-continue) whole when several
+/// workers find one at once
+static REPORTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The text of a state in a behavior: its view with -view (and a VIEW), only the variables that
+/// changed since `prev` with -difftrace, otherwise the state. TLC prints a view without the empty
+/// line after it
+fn trace_text(s: &State, prev: Option<&State>) -> String {
+    if flag(&VIEW_TRACE) && HAS_VIEW {
+        return show_view(s);
+    }
+    let Some(p) = prev.filter(|_| flag(&DIFFTRACE)) else { return format!("{}\n", show(s)) };
+    let parts = |t: String| {
+        let mut v: Vec<String> = vec![];
+        for line in t.split('\n') {
+            match v.last_mut() {
+                Some(x) if !line.starts_with("/\\ ") => {
+                    x.push('\n');
+                    x.push_str(line);
+                }
+                _ => v.push(line.to_string()),
+            }
+        }
+        v
+    };
+    let (a, b) = (parts(show(p)), parts(show(s)));
+    let changed: Vec<&String> = b.iter().enumerate().filter(|(i, x)| a.get(*i) != Some(*x)).map(|(_, x)| x).collect();
+    let mut o = String::new();
+    for x in changed {
+        o += x;
+        o.push('\n');
+    }
+    o
+}
+
+/// The state before step `i` (from 0) of a behavior of `len` states, for -difftrace: TLC 2.19
+/// prints the last state of a behavior of three states or more in full (measured)
+fn diff_prev<'a>(i: usize, len: usize, prev: Option<&'a State>) -> Option<&'a State> {
+    prev.filter(|_| !(len >= 3 && i + 1 == len))
+}
+
+/// Prints `State n: <action>` and the state (see `trace_text`)
+fn print_step(head: &str, s: &State, prev: Option<&State>) {
+    println!("{head}\n{}", trace_text(s, prev));
+}
+
 /// TLC's warnings printed so far, as printed (TLC prints a warning only when it has not printed
 /// that text before, and the first warning of a run carries the note `NOWARNING`), and whether
 /// one was printed. Starts from the warnings among STARTUP_PRINTS
@@ -650,6 +707,9 @@ fn put_line(l: &str) {
         println!("{l}");
         return;
     };
+    if flag(&NOWARN) {
+        return;
+    }
     let mut g = WARNED.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, any) = g.get_or_insert_with(|| {
         let mut seen = std::collections::HashSet::new();
@@ -908,7 +968,7 @@ fn eval_again_prints(s: &State, e: &EvalErr) {
 /// expanded (the states after it are successors), `extra` one more state after the trace
 fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)>) -> usize {
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
-    let state = |n: usize, (s, l): &(State, u32)| println!("State {n}: <{}>\n{}\n", name(*l), show(s));
+    let state = |n: usize, (s, l): &(State, u32), prev: Option<&State>| print_step(&format!("State {n}: <{}>", name(*l)), s, prev);
     if k >= 2 {
         let mut v = vec![];
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
@@ -917,14 +977,16 @@ fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)
         }
     }
     println!("Error: The behavior up to this point is:");
+    let len = trace.len() + extra.is_some() as usize;
+    let prev = |i: usize| diff_prev(i, len, (i > 0).then(|| &trace[i - 1].0));
     for (i, st) in trace.iter().enumerate().take(k.saturating_sub(1)) {
-        state(i + 1, st);
+        state(i + 1, st, prev(i));
     }
     for i in k.max(1) - 1..trace.len() {
         if i > 0 {
             step_prints(&trace[i - 1].0, &trace[i].0);
         }
-        state(i + 1, &trace[i]);
+        state(i + 1, &trace[i], prev(i));
     }
     let mut n = trace.len();
     if let Some(x) = extra {
@@ -932,7 +994,7 @@ fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)
             step_prints(last, &x.0);
         }
         n += 1;
-        state(n, &x);
+        state(n, &x, diff_prev(n - 1, len, trace.last().map(|t| &t.0)));
     }
     n
 }
@@ -1108,14 +1170,18 @@ impl Graph {
         }
         println!("Error: The behavior up to this point is:");
         let mut n = 0;
+        let mut prev: Option<State> = None;
+        let len = ids.len() + extra.is_some() as usize;
         for id in ids.iter().rev() {
             n += 1;
             let l = self.parent[*id as usize].1;
             let name = if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
-            println!("State {n}: <{name}>\n{}\n", show(&unpack(&self.states[*id as usize])));
+            let s = unpack(&self.states[*id as usize]);
+            print_step(&format!("State {n}: <{name}>"), &s, diff_prev(n - 1, len, prev.as_ref()));
+            prev = Some(s);
         }
         if let Some((s, l)) = extra {
-            println!("State {}: <{}>\n{}\n", n + 1, LABELS[l as usize], show(s));
+            print_step(&format!("State {}: <{}>", n + 1, LABELS[l as usize]), s, diff_prev(n, len, prev.as_ref()));
         }
     }
 }
@@ -1399,13 +1465,13 @@ fn expand_one_succ(
         let act = check_action_props(&s, &t);
         let Some(w) = pack(&t) else {
             if dumping() {
-                dump_unpacked(&mut c.dump, sfp_dump, &t);
+                dump_unpacked(&mut c.dump, sfp_dump, &t, l);
             }
             return Some(Found::Succ(head as u32, t, l, pack_failed(0, t, l).msg, true));
         };
         let tfp = state_fp(&t, &w);
         if dumping() {
-            dump_edge(&mut c.dump, sfp_dump, &tfp);
+            dump_edge(&mut c.dump, sfp_dump, &tfp, l);
         }
         if LIVENESS && tfp != sfp {
             // Its atoms are evaluated with fairness, after the successors (as TLC does)
@@ -1423,6 +1489,11 @@ fn expand_one_succ(
             held.flush(k as u32 + 1);
             match eval_invariants(&t) {
                 Ok(None) => {}
+                Ok(Some(inv)) if flag(&CONTINUE) => {
+                    let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
+                    report_msg(&SMsg::Inv(inv), true);
+                    g.print_trace(head as u32, Some((&t, l)), false);
+                }
                 Ok(Some(inv)) => return Some(Found::New(me, c.states.len() - 1, SMsg::Inv(inv))),
                 Err((inv, e)) => return Some(Found::New(me, c.states.len() - 1, SMsg::InvEval(inv, e))),
             }
@@ -1432,6 +1503,12 @@ fn expand_one_succ(
             }
         }
         if let Some(m) = act {
+            if flag(&CONTINUE) && matches!(m, SMsg::Action(_)) {
+                let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
+                report_msg(&m, true);
+                g.print_trace(head as u32, Some((&t, l)), false);
+                continue;
+            }
             c.unqueued = new;
             return Some(Found::Succ(head as u32, t, l, m, true));
         }
@@ -1588,7 +1665,17 @@ fn dumping() -> bool {
     DUMPING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn dump_open(path: &std::path::Path) {
+/// With -dumpstates FILE (TLC's `-dump FILE`), the file lists the distinct states in the order
+/// found, as `State N:` and the state, instead of a graph
+static DUMP_STATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DUMP_NO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// With -dumplabels (TLC's `-dump dot,actionlabels`), each edge is labelled with its action. With
+/// -dumpattrs (TLC's `-dump dot,` and any other option), each edge has the attributes of a label,
+/// with an empty one
+static DUMP_LABELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DUMP_ATTRS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn dump_open(path: &std::path::Path, states: bool) {
     use std::io::Write;
     let mut w = match std::fs::File::create(path) {
         Ok(f) => std::io::BufWriter::new(f),
@@ -1597,7 +1684,11 @@ fn dump_open(path: &std::path::Path) {
             std::process::exit(2);
         }
     };
-    let _ = w.write_all(b"strict digraph DiskGraph {\n");
+    if states {
+        DUMP_STATES.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        let _ = w.write_all(b"strict digraph DiskGraph {\n");
+    }
     *DUMP.lock().unwrap() = Some(w);
     DUMPING.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1621,7 +1712,8 @@ fn dump_finish() {
     use std::io::Write;
     if DUMPING.swap(false, std::sync::atomic::Ordering::Relaxed) {
         if let Some(mut w) = DUMP.lock().unwrap().take() {
-            if w.write_all(b"}\n").and_then(|_| w.flush()).is_err() {
+            let end: &[u8] = if flag(&DUMP_STATES) { b"" } else { b"}\n" };
+            if w.write_all(end).and_then(|_| w.flush()).is_err() {
                 eprintln!("cannot write the state graph");
             }
         }
@@ -1637,11 +1729,16 @@ fn exit(code: i32) -> ! {
 
 /// A state's text as a dot label, escaped as TLC escapes it
 fn dot_label(s: &State) -> String {
-    show(s).replace('\\', "\\\\").replace('"', "\\\"").trim_matches(|c| c <= ' ').replace('\n', "\\n")
+    (if flag(&VIEW_TRACE) && HAS_VIEW { show_view(s) } else { show(s) }).replace('\\', "\\\\").replace('"', "\\\"").trim_matches(|c| c <= ' ').replace('\n', "\\n")
 }
 
 fn dump_node(buf: &mut String, id: &dyn std::fmt::Display, s: &State, init: bool) {
     use std::fmt::Write;
+    if flag(&DUMP_STATES) {
+        let n = DUMP_NO.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let _ = writeln!(buf, "State {n}:\n{}\n", show(s));
+        return;
+    }
     let _ = if init {
         writeln!(buf, "{id} [label=\"{}\",style = filled]", dot_label(s))
     } else {
@@ -1649,16 +1746,25 @@ fn dump_node(buf: &mut String, id: &dyn std::fmt::Display, s: &State, init: bool
     };
 }
 
-fn dump_edge(buf: &mut String, from: Fp, to: &dyn std::fmt::Display) {
+/// An edge, by the action labelled `l` (u32::MAX: unknown)
+fn dump_edge(buf: &mut String, from: Fp, to: &dyn std::fmt::Display, l: u32) {
     use std::fmt::Write;
-    let _ = writeln!(buf, "{from} -> {to};");
+    if flag(&DUMP_STATES) {
+        return;
+    }
+    if flag(&DUMP_ATTRS) {
+        let name = LABELS.get(l as usize).filter(|_| flag(&DUMP_LABELS)).map_or("", |n| n.split(" line ").next().unwrap_or(""));
+        let _ = writeln!(buf, "{from} -> {to} [label=\"{name}\",color=\"black\",fontcolor=\"black\"];");
+    } else {
+        let _ = writeln!(buf, "{from} -> {to};");
+    }
 }
 
 /// An edge to a successor that tla2rs cannot pack. TLC can represent it, and it is new to TLC (an
 /// earlier one would have stopped tla2rs), so it gets a node of its own.
-fn dump_unpacked(buf: &mut String, from: Fp, t: &State) {
+fn dump_unpacked(buf: &mut String, from: Fp, t: &State, l: u32) {
     let id = format!("u{}", DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    dump_edge(buf, from, &id);
+    dump_edge(buf, from, &id, l);
     dump_node(buf, &id, t, false);
 }
 
@@ -1669,7 +1775,7 @@ fn dump_unrepresentable(from: Fp) {
     if dumping() {
         let mut buf = String::new();
         let id = format!("u{}", DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        dump_edge(&mut buf, from, &id);
+        dump_edge(&mut buf, from, &id, u32::MAX);
         use std::fmt::Write;
         let _ = writeln!(buf, "{id} [label=\"(a successor that tla2rs cannot represent)\"];");
         dump_write(&mut buf);
@@ -1686,10 +1792,10 @@ fn dump_fp(t: &State) -> Option<Fp> {
 }
 
 /// Records the edge s -> t for a successor in the model
-fn dump_succ(buf: &mut String, sfp: Fp, t: &State) {
+fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
     match dump_fp(t) {
-        Some(fp) => dump_edge(buf, sfp, &fp),
-        None => dump_unpacked(buf, sfp, t),
+        Some(fp) => dump_edge(buf, sfp, &fp, l),
+        None => dump_unpacked(buf, sfp, t, l),
     }
 }
 
@@ -1705,19 +1811,19 @@ fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
     let _ = successors(s, &mut buf, true);
     let mut out = String::new();
     let mut added = std::collections::HashSet::new();
-    for (t, _) in buf {
+    for (t, l) in buf {
         let Ok(inm) = std::panic::catch_unwind(|| in_model(s, &t)) else { break };
         let mut unseen = true;
         if inm {
             match std::panic::catch_unwind(|| dump_fp(&t)) {
                 Ok(Some(fp)) => {
-                    dump_edge(&mut out, sfp, &fp);
+                    dump_edge(&mut out, sfp, &fp, l);
                     unseen = !visited(fp) && added.insert(fp);
                     if unseen {
                         dump_node(&mut out, &fp, &t, false);
                     }
                 }
-                Ok(None) => dump_unpacked(&mut out, sfp, &t),
+                Ok(None) => dump_unpacked(&mut out, sfp, &t, l),
                 Err(_) => break,
             }
         }
@@ -1734,8 +1840,15 @@ fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
 fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().collect();
+    for (f, a) in [(&CONTINUE, "-continue"), (&DIFFTRACE, "-difftrace"), (&VIEW_TRACE, "-view"), (&NOWARN, "-nowarning")] {
+        f.store(args.iter().any(|x| x == a), std::sync::atomic::Ordering::Relaxed);
+    }
+    DUMP_LABELS.store(args.iter().any(|x| x == "-dumplabels"), std::sync::atomic::Ordering::Relaxed);
+    DUMP_ATTRS.store(args.iter().any(|x| x == "-dumplabels" || x == "-dumpattrs"), std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = args.iter().position(|a| a == "-dumpgraph").and_then(|i| args.get(i + 1)) {
-        dump_open(std::path::Path::new(p));
+        dump_open(std::path::Path::new(p), false);
+    } else if let Some(p) = args.iter().position(|a| a == "-dumpstates").and_then(|i| args.get(i + 1)) {
+        dump_open(std::path::Path::new(p), true);
     }
     let opt = Opt {
         check_deadlock: CHECK_DEADLOCK && !args.iter().any(|a| a == "-deadlock"),
@@ -1770,7 +1883,7 @@ fn main() {
     // suppressed above).
     // What TLC prints when it starts: Print and PrintT in the constant definitions, its warnings,
     // Print and PrintT in the ASSUMEs
-    for l in STARTUP_PRINTS {
+    for l in if flag(&NOWARN) { STARTUP_PRINTS_NOWARN } else { STARTUP_PRINTS } {
         println!("{l}");
     }
     str_order_start(opt.workers);
@@ -1784,7 +1897,7 @@ fn main() {
         }
         if LIVENESS {
             run_liveness(&opt);
-        } else if opt.batched && !PRINT_ORDER && !str_on() {
+        } else if opt.batched && !PRINT_ORDER && !str_on() && !flag(&CONTINUE) && !flag(&DUMP_STATES) {
             run_safety_batched(&opt);
         } else {
             run_safety(&opt);
@@ -2018,8 +2131,16 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         match eval_invariants(&s) {
             Ok(None) => {}
             Ok(Some(inv)) => {
-                println!("Error: Invariant {inv} is violated by the initial state:\n{}", show(&s));
-                exit(12);
+                // With -continue, reported once (initial_states also runs to rebuild a behavior)
+                if flag(&CONTINUE) {
+                    if !INITS_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
+                        println!("Error: Invariant {inv} is violated by the initial state:\n{}\n", show(&s));
+                    }
+                } else {
+                    println!("Error: Invariant {inv} is violated by the initial state:\n{}", show(&s));
+                    exit(12);
+                }
             }
             Err((inv, e)) => {
                 stop(e, &format!("evaluating invariant {inv} on an initial state"), Some(&s), generated, out.len())
@@ -2044,6 +2165,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         }
     }
     held.flush(u32::MAX);
+    INITS_REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = failed {
         let e = describe_panic(p);
         // TLC shows the state with the variables it leaves unassigned null, and no counts
@@ -2054,6 +2176,17 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         stop(e, "computing the initial states", None, generated, out.len());
     }
     (out, generated)
+}
+
+/// Whether the violations of the initial states have been reported (-continue)
+static INITS_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// With -continue, reports a violation of an invariant or an action property found while the
+/// search goes on, with the behavior to it, as TLC does
+fn report_continued(seen: &dyn Visited, f: &SFound) {
+    let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
+    report_msg(&f.msg, f.in_model);
+    report_trace(seen, f);
 }
 
 /// A detected error. The trace is shown by following fingerprints back from `fp`; if `extra` is
@@ -2207,6 +2340,8 @@ struct SWork {
     dump: String,
     /// The lines printed while computing the successors (PRINT_ORDER)
     held: Held,
+    /// With -continue, the successors (index in `buf`) that violate an action property
+    acts: Vec<(usize, &'static str)>,
 }
 
 /// Expands a single state, pushing newly found states onto c.next.
@@ -2222,6 +2357,7 @@ fn expand_safety_one(
     let s = unpack(w);
     ws.cand.clear();
     ws.dpend.clear();
+    ws.acts.clear();
     let cap = Capturing::start();
     let failed = successors(&s, &mut ws.buf, careful);
     ws.held = cap.finish();
@@ -2280,12 +2416,19 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
         }
         if dumping() {
             let mut e = String::new();
-            dump_succ(&mut e, sfp, t);
+            dump_succ(&mut e, sfp, t, l);
             ws.dpend.push((i, e));
         }
         // A violated action property is reported after t is added (if new) and its invariants are
         // checked, as TLC does: t stays a candidate, and the search stops after it.
-        let act = check_action_props(s, t).map(|m| SFound::new(sfp, Some((*t, l)), m));
+        let act = match check_action_props(s, t) {
+            // With -continue, reported in `insert_candidates` and the search goes on
+            Some(SMsg::Action(name)) if flag(&CONTINUE) => {
+                ws.acts.push((i, name));
+                None
+            }
+            m => m.map(|m| SFound::new(sfp, Some((*t, l)), m)),
+        };
         // With a VIEW, most successors are duplicates, so only new ones are packed. An out-of-type
         // duplicate then goes unreported, as TLC checks invariants only on new states.
         let (tfp, tw) = if HAS_VIEW {
@@ -2320,9 +2463,27 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
 /// Adds the candidates to the visited set in order and queues the new ones. Stops at a new state
 /// that is an error and returns it. `base` is c.generated before the first successor.
 fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+    // With -continue, the violations of action properties, each after its successor is checked
+    let mut acts = 0;
+    let report_acts = |upto: usize, acts: &mut usize, ws: &SWork| {
+        while let Some(&(j, name)) = ws.acts.get(*acts).filter(|(j, _)| *j < upto) {
+            report_continued(seen, &SFound::new(sfp, Some(ws.buf[j]), SMsg::Action(name)));
+            *acts += 1;
+        }
+    };
+    let r = insert_candidates_in(base, sfp, seen, c, ws, &mut |upto, ws| report_acts(upto, &mut acts, ws));
+    if r.is_none() {
+        report_acts(usize::MAX, &mut acts, ws);
+    }
+    r
+}
+
+fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork, acts: &mut dyn FnMut(usize, &SWork)) -> Option<SFound> {
     for k in 0..ws.cand.len() {
         let (i, tfp, tw) = ws.cand[k];
+        acts(i, ws);
         if !seen.insert_with(tfp, sfp) {
+            acts(i + 1, ws);
             continue;
         }
         c.generated = base + i as u64 + 1;
@@ -2337,10 +2498,12 @@ fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut
         ws.held.flush(i as u32 + 1);
         match eval_invariants(t) {
             Ok(None) => {}
+            Ok(Some(inv)) if flag(&CONTINUE) => report_continued(seen, &SFound::new(tfp, None, SMsg::Inv(inv))),
             Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
             Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
         c.next.push((tw, tfp));
+        acts(i + 1, ws);
     }
     None
 }
@@ -2362,6 +2525,7 @@ fn expand_safety(
         dpend: vec![],
         dump: String::new(),
         held: Held::default(),
+        acts: vec![],
     };
     for i in lo..hi {
         if stop.load(Relaxed) {
@@ -2475,13 +2639,16 @@ fn print_states(trace: &[(State, u32)], extra: Option<(State, u32)>) -> usize {
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     println!("Error: The behavior up to this point is:");
     let mut n = 0;
+    let mut prev: Option<&State> = None;
+    let len = trace.len() + extra.is_some() as usize;
     for (s, l) in trace {
         n += 1;
-        println!("State {n}: <{}>\n{}\n", name(*l), show(s));
+        print_step(&format!("State {n}: <{}>", name(*l)), s, diff_prev(n - 1, len, prev));
+        prev = Some(s);
     }
     if let Some((s, l)) = extra {
         n += 1;
-        println!("State {n}: <{}>\n{}\n", name(l), show(&s));
+        print_step(&format!("State {n}: <{}>", name(l)), &s, diff_prev(n - 1, len, prev));
     }
     n
 }
@@ -2652,6 +2819,7 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if let SMsg::Eval(e) | SMsg::InvEval(_, e) | SMsg::ActionEval(_, e) = &f.msg {
         fp_note(e);
     }
+    let code = continued_inv_eval(&f.msg, f.in_model).unwrap_or(code);
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
     }
@@ -2664,6 +2832,17 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     }
     println!("{generated} states generated, {distinct} distinct states found, {left} states left on queue.");
     exit(code);
+}
+
+/// With -continue, TLC reports a failed invariant as without it, then stops with an exception it
+/// did not expect (measured on TLC 2.19): prints that and returns its exit code
+fn continued_inv_eval(msg: &SMsg, in_model: bool) -> Option<i32> {
+    let SMsg::InvEval(_, e) = msg else { return None };
+    if !flag(&CONTINUE) || !in_model {
+        return None;
+    }
+    report_eval_as(e, true);
+    Some(255)
 }
 
 fn finish(opt: &Opt, t0: std::time::Instant, generated: u64, distinct: u64, depth: u32) {
@@ -3026,7 +3205,7 @@ fn collect_phase(
                     continue;
                 }
                 if dumping() {
-                    dump_succ(&mut out.dump, *sfp, &t);
+                    dump_succ(&mut out.dump, *sfp, &t, l);
                 }
                 // As in `fingerprint_successors`, a violated action property stops the search after
                 // t is collected (and its invariants are checked)
@@ -3467,7 +3646,7 @@ fn run_liveness(opt: &Opt) {
                     if let SMsg::InvEval(_, e) = &msg {
                         fp_note(e);
                     }
-                    code
+                    continued_inv_eval(&msg, true).unwrap_or(code)
                 }
                 Found::Deadlock(id) => {
                     println!("Error: Deadlock reached.");
@@ -4034,9 +4213,8 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
     // The states shown, for -lassocheck
     let mut texts: Vec<String> = vec![];
     for (i, &(s, l)) in states.iter().enumerate() {
-        let t = show(&s);
-        println!("State {}: <{}>\n{t}\n", i + 1, name(l));
-        texts.push(t);
+        print_step(&format!("State {}: <{}>", i + 1, name(l)), &s, (i > 0).then(|| &states[i - 1].0));
+        texts.push(show(&s));
     }
     match ret {
         None => {

@@ -49,6 +49,12 @@ pub const NOWARNING: &str = "(Use the -nowarning option to disable this warning.
 
 impl Startup {
     pub fn lines(&self) -> Vec<String> {
+        self.lines_with(false)
+    }
+
+    /// The lines, without TLC's warnings that `-nowarning` turns off when `nowarn` (those with its
+    /// note; the PlusCal and SANY warnings stay)
+    pub fn lines_with(&self, nowarn: bool) -> Vec<String> {
         // TLC prints the PlusCal warnings itself, not as the messages its note follows
         let mut v = self.pcal.clone();
         v.extend(self.sany.iter().cloned());
@@ -62,6 +68,9 @@ impl Startup {
                 v.push(l);
                 continue;
             };
+            if nowarn {
+                continue;
+            }
             let text = if seen.is_empty() { format!("{w}\n{NOWARNING}") } else { w.to_string() };
             if seen.insert(text) {
                 v.push(w.to_string());
@@ -1818,6 +1827,7 @@ fn compile_inner(
     writeln!(src, "const NO_NEXT: bool = {};", no_next || actions == 0).unwrap();
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
+    writeln!(src, "static STARTUP_PRINTS_NOWARN: &[&str] = &{:?};", startup.lines_with(true)).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
     // The capacity of a set whose element type has n values (types::set_cap)
     writeln!(src, "const fn set_cap(n: usize) -> usize {{ if SCAP < n {{ SCAP }} else {{ n }} }}").unwrap();
