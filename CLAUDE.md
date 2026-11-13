@@ -984,6 +984,8 @@ Checked by setting the bound to 0 and comparing, at run time, each set enumerate
 
 Not done: a large constant set of another form (a filter, a set of images, a union) is still written out, also where its membership is tested (`x \in {f \in [D -> R] : P}` compares x with each element), and an `\A` over a constant set in an action that assigns variables is unrolled per element.
 
+When compiling, the constant evaluator (`value.rs`, for ASSUMEs and constant definitions) goes through such a set without building it as TLC does: `[D -> R]`, `\X`, `[f : S]` and `SUBSET S` (`BigSet`, from parts that are sets) are enumerated from their parts in `\E`, `\A` and `{x \in S : P}` (`each_elem`), in the order of their values, which is TLC's. Measured on TLC 2.19 (`tests/tlc/BigConst`, `BigConstErr`): of more than its limit of a million elements (its `-maxSetSize`), TLC enumerates them there and in CHOOSE over SUBSET, and stops with "Attempted to construct a set with too many elements (>1000000)." for CHOOSE over the others and for `{e : x \in S}` over any (`TOO_MANY`). A filter of one of these (of any size, but a name a BIND label binds, whose value is kept) is gone through element by element, its condition evaluated as each element is taken, while TLC builds a filter of an interval or of a set it holds element by element first (as the evaluator does). A quantifier over one variable takes the next element before it evaluates its body for one, as TLC does (seen where taking it evaluates a filter's condition that prints). Not done: over several variables (`\E a \in S, b \in T`), TLC varies the first fastest and takes the next combination ahead, while the evaluator varies the last fastest; this shows only where printing or an error depends on the order. `CarTalkPuzzle` `Model_3` (corpus, `skip`) is the case that needed it: `{B \in [1..5 -> 1..121] : ...}` has 121^5 (about 2.6 * 10^10) functions; the ASSUME now evaluates, but the evaluator goes through about 50,000 of them a second (67 million, 0.26%, in the first 22 minutes of a run capped at 30), so it would take about six days; TLC did not finish in 2 hours either.
+
 ### The corpus
 
 The configurations in `tests/tlc/` cover the forms someone thought of. `scripts/corpus.sh` also cross-checks the
@@ -1216,7 +1218,18 @@ others are not). Measured on TLC 2.19 (`tests/tlc/Opt*`):
 - `-dump FILE`: `State N:` per distinct state, numbered when written (TLC's order with one worker, so not with
   `-batched`). `-dump dot,...`: with any option TLC gives each edge `[label="...",color="black",fontcolor="black"]`
   (empty label without `actionlabels`) and adds `{rank = same; ...}` lines, which the comparison ignores. TLC takes
-  only one `-dump`, so `crosscheck.sh` leaves out its own and compares the cfg's file with `tla2rs --dump`
+  only one `-dump`, so `crosscheck.sh` leaves out its own and compares the cfg's file with `tla2rs --dump`.
+  `colorize` (`-dumpcolors`): the edge gets a placeholder (`COLOR_MARK` around its label) that `dump_write` turns into
+  the action's color as it writes the edge to the file, so an edge buffered for a successor TLC never reaches does not
+  number one (measured: TLC numbers by name from 2, in the order first written, `tests/tlc/OptDumpColor-Inv`);
+  `dump_finish` writes the legend in the order of a Java `HashMap<String, _>` (`java_hash_order`: buckets of
+  `String.hashCode` spread, default capacity, resized at 3/4 and on a bucket of more than 8). `options.rs` keeps the
+  colors with the edges and lists the legend in file order
+- `-userFile FILE` (`-userfile`): what Print and PrintT print is kept as the values as TLC shows them, marked
+  (`compile::USER_MARK`, the values separated by `USER_SEP`), and only the standard output pretty-prints them, since
+  TLC writes them to the file as is (measured, `tests/tlc/OptUserFile-Wide`); `user_line` in the checker, and
+  `main.rs` for the lines of a spec TLC refuses before exploring. `crosscheck.sh` compares the file (its lines and
+  their hash)
 
 ## Verification rules
 

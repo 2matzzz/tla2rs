@@ -72,9 +72,9 @@ TLC's meaning, output and exit codes (each is cross-checked against TLC by a con
 | | Options |
 |---|---|
 | Supported from the start | `-config FILE`, `-deadlock`, `-workers N` (`auto` and the default both use every CPU; TLC's default is 1) |
-| Supported now | `-continue`, `-difftrace`, `-view`, `-nowarning`, `-dump FILE`, `-dump dot[,actionlabels][,snapshot] FILE` |
+| Supported now | `-continue`, `-difftrace`, `-view`, `-nowarning`, `-dump FILE`, `-dump dot[,actionlabels][,colorize][,snapshot] FILE`, `-userFile FILE` |
 | Accepted with no effect | `-cleanup`, `-gzip`, `-metadir DIR`, `-checkpoint N`, `-fp N`, `-fpbits N`, `-fpmem X`, `-lncheck S`, `-modelcheck` |
-| Not supported (refused) | `-simulate`, `-depth`, `-seed`, `-aril`, `-dfid`, `-generateSpecTE`, `-tool`, `-debug`, `-recover`, `-coverage`, `-terse`, `-maxSetSize`, `-userFile`, `-dump dot,colorize` |
+| Not supported (refused) | `-simulate`, `-depth`, `-seed`, `-aril`, `-dfid`, `-generateSpecTE`, `-tool`, `-debug`, `-recover`, `-coverage`, `-terse`, `-maxSetSize` |
 
 - `-continue` reports every state that violates an invariant (the first invariant it violates, in the order of the
   cfg) and every step that violates an action property, each with its behavior, and searches on. As in TLC, the run
@@ -88,9 +88,14 @@ TLC's meaning, output and exit codes (each is cross-checked against TLC by a con
   properties). The parser's warnings and the PlusCal checksum warning stay, as in TLC
 - `-dump FILE` writes the distinct states in the order found (`State N:` and the state); `-dump dot FILE` writes the
   state graph (as `-dumpgraph`), `actionlabels` labels each edge with its action, and `snapshot` gives the edges the
-  attributes TLC then writes (TLC's snapshots during the run are not written). As in TLC, `.dump` or `.dot` is added
-  to a name without it. With one worker the order of `-dump FILE` is TLC's; `-dump FILE` and `-continue` run without
-  `-batched`
+  attributes TLC then writes (TLC's snapshots during the run are not written). `colorize` gives each edge the color
+  of its action and ends the graph with a legend of the actions, as TLC does: the colors are numbered from 2 by
+  action name, in the order an edge of each is first written, and the legend lists them in the order TLC's Java hash
+  map holds them. As in TLC, `.dump` or `.dot` is added to a name without it. With one worker the order of `-dump
+  FILE` and the colors are TLC's; `-dump FILE` and `-continue` run without `-batched`
+- `-userFile FILE` writes the lines the spec prints (Print and PrintT, also in ASSUMEs and constant definitions) to
+  FILE instead of the standard output, which keeps TLC's own messages and warnings. As in TLC, each value is written
+  as is on one line, without the pretty-printing of the standard output
 - The options accepted with no effect change only TLC's files on disk (`-cleanup`, `-gzip`, `-metadir`,
   `-checkpoint`; TLC also prints a line at each checkpoint, every 30 minutes by default, which tla2rs does not),
   its fingerprints and their memory (`-fp`, `-fpbits`, `-fpmem`; tla2rs has fingerprints of its own), or when it
@@ -105,8 +110,7 @@ TLC's meaning, output and exit codes (each is cross-checked against TLC by a con
   constants once and fuses expressions, so the counts depend on TLC's evaluator. `-terse` prints sets in the lazy
   form TLC holds them in (`SUBSET S`, `[S -> T]`), which a compiled checker does not keep (as with intervals, see
   Limitations). `-maxSetSize` bounds the sets TLC's interpreter enumerates, and where its error appears depends on
-  where the interpreter enumerates. `-userFile` (the spec's printed lines to a file) and `-dump dot,colorize`
-  (colors per action and a legend in the order of a Java hash map) are not done yet
+  where the interpreter enumerates
 
 ## Speed
 
@@ -251,6 +255,11 @@ bounds the size of a model with temporal properties (one property per thread, so
   TLC evaluates it without enumerating its domain (it prints `[n \in Nat |-> <expression line 5, col 26 to line 5, col
   30 of module M>]`, with the position of the body). Used as a value otherwise (assigned to a variable, compared,
   inside another value) it is refused: TLC stops with an error on most such uses
+- In ASSUMEs and constant definitions, `[D -> R]`, `\X`, `[f : S]` and `SUBSET S` of more than a million elements
+  are gone through without building them in `\E`, `\A` and `{x \in S : P}`, and in CHOOSE over SUBSET, in TLC's
+  order, as TLC does; CHOOSE over the others and `{e : x \in S}` over any of them stop with TLC's error. Over several
+  bound variables (`\E a \in S, b \in T`) TLC varies the first fastest and tla2rs the last, which shows only where
+  printing or an error depends on the order
 - Functions over a set from the state (`[x \in S |-> e]`, `[S -> T]`, `:>`, `@@`, `Permutations`) are functions over
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC

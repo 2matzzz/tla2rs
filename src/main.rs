@@ -168,8 +168,9 @@ fn main() {
                             // Snapshots of the graph written while the search runs: the final file
                             // is the same, with the edges as with any option
                             "snapshot" => pass.push("-dumpattrs".into()),
+                            "colorize" => pass.push("-dumpcolors".into()),
                             _ => {
-                                eprintln!("tla2rs: -dump dot,{o} is not supported (only actionlabels and snapshot)");
+                                eprintln!("tla2rs: -dump dot,{o} is not supported (only actionlabels, colorize and snapshot)");
                                 exit(2);
                             }
                         }
@@ -194,8 +195,14 @@ fn main() {
                     pass.push(v.clone());
                 }
             }
+            // TLC's -userFile FILE: what the spec prints goes to FILE
+            "-userFile" => {
+                i += 1;
+                pass.push("-userfile".into());
+                pass.push(args.get(i).unwrap_or_else(|| usage()).clone());
+            }
             "-simulate" | "-seed" | "-aril" | "-depth" | "-dfid" | "-generateSpecTE" | "-tool" | "-debug" | "-recover"
-            | "-coverage" | "-terse" | "-userFile" | "-maxSetSize" => {
+            | "-coverage" | "-terse" | "-maxSetSize" => {
                 eprintln!("tla2rs: TLC's option {} is not supported (see README.md, \"TLC's options\")", args[i]);
                 exit(2);
             }
@@ -266,7 +273,22 @@ fn main() {
                     std::fs::write(f, "").expect("write the states");
                 }
             }
-            println!("{msg}");
+            // What the spec printed (marked by `compile::USER_MARK`) goes to the -userFile file
+            let user_file = pass.iter().position(|a| a == "-userfile").and_then(|i| pass.get(i + 1));
+            let mut user = String::new();
+            for l in msg.lines() {
+                match l.strip_prefix(compile::USER_MARK) {
+                    Some(u) if user_file.is_some() => user += &format!("{}\n", compile::user_text(u, true)),
+                    Some(u) => println!("{}", compile::user_text(u, false)),
+                    None => println!("{l}"),
+                }
+            }
+            if let Some(f) = user_file {
+                if let Err(e) = std::fs::write(f, user) {
+                    eprintln!("cannot write {f}: {e}");
+                    exit(2);
+                }
+            }
             exit(*code);
         }
         let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0) else { return };

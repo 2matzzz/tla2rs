@@ -49,17 +49,18 @@ tla2rs は、TLC 2.19 のコマンドラインオプションのうち、状態�
 | | オプション |
 |---|---|
 | 前から使える | `-config FILE`、`-deadlock`、`-workers N`（`auto` も既定も CPU を全部使う。TLC の既定は 1） |
-| 今回使えるようにした | `-continue`、`-difftrace`、`-view`、`-nowarning`、`-dump FILE`、`-dump dot[,actionlabels][,snapshot] FILE` |
+| 今回使えるようにした | `-continue`、`-difftrace`、`-view`、`-nowarning`、`-dump FILE`、`-dump dot[,actionlabels][,colorize][,snapshot] FILE`、`-userFile FILE` |
 | 受け付けるが何もしない | `-cleanup`、`-gzip`、`-metadir DIR`、`-checkpoint N`、`-fp N`、`-fpbits N`、`-fpmem X`、`-lncheck S`、`-modelcheck` |
-| 使えない（エラーにする） | `-simulate`、`-depth`、`-seed`、`-aril`、`-dfid`、`-generateSpecTE`、`-tool`、`-debug`、`-recover`、`-coverage`、`-terse`、`-maxSetSize`、`-userFile`、`-dump dot,colorize` |
+| 使えない（エラーにする） | `-simulate`、`-depth`、`-seed`、`-aril`、`-dfid`、`-generateSpecTE`、`-tool`、`-debug`、`-recover`、`-coverage`、`-terse`、`-maxSetSize` |
 
 - `-continue` を付けると、不変条件を破る状態（cfg の順で最初に破った不変条件）と、アクションの性質を破るステップを見つけるたびに、そこまでの振る舞いと一緒に報告して探索を続ける。TLC と同じく、最後は `No error has been found` で終わり、終了コードは 0 になる。デッドロックと評価の失敗ではそこで止まる。不変条件の評価に失敗したときは、TLC と同じく「想定外の例外」を出して 255 で終わる。時相の性質は最後に確かめる
 - `-difftrace` を付けると、振る舞いの 2 番目からの状態は、前の状態から変わった変数だけを表示する。TLC 2.19 は 3 状態以上の振る舞いの最後の状態だけは全部を表示するので、tla2rs もそうする
 - `-view` を付けると、振る舞いの各状態の代わりにその `VIEW` の値を、後ろに空行を入れずに表示する。`-dump dot` の節点のラベルも `VIEW` の値になる。どちらも TLC と同じで、`VIEW` が無ければ何も変わらない
 - `-nowarning` を付けると、TLC 自身の警告（無い引数への EXCEPT、時相の性質と一緒の SYMMETRY や制約）を出さない。構文解析器の警告と PlusCal のチェックサムの警告は、TLC と同じく残る
-- `-dump FILE` は、見つけた順に distinct な状態を書き出す（`State N:` と状態）。`-dump dot FILE` は状態グラフを書く（`-dumpgraph` と同じ）。`actionlabels` を付けると各辺にアクションの名前が付き、`snapshot` を付けると TLC がそのとき辺に付ける属性が付く（TLC が途中で書くスナップショットは書かない）。TLC と同じく、名前に `.dump` か `.dot` が無ければ付け足す。ワーカーが 1 つなら `-dump FILE` の順は TLC と同じになる。`-dump FILE` と `-continue` のときは `-batched` を使わない
+- `-dump FILE` は、見つけた順に distinct な状態を書き出す（`State N:` と状態）。`-dump dot FILE` は状態グラフを書く（`-dumpgraph` と同じ）。`actionlabels` を付けると各辺にアクションの名前が付き、`snapshot` を付けると TLC がそのとき辺に付ける属性が付く（TLC が途中で書くスナップショットは書かない）。`colorize` を付けると、TLC と同じく各辺がそのアクションの色になり、グラフの最後にアクションの凡例が付く。色の番号はアクションの名前ごとに、その辺を初めて書いた順に 2 から振り、凡例は TLC の Java のハッシュ表が持つ順に並ぶ。TLC と同じく、名前に `.dump` か `.dot` が無ければ付け足す。ワーカーが 1 つなら `-dump FILE` の順も色も TLC と同じになる。`-dump FILE` と `-continue` のときは `-batched` を使わない
+- `-userFile FILE` を付けると、仕様が表示する行（Print と PrintT。ASSUME や定数の定義の中のものも）を標準出力ではなく FILE に書く。TLC 自身のメッセージと警告は標準出力に残る。TLC と同じく、ファイルには値をそのまま 1 行で書き、標準出力のような整形はしない
 - 受け付けるが何もしないオプションは、TLC のディスク上のファイル（`-cleanup`、`-gzip`、`-metadir`、`-checkpoint`。TLC はチェックポイントのたびに 1 行出し、既定では 30 分おきだが、tla2rs は出さない）、指紋とそのメモリ（`-fp`、`-fpbits`、`-fpmem`。tla2rs は自前の指紋を使う）、時相の性質を確かめる時期（`-lncheck`。tla2rs は最後に確かめ、TLC の `final` にあたる）だけを変える。`-modelcheck` は既定の動きそのもの
-- 使えないものとその理由。`-simulate`・`-depth`・`-seed`・`-aril` は乱択のシミュレーション用で、漏れなく調べる検査ではない。`-dfid` は反復深化の深さ優先探索で、状態にたどり着く順が違うので、数も反例も幅優先とは変わる。tla2rs は幅優先しかしない。`-generateSpecTE` と `-tool` は Toolbox とトレースエクスプローラのためのもの（SpecTE モジュールを書く、出力をメッセージコードで囲む）。`-debug` は TLC 自身のデバッグ出力。`-recover` は TLC 独自の形式のチェックポイントから再開するもので、tla2rs はそれを書かない。`-coverage` は TLC のインタプリタが部分式をそれぞれ何回評価したかを数える。コンパイルした検査器は定数を一度だけ評価し、式をまとめてしまうので、回数は TLC の評価器の動きに左右される。`-terse` は TLC が内部で遅延評価のまま持っている集合を、その形のまま表示する（`SUBSET S`、`[S -> T]`）。コンパイルした検査器はその形を持っていない（区間と同じ事情で、制約を参照）。`-maxSetSize` は TLC のインタプリタが列挙する集合の大きさの上限で、そのエラーがどこで出るかはインタプリタがどこで列挙するかで決まる。`-userFile`（仕様が表示した行をファイルに書く）と `-dump dot,colorize`（アクションごとの色と、Java のハッシュ表の順に並ぶ凡例）はまだ作っていない
+- 使えないものとその理由。`-simulate`・`-depth`・`-seed`・`-aril` は乱択のシミュレーション用で、漏れなく調べる検査ではない。`-dfid` は反復深化の深さ優先探索で、状態にたどり着く順が違うので、数も反例も幅優先とは変わる。tla2rs は幅優先しかしない。`-generateSpecTE` と `-tool` は Toolbox とトレースエクスプローラのためのもの（SpecTE モジュールを書く、出力をメッセージコードで囲む）。`-debug` は TLC 自身のデバッグ出力。`-recover` は TLC 独自の形式のチェックポイントから再開するもので、tla2rs はそれを書かない。`-coverage` は TLC のインタプリタが部分式をそれぞれ何回評価したかを数える。コンパイルした検査器は定数を一度だけ評価し、式をまとめてしまうので、回数は TLC の評価器の動きに左右される。`-terse` は TLC が内部で遅延評価のまま持っている集合を、その形のまま表示する（`SUBSET S`、`[S -> T]`）。コンパイルした検査器はその形を持っていない（区間と同じ事情で、制約を参照）。`-maxSetSize` は TLC のインタプリタが列挙する集合の大きさの上限で、そのエラーがどこで出るかはインタプリタがどこで列挙するかで決まる
 
 ## 速さ
 
@@ -126,6 +127,7 @@ TLC が終わらなかった全探索（distinct 約 5.9 億、深さ 73）を 5
 - レコードは TLC と同じ順序（TLC がフィールド名を初めて作った順）でフィールドを比べ、表示する。文字列の上の関数は、定義域の文字列がすべて識別子として読めるならレコードとして、そうでなければ TLC と同じく `("a-b" :> 1 @@ ...)` の形で表示する。状態の値の `ToString` は型のすべての値の文字列をコンパイル時に作るので、型の値の数は 16 bit の文字列 ID に収まる分（文字列とモデル値を合わせて 65536 個）まで。仕様がフィールドを TLC と違う順に書いたレコードの `ToString` は拒否する。TLC はそのレコードを初めて比べるまでは書いた順に表示するので、文字列がそのタイミングで変わるため
 - 型の一部を定義域にする関数（とバッグ）は、型が 65536 通りまでなら型全体の上の配列で持つ。それより大きい型や上限のない型（Nat、広い整数の範囲、集合、それらのレコード）の上では（キー, 値）の組を整列して持ち、キーの容量は集合と同じように増える（`TypeOK` に `Cardinality(DOMAIN f) <= K` と書けば、そこから始まる）。タプルのリテラルは 99,999 要素まで（要素ごとに生成する型のフィールドになる）
 - 列挙できない集合（Nat・Int・STRING・`Seq(S)`）の上の関数は、引数に適用するとき（更新ごとに添字 1 つの EXCEPT の後でもよい）、`x \in DOMAIN f`、`ToString`・`Print`・`PrintT` で使える。TLC もそこでは定義域を列挙せずに評価する（表示は `[n \in Nat |-> <expression line 5, col 26 to line 5, col 30 of module M>]` のように、本体の位置を出す）。それ以外で値として使う（変数に入れる、比べる、ほかの値の中に入れる）と拒否する。TLC もそうした使い方の大半ではエラーで止まる
+- ASSUME と定数の定義の中では、要素が 100 万を超える `[D -> R]`・`\X`・`[f : S]`・`SUBSET S` を、`\E`・`\A`・`{x \in S : P}` と SUBSET の上の CHOOSE で、組み立てずに TLC と同じ順にたどる。TLC もそうしている。それ以外の集合の上の CHOOSE と、どれかの上の `{e : x \in S}` では、TLC と同じエラーで止まる。束縛変数が複数ある（`\E a \in S, b \in T`）ときは、TLC は最初の変数を一番速く回し、tla2rs は最後の変数を一番速く回す。違いが見えるのは、表示やエラーがその順に左右されるときだけ
 - 状態にある集合の上の関数（`[x \in S |-> e]`・`[S -> T]`・`:>`・`@@`・`Permutations`）は型の一部を定義域にする関数として持つ。入れ子のモジュールを INSTANCE できる。仕様が定義する後置演算子（`^+`・`^*`・`^#`）と中置の `--`・`|-`・`??`・`!!`・`\bigcirc` も使える。`Print` / `PrintT` は TLC と同じく標準出力に書く。引数のない定数の層の定義と ASSUME の中のものは、検査器が始まったときに一度だけ書く
 - 初期述語・アクション・不変条件の中の `Print` / `PrintT` は、ワーカーが 1 つなら TLC と同じ順で書く。状態ごとに、その状態を調べる前に出た行を先に書き、探索を止めた状態より後の行は書かない。TLC が反例を組み立て直すときに Init やアクションを評価し直して出す行も、同じところに書く（CLAUDE.md の「Messages and printed lines」）。こうした仕様は `-batched` を付けても通常の探索で調べる
 - `TLCGet` / `TLCSet` は、ワーカーが 1 つなら TLC 2.19 と同じ値を返す。使えるのは、整数を入れるレジスタの `TLCGet(i)` / `TLCSet(i, v)`、`TLCGet("level")`・`("diameter")`・`("distinct")`・`("queue")`、それに `TLCSet("exit", TRUE)` で、TLC が反例を組み立て直すときに評価し直した値も同じになる（CLAUDE.md の「TLCGet and TLCSet」）。これらを使う仕様では、ワーカーを複数にするのと時相の性質を調べるのは断る

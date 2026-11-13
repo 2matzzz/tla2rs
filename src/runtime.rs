@@ -1016,8 +1016,49 @@ static WARNED: std::sync::Mutex<Option<(std::collections::HashSet<String>, bool)
 
 const NOWARNING: &str = "(Use the -nowarning option to disable this warning.)";
 
+/// With -userfile FILE (TLC's `-userFile FILE`), the file the lines the spec prints go to instead of
+/// the standard output (TLC's own messages and warnings stay there)
+static USER_FILE: std::sync::Mutex<Option<std::io::LineWriter<std::fs::File>>> = std::sync::Mutex::new(None);
+
+/// What starts a line the spec printed, and what separates the values printed on it, as TLC writes
+/// them to its `-userFile` (`compile::USER_MARK`, `USER_SEP`)
+const USER_MARK: char = '\u{3}';
+const USER_SEP: char = '\u{4}';
+
+/// A line printed by Print or PrintT, of the values given as TLC shows them
+fn printed(vals: &[&str]) -> String {
+    let mut l = String::from(USER_MARK);
+    for (i, v) in vals.iter().enumerate() {
+        if i > 0 {
+            l.push(USER_SEP);
+        }
+        l += v;
+    }
+    l
+}
+
+/// Prints a line the spec printed (without its USER_MARK): to the -userfile file if there is one,
+/// as is, or else with each value pretty-printed, as TLC does
+fn user_line(l: &str) {
+    use std::io::Write;
+    let vals = l.split(USER_SEP);
+    match USER_FILE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        Some(w) => {
+            if writeln!(w, "{}", vals.collect::<Vec<_>>().join("  ")).is_err() {
+                eprintln!("cannot write the user file");
+                std::process::exit(2);
+            }
+        }
+        None => println!("{}", vals.map(ppr).collect::<Vec<_>>().join("  ")),
+    }
+}
+
 /// Prints a line printed by the spec, or a warning (marked with WARNING_MARK) as TLC does
 fn put_line(l: &str) {
+    if let Some(u) = l.strip_prefix(USER_MARK) {
+        user_line(u);
+        return;
+    }
     let Some(w) = l.strip_prefix(WARNING_MARK) else {
         println!("{l}");
         return;
@@ -2350,6 +2391,71 @@ static DUMP_NO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// with an empty one
 static DUMP_LABELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DUMP_ATTRS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// With -dumpcolors (TLC's `-dump dot,colorize`), each edge has the color of its action: the
+/// actions are numbered from 2 by name, in the order an edge of each is first written (measured
+/// on TLC 2.19, `tests/tlc/OptDumpColor`), and the graph ends with a legend of them
+static DUMP_COLORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The names of the actions with a color, in the order of their colors
+static COLORED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(vec![]);
+/// The color of each entry of LABELS, once known (0 before)
+static LABEL_COLORS: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU32>> = std::sync::OnceLock::new();
+
+/// The name of an action labelled `l` (in LABELS) as TLC names it in the graph
+fn action_name(l: u32) -> &'static str {
+    LABELS.get(l as usize).map_or("", |n| n.split(" line ").next().unwrap_or(""))
+}
+
+/// The color of the action labelled `l` (in LABELS), numbering its name if it has none yet
+fn action_color(l: u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cs = LABEL_COLORS.get_or_init(|| LABELS.iter().map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+    let Some(c) = cs.get(l as usize) else { return 0 };
+    let k = c.load(Relaxed);
+    if k != 0 {
+        return k;
+    }
+    let name = action_name(l);
+    let mut v = COLORED.lock().unwrap_or_else(|e| e.into_inner());
+    let i = v.iter().position(|n| *n == name).unwrap_or_else(|| {
+        v.push(name);
+        v.len() - 1
+    });
+    let k = i as u32 + 2;
+    c.store(k, Relaxed);
+    k
+}
+
+/// The order in which a Java `HashMap` with these keys (`String`s, put in this order, into a map
+/// made with its default capacity) goes through them, which is the order of TLC's legend: by
+/// bucket of the key's hash, each bucket in the order put
+fn java_hash_order(keys: &[&str]) -> Vec<usize> {
+    let hash = |k: &str| {
+        let h = k.encode_utf16().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32)) as u32;
+        (h ^ (h >> 16)) as usize
+    };
+    let mut cap = 16;
+    let mut buckets: Vec<Vec<usize>> = vec![vec![]; cap];
+    let resize = |buckets: &mut Vec<Vec<usize>>, cap: &mut usize| {
+        *cap *= 2;
+        let mut nb: Vec<Vec<usize>> = vec![vec![]; *cap];
+        for i in buckets.iter().flatten() {
+            nb[hash(keys[*i]) & (*cap - 1)].push(*i);
+        }
+        *buckets = nb;
+    };
+    for (i, k) in keys.iter().enumerate() {
+        let b = &mut buckets[hash(k) & (cap - 1)];
+        b.push(i);
+        // A bucket of more than 8 entries makes a small table grow (a larger one would make it a tree)
+        if b.len() > 8 && cap < 64 {
+            resize(&mut buckets, &mut cap);
+        }
+        if i + 1 > cap * 3 / 4 {
+            resize(&mut buckets, &mut cap);
+        }
+    }
+    buckets.into_iter().flatten().collect()
+}
 
 fn dump_open(path: &std::path::Path, states: bool) {
     use std::io::Write;
@@ -2364,10 +2470,16 @@ fn dump_open(path: &std::path::Path, states: bool) {
         DUMP_STATES.store(true, std::sync::atomic::Ordering::Relaxed);
     } else {
         let _ = w.write_all(b"strict digraph DiskGraph {\n");
+        if flag(&DUMP_COLORS) {
+            let _ = w.write_all(b"edge [colorscheme=\"paired12\"]\n");
+        }
     }
     *DUMP.lock().unwrap() = Some(w);
     DUMPING.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Where `dump_edge` leaves the color of an edge to `dump_write`, around the action's label
+const COLOR_MARK: char = '\u{1}';
 
 /// Appends a worker's buffered lines to the file
 fn dump_write(buf: &mut String) {
@@ -2376,6 +2488,19 @@ fn dump_write(buf: &mut String) {
         return;
     }
     if let Some(w) = DUMP.lock().unwrap().as_mut() {
+        if flag(&DUMP_COLORS) && buf.contains(COLOR_MARK) {
+            let mut out = String::with_capacity(buf.len());
+            for (i, part) in buf.split(COLOR_MARK).enumerate() {
+                match i % 2 {
+                    0 => out += part,
+                    _ => match action_color(part.parse().unwrap_or(u32::MAX)) {
+                        0 => out += "black",
+                        c => out += &c.to_string(),
+                    },
+                }
+            }
+            *buf = out;
+        }
         if let Err(e) = w.write_all(buf.as_bytes()) {
             eprintln!("cannot write the state graph: {e}");
             std::process::exit(2);
@@ -2388,8 +2513,20 @@ fn dump_finish() {
     use std::io::Write;
     if DUMPING.swap(false, std::sync::atomic::Ordering::Relaxed) {
         if let Some(mut w) = DUMP.lock().unwrap().take() {
-            let end: &[u8] = if flag(&DUMP_STATES) { b"" } else { b"}\n" };
-            if w.write_all(end).and_then(|_| w.flush()).is_err() {
+            let mut end = String::new();
+            if !flag(&DUMP_STATES) {
+                if flag(&DUMP_COLORS) {
+                    end += "subgraph cluster_legend {graph[style=bold];label = \"Next State Actions\" style=\"solid\"\n";
+                    end += "node [ labeljust=\"l\",colorscheme=\"paired12\",style=filled,shape=record ]\n";
+                    let names = COLORED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    for i in java_hash_order(&names) {
+                        end += &format!("{n} [label=\"{n}\",fillcolor={}]\n", i + 2, n = names[i]);
+                    }
+                    end += "}\n";
+                }
+                end += "}\n";
+            }
+            if w.write_all(end.as_bytes()).and_then(|_| w.flush()).is_err() {
                 eprintln!("cannot write the state graph");
             }
         }
@@ -2429,8 +2566,11 @@ fn dump_edge(buf: &mut String, from: Fp, to: &dyn std::fmt::Display, l: u32) {
         return;
     }
     if flag(&DUMP_ATTRS) {
-        let name = LABELS.get(l as usize).filter(|_| flag(&DUMP_LABELS)).map_or("", |n| n.split(" line ").next().unwrap_or(""));
-        let _ = writeln!(buf, "{from} -> {to} [label=\"{name}\",color=\"black\",fontcolor=\"black\"];");
+        let name = if flag(&DUMP_LABELS) { action_name(l) } else { "" };
+        // The color is numbered when the edge is written to the file (`dump_write`): an edge
+        // buffered for a successor TLC does not reach is not
+        let color = if flag(&DUMP_COLORS) { format!("{COLOR_MARK}{l}{COLOR_MARK}") } else { "black".to_string() };
+        let _ = writeln!(buf, "{from} -> {to} [label=\"{name}\",color=\"{color}\",fontcolor=\"{color}\"];");
     } else {
         let _ = writeln!(buf, "{from} -> {to};");
     }
@@ -2546,9 +2686,19 @@ fn main() {
     for (f, a) in [(&CONTINUE, "-continue"), (&DIFFTRACE, "-difftrace"), (&VIEW_TRACE, "-view"), (&NOWARN, "-nowarning")] {
         f.store(args.iter().any(|x| x == a), std::sync::atomic::Ordering::Relaxed);
     }
+    if let Some(p) = args.iter().position(|a| a == "-userfile").and_then(|i| args.get(i + 1)) {
+        match std::fs::File::create(p) {
+            Ok(f) => *USER_FILE.lock().unwrap() = Some(std::io::LineWriter::new(f)),
+            Err(e) => {
+                eprintln!("cannot write {p}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     DUMP_LABELS.store(args.iter().any(|x| x == "-dumplabels"), std::sync::atomic::Ordering::Relaxed);
+    DUMP_COLORS.store(args.iter().any(|x| x == "-dumpcolors"), std::sync::atomic::Ordering::Relaxed);
     OTHER_FP.store(args.iter().any(|x| x == "-tlcfp"), std::sync::atomic::Ordering::Relaxed);
-    DUMP_ATTRS.store(args.iter().any(|x| x == "-dumplabels" || x == "-dumpattrs"), std::sync::atomic::Ordering::Relaxed);
+    DUMP_ATTRS.store(args.iter().any(|x| x == "-dumplabels" || x == "-dumpattrs" || x == "-dumpcolors"), std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = args.iter().position(|a| a == "-dumpgraph").and_then(|i| args.get(i + 1)) {
         dump_open(std::path::Path::new(p), false);
     } else if let Some(p) = args.iter().position(|a| a == "-dumpstates").and_then(|i| args.get(i + 1)) {
@@ -2588,7 +2738,12 @@ fn main() {
     // What TLC prints when it starts: Print and PrintT in the constant definitions, its warnings,
     // Print and PrintT in the ASSUMEs
     for l in if flag(&NOWARN) { STARTUP_PRINTS_NOWARN } else { STARTUP_PRINTS } {
-        println!("{l}");
+        for l in l.lines() {
+            match l.strip_prefix(USER_MARK) {
+                Some(u) => user_line(u),
+                None => println!("{l}"),
+            }
+        }
     }
     if TLCGET {
         // TLC's counts and registers are those of its workers' shared queue and threads, and its

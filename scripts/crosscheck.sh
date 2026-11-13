@@ -61,11 +61,14 @@ if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*args[[:
 fi
 # With TLC's `-dump [dot,...] FILE`, that file is compared instead of the state graph (TLC writes
 # only one dump), and with `-view` the counterexample is read as TLC prints it then (see
-# src/options.rs). TLC adds the extension .dump or .dot when the name lacks it
-user_dump=""; view=0
+# src/options.rs). TLC adds the extension .dump or .dot when the name lacks it. With `-userFile
+# FILE`, what the spec prints goes to that file, and the file is compared too (its lines and their
+# hash)
+user_dump=""; view=0; user_file=""
 for ((k = 0; k < ${#extra[@]}; k++)); do
   case "${extra[k]}" in
     -view) view=1 ;;
+    -userFile) user_file="${extra[k + 1]:-}" ;;
     -dump)
       v="${extra[k + 1]:-}"
       if [[ "$v" == dot || "$v" == dot,* ]]; then user_dump="${extra[k + 2]:-}"; [[ "$user_dump" == *.dot ]] || user_dump="$user_dump.dot"
@@ -214,6 +217,7 @@ run_tlc() {
   [[ -z "$user_dump" && $large == 0 ]] || dump=()
   java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 ${fp0[@]+"${fp0[@]}"} ${dump[@]+"${dump[@]}"} -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
   [[ -z "$user_dump" ]] || mv "$user_dump" tlc.userdump 2> /dev/null || true
+  [[ -z "$user_file" ]] || mv "$user_file" tlc.userfile 2> /dev/null || true
   a=$(result tlc)
 }
 # The summary of tlc.out or rs.out (and of its graph), as kept in tests/expected/
@@ -222,6 +226,9 @@ result() {
     printf '%s\n%s\n' "$(summarize "$1.out")" "$(messages "$1.out")"
   else
     printf '%s\n%s\n%s\n' "$(summarize "$1.out")" "$(graphs "$1")" "$(messages "$1.out")"
+  fi
+  if [[ -n "$user_file" ]]; then
+    if [[ -f "$1.userfile" ]]; then echo "userfile $(wc -l < "$1.userfile" | tr -d ' ') $(shasum -a 256 < "$1.userfile" | cut -d' ' -f1)"; else echo "userfile missing"; fi
   fi
 }
 # The state graph reduced to hashes of its states and its edges (see src/graph.rs).
@@ -308,6 +315,7 @@ rs_dump=(-dumpgraph rs.dot)
 [[ -z "$user_dump" && $large == 0 ]] || rs_dump=()
 "$bin" "$t" -config "$c" -o "$work/gen" -workers 1 ${rs_dump[@]+"${rs_dump[@]}"} -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 [[ -z "$user_dump" ]] || mv "$user_dump" rs.userdump 2> /dev/null || true
+[[ -z "$user_file" ]] || mv "$user_file" rs.userfile 2> /dev/null || true
 s2=$(date +%s.%N)
 # When a set or sequence outgrew the capacity the checker was built with, or the checker made
 # strings in another order than they were numbered in, tla2rs built it again and checked from the
