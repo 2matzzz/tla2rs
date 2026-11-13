@@ -472,6 +472,33 @@ impl TExpr {
         }
     }
 
+    /// TLC's tableau ignores boolean constants: a particle's consistency (TBPar.isLocallyConsistent)
+    /// and a state's (TBGraphNode.isConsistent) look at state predicates only. So a constant that
+    /// simplify leaves under [] or <> (`<>TRUE` negated is `[]FALSE`) holds in every state, outside
+    /// the forms <>[]A and []<>A, which TLC checks without the tableau. Called on the simplified
+    /// negation, whose top-level junctions are those TLC's DNF splits
+    fn tableau_bools(self) -> TExpr {
+        match self {
+            TExpr::Conj(xs) => TExpr::Conj(xs.into_iter().map(|x| x.tableau_bools()).collect()),
+            TExpr::Disj(xs) => TExpr::Disj(xs.into_iter().map(|x| x.tableau_bools()).collect()),
+            e if matches!(&e, TExpr::Even(b) if matches!(b.as_ref(), TExpr::All(c) if c.level() < 3)) => e,
+            e if matches!(&e, TExpr::All(b) if matches!(b.as_ref(), TExpr::Even(c) if c.level() <= 2)) => e,
+            TExpr::All(b) => TExpr::All(b.bools_true().into()),
+            TExpr::Even(b) => TExpr::Even(b.bools_true().into()),
+            e => e,
+        }
+    }
+    fn bools_true(self) -> TExpr {
+        match self {
+            TExpr::Bool(_) => TExpr::Bool(true),
+            TExpr::Neg(b) => TExpr::Neg(b.bools_true().into()),
+            TExpr::Conj(xs) => TExpr::Conj(xs.into_iter().map(|x| x.bools_true()).collect()),
+            TExpr::Disj(xs) => TExpr::Disj(xs.into_iter().map(|x| x.bools_true()).collect()),
+            TExpr::All(b) => TExpr::All(b.bools_true().into()),
+            TExpr::Even(b) => TExpr::Even(b.bools_true().into()),
+            e => e,
+        }
+    }
     fn to_ltl(&self) -> Ltl {
         match self {
             TExpr::Bool(b) => Ltl::Bool(*b),
@@ -526,6 +553,18 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
     if !temporal(e) {
         if let Bool(b) = e {
             return Ok(Ok(TExpr::Bool(*b)));
+        }
+        // A predicate of constant level is a boolean constant to TLC, which evaluates it here
+        // (Liveness.astToLive); see TExpr::tableau_bools for what that changes
+        let reads_state = e.any(&|x| match x {
+            Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
+            Prime(_) | Un(UOp::Enabled | UOp::Unchanged, _) => true,
+            _ => false,
+        });
+        if !reads_state {
+            if let Ok(Value::Bool(b)) = g.ce.eval(e, env) {
+                return Ok(Ok(TExpr::Bool(b)));
+            }
         }
         return Ok(Ok(if action_level(e) {
             TExpr::Action(atoms.action(g, &box_to_or(e), env)?)
@@ -850,12 +889,8 @@ pub fn compile(
     };
     src += &tlc_live(fair, &atexprs, &texprs);
     for ((name, _, _), t) in parts.iter().zip(&texprs) {
-        let f = t.to_ltl();
-        let neg = if atexprs.is_empty() {
-            f.not()
-        } else {
-            Ltl::And(atexprs.iter().map(|a| a.to_ltl()).chain([f.not()]).collect())
-        };
+        let neg = TExpr::junction(atexprs.iter().cloned().chain([TExpr::Neg(t.clone().into())]), true);
+        let neg = neg.push_neg(false).simplify().tableau_bools().to_ltl();
         let (nodes, nacc) = automaton(&neg, 4096).map_err(|m| format!("property {name}: {m}"))?;
         let mut ns = vec![];
         for n in &nodes {
