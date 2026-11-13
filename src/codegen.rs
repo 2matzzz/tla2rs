@@ -4113,10 +4113,13 @@ impl<'a> Gen<'a> {
                 let neg = if op == NotIn { "!" } else { "" };
                 (format!("{neg}{{ let {x} = {xc}; {m} }}"), Ty::Bool)
             }
-            // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
+            // A \subseteq Nat (or Int, or any set that is not a value here, such as records with a
+            // field in Int: `tests/tlc/SubsetInf`) is A \in SUBSET B
             Subseteq
-                if matches!(b.strip(), Expr::Ident(n, _) if n == "Nat" || n == "Int" || n == "STRING")
-                    || matches!(b.strip(), Expr::Call(f, a) if f == "Seq" && a.len() == 1) =>
+                if b.any(&|x| {
+                    matches!(x, Expr::Ident(n, _) if (n == "Nat" || n == "Int" || n == "STRING") && !env.locals.contains_key(n))
+                        || matches!(x, Expr::Call(f, a) if f == "Seq" && a.len() == 1)
+                }) =>
             {
                 let (ac, at) = self.gen(a, env, None)?;
                 let x = self.fresh("x");
