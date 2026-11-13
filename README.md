@@ -215,6 +215,9 @@ memory.
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning
+- TLC's warning that an EXCEPT names an argument or field the value does not have is printed as TLC prints it (each
+  text once, the first with TLC's note about `-nowarning`), except for an EXCEPT of constant level inside an action
+  or an invariant, which the compiler evaluates once and the checker does not warn about
 - Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
   body; 50,000 levels at compile time). TLC overflows its JVM stack much earlier (500 to 900 levels for small
   bodies), so a recursion between the two depths passes here where TLC reports a stack overflow
