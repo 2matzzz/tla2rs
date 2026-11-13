@@ -4159,7 +4159,7 @@ fn run_liveness(opt: &Opt) {
     if LIVENESS {
         let t1 = std::time::Instant::now();
         dump_finish();
-        let ok = liveness(&g, live);
+        let ok = liveness(&g, live, workers);
         println!("Checked temporal properties in {:.3}s", t1.elapsed().as_secs_f64());
         if !ok {
             exit(13);
@@ -4443,7 +4443,7 @@ fn path_to(
     vec![]
 }
 
-fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
+fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
     let n = g.states.len();
     // Fingerprint -> state index
     let cap = (n * 2).next_power_of_two().max(16);
@@ -4512,114 +4512,161 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
     drop(live);
     let inits: Vec<u32> = (0..n as u32).filter(|&i| g.parent[i as usize].0 == u32::MAX).collect();
     let edges = st.dst.len();
-    for prop in LPROPS {
-        let pr = Product { st: &st, nodes: prop.nodes, q: prop.nodes.len().max(1) };
-        if prop.nodes.is_empty() {
-            continue;
-        }
-        // Reachable product nodes, in BFS order, with their BFS parents
-        let mut par: std::collections::HashMap<usize, (usize, u32)> = std::collections::HashMap::new();
-        let mut order = vec![];
-        for &s in &inits {
-            for (q, nd) in prop.nodes.iter().enumerate() {
-                let p = s as usize * pr.q + q;
-                if nd.init && pr.valid(s, q) && !par.contains_key(&p) {
-                    par.insert(p, (usize::MAX, u32::MAX));
-                    order.push(p);
-                }
-            }
-        }
-        let mut h = 0;
-        let mut buf = vec![];
-        while h < order.len() {
-            let u = order[h];
-            h += 1;
-            pr.succ(u, &mut buf);
-            for &(v, l, _) in &buf {
-                if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
-                    e.insert((u, l));
-                    order.push(v);
-                }
-            }
-        }
-        let rank: std::collections::HashMap<usize, usize> = order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
-        for c in sccs(&pr, &order, &|_| true) {
-            let Some((c, steps, off)) = search(&pr, prop.nacc, c) else { continue };
-            let set: std::collections::HashSet<usize> = c.iter().copied().collect();
-            let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
-            // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
-            // disabled or one of its steps; for each strongly fair action that is enabled somewhere
-            // on the cycle, one of its steps; then return to the entry
-            let _ = &off;
-            let fen = |p: usize| st.fen[pr.state(p) as usize];
-            let mut cyc: Vec<(usize, u32, FMask)> = vec![];
-            let mut cur = entry;
-            let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
-                let p = path_to(&pr, &set, *cur, goal, edge);
-                if let Some(&(l, _, _)) = p.last() {
-                    *cur = l;
-                }
-                cyc.extend(p);
-            };
-            let visited = |cyc: &[(usize, u32, FMask)], f: &dyn Fn(usize) -> bool| f(entry) || cyc.iter().any(|&(p, _, _)| f(p));
-            for j in 0..prop.nacc {
-                let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
-                if !visited(&cyc, &here) {
-                    go(&mut cyc, &mut cur, &here, &|_| false);
-                }
-            }
-            for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
-                let off_here = |p: usize| fen(p) & (1 << i) == 0;
-                if !*weak || visited(&cyc, &off_here) {
-                    continue;
-                }
-                if c.iter().any(|&p| off_here(p)) {
-                    go(&mut cyc, &mut cur, &off_here, &|_| false);
-                } else {
-                    go(&mut cyc, &mut cur, &|_| false, &|f| f & (1 << i) != 0);
-                }
-            }
-            loop {
-                // Back to the entry (at least one step)
-                if cur != entry || cyc.is_empty() {
-                    go(&mut cyc, &mut cur, &|p| p == entry, &|_| false);
-                }
-                let mut added = false;
-                for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
-                    let b: FMask = 1 << i;
-                    let on = |p: usize| fen(p) & b != 0;
-                    if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
-                        continue;
+    // The properties are independent, so several threads check them, and the first one in order
+    // that is violated is reported, as when they are checked one after another. A property after
+    // one found violated is given up.
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let (next, first_bad) = (AtomicUsize::new(0), AtomicUsize::new(usize::MAX));
+    let found: Vec<Vec<(usize, Lasso)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..workers.clamp(1, LPROPS.len().max(1)))
+            .map(|_| {
+                spawn_worker(sc, || {
+                    let mut out = vec![];
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        if i >= LPROPS.len() {
+                            break;
+                        }
+                        let quit = || first_bad.load(Relaxed) < i;
+                        if quit() {
+                            continue;
+                        }
+                        if let Some(l) = check_prop(&st, &LPROPS[i], &inits, &quit) {
+                            first_bad.fetch_min(i, Relaxed);
+                            out.push((i, l));
+                        }
                     }
-                    go(&mut cyc, &mut cur, &|_| false, &|f| f & b != 0);
-                    added = true;
-                }
-                if !added && cur == entry {
-                    break;
-                }
-            }
-            let mut prefix = vec![];
-            let mut y = entry;
-            while y != usize::MAX {
-                let (p, l) = par[&y];
-                prefix.push((pr.state(y), l));
-                y = p;
-            }
-            prefix.reverse();
-            let cycle: Vec<(u32, u32)> = cyc.iter().map(|&(p, l, _)| (pr.state(p), l)).collect();
-            println!("Error: Temporal properties were violated.");
-            println!("Error: The following behavior constitutes a counter-example:");
-            match tlc_lasso(g, &st, &inits, &selfs) {
-                Ok(true) => return false,
-                Ok(false) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
-                Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
-            }
-            print_lasso(g, &prefix, &cycle);
-            return false;
+                    out
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+    });
+    if let Some((_, (prefix, cycle))) = found.into_iter().flatten().min_by_key(|x| x.0) {
+        println!("Error: Temporal properties were violated.");
+        println!("Error: The following behavior constitutes a counter-example:");
+        match tlc_lasso(g, &st, &inits, &selfs) {
+            Ok(true) => return false,
+            Ok(false) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
+            Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
         }
+        print_lasso(g, &prefix, &cycle);
+        return false;
     }
     println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", LPROPS.len(), FAIRS.len(), edges);
     true
+}
+
+/// A lasso: the steps from an initial state to the entry of the cycle, and the cycle
+type Lasso = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
+/// Looks for a behavior that violates one property: a fair cycle in its product with the state
+/// graph that the property's automaton accepts. None also when `quit` says to give up.
+fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) -> Option<Lasso> {
+    let pr = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1) };
+    if prop.nodes.is_empty() {
+        return None;
+    }
+    // Reachable product nodes, in BFS order, with their BFS parents
+    let mut par: std::collections::HashMap<usize, (usize, u32)> = std::collections::HashMap::new();
+    let mut order = vec![];
+    for &s in inits {
+        for (q, nd) in prop.nodes.iter().enumerate() {
+            let p = s as usize * pr.q + q;
+            if nd.init && pr.valid(s, q) && !par.contains_key(&p) {
+                par.insert(p, (usize::MAX, u32::MAX));
+                order.push(p);
+            }
+        }
+    }
+    let mut h = 0;
+    let mut buf = vec![];
+    while h < order.len() {
+        if h % 4096 == 0 && quit() {
+            return None;
+        }
+        let u = order[h];
+        h += 1;
+        pr.succ(u, &mut buf);
+        for &(v, l, _) in &buf {
+            if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
+                e.insert((u, l));
+                order.push(v);
+            }
+        }
+    }
+    let rank: std::collections::HashMap<usize, usize> = order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+    for c in sccs(&pr, &order, &|_| true) {
+        if quit() {
+            return None;
+        }
+        let Some((c, steps, off)) = search(&pr, prop.nacc, c) else { continue };
+        let set: std::collections::HashSet<usize> = c.iter().copied().collect();
+        let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
+        // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
+        // disabled or one of its steps; for each strongly fair action that is enabled somewhere
+        // on the cycle, one of its steps; then return to the entry
+        let _ = &off;
+        let fen = |p: usize| st.fen[pr.state(p) as usize];
+        let mut cyc: Vec<(usize, u32, FMask)> = vec![];
+        let mut cur = entry;
+        let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
+            let p = path_to(&pr, &set, *cur, goal, edge);
+            if let Some(&(l, _, _)) = p.last() {
+                *cur = l;
+            }
+            cyc.extend(p);
+        };
+        let visited = |cyc: &[(usize, u32, FMask)], f: &dyn Fn(usize) -> bool| f(entry) || cyc.iter().any(|&(p, _, _)| f(p));
+        for j in 0..prop.nacc {
+            let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
+            if !visited(&cyc, &here) {
+                go(&mut cyc, &mut cur, &here, &|_| false);
+            }
+        }
+        for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
+            let off_here = |p: usize| fen(p) & (1 << i) == 0;
+            if !*weak || visited(&cyc, &off_here) {
+                continue;
+            }
+            if c.iter().any(|&p| off_here(p)) {
+                go(&mut cyc, &mut cur, &off_here, &|_| false);
+            } else {
+                go(&mut cyc, &mut cur, &|_| false, &|f| f & (1 << i) != 0);
+            }
+        }
+        loop {
+            // Back to the entry (at least one step)
+            if cur != entry || cyc.is_empty() {
+                go(&mut cyc, &mut cur, &|p| p == entry, &|_| false);
+            }
+            let mut added = false;
+            for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
+                let b: FMask = 1 << i;
+                let on = |p: usize| fen(p) & b != 0;
+                if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
+                    continue;
+                }
+                go(&mut cyc, &mut cur, &|_| false, &|f| f & b != 0);
+                added = true;
+            }
+            if !added && cur == entry {
+                break;
+            }
+        }
+        let mut prefix = vec![];
+        let mut y = entry;
+        while y != usize::MAX {
+            let (p, l) = par[&y];
+            prefix.push((pr.state(y), l));
+            y = p;
+        }
+        prefix.reverse();
+        let cycle: Vec<(u32, u32)> = cyc.iter().map(|&(p, l, _)| (pr.state(p), l)).collect();
+        return Some((prefix, cycle));
+    }
+    None
+
 }
 
 /// Prints a lasso as TLC does: the states from an initial state to the entry of the cycle, then
