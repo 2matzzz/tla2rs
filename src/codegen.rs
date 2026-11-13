@@ -381,6 +381,13 @@ impl<'a> Gen<'a> {
             }
             return Ok(Cmp::Normal);
         }
+        // An optional field (of a record among records of other fields) compares as its value
+        if let (Ty::Opt(x), y) | (y, Ty::Opt(x)) = (a, b) {
+            return Ok(match self.tuple_cmp(x, y)? {
+                Cmp::Fails(m) => Cmp::Fails(m),
+                _ => Cmp::Normal,
+            });
+        }
         if let (Ty::Seq(_), t) | (t, Ty::Seq(_)) = (a, b) {
             if seq_elems(t).is_none() && !matches!(t, Ty::Enum(v) if v.is_empty()) {
                 return self.tuple_vs(t).map(|c| if c == Cmp::Normal { Cmp::Normal } else { c });
@@ -401,13 +408,8 @@ impl<'a> Gen<'a> {
                         .filter_map(|(n, s)| y.iter().find(|(m, _)| m == n).map(|(_, t)| self.tuple_cmp(s, t)))
                         .collect::<R<_>>()?,
                 ),
-                // Only an error carries over: empty sets or absent fields can still be equal
-                (Ty::Opt(_), _) | (_, Ty::Opt(_)) | (Ty::Set(_), Ty::Set(_)) | (Ty::Fun(..), Ty::Fun(..)) => {
-                    let (x, y): (&Ty, &Ty) = match (a, b) {
-                        (Ty::Opt(x), y) | (y, Ty::Opt(x)) => (x, y),
-                        (Ty::Set(x), Ty::Set(y)) | (Ty::Fun(_, x), Ty::Fun(_, y)) => (x, y),
-                        _ => unreachable!(),
-                    };
+                // Only an error carries over: empty sets can still be equal
+                (Ty::Set(x), Ty::Set(y)) | (Ty::Fun(_, x), Ty::Fun(_, y)) => {
                     match self.tuple_cmp(x, y)? {
                         Cmp::Fails(m) => Cmp::Fails(m),
                         _ => Cmp::Normal,
@@ -1860,6 +1862,15 @@ impl<'a> Gen<'a> {
             let inner = self.s_has(&v, &jst, x, xt)?;
             return Ok(format!("{{ let {v} = {cc}; {inner} }}"));
         }
+        // x has fields the elements lack (records of other fields, model values beside records):
+        // compare in x's type
+        if self.coerce_soft(x.to_string(), xt, &et).is_err() && join(xt, &et).ok().as_ref() == Some(xt) {
+            let xst = Ty::Set(xt.clone().into());
+            let cc = self.coerce(c.to_string(), st, &xst)?;
+            let v = self.fresh("s");
+            let inner = self.s_has(&v, &xst, x, xt)?;
+            return Ok(format!("{{ let {v} = {cc}; {inner} }}"));
+        }
         if is_sparse(st) {
             let Ok(xc) = self.coerce_soft(x.to_string(), xt, &et) else { return Ok("false".into()) };
             return Ok(format!("({c}).contains(&{xc})"));
@@ -1952,6 +1963,18 @@ impl<'a> Gen<'a> {
             Ty::Set(_) if is_sparse(t) => format!("{}::new()", t.repr().replace('<', "::<")),
             Ty::Set(_) => "0u128".into(),
             Ty::Seq(_) => format!("{}::new()", t.repr().replace('<', "::<")),
+        }
+    }
+
+    /// A value of type t: the default where it is one, which it need not be (atom 0, integer 0)
+    fn some_code(t: &Ty) -> String {
+        match t {
+            Ty::Enum(v) if !v.is_empty() && !v.contains(&0) => format!("{}u16", v[0]),
+            Ty::Int(lo, hi) | Ty::IntAtom(lo, hi, _) if lo <= hi && (*lo > 0 || *hi < 0) => format!("{lo}i64"),
+            Ty::IntAtom(lo, hi, v) if lo > hi && !v.is_empty() => format!("(i64::MIN + {}i64)", v[0]),
+            Ty::Rec(fs) => rec_build(&fs.iter().map(|(_, f)| Self::some_code(f)).collect::<Vec<_>>()),
+            Ty::Fun(d, c) => format!("[{}; {}]", Self::some_code(c), d.size().unwrap_or(0)),
+            _ => Self::default_code(t),
         }
     }
 
@@ -4134,7 +4157,12 @@ impl<'a> Gen<'a> {
             for x in set {
                 parts.push(self.lit(x, &et)?);
             }
-            return Ok((self.note_folded(format!("[{}].into_iter()", parts.join(", ")), &made), *et, None));
+            // rustc takes minutes over a temporary array of thousands of values, not over a static
+            let it = match parts.len() > LIT_TABLE && const_lit(&et) {
+                true => format!("{{ static __A: [{}; {}] = [{}]; __A.iter().copied() }}", et.repr(), parts.len(), parts.join(", ")),
+                false => format!("[{}].into_iter()", parts.join(", ")),
+            };
+            return Ok((self.note_folded(it, &made), *et, None));
         }
         // A product of sets that depend on the state, in TLC's order (the first element varies
         // slowest)
@@ -4223,6 +4251,33 @@ impl<'a> Gen<'a> {
             let (ac, (alo, _)) = self.gen_int(a, env)?;
             let (bc, (_, bhi)) = self.gen_int(b, env)?;
             return Ok((format!("({ac}..={bc})"), Ty::Int(alo, bhi), None));
+        }
+        // A constant set too large to fold, such as the filter of a large set of records: computed
+        // once, into a vector, as an array of limited capacity cannot hold more than MAX_CAP
+        // elements. Iterated in the order of such an array (see `s_iter`)
+        if let Expr::SetFilter(x, inner, p) = s {
+            if self.is_const(s, env) {
+                let (it, et, ix) = self.iter_of_indexed(inner, env)?;
+                let st = Ty::Set(et.clone().into());
+                if is_sparse(&st) {
+                    let mut env2 = env.clone();
+                    let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                    let pc = self.gen_as(p, &env2, &Ty::Bool)?;
+                    let elem = env2.locals[x].0.clone();
+                    let tr = et.repr();
+                    let order = if needs_tlc_order(&et) {
+                        format!("__v.sort_by(|x, y| {});", self.tlc_cmp(&et, "x", "y")?)
+                    } else {
+                        String::new()
+                    };
+                    let code = format!(
+                        "{{ static __S: std::sync::OnceLock<Vec<{tr}>> = std::sync::OnceLock::new(); \
+                         __S.get_or_init(|| {{ let mut __v: Vec<{tr}> = Vec::new(); for {lx} in {it} {{ if {pc} {{ __v.push({elem}); }} }} \
+                         __v.sort(); __v.dedup(); {order} __v }}).iter().copied() }}"
+                    );
+                    return Ok((code, et, None));
+                }
+            }
         }
         let (c, t) = self.gen_val(s, env)?;
         let Ty::Set(et) = &t else { return Err(format!("cannot iterate over {t:?}")) };
@@ -4586,6 +4641,31 @@ impl<'a> Gen<'a> {
                 let Ty::Rec(xf) = xt else { return Ok("false".into()) };
                 let mut fs = fs.clone();
                 fs.sort_by(|a, b| field_cmp(&a.0, &b.0));
+                // Records of different fields (or model values beside records) in one type: x is
+                // in the set when it has the set's fields and no other
+                if xf.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) {
+                    if fs.iter().any(|(n, _)| !xf.iter().any(|(m, _)| m == n)) {
+                        return Ok("false".into());
+                    }
+                    let mut parts = vec![];
+                    for (i, (n, ft)) in xf.iter().enumerate() {
+                        let f = format!("{x}{}", rec_field(xf.len(), i));
+                        let e = self.fresh("e");
+                        match (fs.iter().find(|(m, _)| m == n), ft) {
+                            (Some((_, se)), Ty::Opt(t)) => {
+                                let inner = self.gen_member(&e, t, se, env)?;
+                                parts.push(format!("({f}.0 && {{ let {e} = {f}.1; {inner} }})"));
+                            }
+                            (Some((_, se)), t) => {
+                                let inner = self.gen_member(&e, t, se, env)?;
+                                parts.push(format!("{{ let {e} = {f}; {inner} }}"));
+                            }
+                            (None, Ty::Opt(_)) => parts.push(format!("!{f}.0")),
+                            (None, _) => return Ok("false".into()),
+                        }
+                    }
+                    return Ok(format!("({})", parts.join(" && ")));
+                }
                 if fs.len() != xf.len() || fs.iter().zip(xf).any(|(a, b)| a.0 != b.0) {
                     return Ok("false".into());
                 }
@@ -4807,8 +4887,20 @@ impl<'a> Gen<'a> {
             // Element by element, also for a set of more than 128 possible elements (records of
             // different fields), which would be an array of limited capacity
             if fits.len() <= 8 || !xt.is_scalar() || is_sparse(&st) {
-                let parts: Vec<String> =
-                    fits.iter().map(|e| Ok(format!("{x} == {}", self.lit(e, xt)?))).collect::<R<_>>()?;
+                let lits: Vec<String> = fits.iter().map(|e| self.lit(e, xt)).collect::<R<_>>()?;
+                // A chain of thousands of comparisons nests too deep for rustc: search a sorted copy
+                if lits.len() > LIT_TABLE {
+                    let tr = xt.repr();
+                    let v = match const_lit(xt) {
+                        true => format!("{{ static __A: [{tr}; {}] = [{}]; __A.to_vec() }}", lits.len(), lits.join(", ")),
+                        false => format!("vec![{}]", lits.join(", ")),
+                    };
+                    return Ok(format!(
+                        "{{ static __S: std::sync::OnceLock<Vec<{tr}>> = std::sync::OnceLock::new(); \
+                         __S.get_or_init(|| {{ let mut __v: Vec<{tr}> = {v}; __v.sort(); __v }}).binary_search(&{x}).is_ok() }}"
+                    ));
+                }
+                let parts: Vec<String> = lits.iter().map(|l| format!("{x} == {l}")).collect();
                 return Ok(format!("({})", parts.join(" || ")));
             }
             let mask = self.lit(&v, &st)?;
@@ -6498,7 +6590,11 @@ impl<'a> Gen<'a> {
                     }
                     None => write!(out, "put(&mut w, &mut p, ({c}).0 as u128, 1); ").unwrap(),
                 }
-                1 + self.pack_value(&format!("({c}).1"), inner, out, at)?
+                // An absent value holds the default, which may lie outside the type (atom 0,
+                // integer 0): written as a value of the type, which unpacking turns back
+                let v = self.fresh("o");
+                write!(out, "let {v} = if ({c}).0 {{ ({c}).1 }} else {{ {} }}; ", Self::some_code(inner)).unwrap();
+                1 + self.pack_value(&v, inner, out, at)?
             }
             Ty::Fun(d, cod) => {
                 let n = d.size().unwrap();
@@ -6602,7 +6698,9 @@ impl<'a> Gen<'a> {
                     }
                     None => "get(w, &mut p, 1) == 1".into(),
                 };
-                format!("({flag}, {})", self.unpack_value(inner, at)?)
+                let (f, v) = (self.fresh("f"), self.fresh("o"));
+                let val = self.unpack_value(inner, at)?;
+                format!("{{ let {f} = {flag}; let {v} = {val}; ({f}, if {f} {{ {v} }} else {{ {} }}) }}", Self::default_code(inner))
             }
             Ty::Fun(d, cod) => {
                 let n = d.size().unwrap();
@@ -6892,6 +6990,24 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
 /// examples/ and tests/tlc/ and of the corpus but GameOfLife enumerated the same elements in the
 /// same order as written out (measured by comparing the two at run time)
 const BIG_SET: usize = 1024;
+
+/// A constant set of more elements than this, written out, is a table: a static where the
+/// elements are constant expressions (`const_lit`)
+const LIT_TABLE: usize = 64;
+
+/// Whether `Gen::lit` writes the values of type t as constant expressions: not those holding a
+/// sequence or a set held as an array, which it builds by calls
+fn const_lit(t: &Ty) -> bool {
+    match t {
+        Ty::Bool | Ty::Int(..) | Ty::IntAtom(..) | Ty::Enum(_) => true,
+        Ty::Rec(fs) => fs.iter().all(|(_, f)| const_lit(f)),
+        Ty::Opt(e) | Ty::Fun(_, e) => const_lit(e),
+        Ty::PFun(_, c) => !is_sparse_fun(t) && const_lit(c),
+        Ty::Bag(_) => !is_sparse_fun(t),
+        Ty::Set(_) => !is_sparse(t),
+        Ty::Seq(_) => false,
+    }
+}
 
 /// A constant set by its parts, enumerated by the checker (see `Gen::big_set_iter`). Its elements
 /// come in the order of the set's value: functions, tuples and records compare their values one
