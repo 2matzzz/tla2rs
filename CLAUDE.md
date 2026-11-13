@@ -185,7 +185,8 @@ Strings made by operations (`\o`, `Append`, `Head`, `Tail` and `SubSeq` on strin
 the order TLC first makes them. Measured on TLC 2.19 (`tests/tlc/StrMade*`), with one worker:
 
 - When it starts, TLC evaluates the constants, every definition of constant level without arguments (used or not),
-  the constant invariants and properties, and the ASSUMEs, in that order; the strings these make come first
+  the constant invariants and properties, the sets of the `\E` it splits the next-state relation through (once,
+  `StrMadeSplit`; `Gen::split_strs`), and the ASSUMEs, in that order; the strings these make come first
   (`StrMadeStart`: an unused `Words == {"c" \o w : w \in {"a", "b"}}` puts `"ca"` before `"cb"`)
 - Then the strings made while exploring, in the order the search makes them: a string made and dropped counts (a
   comparison, a branch that fails later), and so does one made by a constant expression inside an action or an

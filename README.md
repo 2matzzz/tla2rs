@@ -236,7 +236,8 @@ memory.
 - Strings are ordered as TLC orders them, by when TLC first creates them: those of the cfg and the modules (names,
   numbers as written, string literals) as TLC parses them, then those made by operations (`\o`, `Append`, `Head`,
   `Tail`, `SubSeq`, `ToString`) in the order TLC makes them, first when it starts (it evaluates every definition of
-  constant level, used or not, then the ASSUMEs) and then while it explores. The checker's strings are numbered when
+  constant level, used or not, the sets of the `\E` it splits the next-state relation through, then the ASSUMEs)
+  and then while it explores. The checker's strings are numbered when
   it is built, so with one worker it notes the order it makes them in; when that differs from their numbers, tla2rs
   prints `tla2rs: strings were made in another order than they were numbered in; checking again from the start with
   them in that order`, builds the checker again with that order and runs it from the start (at most 8 times; output

@@ -101,6 +101,8 @@ pub struct Gen<'a> {
     split_warning: Option<Vec<String>>,
     /// The EXCEPT warnings TLC prints while it splits the next-state relation into actions
     pub split_warns: Vec<String>,
+    /// The strings TLC makes then, in the order made
+    pub split_strs: Vec<u32>,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
     /// Maximum length of a sequence (QCAP); 0 while no bound is known
@@ -176,6 +178,7 @@ impl<'a> Gen<'a> {
             tmp: 0,
             split_warning: None,
             split_warns: vec![],
+            split_strs: vec![],
             scap: 8,
             qcap: 0,
             infer: None,
@@ -543,7 +546,17 @@ impl<'a> Gen<'a> {
     }
 
     fn note_folded(&mut self, c: String, made: &Made) -> String {
-        let notes: Vec<String> = made.strs.iter().filter(|&&a| a >= self.track_from).map(|a| format!("str_made({a}u16); ")).collect();
+        if self.split_warning.is_some() {
+            for &a in &made.strs {
+                if !self.split_strs.contains(&a) {
+                    self.split_strs.push(a);
+                }
+            }
+        }
+        let notes: Vec<String> = match self.split_warning {
+            Some(_) => vec![],
+            None => made.strs.iter().filter(|&&a| a >= self.track_from).map(|a| format!("str_made({a}u16); ")).collect(),
+        };
         if !notes.is_empty() {
             self.str_notes = true;
         }

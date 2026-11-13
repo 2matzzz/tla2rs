@@ -1375,6 +1375,9 @@ fn compile_inner(
             Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), caps: (0, 0), atoms: vec![] }),
         }
     };
+    // Where the strings the ASSUMEs make start (those TLC makes while it splits the next-state
+    // relation into actions come before them, see `Gen::split_strs`)
+    let assumes_from = made_now.len();
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
     // is false. An expression that cannot be evaluated is an error rather than silently passing.
     {
@@ -1408,11 +1411,19 @@ fn compile_inner(
     }
 
     // Each once, in the order first made; a string written in the spec was created when TLC parsed it
-    for a in made_now {
+    let mut made_split_at = 0;
+    let made_count = made_now.len();
+    for (k, a) in made_now.into_iter().enumerate() {
+        if k == assumes_from {
+            made_split_at = startup.made.len();
+        }
         let n = atoms.name(a);
         if !atoms.is_model(a) && !literals.contains(&n) && !startup.made.contains(&n) {
             startup.made.push(n);
         }
+    }
+    if assumes_from >= made_count {
+        made_split_at = startup.made.len();
     }
     if no_behavior {
         return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), caps: (0, 0), atoms: vec![] });
@@ -1555,11 +1566,22 @@ fn compile_inner(
     let mut next_code = String::new();
     g.actions = 0;
     g.split_warns.clear();
+    g.split_strs.clear();
     g.gen_action(&[next_pos], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
     // TLC warns about an EXCEPT in the sets it splits the next-state relation through when it
     // reads the spec, after the constant invariants and before the ASSUMEs
     let head = format!("{}Warning: The EXCEPT was applied to non-existing fields of the value at\n", crate::value::WARNING_MARK);
     startup.invs.extend(g.split_warns.iter().map(|at| format!("{head}{at}")));
+    // And it makes the strings of those sets then, before the ASSUMEs make theirs
+    for a in std::mem::take(&mut g.split_strs) {
+        let n = atoms.name(a);
+        if atoms.is_model(a) || literals.contains(&n) || startup.made[..made_split_at].contains(&n) {
+            continue;
+        }
+        startup.made.retain(|x| *x != n);
+        startup.made.insert(made_split_at, n);
+        made_split_at += 1;
+    }
     let actions = g.actions;
     if actions == 0 && !no_next {
         // TLC splits the next-state relation into no action at all (\E over an empty set): it
