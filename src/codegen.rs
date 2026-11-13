@@ -3918,6 +3918,15 @@ impl<'a> Gen<'a> {
                     let neg = if op == Eq { "" } else { "!" };
                     return Ok((format!("{neg}mixed_eq({ac}, {bc})"), Ty::Bool));
                 }
+                // A comparison with the empty set or sequence reads the length, rather than build
+                // an empty array of the capacity's width and compare every slot
+                if is_sparse(&t) || matches!(t, Ty::Seq(_)) {
+                    let empty = if is_sparse(&t) { self.s_empty(&t)? } else { format!("{}::from_slice(&[])", t.repr().replace('<', "::<")) };
+                    let other = if bc == empty { Some(&ac) } else if ac == empty { Some(&bc) } else { None };
+                    if let Some(o) = other {
+                        return Ok((format!("(({o}).len {} 0)", if op == Eq { "==" } else { "!=" }), Ty::Bool));
+                    }
+                }
                 (format!("({ac} {} {bc})", if op == Eq { "==" } else { "!=" }), Ty::Bool)
             }
             Lt | Le | Gt | Ge => {
