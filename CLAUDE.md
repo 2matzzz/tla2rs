@@ -100,8 +100,16 @@ There are two paths, depending on what is checked.
 | With temporal properties (`run_liveness`) | The whole state graph (states, parents, edges with their atom and fairness bits) | State width + a few dozen bytes, plus hash maps over the product with each property's automaton during the search |
 
 The safety path never keeps states. A counterexample is rebuilt by walking fingerprints back to an initial state and
-replaying `next` from there (`fp_chain` → `replay`). Liveness needs the whole graph for the SCC search, so it is kept in
-memory.
+replaying `next` from there (`fp_chain` → `replay`). Liveness needs the whole graph for the SCC search. It is kept in
+columns (`Col`: the states, their parents, and `LiveGraph`: where each state's edges start, the edges' targets, and
+class numbers into tables of the distinct (state atoms, enabled fairness, stuttering atoms) and (label, action atoms,
+fairness steps), a byte each while there are at most 256, `ClassCol`). Once the columns hold more than `-memlimit`,
+each column that grows moves to an unlinked temp file in `-tmpdir` that is mapped for reading, so the kernel's page
+cache holds what fits. A level is expanded a slice of `LEVEL_SLICE` states at a time, so what the threads find before
+it is merged stays small. The search in the product with a property's automaton numbers the product nodes in BFS
+order in arrays (`Rank`, dense over all product nodes for an automaton of at most 16 nodes), and its Tarjan keeps a
+cursor per node on its stack (`At`) instead of the node's successors; the BFS keeps only each node's parent, and the
+label of a step on the counterexample's prefix is found again from the parent's successors.
 
 The parts of a level beyond `-memlimit` spill to a temp file. The file is unlinked as soon as it is opened, so nothing is
 left behind even when the checker is killed. A failed read of the spilled queue is a fatal error: skipping it could turn

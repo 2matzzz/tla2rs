@@ -31,7 +31,8 @@ cargo build --release
 
 - `-deadlock` / `CHECK_DEADLOCK FALSE` mean the same as in TLC: deadlock is not an error
 - `-workers N` sets the number of search threads (default: number of CPUs)
-- `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB); the rest spills to a temp file (`-tmpdir`)
+- `-memlimit MB` caps how much of the BFS queue stays in memory (default 256 MB), and with temporal properties how
+  much of the state graph does; the rest spills to temp files (`-tmpdir`)
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` and `-seqcap N` set where the capacity of sets held as arrays (and of the domains of functions and
   bags over large types) and the maximum length of sequences start. They are never needed: a value that outgrows
@@ -152,8 +153,20 @@ When a violation is found, the checker walks the fingerprints back to an initial
 by replaying `next` from there. Memory stays within "fingerprint table plus a capped queue", whatever the state width
 or model size.
 
-Checking temporal properties needs the whole state graph for the SCC search, so in that case everything is kept in
-memory.
+Checking temporal properties needs the whole state graph for the SCC search. The checker keeps it in columns:
+
+- per state, the packed state, the state it was first reached from, where its edges start, and a class: the state
+  atoms that hold there, the fairness conditions enabled there and the action atoms of its stuttering step, numbered
+  among the distinct combinations, which are few (a byte while there are at most 256)
+- per edge, the target and a class (the action, the action atoms and the fairness conditions of the step), 5 bytes;
+  while the search runs the target is still a fingerprint, 9 bytes in all
+
+Once the columns hold more than `-memlimit`, each column that grows moves to a temp file in `-tmpdir`, unlinked as
+soon as it is opened, which the checker maps into memory. The kernel keeps in its page cache what fits and reads the
+rest back from the disk, much as TLC keeps its liveness graph on disk. What stays in memory is the visited
+fingerprints while the search runs, and then, for each property, the search of its product with the property's
+automaton: 4 bytes per state and automaton node, and about 30 bytes per product node it reaches. That part is what
+bounds the size of a model with temporal properties (one property per thread, so several at once take more).
 
 ## What is supported
 
@@ -281,8 +294,8 @@ memory.
   bodies), so a recursion between the two depths passes here where TLC reports a stack overflow
 - Once a state exceeds 64 bits, the visited set holds fingerprints, so, as with TLC, there is a small chance of a
   collision (an estimate is printed at the end)
-- Liveness checking keeps the whole state graph in memory (about 40 bytes per edge), and the search over its product
-  with a property's automaton uses hash maps sized by the reachable product. For invariants only, see Memory above
+- Liveness checking keeps the whole state graph, beyond `-memlimit` in temp files, and the search over its product
+  with a property's automaton keeps about 30 bytes per product node it reaches in memory (see Memory above)
 - Strings are ordered as TLC orders them, by when TLC first creates them: those of the cfg and the modules (names,
   numbers as written, string literals) as TLC parses them, then those made by operations (`\o`, `Append`, `Head`,
   `Tail`, `SubSeq`, `ToString`) in the order TLC makes them, first when it starts (it evaluates every definition of
