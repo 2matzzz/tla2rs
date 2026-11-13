@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 743 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 793 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -185,7 +185,8 @@ Strings made by operations (`\o`, `Append`, `Head`, `Tail` and `SubSeq` on strin
 the order TLC first makes them. Measured on TLC 2.19 (`tests/tlc/StrMade*`), with one worker:
 
 - When it starts, TLC evaluates the constants, every definition of constant level without arguments (used or not),
-  the constant invariants and properties, and the ASSUMEs, in that order; the strings these make come first
+  the constant invariants and properties, the sets of the `\E` it splits the next-state relation through (once,
+  `StrMadeSplit`; `Gen::split_strs`), and the ASSUMEs, in that order; the strings these make come first
   (`StrMadeStart`: an unused `Words == {"c" \o w : w \in {"a", "b"}}` puts `"ca"` before `"cb"`)
 - Then the strings made while exploring, in the order the search makes them: a string made and dropped counts (a
   comparison, a branch that fails later), and so does one made by a constant expression inside an action or an
@@ -207,7 +208,10 @@ number a string when it makes one. tla2rs numbers them in an order measured inst
 - The strings the checker may make while exploring are numbered from `TRACK_FROM`, first in the order a checker built
   before made them, then as the compiler meets them. Code generation notes each such string the checker makes
   (`Gen::note_made` for the operations on strings from the state and ToString, `Gen::note_folded` for a constant
-  expression TLC evaluates there: as a value, a set a quantifier ranges over, or a set tested for membership).
+  expression TLC evaluates there: as a value, a set a quantifier ranges over, or a set tested for membership;
+  `Gen::fold_notes` for one the compiler evaluates without generating code for it: a condition of an action or of
+  an IF, the set of a `\A` that assigns variables, and the argument of a recursive operator unrolled in an action
+  when its body reads the parameter, since TLC evaluates an argument only there; `StrMadeCond*`).
   When tla2rs runs the checker with one worker, it names a file in `TLA2RS_ORDER`, and the checker records the
   first time it makes each such string, where TLC would: what it makes while computing a successor counts after the
   invariants of the successors before it (held like the printed lines, see "Messages and printed lines"), and the
@@ -224,10 +228,9 @@ Not followed:
 - With several workers the order depends on thread scheduling: CHOOSE over `{ToString(n) \o "w" : n \in 1..2000}`
   after the search created those strings gave `"4w"`, `"1w"`, `"2w"` and `"4w"` in four runs with `-workers 4`, and
   `"1w"` every time with one worker. The checker notes nothing then and keeps the order it was built with
-- A string made by a constant expression that the compiler evaluates elsewhere (the condition of an IF, the set of a
-  `\A` that assigns variables in an action, ...), and the characters TLC makes when it takes a string apart
-  into a tuple (`SelectSeq`, `SortSeq`, a string compared with a tuple), are numbered as the compiler meets them and
-  not noted
+- A string made by a constant expression that the compiler evaluates elsewhere than above (the size of the set of a
+  split `\E`, say), and the characters TLC makes when it takes a string apart into a tuple (`SelectSeq`, `SortSeq`,
+  a string compared with a tuple), are numbered as the compiler meets them and not noted
 
 ### How TLC reads SPECIFICATION
 
@@ -243,6 +246,11 @@ Measured on TLC 2.19 (`tests/tlc/SpecConj*`, `SpecShape*`, `SpecInst*`, `RtSpec*
 - Without an initial predicate TLC stops (exit 151). Without a next-state action it stops (exit 151) if anything must
   be checked on steps (an invariant, `[]P`, an action or temporal property); otherwise it computes and checks the
   initial states and then stops with exit 75
+- A NEXT of constant level (`FALSE`, `1 = 2`) is refused when TLC reads the spec (`The next state action Next cannot
+  be a constant.`, exit 151; `[][FALSE]_x` in a SPECIFICATION is not, and deadlocks). A next-state relation that TLC
+  splits into no action (`\E` over an empty constant set, also in `[][...]_v`) is not refused: TLC computes and
+  checks the initial states and then stops with `No next state actions defined to generate successor states
+  from.` (exit 75), as for a spec without a next-state action (`NO_NEXT` in the checker; `tests/tlc/NoActions*`)
 - A module without variables, with a cfg that has no SPECIFICATION, INIT or NEXT (one that only checks its ASSUMEs),
   is not refused: TLC evaluates the ASSUMEs and reports no error with no states, and writes an empty state graph
   (`compile::NO_BEHAVIOR`, `tests/tlc/NoBehavior*`). With variables, it is refused for lack of an initial predicate
@@ -348,7 +356,9 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
   definition reached twice is one symbol: a module extended along two paths, or a module without constants or
   variables both extended and instantiated (or instantiated twice). An INSTANCE of a module with constants or
   variables gives new definitions, so instantiating it twice without names is refused. Two different definitions
-  of one name in two extended modules are only a warning for SANY, and are not refused
+  of one name in two extended modules are only a warning for SANY (`Semantic errors in global context:`, before the
+  module's own warnings, and again for each module that extends that one), and TLC uses the one extended first
+  (`tests/tlc/SanyTwoDefs*`; `compile::load_parsed` keeps it)
 - A label `l(p, q) :: e` must list exactly the bound variables introduced between it and the enclosing label or
   definition, each once; a LET definition starts afresh, and operator parameters and LET names do not count. LAMBDA
   is accepted only as an argument of an operator or in a WITH substitution
@@ -363,17 +373,36 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
   `(SUBSET 1)..2` (TLC then fails to evaluate it). Unary minus as the operand of an infix operator whose range
   starts above 12 is refused (`a * -b`, `a ^ -b`); `~` never conflicts
 - Positional subexpression names (`Op!3`, `Op!(1, 2)`, `Op!lab`) that name nothing, in every definition and ASSUME
-  (`Expander::check_subexprs`), also in definitions nothing uses
+  (`Expander::check_subexprs`, also of a LET definition: `RejSanySubLet*`), also in definitions nothing uses. One whose operator is not a definition (a
+  CONSTANT, VARIABLE, parameter or bound variable: `Cannot take subexpression of `x'.`), or is named without the
+  arguments it takes (`Op!1`, `Lab!lab`: `The operator Op requires 1 arguments.`, placed from the name to the last
+  selector) is refused (`tests/tlc/RejSanySubOp`)
+- What an operator is passed must fit the parameter (`Walker::args`, from the number of arguments each parameter
+  takes: `Sym::params`; `tests/tlc/RejSanyOpArg*`): where the parameter takes none, an operator's name that takes
+  some (`The operator Len requires 1 arguments.`) or a LAMBDA (`LAMBDA expression used where an expression is
+  required.`); where it takes some, a name of another arity (`Expected arity 1 but found operator of arity 0.`, also a
+  CONSTANT or VARIABLE), a LAMBDA of another arity (placed at the operator's name) or any other expression (`An
+  expression appears as argument number 1 ...`, whose own names SANY does not look at), each followed, after the
+  other arguments' errors, by `Argument number 1 to operator 'B' should be a 1-parameter operator.` placed from the
+  name to the closing parenthesis. This covers the operators of the module, LET, the standard modules (SelectSeq,
+  SortSeq and BagOfAll take operators) and of a named INSTANCE without parameters (`I!Op`, also named alone). The
+  parser gives each argument its position in an ARG_AT label (`parser::ARG_AT`) when it parses again for SANY's report
+- A CONSTANT or VARIABLE declared again as the same kind (`VARIABLE x, x`, also one of an extended module) is a
+  warning (`Multiple declarations or definitions for symbol x.`), and the two are one; as another kind it is an
+  error (`tests/tlc/SanyDupDecl`, `RejSanyDupKind`). SANY prints the warnings of a module without errors and goes on
+  (`sany::take_warnings`, printed first by `compile::Startup`)
 - String escapes other than `\\ \" \n \t \r \f`
 
 LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile::hide_locals`), since they are not
 in scope in the module that reads it, which may define the same name (`tests/tlc/SanyScope`, `SanyLocalRec`).
 
-Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
-(their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
-a LET definition; and SANY's checks of other kinds (an operator passed where a parameter takes none, `Op!1` of an operator that takes arguments, levels outside temporal formulas, the warning for
-two definitions of one name in two extended modules). Two declarations of one name (`VARIABLE x, x`) are refused,
-where SANY only warns.
+Not repeated: names inside `\EE` and `\AA` (their bound variables are not kept, so `D == \EE y : y = Unknown` in a
+definition nothing uses passes, where SANY reports `Unknown operator`; those of `\E x : P`, `\A x : P`
+and `CHOOSE x : P` without a set are checked from `parser::unbounded_body`, `tests/tlc/RejSanyUnbounded`); the WITH
+substitutions of an INSTANCE inside LET; what is passed to an operator of an INSTANCE with parameters; and SANY's
+checks of other kinds (levels outside temporal formulas). The warnings in global context are not printed when the
+module has errors. A positional name that names nothing is reported only when the module has no other semantic
+error, and only the first one (SANY reports them all, among the others in the order of the module).
 
 ### Quantifiers and CHOOSE without a set
 
@@ -597,9 +626,13 @@ How TLC words an evaluation error depends on where it happens, measured on the `
   of the properties (the same on every run; `tests/tlc/LiveErr-Fair`, `LiveOrder`), so an error in
   both is reported from ENABLED. Between the state and the action predicates of the properties its
   order changes from run to run (three runs each of a property `[]<><<A>>_v \/ []<>Q` and of two
-  properties gave both orders); the checker evaluates the state predicates first. Not followed: TLC
-  stops computing ENABLED at the first successor it finds, while the checker computes them all, so
-  an error in a later successor stops the checker only
+  properties gave both orders); the checker evaluates the state predicates first
+- TLC stops computing whether an action is enabled (ENABLED, and the fair actions in the liveness
+  checks) at the first successor it finds, in the order it computes successors, so an error that
+  only a later successor would raise is not reached (`tests/tlc/EnFirst*`: a later disjunct, `x'
+  \in S` taken in TLC's order of S, `\E` over a constant set or one from the state, a recursive
+  operator). The checker leaves the block of such a computation at its first successor
+  (`Env::en_exit`)
 
 TLC prints a warning only when it has not printed the same text before, and its first warning of
 a run carries the note `(Use the -nowarning option to disable this warning.)`, so the same warning
@@ -617,9 +650,22 @@ when it starts. The warnings:
   with the printed lines (`except_warning`), the constant evaluator records it with them. TLC
   evaluates a definition of constant level when it starts and keeps its value, so such a definition
   with an EXCEPT warns then, and not again where it is used (`uncache_prints`); a constant invariant
-  or property warns when TLC evaluates it before exploring (`Startup::invs`). Not followed: an
-  EXCEPT of constant level inside an action or invariant, which the compiler folds, does not warn
-  in the checker
+  or property warns when TLC evaluates it before exploring (`Startup::invs`). An EXCEPT of constant
+  level inside Init, an action or an invariant, which the compiler folds, warns where it is
+  evaluated: folding notes the warnings (`Gen::try_const_made`, with the definitions TLC evaluated
+  when it started not warning again) and the folded code calls `except_warning` for each
+  (`Gen::note_folded`; also a constant condition of an action or of an IF, the set of a `\A` that
+  assigns variables, an empty set of `\E`, the arguments of a recursive operator unrolled in an
+  action whose parameters its body reads; `tests/tlc/ExceptFold*`). A LET definition or an
+  argument whose constant value warns is computed where first used, as one that is not constant
+  (`Gen::gen_bind`), so it warns once for the evaluation of the LET or the call, and an argument
+  that is the value an EXCEPT changes keeps the position of the parameter
+  (`expand::subst_ident`; `tests/tlc/ExceptFoldOnce*`). The set of a `\E` that TLC splits the
+  next-state relation through is evaluated once, when TLC reads the spec, so its warnings come
+  when TLC starts, after the constant invariants and before the ASSUMEs (`Gen::split_warns`,
+  `tests/tlc/ExceptSplit*`).
+  Not followed: other places where the compiler evaluates a constant without the warnings it notes
+  (`Gen::try_const`)
 
 TLC warns that SYMMETRY and constraints are dangerous when it checks temporal properties. It prints
 these warnings after the Print and PrintT of the constant definitions and before those of the
@@ -763,7 +809,8 @@ bound variable. What TLC does, measured on TLC 2.19 with PrintT (`tests/tlc/Lazy
   use: there `LET d == PrintT(1) IN d /\ d` prints twice. Such a label stays where it is, renamed BIND_ACT, and code
   generation writes its names out as before
 
-A name is also written out where it is used when its value is constant (code generation folds it there), when TLC
+A name is also written out where it is used when its value is constant (code generation folds it there; not when
+computing it warns about an EXCEPT, see "Messages and printed lines"), when TLC
 keeps the value unevaluated so that only what is used is computed (`codegen::lazy_value`: a function constructor, a
 range, SUBSET, UNION, a set of functions, records, sequences or tuples), in Init while a variable it reads is still
 unassigned (the closure would hold the state being built), and when code generation cannot generate its value on its

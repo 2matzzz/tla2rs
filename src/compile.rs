@@ -31,6 +31,8 @@ pub struct Output {
 #[derive(Default)]
 pub struct Startup {
     pub pcal: Vec<String>,
+    /// SANY's warnings, when it reported no errors
+    pub sany: Vec<String>,
     pub consts: Vec<String>,
     pub warnings: Vec<String>,
     /// TLC's warnings while it evaluates the invariants and properties of constant level
@@ -49,6 +51,7 @@ impl Startup {
     pub fn lines(&self) -> Vec<String> {
         // TLC prints the PlusCal warnings itself, not as the messages its note follows
         let mut v = self.pcal.clone();
+        v.extend(self.sany.iter().cloned());
         let mark = |w: &String| format!("{}{w}", crate::value::WARNING_MARK);
         let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
         // TLC prints a warning only when it has not printed the same text before, and the first
@@ -436,7 +439,10 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
                 out.extends.extend(sub.extends);
                 out.constants.extend(sub.constants);
                 out.variables.extend(sub.variables);
-                out.defs.extend(sub.defs);
+                // Of two definitions of one name in two extended modules (SANY warns), TLC uses the
+                // one extended first (`tests/tlc/SanyTwoDefs`)
+                let have: HashSet<String> = out.defs.iter().map(|d| d.name.clone()).collect();
+                out.defs.extend(sub.defs.into_iter().filter(|d| !have.contains(&d.name)));
                 out.assumes.extend(sub.assumes);
                 out.modules.extend(sub.modules);
                 out.op_constants.extend(sub.op_constants);
@@ -448,6 +454,11 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     out.recursive.extend(m.recursive);
     out.constants.extend(m.constants);
     out.variables.extend(m.variables);
+    // A CONSTANT or VARIABLE declared again (SANY only warns) is one
+    for v in [&mut out.constants, &mut out.variables] {
+        let mut seen = HashSet::new();
+        v.retain(|x| seen.insert(x.clone()));
+    }
     out.defs.extend(m.defs);
     out.assumes.extend(m.assumes);
     out.local_defs.extend(m.local_defs);
@@ -1041,7 +1052,7 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
 /// e with Print and PrintT removed (as TLC uses the value it computed when it started)
 /// e with the definitions in `cached` (evaluated when TLC started) not printing again, nor
 /// warning again about an EXCEPT
-fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
+pub fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
     match e {
         Expr::Label(n, a, b) if a.is_empty() && cached.contains(n) => Expr::Label(n.clone(), vec![], strip_prints(b).b()),
         _ => crate::codegen::map_children(e, &|c| uncache_prints(c, cached)),
@@ -1154,7 +1165,9 @@ fn compile_inner(
 ) -> R<Output> {
     let mut warnings = vec![];
     INTEGERS.with(|i| i.set(false));
+    crate::sany::take_warnings();
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
+    startup.sany = crate::sany::take_warnings();
     crate::value::NAT_DIV.with(|n| n.set(!INTEGERS.with(|i| i.get())));
     let cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;
@@ -1362,6 +1375,9 @@ fn compile_inner(
             Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), caps: (0, 0), atoms: vec![] }),
         }
     };
+    // Where the strings the ASSUMEs make start (those TLC makes while it splits the next-state
+    // relation into actions come before them, see `Gen::split_strs`)
+    let assumes_from = made_now.len();
     // ASSUMEs are constant-level expressions, so check them here and stop with TLC's message if one
     // is false. An expression that cannot be evaluated is an error rather than silently passing.
     {
@@ -1395,11 +1411,19 @@ fn compile_inner(
     }
 
     // Each once, in the order first made; a string written in the spec was created when TLC parsed it
-    for a in made_now {
+    let mut made_split_at = 0;
+    let made_count = made_now.len();
+    for (k, a) in made_now.into_iter().enumerate() {
+        if k == assumes_from {
+            made_split_at = startup.made.len();
+        }
         let n = atoms.name(a);
         if !atoms.is_model(a) && !literals.contains(&n) && !startup.made.contains(&n) {
             startup.made.push(n);
         }
+    }
+    if assumes_from >= made_count {
+        made_split_at = startup.made.len();
     }
     if no_behavior {
         return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), caps: (0, 0), atoms: vec![] });
@@ -1541,7 +1565,23 @@ fn compile_inner(
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
     g.actions = 0;
+    g.split_warns.clear();
+    g.split_strs.clear();
     g.gen_action(&[next_pos], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
+    // TLC warns about an EXCEPT in the sets it splits the next-state relation through when it
+    // reads the spec, after the constant invariants and before the ASSUMEs
+    let head = format!("{}Warning: The EXCEPT was applied to non-existing fields of the value at\n", crate::value::WARNING_MARK);
+    startup.invs.extend(g.split_warns.iter().map(|at| format!("{head}{at}")));
+    // And it makes the strings of those sets then, before the ASSUMEs make theirs
+    for a in std::mem::take(&mut g.split_strs) {
+        let n = atoms.name(a);
+        if atoms.is_model(a) || literals.contains(&n) || startup.made[..made_split_at].contains(&n) {
+            continue;
+        }
+        startup.made.retain(|x| *x != n);
+        startup.made.insert(made_split_at, n);
+        made_split_at += 1;
+    }
     let actions = g.actions;
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
@@ -1773,7 +1813,9 @@ fn compile_inner(
     writeln!(show, "const ACTIONS: usize = {actions};").unwrap();
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
-    writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();
+    // A next-state relation that TLC splits into no action (\E over an empty set) ends the same
+    // way: TLC computes and checks the initial states and stops (`tests/tlc/NoActions`)
+    writeln!(src, "const NO_NEXT: bool = {};", no_next || actions == 0).unwrap();
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
@@ -1983,7 +2025,14 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
                 ex.keep_pos = true;
                 let e = ex.expand_def_code(n, true);
                 ex.keep_pos = false;
-                Some(e?)
+                let e = e?;
+                // TLC refuses a next-state action of constant level (`tests/tlc/NoActions`)
+                // (not one whose body the parser dropped: \E x : P without a set, \EE, \AA)
+                let dropped = e.any(&|x| matches!(x, Expr::Call(n, _) if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA"));
+                if constant_level(&e, m) && !dropped {
+                    return Ok(Err((format!("Error: The next state action {n} cannot be a constant."), 151)));
+                }
+                Some(e)
             }
             None => None,
         };

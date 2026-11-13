@@ -1,0 +1,10 @@
+key 60ebe67b6e7de04699b09698f333acd4f394e09533755e3ab23a90a1d2ecb666
+tlc Version 2.19
+rc 12
+Invariant InvBad is violated
+
+trace 0
+states incomplete
+edges incomplete
+messages 5 c38aca05957b2125df0a7193713d0ae8b7e16e6a8aa5291fadad2c00868bab2e
+errors 1 c7bd45f81d76cb9dd173753ba6188b9a206922139471c316a01bac4631048a17

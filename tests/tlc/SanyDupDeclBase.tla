@@ -1,0 +1,3 @@
+---- MODULE SanyDupDeclBase ----
+VARIABLE z
+====

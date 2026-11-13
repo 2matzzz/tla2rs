@@ -26,6 +26,9 @@
 //!   paths, or extended and instantiated when it has no CONSTANT or VARIABLE) is one symbol; two
 //!   different definitions of one name in two extended modules are only a warning for SANY, and
 //!   are not refused here
+//! - What an operator is passed must fit its parameter (an operator of as many parameters where
+//!   the parameter takes some, anything else where it takes none; `Walker::args`), and a
+//!   subexpression `Op!1` needs a definition named with its arguments
 //! - A label `l(p, q) :: e` must list exactly the bound variables introduced between it and the
 //!   enclosing label or definition (a LET definition starts afresh; operator parameters and LET
 //!   names do not count), each once
@@ -37,7 +40,7 @@
 
 use crate::ast::*;
 use crate::lexer::{R, SANY};
-use crate::parser::{NAME_AT, OP_AT};
+use crate::parser::{ARG_AT, NAME_AT, OP_AT};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -55,6 +58,10 @@ struct Sym {
     fixed: bool,
     at: String,
     arity: usize,
+    /// The number of arguments each parameter takes (0 for an ordinary one)
+    params: Vec<usize>,
+    /// For `N == INSTANCE M`: M
+    inst: Option<String>,
 }
 
 impl PartialEq for Sym {
@@ -85,6 +92,13 @@ thread_local! {
 
 fn error(at: &str, msg: String) {
     DIAG.with(|d| d.borrow_mut().errors.push((at.to_string(), msg)));
+}
+
+thread_local! {
+    /// See `take_warnings`
+    static WARNED: RefCell<Vec<String>> = const { RefCell::new(vec![]) };
+    /// SANY's warnings "in global context" for the module being checked
+    static GLOBAL: RefCell<Vec<(String, String)>> = const { RefCell::new(vec![]) };
 }
 
 fn warning(at: &str, msg: String) {
@@ -237,7 +251,14 @@ fn std_exports(m: &str) -> Option<Vec<Sym>> {
             .flat_map(|(o, ns)| {
                 ns.iter().map(move |n| {
                     let (at, arity) = place(o, n);
-                    Sym { name: n.to_string(), origin: o.to_string(), decl: *n == "now", fixed: *n != "now", at, arity }
+                    // The operator parameters of the standard modules' operators
+                    let params = match *n {
+                        "SelectSeq" => vec![0, 1],
+                        "SortSeq" => vec![0, 2],
+                        "BagOfAll" => vec![1, 0],
+                        _ => vec![0; arity],
+                    };
+                    Sym { name: n.to_string(), origin: o.to_string(), decl: *n == "now", fixed: *n != "now", at, arity, params, inst: None }
                 })
             })
             .collect(),
@@ -278,7 +299,10 @@ pub const SEMANTIC: &str = "#sem ";
 /// line and the message, then two empty lines
 fn report(d: &Diag) -> String {
     let item = |(at, msg): &(String, String)| if at.is_empty() { format!("{msg}\n\n\n") } else { format!("{at}\n\n{msg}\n\n\n") };
-    let mut s = format!("Semantic errors:\n\n*** Errors: {}\n\n", d.errors.len());
+    let mut s = "Semantic errors:\n\n".to_string();
+    if !d.errors.is_empty() {
+        s += &format!("*** Errors: {}\n\n", d.errors.len());
+    }
     s.extend(d.errors.iter().map(item));
     if !d.warnings.is_empty() {
         s += &format!("*** Warnings: {}\n\n", d.warnings.len());
@@ -304,11 +328,19 @@ fn duplicate(x: &str, other: &str) -> String {
 /// have been loaded) and the modules nested in it, and records what they export
 pub fn check(m: &Module) -> R<()> {
     DIAG.with(|d| *d.borrow_mut() = Diag::default());
+    GLOBAL.with(|g| g.borrow_mut().clear());
     let ex = module(m, vec![], true);
+    let global = GLOBAL.with(|g| std::mem::take(&mut *g.borrow_mut()));
     EXPORTS.with(|e| e.borrow_mut().insert(m.name.clone(), ex));
     let take = || DIAG.with(|d| std::mem::take(&mut *d.borrow_mut()));
     let d = take();
-    if d.errors.is_empty() {
+    if d.errors.is_empty() && !global.is_empty() {
+        let item = |(at, msg): &(String, String)| format!("{at}\n\n{msg}\n\n\n");
+        let mut s = format!("Semantic errors in global context:\n\n*** Warnings: {}\n\n", global.len());
+        s.extend(global.iter().map(item));
+        WARNED.with(|w| w.borrow_mut().push(s));
+    }
+    if d.errors.is_empty() && d.warnings.is_empty() {
         return Ok(());
     }
     // The same checks on the module parsed with the positions SANY reports (the same errors are
@@ -322,7 +354,18 @@ pub fn check(m: &Module) -> R<()> {
         Some(again) if again.errors.len() == d.errors.len() && again.warnings.len() == d.warnings.len() => again,
         _ => d,
     };
+    if d.errors.is_empty() {
+        // SANY prints its warnings and goes on
+        WARNED.with(|w| w.borrow_mut().push(report(&d)));
+        return Ok(());
+    }
     Err(format!("{SANY}{SEMANTIC}{}", report(&d)))
+}
+
+/// SANY's reports of the modules checked since the last call that had warnings and no errors, in
+/// the order checked
+pub fn take_warnings() -> Vec<String> {
+    WARNED.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
 /// The names in scope at a point of a module
@@ -393,6 +436,12 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                         out.push(s.clone());
                     }
                     if !scope.syms.contains(&s) {
+                        // Another definition of the name from another extended module: SANY
+                        // warns "in global context"
+                        if let Some(old) = scope.get(&s.name).filter(|o| !o.decl && !s.decl) {
+                            let msg = format!("Warning: the definition of '{}' conflicts with \nits definition at {}.", s.name, old.at);
+                            GLOBAL.with(|g| g.borrow_mut().push((s.at.clone(), msg)));
+                        }
                         scope.push(s);
                     }
                 }
@@ -400,14 +449,17 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
             _ => known = false,
         }
     }
-    let own = |n: &str, decl: bool, at: &str, arity: usize| Sym {
+    let own = |n: &str, decl: bool, at: &str, params: Vec<usize>| Sym {
         name: n.to_string(),
         origin: format!("{}.{n}", m.name),
         decl,
         fixed: false,
         at: at.to_string(),
-        arity,
+        arity: params.len(),
+        params,
+        inst: None,
     };
+    let params_of = |d: &Def| (0..d.params.len()).map(|k| d.arity.get(k).copied().unwrap_or(0)).collect::<Vec<usize>>();
     // The RECURSIVE declarations not defined yet, with their positions
     let mut pending_rec: Vec<(String, String)> = vec![];
     // The name of a recursive function whose body was checked with its `#app` definition
@@ -417,10 +469,22 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
         match u {
             Unit::Decl(n) | Unit::Theorem(n) => {
                 if let Some((other, _, _)) = scope.place(n) {
-                    error(at, clash(n, &other));
+                    // A second declaration of the module's own CONSTANT or VARIABLE, of the same
+                    // kind, is only a warning (`VARIABLE x, x`)
+                    let kind = match (m.variables.contains(n), m.constants.contains(n)) {
+                        (true, false) => Some(Kind::Var),
+                        (false, true) => Some(Kind::Const),
+                        _ => None,
+                    };
+                    let same = kind.is_some() && ctx.all.iter().find(|(x, _)| x == n).map(|(_, k)| *k) == kind;
+                    if matches!(u, Unit::Decl(_)) && scope.get(n).is_some_and(|s| s.decl) && same {
+                        warning(at, duplicate(n, &other));
+                    } else {
+                        error(at, clash(n, &other));
+                    }
                     continue;
                 }
-                let s = own(n, matches!(u, Unit::Decl(_)), at, arity);
+                let s = own(n, matches!(u, Unit::Decl(_)), at, vec![0; arity]);
                 scope.push(s.clone());
                 out.push(s);
                 let k = match u {
@@ -439,8 +503,9 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                 ctx.add(n, Kind::Def, true);
                 // Exported even when the definition is LOCAL (measured: a module that extends
                 // one with `RECURSIVE F(_)` and `LOCAL F(n) == ...` may not define F)
-                scope.push(own(n, false, at, arity));
-                out.push(own(n, false, at, arity));
+                // What its parameters take is known once it is defined
+                scope.push(own(n, false, at, vec![usize::MAX; arity]));
+                out.push(own(n, false, at, vec![usize::MAX; arity]));
             }
             Unit::Assume(i) => Walker::new(&scope, known, &m.recursive).expr(&m.assumes[*i].expr),
             Unit::Def(i, fun) => {
@@ -466,6 +531,7 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                         // SANY places the symbol at its definition from now on
                         for s in scope.syms.iter_mut().chain(out.iter_mut()).filter(|s| s.name == d.name && s.origin == format!("{}.{}", m.name, d.name)) {
                             s.at = at.to_string();
+                            s.params = params_of(d);
                         }
                         true
                     }
@@ -491,7 +557,7 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                     }
                 }
                 ctx.add(&d.name, Kind::Def, !m.local_defs.contains(&d.name));
-                let s = own(&d.name, false, at, d.params.len());
+                let s = own(&d.name, false, at, params_of(d));
                 if added && !scope.syms.contains(&s) {
                     scope.push(s.clone());
                 }
@@ -528,7 +594,8 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                             w.arg(e);
                         }
                         redefined(n, at, inst.params.len(), scope.place(n));
-                        let s = own(n, false, at, inst.params.len());
+                        let mut s = own(n, false, at, (0..inst.params.len()).map(|k| inst.arity.get(k).copied().unwrap_or(0)).collect());
+                        s.inst = Some(inst.module.clone());
                         scope.push(s.clone());
                         if !local {
                             out.push(s);
@@ -587,6 +654,20 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
     known.then_some(out)
 }
 
+/// An argument of a call without the ARG_AT label around it in a tree from
+/// `parser::parse_module_sany`, and the position the label gives (empty without one)
+fn arg_at(e: &Expr) -> (&Expr, String) {
+    match e {
+        Expr::Label(n, _, b) if n.starts_with(ARG_AT) => (b, n[ARG_AT.len()..].to_string()),
+        e => (e, String::new()),
+    }
+}
+
+/// The number of arguments each parameter of d takes
+fn let_params(d: &Def) -> Vec<usize> {
+    (0..d.params.len()).map(|k| d.arity.get(k).copied().unwrap_or(0)).collect()
+}
+
 /// A parameter, bound variable or LET definition in scope: where SANY places it, its number of
 /// parameters and whether it is a definition
 struct Local {
@@ -594,6 +675,8 @@ struct Local {
     at: String,
     arity: usize,
     def: bool,
+    /// The number of arguments each parameter takes
+    params: Vec<usize>,
 }
 
 /// Checks the names in the expressions of one definition (or ASSUME, or INSTANCE)
@@ -625,6 +708,79 @@ impl<'a> Walker<'a> {
         self.scope.has(n) || self.locals.iter().any(|l| l.name == n)
     }
 
+    /// The number of parameters of the operator n in scope and the number of arguments each of
+    /// them takes, also for `N!Op` of a named INSTANCE without parameters (None when not known)
+    fn op_info(&self, n: &str) -> Option<(usize, Vec<usize>)> {
+        if let Some((inst, op)) = n.split_once('!') {
+            if self.locals.iter().any(|l| l.name == inst) {
+                return None;
+            }
+            let s = self.scope.get(inst)?;
+            let module = s.inst.as_ref().filter(|_| s.arity == 0)?;
+            let syms = exports(module)??;
+            let d = syms.iter().rev().find(|d| d.name == op && !d.decl)?;
+            return Some((d.arity, d.params.clone()));
+        }
+        if let Some(l) = self.locals.iter().rev().find(|l| l.name == n) {
+            return Some((l.arity, l.params.clone()));
+        }
+        self.scope.get(n).map(|s| (s.arity, s.params.clone()))
+    }
+
+    /// The arguments of the operator n called at `at_all` (where its name is at `at_name`), as
+    /// SANY checks them against the operator's parameters: an operator's name or a LAMBDA where
+    /// a parameter takes no arguments is refused, and so is anything but an operator of as many
+    /// parameters where it takes some (measured on SANY 2.19, `tests/tlc/RejSanyOpArg*`)
+    fn args(&mut self, n: &str, args: &[Expr], at_name: &str, at_all: &str) {
+        let Some((_, params)) = self.op_info(n).filter(|(_, p)| p.len() == args.len() && !p.contains(&usize::MAX)) else {
+            return args.iter().for_each(|a| self.arg(arg_at(a).0));
+        };
+        // From the operator's name to the closing parenthesis
+        let whole = match (at_name.split_once(" to "), at_all.split_once(" to ")) {
+            (Some((from, _)), Some((_, to))) => format!("{from} to {to}"),
+            _ => at_all.to_string(),
+        };
+        // Reported after the arguments' own errors
+        let mut wrongs = vec![];
+        let mut wrong = |i: usize, j: usize| wrongs.push(format!("Argument number {} to operator '{}' \nshould be a {j}-parameter operator.", i + 1, sany_name(n)));
+        for (i, (a, &j)) in args.iter().zip(&params).enumerate() {
+            let (a, at) = arg_at(a);
+            match a {
+                Expr::Ident(x, xat) => {
+                    let x = untag(x).0;
+                    let xat = xat.text_if_known();
+                    // An operator symbol passed as an argument (`SortSeq(s, <)`) is not checked
+                    if !self.resolve(x, &xat, true) || !x.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let Some((k, _)) = self.op_info(x).or_else(|| self.place(x).map(|p| (p.2, vec![]))) else { continue };
+                    if j == 0 && k > 0 {
+                        error(&xat, format!("The operator {} requires {k} arguments.", sany_name(x)));
+                    } else if j > 0 && k != j {
+                        error(&xat, format!("Expected arity {j} but found operator of arity {k}."));
+                        wrong(i, j);
+                    }
+                }
+                Expr::Lambda(ps, _) if j == 0 => {
+                    let _ = ps;
+                    error(&at, "LAMBDA expression used where an expression is required.".into());
+                }
+                Expr::Lambda(ps, _) if ps.len() != j => {
+                    error(at_name, format!("Lambda expression with arity {} used as argument {} of operator `{}', \nbut an operator of arity {j} is required.", ps.len(), i + 1, sany_name(n)));
+                    wrong(i, j);
+                }
+                a if j > 0 && !matches!(a, Expr::Lambda(..)) => {
+                    error(&at, format!("An expression appears as argument number {} (counting from 1) to operator '{}', in a position an operator is required.", i + 1, sany_name(n)));
+                    wrong(i, j);
+                }
+                a => self.arg(a),
+            }
+        }
+        for w in wrongs {
+            error(&whole, w);
+        }
+    }
+
     /// See `Scope::place`, for locals too
     fn place(&self, n: &str) -> Option<(String, bool, usize)> {
         match self.locals.iter().rev().find(|l| l.name == n) {
@@ -643,7 +799,7 @@ impl<'a> Walker<'a> {
                 return false;
             }
         }
-        self.locals.push(Local { name: n.to_string(), at: at.to_string(), arity, def: false });
+        self.locals.push(Local { name: n.to_string(), at: at.to_string(), arity, def: false, params: vec![0; arity] });
         true
     }
 
@@ -660,7 +816,7 @@ impl<'a> Walker<'a> {
         if self.has(f) {
             error(at, format!("Function name `{f}' already defined or declared."));
         } else {
-            self.locals.push(Local { name: f.to_string(), at: at.to_string(), arity: 0, def: true });
+            self.locals.push(Local { name: f.to_string(), at: at.to_string(), arity: 0, def: true, params: vec![] });
         }
     }
 
@@ -679,6 +835,15 @@ impl<'a> Walker<'a> {
             Some((_, _, k)) => {
                 if word && !arg && k > 0 && !n.contains('!') {
                     error(at, format!("The operator {base} requires {k} arguments."));
+                }
+                // `N!Op` of a named INSTANCE, or `Op!lab` of a definition, named without the
+                // arguments its operator takes
+                if word && !arg && n.contains('!') {
+                    if let Some((k, _)) = self.op_info(n).filter(|(k, _)| *k > 0) {
+                        error(at, format!("The operator {n} requires {k} arguments."));
+                    } else if let Some((_, true, k)) = self.place(base).filter(|p| p.2 > 0 && self.scope.get(base).is_none_or(|s| s.inst.is_none())) {
+                        error(at, format!("The operator {base} requires {k} arguments."));
+                    }
                 }
                 true
             }
@@ -715,7 +880,7 @@ impl<'a> Walker<'a> {
     /// An argument of an operator, which may be a LAMBDA (only there, or in a WITH substitution)
     /// or an operator's name
     fn arg(&mut self, e: &Expr) {
-        match e {
+        match arg_at(e).0 {
             Expr::Lambda(ps, body) => self.scoped(|w| {
                 for p in ps {
                     w.bind(p, 0);
@@ -738,7 +903,18 @@ impl<'a> Walker<'a> {
                 self.resolve(untag(n).0, &at.text_if_known(), false);
             }
             Call(n, args) => {
-                if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA" {
+                if n.starts_with(crate::parser::UNBOUNDED) {
+                    if let Some((vars, body)) = crate::parser::unbounded_body(n) {
+                        self.scoped(|w| {
+                            for x in &vars {
+                                w.bind_var(x);
+                            }
+                            w.expr(&body)
+                        });
+                    }
+                    return;
+                }
+                if n == "\\EE" || n == "\\AA" {
                     // Their bound variables are not kept
                     return;
                 }
@@ -749,7 +925,25 @@ impl<'a> Walker<'a> {
                             Call(l, la) if l.starts_with("#label") => la.iter().for_each(|x| self.expr(x)),
                             Tuple(vs) if k > 0 => vs.iter().for_each(|x| self.expr(x)),
                             Ident(x, at) if k == 0 => {
-                                self.resolve(untag(x).0, &at.text_if_known(), true);
+                                let (x, at) = (untag(x).0, at.text_if_known());
+                                if !self.resolve(x, &at, true) || builtin(x) {
+                                    continue;
+                                }
+                                // Only a definition has subexpressions, and only applied to its
+                                // arguments (SANY places that error from the name to the last
+                                // selector)
+                                match self.place(x) {
+                                    Some((_, false, _)) => error(&at, format!("Cannot take subexpression of `{x}'.")),
+                                    Some((_, true, k)) if k > 0 => {
+                                        let last = crate::parser::subexpr_at(n).last().and_then(|l| l.split_once(" to ")).map(|(_, to)| to.to_string());
+                                        let whole = match (at.split_once(" to "), last) {
+                                            (Some((from, _)), Some(to)) => format!("{from} to {to}"),
+                                            _ => at.clone(),
+                                        };
+                                        error(&whole, format!("The operator {x} requires {k} arguments."));
+                                    }
+                                    _ => {}
+                                }
                             }
                             a => self.expr(a),
                         }
@@ -765,7 +959,8 @@ impl<'a> Walker<'a> {
                 match arity {
                     _ if !found => {}
                     Some(k) if k != args.len() => error(&at_all, format!("The operator {n} requires {k} arguments.")),
-                    _ => args.iter().for_each(|a| self.arg(a)),
+                    _ if found => self.args(n, args, &at_name, &at_all),
+                    _ => args.iter().for_each(|a| self.arg(arg_at(a).0)),
                 }
             }
             Un(op, x) => {
@@ -844,7 +1039,7 @@ impl<'a> Walker<'a> {
                         if fun_app.is_some() {
                             w.fun_name(name, at);
                         } else if rec {
-                            w.locals.push(Local { name: name.to_string(), at: at.to_string(), arity: d.params.len(), def: true });
+                            w.locals.push(Local { name: name.to_string(), at: at.to_string(), arity: d.params.len(), def: true, params: let_params(d) });
                         } else if w.has(name) {
                             error(at, format!("Operator {name} already defined or declared."));
                         }
@@ -861,7 +1056,7 @@ impl<'a> Walker<'a> {
                     // A function takes no parameters, unlike the `#app` operator it is checked with
                     let arity = if fun_app.is_some() { 0 } else { d.params.len() };
                     if rec || redefined(name, at, arity, w.place(name)) {
-                        w.locals.push(Local { name: name.to_string(), at: at.to_string(), arity, def: true });
+                        w.locals.push(Local { name: name.to_string(), at: at.to_string(), arity, def: true, params: if arity == 0 { vec![] } else { let_params(d) } });
                     }
                 }
                 if let Some((f, at)) = fun {
@@ -869,6 +1064,7 @@ impl<'a> Walker<'a> {
                 }
                 w.expr(body)
             }),
+            Label(n, _, body) if n.starts_with(ARG_AT) => self.expr(body),
             Label(n, _, body) if n.starts_with(OP_AT) => {
                 let (s, all) = n[OP_AT.len()..].split_once('\u{1}').unwrap_or_default();
                 self.op_at = Some((s.to_string(), all.to_string()));

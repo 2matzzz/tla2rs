@@ -94,6 +94,8 @@ fn sany_pos() -> bool {
 
 /// After a name in a tree from `parse_module_sany`: the position of the name follows
 pub const NAME_AT: char = '\u{5}';
+/// In a tree from `parse_module_sany`, the label around each argument of a call, with its position
+pub const ARG_AT: &str = "#argat ";
 
 /// The label around an operator applied, in a tree from `parse_module_sany`: `#opat `, the
 /// position of the operator's symbol or name, `\u{1}` and the position of the whole expression
@@ -264,6 +266,18 @@ pub fn is_infix_name(name: &str) -> bool {
 /// The name of the call an unbounded quantifier or CHOOSE becomes, followed by `\\E`, `\\A` or
 /// `CHOOSE`, a space and its position
 pub const UNBOUNDED: &str = "#unbounded";
+
+thread_local! {
+    /// The bound variables and body of each `\E x : P`, `\A x : P` and `CHOOSE x : P` without a
+    /// set, by the name of the call it parses into (which has its position), for SANY's checks of
+    /// the names in them (sany.rs); the tree keeps neither
+    static UNBOUNDED_BODIES: std::cell::RefCell<std::collections::HashMap<String, (Vec<String>, Expr)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// See UNBOUNDED_BODIES
+pub fn unbounded_body(call: &str) -> Option<(Vec<String>, Expr)> {
+    UNBOUNDED_BODIES.with(|b| b.borrow().get(call).cloned())
+}
 
 /// TLC's error when it evaluates the unbounded quantifier or CHOOSE named `call` (see UNBOUNDED)
 pub fn unbounded_error(call: &str) -> Option<String> {
@@ -601,7 +615,10 @@ impl Parser {
                         }
                         m.units.push(Unit::Decl(c.clone()));
                         m.unit_at.push((at, n));
-                        m.constants.push(c);
+                        // Declared twice: one constant (SANY warns, see sany.rs)
+                        if !m.constants.contains(&c) {
+                            m.constants.push(c);
+                        }
                     }
                 }
                 Tok::Ident(k) if k == "VARIABLE" || k == "VARIABLES" => {
@@ -609,7 +626,11 @@ impl Parser {
                     let vs = self.ident_list()?;
                     m.units.extend(vs.iter().map(|v| Unit::Decl(v.clone())));
                     m.unit_at.extend(std::mem::take(&mut self.names_at).into_iter().map(|at| (at, 0)));
-                    m.variables.extend(vs);
+                    for v in vs {
+                        if !m.variables.contains(&v) {
+                            m.variables.push(v);
+                        }
+                    }
                 }
                 // TLC checks ASSUME and ASSUMPTION, and skips THEOREM and AXIOM
                 Tok::Ident(k) if k == "ASSUME" || k == "ASSUMPTION" => {
@@ -1192,10 +1213,16 @@ impl Parser {
         }
         // The position runs from the quantifier to the end of its body
         let start = self.pos - 1;
+        let vars: Vec<String> = (self.pos..=i).step_by(2).filter_map(|k| match &self.toks[k].tok {
+            Tok::Ident(x) => Some(self.tagged(x.clone(), k)),
+            _ => None,
+        }).collect();
         self.pos = i + 2;
-        self.expr(0)?;
+        let body = self.expr(0)?;
         let at = self.span_text(start, self.pos - 1);
-        Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind} {at}"), vec![])))
+        let call = format!("{UNBOUNDED}{kind} {at}");
+        UNBOUNDED_BODIES.with(|b| b.borrow_mut().insert(call.clone(), (vars, body)));
+        Ok(Some(Expr::Call(call, vec![])))
     }
 
     /// The operand of the prefix operator `op` (by its name in `sany_range`), parsed at
@@ -1483,6 +1510,11 @@ impl Parser {
 
     /// Comma-separated items up to and including `close`.
     fn comma_list(&mut self, close: &str) -> R<Vec<Expr>> {
+        self.comma_list_at(close, &std::cell::RefCell::new(vec![]))
+    }
+
+    /// `comma_list`, noting the first and last token of each element in `at`
+    fn comma_list_at(&mut self, close: &str, at: &std::cell::RefCell<Vec<(usize, usize)>>) -> R<Vec<Expr>> {
         let mut v = vec![];
         if self.is(close) {
             self.pos += 1;
@@ -1493,6 +1525,7 @@ impl Parser {
             if let Some((_, _, name)) = infix(self.peek()) {
                 if matches!(self.peek2(), Tok::Sym(s) if s == "," || s == close) {
                     self.pos += 1;
+                    at.borrow_mut().push((self.pos - 1, self.pos - 1));
                     v.push(Expr::Ident(name.to_string(), NOPOS));
                     if self.is(",") {
                         self.pos += 1;
@@ -1502,7 +1535,9 @@ impl Parser {
                     return Ok(v);
                 }
             }
+            let start = self.pos;
             v.push(self.expr(0)?);
+            at.borrow_mut().push((start, self.pos - 1));
             if self.is(",") {
                 self.pos += 1;
             } else {
@@ -1591,7 +1626,16 @@ impl Parser {
                 loop {
                     if self.is("(") {
                         self.pos += 1;
-                        args.extend(self.nested(|p| p.comma_list(")"))?);
+                        let from = args.len();
+                        let starts = std::cell::RefCell::new(vec![]);
+                        args.extend(self.nested(|p| p.comma_list_at(")", &starts))?);
+                        if sany_pos() {
+                            // Each argument with its position, for SANY's errors about it (sany.rs)
+                            let ends = starts.borrow();
+                            for (a, &(b, e)) in args[from..].iter_mut().zip(ends.iter()) {
+                                *a = Expr::Label(format!("{ARG_AT}{}", self.span_text(b, e)), vec![], std::mem::replace(a, Expr::Bool(true)).b());
+                            }
+                        }
                         call = true;
                     }
                     // An operator of an instance: `N!Op`, `N(a)!Op(b)` (the arguments are joined)

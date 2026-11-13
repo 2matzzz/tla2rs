@@ -214,15 +214,18 @@ memory.
   string escapes, LAMBDA), the level errors of temporal formulas, and the semantic errors, all of a module in SANY's
   order with the position of the declaration a name clashes with (also in a standard module), then SANY's warnings.
   A name is in scope only after the statement that introduces it, as in SANY: an operator parameter may be named
-  like a VARIABLE declared later. Not repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and
-  `\AA`; positional names of LET definitions; an operator passed where a parameter takes none; and SANY's other
-  checks (see CLAUDE.md, "What SANY refuses")
+  like a VARIABLE declared later. Not repeated: names inside `\EE` and `\AA`, and SANY's other checks (see CLAUDE.md,
+  "What SANY refuses"). An operator passed where a parameter takes none, or anything but an operator of the right
+  arity where it takes some, is refused, and so is a subexpression of a CONSTANT, VARIABLE or parameter (`x!1`) or of
+  an operator named without its arguments (`Op!1`). A CONSTANT or VARIABLE declared twice (`VARIABLE x, x`) gets
+  SANY's warning, as in TLC
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning
 - TLC's warning that an EXCEPT names an argument or field the value does not have is printed as TLC prints it (each
-  text once, the first with TLC's note about `-nowarning`), except for an EXCEPT of constant level inside an action
-  or an invariant, which the compiler evaluates once and the checker does not warn about
+  text once, the first with TLC's note about `-nowarning`), also for an EXCEPT of constant level inside Init, an
+  action or an invariant, which the compiler evaluates once: the checker warns each time TLC would evaluate it, and
+  when it starts for the set of a `\E` that TLC splits the next-state relation through (TLC evaluates that set once)
 - Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
   body; 50,000 levels at compile time). TLC overflows its JVM stack much earlier (500 to 900 levels for small
   bodies), so a recursion between the two depths passes here where TLC reports a stack overflow
@@ -233,15 +236,16 @@ memory.
 - Strings are ordered as TLC orders them, by when TLC first creates them: those of the cfg and the modules (names,
   numbers as written, string literals) as TLC parses them, then those made by operations (`\o`, `Append`, `Head`,
   `Tail`, `SubSeq`, `ToString`) in the order TLC makes them, first when it starts (it evaluates every definition of
-  constant level, used or not, then the ASSUMEs) and then while it explores. The checker's strings are numbered when
+  constant level, used or not, the sets of the `\E` it splits the next-state relation through, then the ASSUMEs)
+  and then while it explores. The checker's strings are numbered when
   it is built, so with one worker it notes the order it makes them in; when that differs from their numbers, tla2rs
   prints `tla2rs: strings were made in another order than they were numbered in; checking again from the start with
   them in that order`, builds the checker again with that order and runs it from the start (at most 8 times; output
   printed before the line is repeated). Not followed: with several workers TLC's order depends on scheduling, and the
-  checker keeps the order it was built with; a string made by a constant expression that tla2rs evaluates while it
-  compiles, other than a value, a set a quantifier ranges over or a set tested for membership (the condition of an
-  IF, say), and the characters of a string taken apart into a tuple (`SelectSeq`, `SortSeq`, a string compared with a
-  tuple) keep the order tla2rs meets them in
+  checker keeps the order it was built with; the characters of a string taken apart into a tuple (`SelectSeq`,
+  `SortSeq`, a string compared with a tuple) keep the order tla2rs meets them in. A string made by a constant
+  expression that tla2rs evaluates while it compiles counts where TLC evaluates it (as a value, a set, the condition
+  of an IF or of an action, ...)
 - A set that TLC holds as an interval (`x = 1..3`) prints as `{1, 2, 3}`, where TLC prints `1..3` until an
   operation enumerates it. Which form TLC prints depends on how the value was built (see CLAUDE.md, "State graphs"),
   so the comparison with TLC reads an interval as the set it denotes
