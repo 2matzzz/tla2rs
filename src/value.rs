@@ -180,6 +180,12 @@ fn except_warning(at: &str) {
     record_print(vec![format!("{WARNING_MARK}Warning: The EXCEPT was applied to non-existing fields of the value at\n{at}")]);
 }
 
+thread_local! {
+    /// While the ASSUMEs are evaluated: TLC's registers (`TLCSet(i, v)`), which the checker starts
+    /// from (`REG_INIT`). TLCGet and TLCSet are evaluated nowhere else when compiling
+    pub static TLC_REGS: std::cell::RefCell<Option<std::collections::BTreeMap<i64, i64>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn record_print(line: Vec<String>) {
     PRINTS.with(|n| n.set(n.get() + 1));
     PRINTED.with(|p| {
@@ -841,6 +847,33 @@ impl ConstEval<'_> {
                         }
                     }
                     Value::Tuple(out)
+                }
+                // When TLC starts, before any state: level 0, diameter 1, no state found or queued.
+                // Counted as printing, so that a value computed with them is not kept
+                ("TLCGet", [x]) if TLC_REGS.with(|r| r.borrow().is_some()) => {
+                    PRINTS.with(|n| n.set(n.get() + 1));
+                    match self.eval(x, env)? {
+                        Value::Int(i) => match TLC_REGS.with(|r| r.borrow().as_ref().unwrap().get(&i).copied()) {
+                            Some(v) => Value::Int(v),
+                            None => return Err(format!("TLCGet({i}) was undefined.")),
+                        },
+                        Value::Atom(a) => match self.atoms.name(a).as_str() {
+                            "level" | "distinct" | "queue" => Value::Int(0),
+                            "diameter" => Value::Int(1),
+                            k => return Err(format!("TLCGet(\"{k}\") is not supported")),
+                        },
+                        v => return Err(format!("TLCGet of {v:?} is not supported")),
+                    }
+                }
+                ("TLCSet", [x, v]) if TLC_REGS.with(|r| r.borrow().is_some()) => {
+                    PRINTS.with(|n| n.set(n.get() + 1));
+                    match (self.eval(x, env)?, self.eval(v, env)?) {
+                        (Value::Int(i), Value::Int(v)) => {
+                            TLC_REGS.with(|r| r.borrow_mut().as_mut().unwrap().insert(i, v));
+                        }
+                        _ => return Err("TLCSet in an ASSUME is supported for an integer register and value only".into()),
+                    }
+                    Value::Bool(true)
                 }
                 ("PrintT", [x]) => {
                     let x = match self.lazy_fun_shown(x, env).or_else(|| self.interval_shown(x, env)) {
