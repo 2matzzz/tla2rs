@@ -4115,7 +4115,13 @@ impl<'a> Gen<'a> {
                         Some(_) => "true".into(),
                         None => "false".into(),
                     },
-                    _ => return Err("only `\"field\" \\in DOMAIN record` and DOMAIN of functions are supported".into()),
+                    // A function (over strings): a test of membership in its domain
+                    _ => {
+                        let (xc, xt) = self.gen(a, env, None)?;
+                        let x = self.fresh("x");
+                        let m = self.gen_member(&x, &xt, b, env)?;
+                        format!("{{ let _ = &{rc}; let {x} = {xc}; {m} }}")
+                    }
                 };
                 (if op == NotIn { format!("!{has}") } else { has }, Ty::Bool)
             }
