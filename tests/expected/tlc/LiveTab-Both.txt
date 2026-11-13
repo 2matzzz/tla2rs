@@ -1,0 +1,10 @@
+key 91556632c3309d601e41dd586adb3e8bb6612a94ca53077dffbafc91599e1f35
+tlc Version 2.19
+rc 13
+Temporal property violated
+6 states generated 4 distinct states found 0 states left on queue
+trace 6 140f37ac566d95b48d1fd42ca49e47b19d2507864fadf336a5d848ab064baa2b
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 5 a54c84d2a4b435c4f4ca0f9229a34e9b0cdc0a0ddabf62f284939f588e861f9d
+messages 2 6be04df69bad15fab236950a575fcd0eb79db1c87abb9f8463f5b6d04807d609
+errors 2 6be04df69bad15fab236950a575fcd0eb79db1c87abb9f8463f5b6d04807d609
