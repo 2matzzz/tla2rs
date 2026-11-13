@@ -117,6 +117,11 @@ pub struct Gen<'a> {
     /// TLC names them with (`N!` or nothing), and the number of constants and variables
     /// substituted
     pub inst_prefixes: Vec<(String, String, usize)>,
+    /// For each name a BIND label binds, while `is_const` walks it: whether its expression is
+    /// constant (printing or not), and whether computing it prints (see `bind_const`)
+    bconst: std::cell::RefCell<HashMap<String, (bool, bool)>>,
+    /// For each name a BIND label binds, whether its expression depends on the state
+    bstate: std::cell::RefCell<HashMap<String, bool>>,
 }
 
 /// The local holding the value bound to the substituted variable `n` of an instance while
@@ -165,6 +170,8 @@ impl<'a> Gen<'a> {
             ract_progress: vec![],
             def_pos: HashMap::new(),
             inst_prefixes: vec![],
+            bconst: Default::default(),
+            bstate: Default::default(),
         }
     }
 
@@ -930,8 +937,17 @@ impl<'a> Gen<'a> {
                     out.push(x.clone());
                 }
             }
-            // The arguments of a call site are only a trace (an operator passed is named there)
-            if let Expr::Label(_, _, b) = e {
+            // The arguments of a call site are only a trace (an operator passed is named there);
+            // a BIND label binds its names in the expressions after them and in its body
+            if let Expr::Label(l, a, b) = e {
+                if is_bind(l) {
+                    for p in a.chunks(2) {
+                        if let [Expr::Ident(x, _), v] = p {
+                            walk(v, bound, out);
+                            bound.push(x.clone());
+                        }
+                    }
+                }
                 walk(b, bound, out);
             } else {
                 for c in e.children() {
@@ -996,26 +1012,28 @@ impl<'a> Gen<'a> {
         // The values the body can take, through IF: one without a recursive call (a base case)
         // gives its type
         let mut values = vec![];
-        let mut todo = vec![&rd.body];
+        let mut todo = vec![rd.body.clone()];
         while let Some(e) = todo.pop() {
             match e {
-                Expr::Label(_, _, b) => todo.push(b),
+                // The names a BIND label binds, written out (see `gen_bind`)
+                Expr::Label(n, a, b) if is_bind(&n) => todo.push(unbind(&a, &b)),
+                Expr::Label(_, _, b) => todo.push(*b),
                 Expr::If(_, a, b) => {
-                    todo.push(b);
-                    todo.push(a);
+                    todo.push(*b);
+                    todo.push(*a);
                 }
                 e => values.push(e),
             }
         }
         for value in values {
-            if let Expr::FunCons(_, dom, _) = value {
+            if let Expr::FunCons(_, dom, _) = &value {
                 if let Ok((_, Ty::Set(dt))) = self.gen(dom, &env, None) {
                     for c in [Ty::Bool, Ty::Int(0, 0), Ty::Enum(vec![])] {
                         seeds.push(Ty::Fun(dt.clone(), c.into()));
                     }
                 }
             } else if !value.any(&|x| matches!(x, Expr::RecCall(..))) {
-                if let Ok((_, t)) = self.gen(value, &env, None) {
+                if let Ok((_, t)) = self.gen(&value, &env, None) {
                     if !seeds.contains(&t) {
                         seeds.push(t);
                     }
@@ -1156,6 +1174,14 @@ impl<'a> Gen<'a> {
             // prints then, see compile.rs)
             Expr::Call(n, _) if n == "PrintT" || n == "Print" => false,
             Expr::Label(n, a, b) if a.is_empty() && self.zero_defs.contains(n) => self.is_const_quiet(b, env),
+            Expr::Label(n, a, b) if is_bind(n) => {
+                self.bind_const(a, env);
+                self.is_const(b, env)
+            }
+            Expr::Ident(n, _) if !env.locals.contains_key(n) && self.bconst.borrow().contains_key(n) => {
+                let (c, prints) = self.bconst.borrow()[n];
+                c && !prints
+            }
             // A call site keeps its arguments only as a trace: the body has them substituted. A
             // definition of an instantiated module takes the module's variables as leading
             // arguments even where its body reads none of them
@@ -1166,10 +1192,33 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Notes for each name the BIND label with the pairs `pairs` binds whether its expression is
+    /// constant, and whether computing it prints (a name read in a definition of constant level
+    /// without arguments is part of its value, computed when TLC starts; elsewhere, one that
+    /// prints is evaluated where it is used)
+    fn bind_const(&self, pairs: &[Expr], env: &Env) {
+        for p in pairs.chunks(2) {
+            if let [Expr::Ident(n, _), x] = p {
+                let c = self.is_const_quiet(x, env);
+                let prints = x.any(&|y| match y {
+                    Expr::Call(f, _) => f == "Print" || f == "PrintT",
+                    Expr::Ident(m, _) => self.bconst.borrow().get(m).is_some_and(|b| b.1),
+                    _ => false,
+                });
+                self.bconst.borrow_mut().insert(n.clone(), (c, prints));
+            }
+        }
+    }
+
     /// Whether e is constant, printing or not
     fn is_const_quiet(&self, e: &Expr, env: &Env) -> bool {
         match e {
             Expr::Prime(_) | Expr::At | Expr::Un(UOp::Unchanged | UOp::Enabled, _) => false,
+            Expr::Label(n, a, b) if is_bind(n) => {
+                self.bind_const(a, env);
+                self.is_const_quiet(b, env)
+            }
+            Expr::Ident(n, _) if !env.locals.contains_key(n) && self.bconst.borrow().contains_key(n) => self.bconst.borrow()[n].0,
             Expr::Ident(n, _) => !(self.is_var(n) || env.locals.contains_key(n) && !env.vals.contains_key(n)),
             // The arguments of a call site are only a trace (see is_const)
             Expr::Label(_, _, b) => self.is_const_quiet(b, env),
@@ -2265,6 +2314,13 @@ impl<'a> Gen<'a> {
                 return Ok((self.note_folded(c, &made), t));
             }
         }
+        if let Label(n, pairs, body) = e {
+            if is_bind(n) {
+                let (lets, env2, body) = self.gen_bind(pairs, body, env)?;
+                let (c, t) = self.gen(&body, &env2, want)?;
+                return Ok((if lets.is_empty() { c } else { format!("{{ {lets}{c} }}") }, t));
+            }
+        }
         // An operator of the CommunityModules evaluated only when compiling (see ast::CONST_ONLY)
         let mut x = e;
         while let Label(n, _, b) = x {
@@ -2312,6 +2368,10 @@ impl<'a> Gen<'a> {
                     (Self::default_code(&t), t)
                 } else if n == "JavaTime" {
                     return Err("JavaTime is not supported: it reads the clock, so no two runs agree".into());
+                } else if let Some(x) = crate::value::bound_expr(n) {
+                    // A name a BIND label binds and code generation writes out, read in the body of
+                    // a recursive operator (see `gen_bind`)
+                    return self.gen(&x, env, want);
                 } else {
                     return Err(format!("unknown identifier `{n}` (missing CONSTANT in cfg?)"));
                 }
@@ -3606,7 +3666,12 @@ impl<'a> Gen<'a> {
                 }
                 // Bound variables of the call site that the body refers to are passed along
                 for f in self.rec_free(&rd) {
-                    let (c, t) = env.locals.get(&f).cloned().ok_or(format!("recursive operator `{}`: unknown identifier `{f}`", rd.name))?;
+                    // A name a BIND label outside binds and code generation writes out (see
+                    // `gen_bind`): its value
+                    let (c, t) = match env.locals.get(&f) {
+                        None if crate::value::bound_expr(&f).is_some() => self.gen(&Ident(f.clone(), NOPOS), env, None)?,
+                        x => x.cloned().ok_or(format!("recursive operator `{}`: unknown identifier `{f}`", rd.name))?,
+                    };
                     codes.push(c);
                     tys.push(t);
                 }
@@ -4639,6 +4704,18 @@ impl<'a> Gen<'a> {
             return self.emit_state(env, out);
         };
         let with = |x: Vec<Expr>| -> Vec<Expr> { x.into_iter().chain(rest.iter().cloned()).collect() };
+        if let Label(n, pairs, body) = h {
+            if is_bind(n) {
+                // Where TLC computes successors, it evaluates the names again at each use (see
+                // `expand::float_binds`): they are written out
+                if n == BIND_ACT && env.primed.len() < self.vars.len() {
+                    return self.gen_action(&with(vec![unbind(pairs, body)]), env, out);
+                }
+                let (lets, env2, body) = self.gen_bind(pairs, body, env)?;
+                writeln!(out, "{lets}").unwrap();
+                return self.gen_action(&with(vec![body]), &env2, out);
+            }
+        }
         if env.split && !env.init && self.gen_split(h, rest, env, out)? {
             return Ok(());
         }
@@ -5705,9 +5782,61 @@ impl<'a> Gen<'a> {
     /// Whether `e` depends on the state (has level 1 or more for SANY)
     fn mentions_state(&self, e: &Expr) -> bool {
         e.any(&|x| {
-            matches!(x, Expr::Ident(n, _) if self.is_var(n))
+            matches!(x, Expr::Ident(n, _) if self.is_var(n) || self.bound_mentions_state(n))
                 || matches!(x, Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled, _) | Expr::BoxAction(..))
         })
+    }
+
+    /// Whether the expression a BIND label binds to the name n depends on the state
+    fn bound_mentions_state(&self, n: &str) -> bool {
+        if let Some(&b) = self.bstate.borrow().get(n) {
+            return b;
+        }
+        let Some(x) = crate::value::bound_expr(n) else { return false };
+        let b = self.mentions_state(&x);
+        self.bstate.borrow_mut().insert(n.to_string(), b);
+        b
+    }
+
+    /// The names a BIND label binds (`Expander::expand_def_code`), in an expression: TLC evaluates
+    /// a LET definition or an argument where it is first used and keeps the value for the rest of
+    /// the evaluation of the LET or the call (measured, `tests/tlc/LazyLet`). Each name becomes a
+    /// Rust `OnceCell` and a closure computing its value on first use. A name is written out where
+    /// it is used instead (as all were before) when its value is constant (folded there), when TLC
+    /// keeps its value unevaluated (`lazy_value`: a function constructor applied only where it is
+    /// applied, a set it does not enumerate), in Init when it reads variables while some are still
+    /// unassigned (the closure would hold the state being built), and when its value cannot be
+    /// generated on its own (a set only tested for membership). Returns the code declaring the
+    /// names, the environment with them, and the body with the names written out replaced
+    fn gen_bind(&mut self, pairs: &[Expr], body: &Expr, env: &Env) -> R<(String, Env, Expr)> {
+        let mut env2 = env.clone();
+        let mut pairs: Vec<(String, Expr)> = pairs
+            .chunks(2)
+            .map(|p| match p {
+                [Expr::Ident(n, _), x] => (n.clone(), x.clone()),
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut body = body.clone();
+        let mut lets = String::new();
+        for k in 0..pairs.len() {
+            let (n, x) = pairs[k].clone();
+            let all_assigned = env.primed.len() == self.vars.len();
+            let cell = !self.is_const(&x, &env2) && !x.is_action() && !lazy_value(&x) && !(env.init && !all_assigned && self.mentions_state(&x));
+            if cell {
+                if let Ok((c, t)) = self.gen(&x, &env2, None) {
+                    let id = self.fresh("b");
+                    write!(lets, "let {id} = std::cell::OnceCell::new(); let {id}f = || -> {} {{ {c} }}; ", t.repr()).unwrap();
+                    env2.bind(&n, format!("{id}.get_or_init(&{id}f).clone()"), t);
+                    continue;
+                }
+            }
+            for p in &mut pairs[k + 1..] {
+                p.1 = crate::expand::subst_ident(&p.1, &n, &x);
+            }
+            body = crate::expand::subst_ident(&body, &n, &x);
+        }
+        Ok((lets, env2, body))
     }
 
     /// Whether `n` is the hidden definition of an INSTANCE with substitutions, which TLC does not
@@ -6721,6 +6850,32 @@ fn unbounded_ints(t: &Ty) -> Ty {
 impl Env {
     pub fn bind(&mut self, name: &str, code: String, t: Ty) {
         self.locals.insert(name.to_string(), (code, t));
+    }
+}
+
+/// The body of a BIND label with the pairs `pairs`, with the names written out
+fn unbind(pairs: &[Expr], body: &Expr) -> Expr {
+    let mut body = body.clone();
+    for p in pairs.chunks(2).rev() {
+        if let [Expr::Ident(n, _), x] = p {
+            body = crate::expand::subst_ident(&body, n, x);
+        }
+    }
+    body
+}
+
+/// Whether TLC keeps the value of e unevaluated, so that only the parts used are computed: a
+/// function constructor (applied where it is applied), or a set it does not enumerate to test
+/// membership (a range, SUBSET, UNION, a set of functions, records, sequences or tuples)
+fn lazy_value(e: &Expr) -> bool {
+    use Expr::*;
+    match e {
+        Label(_, _, b) => lazy_value(b),
+        If(_, a, b) => lazy_value(a) || lazy_value(b),
+        Case(arms, o) => arms.iter().any(|(_, v)| lazy_value(v)) || o.as_ref().is_some_and(|o| lazy_value(o)),
+        FunCons(..) | FunSet(..) | RecSet(..) | Un(UOp::Subset | UOp::Union, _) | Bin(BOp::Range, ..) => true,
+        Call(f, _) => f == "Seq" || f == "\\X",
+        _ => false,
     }
 }
 

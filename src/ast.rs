@@ -280,6 +280,15 @@ pub const CONST_ONLY: &str = "#const_only ";
 /// it evaluates the expression of a name where the name is first used and keeps the value
 pub const BIND: &str = "#bind";
 
+/// A BIND label where TLC computes the successors of an action, which evaluates each name again
+/// at each use (see `expand::float_binds`)
+pub const BIND_ACT: &str = "#bind-act";
+
+/// Whether `n` names a BIND label (BIND or BIND_ACT)
+pub fn is_bind(n: &str) -> bool {
+    n == BIND || n == BIND_ACT
+}
+
 /// `e` wrapped in an AT label for the position `at`
 pub fn at_err(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{AT}{at}"), vec![], e.b())

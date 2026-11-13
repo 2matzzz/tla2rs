@@ -1269,8 +1269,10 @@ fn compile_inner(
 
     // SANY checks the level rules of temporal formulas in every definition, used or not (a
     // definition with arguments is checked as written, without what it refers to)
+    // (expanded with the bindings of code generation, which binds only expressions of state level,
+    // whose names keep the levels these rules compare: action and temporal)
     for d in &m.defs {
-        let e = if d.params.is_empty() { ex.expand_def_bound(&d.name).ok() } else { Some(d.body.clone()) };
+        let e = if d.params.is_empty() { ex.expand_def_code(&d.name, false).ok() } else { Some(d.body.clone()) };
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
             // As SANY reports it, with the position of the formula it refuses: the root module is
             // parsed again with the positions of temporal formulas (see `parse_module_spans`), and
@@ -1295,10 +1297,12 @@ fn compile_inner(
         let names: Vec<String> = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
         atoms.log_start();
         for n in names {
-            let Ok(e) = ex.expand_def_bound(&n) else { continue };
-            if !constant_level(&e, &m) {
+            // Whether it is of constant level, from the expansion for code generation, which does
+            // not write out the arguments of state level at each use
+            if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) {
                 continue;
             }
+            let Ok(e) = ex.expand_def_bound(&n) else { continue };
             if has_prints(&e) || has_except(&e) {
                 // TLC ignores a definition it fails to evaluate here (and may warn about an
                 // EXCEPT, see `value::except_warning`)
@@ -1319,10 +1323,10 @@ fn compile_inner(
         let ce = ConstEval { atoms: &atoms, constants: &constants };
         let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
         for (what, name) in named {
-            let e = ex.expand_def_bound(name)?;
-            if !constant_level(&e, &m) {
+            if !constant_level(&ex.expand_def_code(name, false)?, &m) {
                 continue;
             }
+            let e = ex.expand_def_bound(name)?;
             atoms.log_start();
             // Only TLC's warnings are kept of what it prints here
             let mut printed = vec![];
@@ -1402,6 +1406,10 @@ fn compile_inner(
     // (see Gen::gen_split); everything else reads it without them
     let next_pos = next.unwrap_or(Expr::Bool(false));
     let next = strip_pos(&next_pos);
+    // The names bound for code generation (see `Expander::expand_def_code`), for the constant
+    // evaluator that folds constant parts
+    crate::value::register_bound(&init);
+    crate::value::register_bound(&next_pos);
 
     let mut g = Gen::new(&atoms, &constants);
     g.track_from = track_from as u32;
@@ -1520,7 +1528,7 @@ fn compile_inner(
     // order of the lines printed (see PRINT_ORDER in the runtime)
     let print_order = has_prints(&init)
         || has_prints(&next_pos)
-        || cfg.invariants.iter().any(|n| ex.expand_def_bound(n).is_ok_and(|e| has_prints(&e)));
+        || cfg.invariants.iter().any(|n| ex.expand_def_code(n, false).is_ok_and(|e| has_prints(&e)));
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
@@ -1540,7 +1548,8 @@ fn compile_inner(
         if type_inv_subsumed && name == tname {
             continue;
         }
-        let e = ex.expand_def(name)?;
+        let e = ex.expand_def_code(name, false)?;
+        crate::value::register_bound(&e);
         inv_prints |= has_prints(&e);
         let c = g.gen_as(&e, &Gen::env_next(), &Ty::Bool).map_err(|m| format!("invariant {name}: {m}"))?;
         writeln!(inv_code, "fn inv_{i}(s: &State) -> bool {{ {c} }}").unwrap();
@@ -1629,7 +1638,8 @@ fn compile_inner(
     // ACTION_CONSTRAINT: like CONSTRAINT, but on the step from a state to its successor
     let mut acons = vec![];
     for name in &cfg.action_constraints {
-        let e = ex.expand_def(name)?;
+        let e = ex.expand_def_code(name, false)?;
+        crate::value::register_bound(&e);
         let env = g.env_step(Gen::env_next());
         acons.push(g.gen_as(&e, &env, &Ty::Bool).map_err(|m| format!("action constraint {name}: {m}"))?);
     }
@@ -1643,7 +1653,8 @@ fn compile_inner(
     // checked against invariants)
     let mut cons = vec![];
     for name in &cfg.constraints {
-        let e = ex.expand_def(name)?;
+        let e = ex.expand_def_code(name, false)?;
+        crate::value::register_bound(&e);
         cons.push(g.gen_as(&e, &Gen::env_next(), &Ty::Bool).map_err(|m| format!("constraint {name}: {m}"))?);
     }
     writeln!(prop_code, "fn constraint(s: &State) -> bool {{ {} }}", if cons.is_empty() { "true".into() } else { cons.join(" && ") }).unwrap();
@@ -1962,7 +1973,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
         let next = match &cfg.next {
             Some(n) => {
                 ex.keep_pos = true;
-                let e = ex.expand_def(n);
+                let e = ex.expand_def_code(n, true);
                 ex.keep_pos = false;
                 Some(e?)
             }
@@ -1976,7 +1987,7 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
             }),
             temporal: vec![],
         });
-        return Ok(Ok(SpecParts { init: ex.expand_def(i)?, next, temporal: vec![], written }));
+        return Ok(Ok(SpecParts { init: ex.expand_def_code(i, true)?, next, temporal: vec![], written }));
     }
     let Some(spec) = cfg.specification.as_ref() else { return Ok(Err((NO_INIT.into(), 151))) };
     let mut w = SpecWalk { init: vec![], next: None, temporal: vec![], twice: false, written: Ok(Default::default()) };
@@ -2029,7 +2040,7 @@ impl SpecWalk {
             Expr::Un(UOp::Always, x) => match x.as_ref() {
                 Expr::BoxAction(a, _) => {
                     ex.keep_pos = true;
-                    let a = ex.expand_top(a);
+                    let a = ex.expand_top_code(a, true);
                     ex.keep_pos = false;
                     self.set_next(a?);
                     if let Ok(w) = &mut self.written {
@@ -2057,7 +2068,7 @@ impl SpecWalk {
                 } else if is_temporal(e, m, &mut HashSet::new()) {
                     self.walk(&b, m, ex)?;
                 } else {
-                    self.init.push(ex.expand_top(e)?);
+                    self.init.push(ex.expand_top_code(e, true)?);
                     if let Ok(w) = &mut self.written {
                         w.init.push(e.clone());
                     }
@@ -2071,7 +2082,7 @@ impl SpecWalk {
                 }
             }
             e => {
-                self.init.push(ex.expand_top(e)?);
+                self.init.push(ex.expand_top_code(e, true)?);
                 if let Ok(w) = &mut self.written {
                     w.init.push(e.clone());
                 }

@@ -209,8 +209,10 @@ thread_local! {
     static BOUND_RECS: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::new());
     /// For each bound name, the names its value can depend on (see `free_names`)
     static BOUND_FREE: std::cell::RefCell<HashMap<String, Rc<Vec<String>>>> = std::cell::RefCell::new(HashMap::new());
-    /// The values of bound names, by name and the values of the names each depends on
-    static BOUND_VALUES: std::cell::RefCell<HashMap<(String, Vec<Option<Value>>), Value>> = std::cell::RefCell::new(HashMap::new());
+    /// The values of bound names, by name and the values of the names each depends on, with the
+    /// strings made while computing each (noted again where the value is used again, see
+    /// `eval_bound`)
+    static BOUND_VALUES: std::cell::RefCell<HashMap<(String, Vec<Option<Value>>), (Value, Vec<u32>)>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Forgets the bound names and their values (the names are fresh for each expansion; the values
@@ -226,7 +228,7 @@ pub fn clear_bound() {
 /// the constant evaluator evaluates e
 pub fn register_bound(e: &Expr) {
     match e {
-        Expr::Label(n, args, body) if n == BIND => {
+        Expr::Label(n, args, body) if is_bind(n) => {
             for pair in args.chunks(2) {
                 if let [Expr::Ident(x, _), a] = pair {
                     BOUND.with(|b| b.borrow_mut().insert(x.clone(), Rc::new(a.clone())));
@@ -251,7 +253,7 @@ pub fn register_bound(e: &Expr) {
     }
 }
 
-fn bound_expr(n: &str) -> Option<Rc<Expr>> {
+pub fn bound_expr(n: &str) -> Option<Rc<Expr>> {
     BOUND.with(|b| b.borrow().get(n).cloned())
 }
 
@@ -377,7 +379,7 @@ impl FreeNames {
                 }
             }
             // The expressions bound are read where their names are used
-            Label(n, _, body) if n == BIND => self.walk(body, bound),
+            Label(n, _, body) if is_bind(n) => self.walk(body, bound),
             e => {
                 for c in e.children() {
                     self.walk(c, bound);
@@ -487,16 +489,28 @@ impl ConstEval<'_> {
 
     /// The value of the bound name n, whose expression is x: evaluated where n is first used, as
     /// the expression written out there would be, and kept for the values of the names it depends
-    /// on. A value whose computation printed is not kept, so it prints again at each use, as before
+    /// on. A value whose computation printed is not kept, so it prints again at each use, as before.
+    /// The strings made computing it are noted again at each use: code generation notes the
+    /// strings a constant part makes where it folds the part (`Gen::note_folded`)
     fn eval_bound(&self, n: &str, x: &Expr, env: &HashMap<String, Value>) -> R<Value> {
         let key = (n.to_string(), bound_free(n, x).iter().map(|k| env.get(k).cloned()).collect::<Vec<_>>());
-        if let Some(v) = BOUND_VALUES.with(|b| b.borrow().get(&key).cloned()) {
+        if let Some((v, made)) = BOUND_VALUES.with(|b| b.borrow().get(&key).cloned()) {
+            for a in made {
+                self.atoms.made(a);
+            }
             return Ok(v);
         }
         let prints = PRINTS.with(|p| p.get());
-        let v = self.eval(x, env)?;
+        let outer = self.atoms.log.replace(Some(vec![]));
+        let v = self.eval(x, env);
+        let mut seen = HashSet::new();
+        let made: Vec<u32> = self.atoms.log.replace(outer).unwrap_or_default().into_iter().filter(|a| seen.insert(*a)).collect();
+        for &a in &made {
+            self.atoms.made(a);
+        }
+        let v = v?;
         if PRINTS.with(|p| p.get()) == prints {
-            BOUND_VALUES.with(|b| b.borrow_mut().insert(key, v.clone()));
+            BOUND_VALUES.with(|b| b.borrow_mut().insert(key, (v.clone(), made)));
         }
         Ok(v)
     }
