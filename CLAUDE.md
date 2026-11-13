@@ -857,9 +857,9 @@ the gaps it showed are written from scratch, reproducing only the form that fail
 `tests/corpus.txt` lists all 243 models of the corpus's manifests. Selected are the exhaustive searches that TLC 2.19
 finishes with `tla2tools.jar` and the CommunityModules' modules, in 60 s or less with one worker and `-dump dot`
 (measured; the manifest's runtimes are for several workers). Skipped, with the reason on each line: 46 symbolic
-(Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 33 that need a module
+(Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 37 that need a module
 neither in `tla2tools.jar` nor in the CommunityModules (the proof system's library: TLAPS, NaturalsInduction,
-FiniteSetTheorems; TLCExt), 35 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
+FiniteSetTheorems; TLCExt), 31 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
 refuses (an `ALIAS` section), 2 where TLC picks values at random (two TLC runs differed), 5 where TLC 2.19 stops in a
 CommunityModules definition that needs its Java override (IOUtils, and quantifiers over `Seq(S)` in Graphs and
 UndirectedGraphs), and 1 that reads `TLCGet("config")`, which TLC 2.19 does not define. That leaves 106 selected.
@@ -897,7 +897,17 @@ definitions of an instance renamed (`InstLet`), in-place EXCEPT on a function ov
 values before strings (`ModelStr`), records compared field by field in an array (`RecNest`), up to 128 fairness
 conditions (`ManyFair`), tuples of different lengths or sets held beside model values (`SeqAtom`, `SetAtom`),
 functions over domains of different sizes (`DomGrow`), TLC's warning that a PlusCal algorithm changed since its
-translation (`PcalSum`), a parameter of an instantiated module named like a definition written after it (`InstShadow`), and constant sets of many elements that the checker enumerates (`BigSets`, `BigSteps`; see "Large constant sets").
+translation (`PcalSum`), a parameter of an instantiated module named like a definition written after it (`InstShadow`), constant sets of many elements that the checker enumerates (`BigSets`, `BigSteps`; see "Large constant sets"), fairness
+under a constant guard (`\A i, j \in P : i # j => WF_v(A(i, j))`, `FairPairs`), and a pair of a record-or-model value
+and a record against pairs of records (`PairSource`).
+
+Of the models skipped for TLC's run time, measured on a Linux machine with one worker (TLC, then tla2rs with its
+generation and builds), these give the same verdict and state counts as TLC: `MCCheckpointCoordination` 204 s / 9 s,
+`MCKVSSafetySmall` 140 / 6, `MCKVSSafetyMedium` 997 / 33, `MCReachable` 77 / 10, `ElevatorSafetyMedium` 688 / 43,
+`ElevatorSafetyLarge` 2266 / 135, `ElevatorLivenessLarge` 1973 / 6, `MCNanoMedium` 19 / 8, `FastPaxos` 37 / 32,
+`SlushMedium` 242 / 20, `MCInnerSerial` 459 / 23, `aba_asyn_byz` 1238 / 42, `bcastFolklore` 3476 / 141, `bosco` 576 /
+6, `cf1s_folklore` 185 / 5, `DijkstraMutex` `Safety-4-processors` 418 / 19 and `PaxosCommit` 148 / 132. They stay
+skipped, since TLC's run time is what keeps them out of `corpus.sh`.
 
 ### CommunityModules
 
