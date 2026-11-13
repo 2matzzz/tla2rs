@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 793 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 797 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -122,6 +122,8 @@ checker which kinds may still grow (both stop at 65535, `types::MAX_CAP`); run d
 checker reports an evaluation error as before. Output before the line is repeated by the next run, so
 `crosscheck.sh` compares only what follows the last such line, and says how many rebuilds there were. A spec that
 stays within its capacities builds and runs exactly as before.
+A constant filter `{x \in S : P}` too large to compute when compiling is no such array where it is only iterated
+over (as in `v \in` it in Init): the checker computes it once into a vector (`tests/tlc/Staircase`).
 
 Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
 
