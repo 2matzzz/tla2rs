@@ -231,10 +231,12 @@ impl<'a> Expander<'a> {
                 let a = self.expand(a, caller)?;
                 if self.bindable(&a) {
                     let n = self.bind(p, &mut env);
-                    // For code generation the call site keeps the argument as written out, which
-                    // it reads to name actions (`Gen::gen_split`)
-                    args.push(if self.bind == BIND_CODE { a.clone() } else { Expr::Ident(n.clone(), NOPOS) });
-
+                    // For code generation the call site keeps the names the argument reads from
+                    // outside, which tell whether it depends on the state, to name actions
+                    // (`Gen::gen_split`). Not the argument written out: it holds the call sites
+                    // of the calls in it, each with its own argument, so it would double at each
+                    // call that passes the value on (`tests/tlc/ArgShare`)
+                    args.push(if self.bind == BIND_CODE { Expr::Tuple(free_idents(&a)) } else { Expr::Ident(n.clone(), NOPOS) });
                     binds.extend([Expr::Ident(n, NOPOS), a]);
                 } else {
                     env.subst.insert(p.clone(), a.clone());
@@ -812,6 +814,53 @@ pub(crate) fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)
 
 const BIND_CONST: u8 = 1;
 const BIND_CODE: u8 = 2;
+
+/// The identifiers e reads from outside it, each once, in the order first read
+fn free_idents(e: &Expr) -> Vec<Expr> {
+    fn walk(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<Expr>) {
+        use Expr::*;
+        let n = bound.len();
+        match e {
+            Ident(x, _) => {
+                if !bound.contains(x) && !out.iter().any(|o| matches!(o, Ident(y, _) if y == x)) {
+                    out.push(e.clone());
+                }
+            }
+            // A BIND label binds its names in the expressions after them and in its body
+            Label(l, a, b) if is_bind(l) => {
+                for p in a.chunks(2) {
+                    if let [Ident(x, _), v] = p {
+                        walk(v, bound, out);
+                        bound.push(x.clone());
+                    }
+                }
+                walk(b, bound, out);
+            }
+            _ => {
+                match e {
+                    Quant(_, bs, _) | SetMap(_, bs) => bound.extend(bs.iter().map(|(x, _)| x.clone())),
+                    Choose(x, ..) | SetFilter(x, ..) | FunCons(x, ..) => bound.push(x.clone()),
+                    Lambda(ps, _) => bound.extend(ps.iter().cloned()),
+                    Let(ds, _) => bound.extend(ds.iter().flat_map(|d| std::iter::once(&d.name).chain(&d.params).cloned())),
+                    Except(_, ups) => bound.extend(ups.iter().flat_map(|(p, _)| {
+                        p.iter().filter_map(|s| match s {
+                            Path::Field(k) if k.starts_with('@') => Some(k.clone()),
+                            _ => None,
+                        })
+                    })),
+                    _ => {}
+                }
+                for c in e.children() {
+                    walk(c, bound, out);
+                }
+            }
+        }
+        bound.truncate(n);
+    }
+    let mut out = vec![];
+    walk(e, &mut vec![], &mut out);
+    out
+}
 
 /// `body` under a BIND label for the names and expressions in `binds`, if any
 
