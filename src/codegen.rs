@@ -3876,6 +3876,9 @@ impl<'a> Gen<'a> {
     /// indices instead (using them as function arguments avoids converting from atom values)
     fn iter_of_indexed(&mut self, s: &Expr, env: &Env) -> R<(String, Ty, Option<String>)> {
         let s = s.strip();
+        if let Some((it, et, indexed)) = self.big_set_iter(s, env)? {
+            return Ok((it, et, indexed.then(String::new)));
+        }
         if let (Some(v), made) = self.try_const_made(s, env) {
             let set = v.as_set()?;
             let Ty::Set(et) = ty_of_value(&v)? else { unreachable!() };
@@ -3988,6 +3991,164 @@ impl<'a> Gen<'a> {
         let Ty::Set(et) = &t else { return Err(format!("cannot iterate over {t:?}")) };
         let it = self.s_iter(&c, &t)?;
         Ok((it, et.as_ref().clone(), None))
+    }
+
+    /// A constant set of more than BIG_SET elements built from sets of functions, products, sets
+    /// of records and SUBSET: an iterator that enumerates it from its parts (written out), in the
+    /// order of its value, which is the order its elements would be written out in (see
+    /// `BigSet`). Also whether it iterates over the indices of the element type (the set is the
+    /// whole type). None for any other set
+    fn big_set_iter(&mut self, s: &Expr, env: &Env) -> R<Option<(String, Ty, bool)>> {
+        if !matches!(s, Expr::FunSet(..) | Expr::RecSet(_) | Expr::Un(UOp::Subset, _)) && !matches!(s, Expr::Call(f, _) if f == "\\X") {
+            return Ok(None);
+        }
+        if !self.is_const(s, env) {
+            return Ok(None);
+        }
+        let mut made = vec![];
+        let Some(b) = self.big_parts(s, env, &mut made) else { return Ok(None) };
+        let n = b.size();
+        if n <= BIG_SET as f64 || n >= (1u64 << 62) as f64 {
+            return Ok(None);
+        }
+        let n = n as u64;
+        let et = b.ty()?;
+        if et.size() == Some(n) {
+            return Ok(Some((self.note_folded(format!("(0..{n}u64)"), &made), et, true)));
+        }
+        let mut pre = String::new();
+        let f = self.big_nth(&b, &et, &mut pre)?;
+        let code = format!("{{ {pre}(0..{n}u64).map({f}) }}");
+        Ok(Some((self.note_folded(code, &made), et, false)))
+    }
+
+    /// The parts of a constant set (see `big_set_iter`); None if one is empty or cannot be
+    /// computed
+    fn big_parts(&self, s: &Expr, env: &Env, made: &mut Vec<u32>) -> Option<BigSet> {
+        let lit = |e: &Expr, made: &mut Vec<u32>| -> Option<Vec<Value>> {
+            let (v, m) = self.try_const_made(e, env);
+            made.extend(m);
+            let v: Vec<Value> = v?.as_set().ok()?.iter().cloned().collect();
+            (!v.is_empty()).then_some(v)
+        };
+        Some(match s.strip() {
+            Expr::FunSet(d, r) => BigSet::Fun(lit(d, made)?, self.big_parts(r, env, made)?.into()),
+            Expr::Call(f, ps) if f == "\\X" => BigSet::Prod(ps.iter().map(|p| self.big_parts(p, env, made)).collect::<Option<_>>()?),
+            Expr::RecSet(fs) => {
+                let mut v = fs.iter().map(|(k, p)| Some((k.clone(), self.big_parts(p, env, made)?))).collect::<Option<Vec<_>>>()?;
+                v.sort_by(|a, b| field_cmp(&a.0, &b.0));
+                BigSet::Rec(v)
+            }
+            // At most 20 elements, as when the set is computed (`subsets_tlc` holds them all)
+            Expr::Un(UOp::Subset, x) => BigSet::Subset(lit(x, made).filter(|v| v.len() <= 20)?),
+            e => BigSet::Lit(lit(e, made)?),
+        })
+    }
+
+    /// Defines (in `pre`) a closure from the index of an element of b to the element, of type t,
+    /// and returns its name
+    fn big_nth(&mut self, b: &BigSet, t: &Ty, pre: &mut String) -> R<String> {
+        let f = self.fresh("nth");
+        // The parts by mixed radix, the first varying slowest
+        let digits = |sizes: &[u64]| -> Vec<String> {
+            (0..sizes.len()).map(|j| format!("(__i / {}u64 % {}u64)", sizes[j + 1..].iter().product::<u64>(), sizes[j])).collect()
+        };
+        let body = match b {
+            BigSet::Lit(xs) => {
+                let parts: Vec<String> = xs.iter().map(|x| self.lit(x, t)).collect::<R<_>>()?;
+                let a = self.fresh("lit");
+                writeln!(pre, "let {a}: [{}; {}] = [{}];", t.repr(), xs.len(), parts.join(", ")).unwrap();
+                format!("{a}[__i as usize]")
+            }
+            BigSet::Fun(d, r) => {
+                let rt = r.ty()?;
+                let g = self.big_nth(r, &rt, pre)?;
+                let parts: Vec<String> = digits(&vec![r.size() as u64; d.len()]).into_iter().map(|i| format!("{g}{i}")).collect();
+                let at = |k: &Value| d.iter().position(|x| x == k).ok_or_else(|| format!("{k:?} outside the domain of {t:?}"));
+                match t {
+                    Ty::Rec(fs) if is_tuple_fields(fs) => {
+                        let ps: Vec<String> = parts.into_iter().zip(fs).map(|(p, (_, ct))| self.coerce(p, &rt, ct)).collect::<R<_>>()?;
+                        rec_build(&ps)
+                    }
+                    Ty::Fun(dt, ct) => {
+                        let mut s = String::from("[");
+                        for k in dt.enumerate() {
+                            s += &self.coerce(parts[at(&k)?].clone(), &rt, ct)?;
+                            s += ",";
+                        }
+                        s + "]"
+                    }
+                    Ty::PFun(..) if is_sparse_fun(t) => {
+                        self.ty_id(t)?;
+                        let (kt, vt) = fun_kv(t);
+                        let mut s = Self::default_code(t);
+                        for (k, p) in d.iter().zip(parts) {
+                            s = format!("{s}.with_put({}, {})", self.lit(k, &kt)?, self.coerce(p, &rt, &vt)?);
+                        }
+                        s
+                    }
+                    Ty::PFun(dt, ct) => {
+                        self.ty_id(t)?;
+                        let mut s = String::from("[");
+                        for k in dt.enumerate() {
+                            s += &match d.iter().position(|x| *x == k) {
+                                Some(j) => format!("(true, {})", self.coerce(parts[j].clone(), &rt, ct)?),
+                                None => format!("(false, {})", Self::default_code(ct)),
+                            };
+                            s += ",";
+                        }
+                        s + "]"
+                    }
+                    _ => return Err(format!("cannot build a function of type {t:?}")),
+                }
+            }
+            BigSet::Prod(ps) => {
+                let Some(fs) = tuple_elems(t).filter(|fs| fs.len() == ps.len()) else {
+                    return Err(format!("cannot build a tuple of type {t:?}"));
+                };
+                let fs: Vec<Ty> = fs.into_iter().cloned().collect();
+                let sizes: Vec<u64> = ps.iter().map(|p| p.size() as u64).collect();
+                let mut parts = vec![];
+                for ((p, i), ft) in ps.iter().zip(digits(&sizes)).zip(&fs) {
+                    let pt = p.ty()?;
+                    let g = self.big_nth(p, &pt, pre)?;
+                    parts.push(self.coerce(format!("{g}{i}"), &pt, ft)?);
+                }
+                rec_build(&parts)
+            }
+            BigSet::Rec(ps) => {
+                let Ty::Rec(fs) = t else { return Err(format!("cannot build a record of type {t:?}")) };
+                let sizes: Vec<u64> = ps.iter().map(|(_, p)| p.size() as u64).collect();
+                let mut got = HashMap::new();
+                for ((k, p), i) in ps.iter().zip(digits(&sizes)) {
+                    let pt = p.ty()?;
+                    let g = self.big_nth(p, &pt, pre)?;
+                    got.insert(k.clone(), (format!("{g}{i}"), pt));
+                }
+                let mut parts = vec![];
+                for (k, ft) in fs {
+                    let Some((c, pt)) = got.remove(k) else { return Err(format!("no field {k} in {t:?}")) };
+                    parts.push(match ft {
+                        Ty::Opt(i) => format!("(true, {})", self.coerce(c, &pt, i)?),
+                        ft => self.coerce(c, &pt, ft)?,
+                    });
+                }
+                rec_build(&parts)
+            }
+            BigSet::Subset(xs) => {
+                let et = Self::elem_of(t);
+                let parts: Vec<String> = xs.iter().map(|x| self.lit(x, &et)).collect::<R<_>>()?;
+                let (a, m) = (self.fresh("lit"), self.fresh("subs"));
+                self.need_subsets = true;
+                writeln!(pre, "let {a}: [{}; {}] = [{}];", et.repr(), xs.len(), parts.join(", ")).unwrap();
+                writeln!(pre, "let {m}: Vec<u128> = subsets_tlc((1u128 << {}) - 1);", xs.len()).unwrap();
+                let empty = self.s_empty(t)?;
+                let add = self.s_add("__s", &format!("{a}[__b as usize]"), t)?;
+                format!("{{ let mut __s = {empty}; for __b in bits({m}[__i as usize]) {{ {add} }} __s }}")
+            }
+        };
+        writeln!(pre, "let {f} = move |__i: u64| -> {} {{ {body} }};", t.repr()).unwrap();
+        Ok(f)
     }
 
     /// Binds a variable in the environment, also recording its index when iterating by index
@@ -6342,6 +6503,68 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
 "#;
 
 /// The domain and codomain types of a function value that @@ can join (None if not a function)
+/// Constant sets of more elements than this that the checker iterates over are enumerated by it
+/// instead of written out (see `Gen::big_set_iter`). A smaller set stays written out, so that the
+/// code generated for it does not change; with 0 here, the checkers of every configuration of
+/// examples/ and tests/tlc/ and of the corpus but GameOfLife enumerated the same elements in the
+/// same order as written out (measured by comparing the two at run time)
+const BIG_SET: usize = 1024;
+
+/// A constant set by its parts, enumerated by the checker (see `Gen::big_set_iter`). Its elements
+/// come in the order of the set's value: functions, tuples and records compare their values one
+/// by one (the first varies slowest), sets of the same size their elements in order
+enum BigSet {
+    /// A set written out: its elements, in order
+    Lit(Vec<Value>),
+    /// `[D -> R]`: D's elements in order, and R
+    Fun(Vec<Value>, Box<BigSet>),
+    /// `S1 \X ... \X Sn`
+    Prod(Vec<BigSet>),
+    /// `[f1 : S1, ...]`, the fields in TLC's order
+    Rec(Vec<(String, BigSet)>),
+    /// `SUBSET S`: S's elements in order (enumerated by `subsets_tlc`)
+    Subset(Vec<Value>),
+}
+
+impl BigSet {
+    fn size(&self) -> f64 {
+        match self {
+            BigSet::Lit(v) => v.len() as f64,
+            BigSet::Fun(d, r) => r.size().powi(d.len() as i32),
+            BigSet::Prod(ps) => ps.iter().map(|p| p.size()).product(),
+            BigSet::Rec(fs) => fs.iter().map(|(_, p)| p.size()).product(),
+            BigSet::Subset(s) => 2f64.powi(s.len() as i32),
+        }
+    }
+
+    /// Elements whose types join to the type `ty_of_value` gives the elements of the whole set
+    fn reps(&self) -> Vec<Value> {
+        // Element i takes the i-th representative of each part (none is empty)
+        let diag = |parts: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
+            let k = parts.iter().map(|p| p.len()).max().unwrap_or(0);
+            (0..k).map(|i| parts.iter().map(|p| p[i % p.len()].clone()).collect()).collect()
+        };
+        match self {
+            BigSet::Lit(v) => v.clone(),
+            BigSet::Fun(d, r) => r.reps().into_iter().map(|x| fun_value(d.iter().map(|k| (k.clone(), x.clone())).collect())).collect(),
+            BigSet::Prod(ps) => diag(ps.iter().map(|p| p.reps()).collect()).into_iter().map(Value::Tuple).collect(),
+            BigSet::Rec(fs) => diag(fs.iter().map(|(_, p)| p.reps()).collect())
+                .into_iter()
+                .map(|xs| Value::Rec(fs.iter().map(|(k, _)| k.clone()).zip(xs).collect()))
+                .collect(),
+            BigSet::Subset(s) => vec![Value::Set(BTreeSet::new()), Value::Set(s.iter().cloned().collect())],
+        }
+    }
+
+    /// The type of the elements
+    fn ty(&self) -> R<Ty> {
+        match ty_of_value(&Value::Set(self.reps().into_iter().collect()))? {
+            Ty::Set(t) => Ok(*t),
+            _ => unreachable!(),
+        }
+    }
+}
+
 fn pfun_parts(t: &Ty) -> Option<(Ty, Ty)> {
     match t {
         Ty::PFun(d, c) | Ty::Fun(d, c) => Some((d.as_ref().clone(), c.as_ref().clone())),
