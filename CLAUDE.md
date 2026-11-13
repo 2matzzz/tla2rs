@@ -245,6 +245,11 @@ Measured on TLC 2.19 (`tests/tlc/SpecConj*`, `SpecShape*`, `SpecInst*`, `RtSpec*
 - Without an initial predicate TLC stops (exit 151). Without a next-state action it stops (exit 151) if anything must
   be checked on steps (an invariant, `[]P`, an action or temporal property); otherwise it computes and checks the
   initial states and then stops with exit 75
+- A NEXT of constant level (`FALSE`, `1 = 2`) is refused when TLC reads the spec (`The next state action Next cannot
+  be a constant.`, exit 151; `[][FALSE]_x` in a SPECIFICATION is not, and deadlocks). A next-state relation that TLC
+  splits into no action (`\E` over an empty constant set, also in `[][...]_v`) is not refused: TLC computes and
+  checks the initial states and then stops with `No next state actions defined to generate successor states
+  from.` (exit 75), which the checker's `next` prints when it is generated for no action (`tests/tlc/NoActions*`)
 - A module without variables, with a cfg that has no SPECIFICATION, INIT or NEXT (one that only checks its ASSUMEs),
   is not refused: TLC evaluates the ASSUMEs and reports no error with no states, and writes an empty state graph
   (`compile::NO_BEHAVIOR`, `tests/tlc/NoBehavior*`). With variables, it is refused for lack of an initial predicate

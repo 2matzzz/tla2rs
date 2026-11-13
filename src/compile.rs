@@ -1561,6 +1561,11 @@ fn compile_inner(
     let head = format!("{}Warning: The EXCEPT was applied to non-existing fields of the value at\n", crate::value::WARNING_MARK);
     startup.invs.extend(g.split_warns.iter().map(|at| format!("{head}{at}")));
     let actions = g.actions;
+    if actions == 0 && !no_next {
+        // TLC splits the next-state relation into no action at all (\E over an empty set): it
+        // computes the initial states and stops (`tests/tlc/NoActions`)
+        next_code = "println!(\"Error: No next state actions defined to generate successor states from.\");\nexit(75);\n".into();
+    }
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
@@ -2001,7 +2006,12 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
                 ex.keep_pos = true;
                 let e = ex.expand_def_code(n, true);
                 ex.keep_pos = false;
-                Some(e?)
+                let e = e?;
+                // TLC refuses a next-state action of constant level (`tests/tlc/NoActions`)
+                if constant_level(&e, m) {
+                    return Ok(Err((format!("Error: The next state action {n} cannot be a constant."), 151)));
+                }
+                Some(e)
             }
             None => None,
         };
