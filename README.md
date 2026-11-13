@@ -160,11 +160,11 @@ memory.
   it runs, so they are refused on values from the state), and `JsonSerialize`, `ndJsonSerialize` and `IOSerialize`,
   which are TRUE in the modules' definitions and write no file. Their operators that read files, run commands or read
   the environment (`JsonDeserialize`, `IOExec`, `IOEnv`, `atoi` and the like) are refused, with the reason TLC 2.19
-  stops on their definitions. HTML's operators evaluate at once in the constant definitions and ASSUMEs, but slowly
-  in Init, the actions and the invariants (`HTMLAttribute("color", "blue")` in Init took 36 seconds to compile; see
-  CLAUDE.md, "Arguments written out at each use"). Not provided: `CSV` and `CBOR`, which read or write files,
-  `ShiViz` and `DifferentialEquations`, whose definitions TLC 2.19 cannot evaluate, and `SVG`, which no
-  configuration compares with TLC yet (see CLAUDE.md, "CommunityModules").
+  stops on their definitions. HTML's operators evaluate at once in the constant definitions and ASSUMEs, and compile
+  quickly in Init, the actions and the invariants too: a LET definition or an argument is computed once, where it is
+  first used, as TLC computes it (see CLAUDE.md, "Arguments written out at each use"). Not provided: `CSV` and
+  `CBOR`, which read or write files, `ShiViz` and `DifferentialEquations`, whose definitions TLC 2.19 cannot
+  evaluate, and `SVG`, which no configuration compares with TLC yet (see CLAUDE.md, "CommunityModules").
   TLC 2.19 cannot load the Java overrides in the CommunityModules jar, so it evaluates the modules' TLA+
   definitions, and tla2rs's give the same values (what CHOOSE picks, the order a fold takes elements in) and the
   same error (the position TLC gives for the CASE of `Interleave` in `SequencesExt` when none of its conditions
@@ -317,9 +317,8 @@ written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model 
 selected (the exhaustive searches that TLC 2.19 finishes, with `tla2tools.jar` and the CommunityModules' modules, in
 60 seconds or less with one worker) and, for each of the others, why it is skipped. A selected model that tla2rs does
 not match yet is listed as a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost.
-Of the 106 selected models, 105 match TLC (6 of them on everything but the generated count, which TLC counts once per
-`\/` branch). The 1 gap is not run each time, as it costs too much; its reason is in `tests/corpus.txt` and
-CLAUDE.md.
+Of the 106 selected models, all 106 match TLC (7 of them on everything but the generated count, which TLC counts once
+per `\/` branch).
 
 | Example | What it is |
 |---|---|
