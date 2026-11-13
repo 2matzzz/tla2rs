@@ -290,9 +290,10 @@ memory.
   `SortSeq`, a string compared with a tuple) keep the order tla2rs meets them in. A string made by a constant
   expression that tla2rs evaluates while it compiles counts where TLC evaluates it (as a value, a set, the condition
   of an IF or of an action, ...)
-- A set that TLC holds as an interval (`x = 1..3`) prints as `{1, 2, 3}`, where TLC prints `1..3` until an
-  operation enumerates it. Which form TLC prints depends on how the value was built (see CLAUDE.md, "State graphs"),
-  so the comparison with TLC reads an interval as the set it denotes
+- A set that TLC holds as an interval (`x = 1..3`) prints as `1..3`, as in TLC, where tla2rs follows how the value
+  was built: assigned to a variable, in a field of a record or tuple, and DOMAIN of a tuple or sequence. Taken from a
+  set, as a function's value, or inside a set of sets, it prints as `{1, 2, 3}` (see CLAUDE.md, "State graphs"), so
+  the comparison with TLC reads an interval as the set it denotes
 - A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
   depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
   it instead (`-lassocheck`). Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a

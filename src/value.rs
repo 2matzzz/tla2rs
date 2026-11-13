@@ -468,6 +468,20 @@ impl ConstEval<'_> {
         crate::codegen::lazy_fun_string(&unbind_spine(f), &mut |p| self.lazy_set_shown(p, env))
     }
 
+    /// The text TLC prints for the value of `x` when it holds it as an interval: `a..b` as
+    /// written, and DOMAIN of a tuple or sequence (`{}` when empty; see `codegen::interval_text`)
+    fn interval_shown(&self, x: &Expr, env: &HashMap<String, Value>) -> Option<String> {
+        let (a, b) = match &*shape(x) {
+            Expr::Bin(BOp::Range, a, b) => (self.eval(a, env).ok()?.as_int().ok()?, self.eval(b, env).ok()?.as_int().ok()?),
+            Expr::Un(UOp::Domain, t) => match self.eval(t, env).ok()? {
+                Value::Tuple(xs) => (1, xs.len() as i64),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(if a <= b { format!("{a}..{b}") } else { "{}".into() })
+    }
+
     fn lazy_set_shown(&self, s: &Expr, env: &HashMap<String, Value>) -> Option<String> {
         match &*shape(s) {
             Expr::Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
@@ -671,6 +685,10 @@ impl ConstEval<'_> {
                     let s = self.lazy_fun_shown(x, env).unwrap();
                     Value::Atom(self.atoms.made(self.atoms.intern(false, &s)))
                 }
+                ("ToString", [x]) if self.interval_shown(x, env).is_some() => {
+                    let s = self.interval_shown(x, env).unwrap();
+                    Value::Atom(self.atoms.made(self.atoms.intern(false, &s)))
+                }
                 ("ToString", [x]) => {
                     let v = self.eval(x, env)?;
                     if let Some((a, b)) = disordered_in(&v) {
@@ -825,7 +843,7 @@ impl ConstEval<'_> {
                     Value::Tuple(out)
                 }
                 ("PrintT", [x]) => {
-                    let x = match self.lazy_fun_shown(x, env) {
+                    let x = match self.lazy_fun_shown(x, env).or_else(|| self.interval_shown(x, env)) {
                         Some(s) => s,
                         None => crate::compile::show_value(self.atoms, &self.eval(x, env)?),
                     };
