@@ -148,6 +148,15 @@ pub fn tla(e: &Expr) -> Result<String, String> {
         // Labels change nothing in what a formula means
         Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() || n.ends_with("::") || n.starts_with(crate::ast::SUBVAR) || n.starts_with(crate::ast::FN) || n == crate::ast::ENINST => tla(b)?,
         Label(n, _, b) if n == crate::parser::INFIX_JUNCTION => tla(b)?,
+        // <<A>>_v, which the parser keeps as A /\ ~(v' = v)
+        Label(n, _, b) if n == "<<>>_" => match b.as_ref() {
+            And(xs) if xs.len() == 2 && matches!(&xs[1], Un(crate::ast::UOp::Not, x) if matches!(x.as_ref(), Bin(crate::ast::BOp::Eq, p, _) if matches!(p.as_ref(), Prime(_)))) => {
+                let Un(_, x) = &xs[1] else { unreachable!() };
+                let Bin(_, _, v) = x.as_ref() else { unreachable!() };
+                format!("<<{}>>_{}", tla(&xs[0])?, sub(v)?)
+            }
+            _ => return Err(format!("cannot write out {}", crate::codegen::short(e))),
+        },
         _ => return Err(format!("cannot write out {}", crate::codegen::short(e))),
     })
 }

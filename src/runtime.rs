@@ -4225,11 +4225,17 @@ struct LNode {
     acc: u64,
 }
 
+/// The automaton of a negated property, or of one disjunct of its normal form with its []<>S
+/// (`ae_state`), []<>A (`ae_action`) and <>[]A (`ea`) parts as conditions on cycles (see
+/// `split_disjuncts` in tla2rs's live.rs)
 struct LProp {
     #[allow(dead_code)]
     name: &'static str,
     nodes: &'static [LNode],
     nacc: u32,
+    ae_state: &'static [LP],
+    ae_action: &'static [LP],
+    ea: &'static [LP],
 }
 
 /// The label of the stuttering step every state has
@@ -4256,11 +4262,13 @@ impl Steps {
     }
 }
 
-/// The product of the state graph with the automaton of one negated property
+/// The product of the state graph with the automaton of one negated property; with `ea`, only the
+/// steps that keep the property's <>[]A parts
 struct Product<'a> {
     st: &'a Steps,
     nodes: &'static [LNode],
     q: usize,
+    ea: &'static [LP],
 }
 
 impl Product<'_> {
@@ -4269,21 +4277,28 @@ impl Product<'_> {
         b & n.s_pos == n.s_pos && b & n.s_neg == 0
     }
 
-    /// Successors of product node p: (node, label, fairness steps)
-    fn succ(&self, p: usize, out: &mut Vec<(usize, u32, FMask)>) {
+    /// Successors of product node p: (node, label, fairness steps, action atoms)
+    fn succ(&self, p: usize, out: &mut Vec<(usize, u32, FMask, u64)>) {
         out.clear();
         let (s, q) = ((p / self.q) as u32, p % self.q);
         let n = &self.nodes[q];
         for (t, l, a, f) in self.st.of(s) {
-            if a & n.a_pos != n.a_pos || a & n.a_neg != 0 {
+            if a & n.a_pos != n.a_pos || a & n.a_neg != 0 || !self.ea.iter().all(|x| self.holds(x, p, a, f)) {
                 continue;
             }
             for &q2 in n.succ {
                 if self.valid(t, q2 as usize) {
-                    out.push((t as usize * self.q + q2 as usize, l, f));
+                    out.push((t as usize * self.q + q2 as usize, l, f, a));
                 }
             }
         }
+    }
+
+    /// Whether predicate x holds of product node p's state, and of the step with action atoms a
+    /// and fairness steps f from it
+    fn holds(&self, x: &LP, p: usize, a: u64, f: FMask) -> bool {
+        let s = p / self.q;
+        x.eval(self.st.sbits[s], self.st.fen[s], a, f)
     }
 
     fn state(&self, p: usize) -> u32 {
@@ -4370,7 +4385,8 @@ enum Verdict {
     Accept { steps: Vec<usize>, off: Vec<usize> },
 }
 
-fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
+fn judge(pr: &Product, prop: &LProp, c: &[usize]) -> Verdict {
+    let nacc = prop.nacc;
     let set: std::collections::HashSet<usize> = c.iter().copied().collect();
     let mut acc = 0u64;
     for &p in c {
@@ -4380,15 +4396,25 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
     if acc & all != all {
         return Verdict::Reject;
     }
+    if !prop.ae_state.iter().all(|x| c.iter().any(|&p| pr.holds(x, p, 0, 0))) {
+        return Verdict::Reject;
+    }
     let mut taken: FMask = 0;
+    let mut ae_taken = vec![false; prop.ae_action.len()];
     let mut buf = vec![];
     for &p in c {
         pr.succ(p, &mut buf);
-        for &(v, _, f) in &buf {
+        for &(v, _, f, a) in &buf {
             if set.contains(&v) {
                 taken |= f;
+                for (j, x) in prop.ae_action.iter().enumerate() {
+                    ae_taken[j] |= pr.holds(x, p, a, f);
+                }
             }
         }
+    }
+    if ae_taken.contains(&false) {
+        return Verdict::Reject;
     }
     let mut some_off: FMask = 0;
     let mut all_off = FMask::MAX;
@@ -4421,8 +4447,8 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
 }
 
 /// Searches a component for a fair accepting cycle, narrowing it for strong fairness
-fn search(pr: &Product, nacc: u32, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
-    match judge(pr, nacc, &c) {
+fn search(pr: &Product, prop: &LProp, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    match judge(pr, prop, &c) {
         Verdict::Reject => None,
         Verdict::Accept { steps, off } => Some((c, steps, off)),
         Verdict::Narrow(keep) => {
@@ -4431,7 +4457,7 @@ fn search(pr: &Product, nacc: u32, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usi
             }
             let set: std::collections::HashSet<usize> = keep.iter().copied().collect();
             for sub in sccs(pr, &keep, &|p| set.contains(&p)) {
-                if let Some(r) = search(pr, nacc, sub) {
+                if let Some(r) = search(pr, prop, sub) {
                     return Some(r);
                 }
             }
@@ -4441,24 +4467,25 @@ fn search(pr: &Product, nacc: u32, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usi
 }
 
 /// A shortest path inside `set` from `from` (excluded) that ends at a node satisfying `goal` or with
-/// a step satisfying `edge` (on its fairness bits): [(node, label, fairness bits of the step)]
+/// a step satisfying `edge` (on the node it leaves, its fairness bits and its action atoms):
+/// [(node, label, fairness bits of the step)]
 fn path_to(
     pr: &Product,
     set: &std::collections::HashSet<usize>,
     from: usize,
     goal: &dyn Fn(usize) -> bool,
-    edge: &dyn Fn(FMask) -> bool,
+    edge: &dyn Fn(usize, FMask, u64) -> bool,
 ) -> Vec<(usize, u32, FMask)> {
     let mut prev: std::collections::HashMap<usize, (usize, u32, FMask)> = std::collections::HashMap::new();
     let mut q = std::collections::VecDeque::from([from]);
     let mut buf = vec![];
     while let Some(u) = q.pop_front() {
         pr.succ(u, &mut buf);
-        for &(v, l, f) in &buf {
+        for &(v, l, f, a) in &buf {
             if !set.contains(&v) {
                 continue;
             }
-            if goal(v) || edge(f) {
+            if goal(v) || edge(u, f, a) {
                 let mut out = vec![(v, l, f)];
                 let mut x = u;
                 while x != from {
@@ -4588,7 +4615,7 @@ fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
         print_lasso(g, &prefix, &cycle);
         return false;
     }
-    println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", LPROPS.len(), FAIRS.len(), edges);
+    println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", NPROPS, FAIRS.len(), edges);
     true
 }
 
@@ -4598,7 +4625,9 @@ type Lasso = (Vec<(u32, u32)>, Vec<(u32, u32)>);
 /// Looks for a behavior that violates one property: a fair cycle in its product with the state
 /// graph that the property's automaton accepts. None also when `quit` says to give up.
 fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) -> Option<Lasso> {
-    let pr = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1) };
+    // The path to a cycle may take any step; the cycle only steps that keep the <>[]A parts
+    let all = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1), ea: &[] };
+    let pr = Product { ea: prop.ea, ..all };
     if prop.nodes.is_empty() {
         return None;
     }
@@ -4622,8 +4651,8 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         }
         let u = order[h];
         h += 1;
-        pr.succ(u, &mut buf);
-        for &(v, l, _) in &buf {
+        all.succ(u, &mut buf);
+        for &(v, l, _, _) in &buf {
             if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
                 e.insert((u, l));
                 order.push(v);
@@ -4635,7 +4664,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         if quit() {
             return None;
         }
-        let Some((c, steps, off)) = search(&pr, prop.nacc, c) else { continue };
+        let Some((c, steps, off)) = search(&pr, prop, c) else { continue };
         let set: std::collections::HashSet<usize> = c.iter().copied().collect();
         let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
         // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
@@ -4645,7 +4674,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         let fen = |p: usize| st.fen[pr.state(p) as usize];
         let mut cyc: Vec<(usize, u32, FMask)> = vec![];
         let mut cur = entry;
-        let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
+        let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(usize, FMask, u64) -> bool| {
             let p = path_to(&pr, &set, *cur, goal, edge);
             if let Some(&(l, _, _)) = p.last() {
                 *cur = l;
@@ -4656,8 +4685,18 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         for j in 0..prop.nacc {
             let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
             if !visited(&cyc, &here) {
-                go(&mut cyc, &mut cur, &here, &|_| false);
+                go(&mut cyc, &mut cur, &here, &|_, _, _| false);
             }
+        }
+        // A state of each []<>S part, and a step of each []<>A part
+        for x in prop.ae_state {
+            let here = |p: usize| pr.holds(x, p, 0, 0);
+            if !visited(&cyc, &here) {
+                go(&mut cyc, &mut cur, &here, &|_, _, _| false);
+            }
+        }
+        for x in prop.ae_action {
+            go(&mut cyc, &mut cur, &|_| false, &|u, f, a| pr.holds(x, u, a, f));
         }
         for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
             let off_here = |p: usize| fen(p) & (1 << i) == 0;
@@ -4665,15 +4704,15 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
                 continue;
             }
             if c.iter().any(|&p| off_here(p)) {
-                go(&mut cyc, &mut cur, &off_here, &|_| false);
+                go(&mut cyc, &mut cur, &off_here, &|_, _, _| false);
             } else {
-                go(&mut cyc, &mut cur, &|_| false, &|f| f & (1 << i) != 0);
+                go(&mut cyc, &mut cur, &|_| false, &|_, f, _| f & (1 << i) != 0);
             }
         }
         loop {
             // Back to the entry (at least one step)
             if cur != entry || cyc.is_empty() {
-                go(&mut cyc, &mut cur, &|p| p == entry, &|_| false);
+                go(&mut cyc, &mut cur, &|p| p == entry, &|_, _, _| false);
             }
             let mut added = false;
             for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
@@ -4682,7 +4721,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
                 if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
                     continue;
                 }
-                go(&mut cyc, &mut cur, &|_| false, &|f| f & b != 0);
+                go(&mut cyc, &mut cur, &|_| false, &|_, f, _| f & b != 0);
                 added = true;
             }
             if !added && cur == entry {
