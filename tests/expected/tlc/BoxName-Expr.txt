@@ -1,0 +1,10 @@
+key a11a3145c76bb6cbf0874ff03b3621fd58baf316a32693080ee3ca407bee765c
+tlc Version 2.19
+rc 12
+Invariant PropExpr is violated
+3 states generated 3 distinct states found 0 states left on queue
+trace 3 1cf3a7ecf69fe928cd0fb07fb56a312111c829e3042ba66145db005a7c7fcc3b
+states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 2 e1fa264056c2c6167d3ecca3b9b029c5eaf9a07c5150212c22709c4e2948be21
+errors 2 e1fa264056c2c6167d3ecca3b9b029c5eaf9a07c5150212c22709c4e2948be21
