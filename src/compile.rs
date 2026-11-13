@@ -740,6 +740,87 @@ fn std_ops(m: &str) -> &'static [(&'static str, usize)] {
 /// Counts instances, to give the definitions of each one unique names
 static INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Rewrites a definition of an instantiated module to call the hidden definitions (see
+/// `instantiate`) with the module's constants and variables as leading arguments
+struct InstRename<'a> {
+    names: &'a HashSet<&'a str>,
+    raw: &'a dyn Fn(&str) -> String,
+    pargs: &'a [Expr],
+    /// The number of parameters of each definition, for one passed as an operator argument
+    arities: &'a HashMap<String, usize>,
+}
+impl InstRename<'_> {
+    /// `bound` holds the parameters, bound variables and LET definitions in scope: a definition
+    /// of the module written after this one may have the same name (a parameter `step` before a
+    /// definition `step`), and here the name is the local one
+    fn rename(&self, e: &Expr, bound: &[String]) -> Expr {
+        let def = |n: &str| self.names.contains(n) && !bound.iter().any(|b| b == n);
+        let with = |xs: &mut dyn Iterator<Item = &String>| -> Vec<String> {
+            let mut b = bound.to_vec();
+            b.extend(xs.cloned());
+            b
+        };
+        let (raw, pargs) = (self.raw, self.pargs);
+        match e {
+            // A definition with parameters named without arguments is an operator argument
+            // (`Test(S, Op)`): the hidden definition with the leading parameters bound
+            Expr::Ident(n, _) if def(n) && !pargs.is_empty() && self.arities.get(n).is_some_and(|&k| k > 0) => {
+                let ps: Vec<String> = (0..self.arities[n]).map(|i| format!("{n}#arg{i}")).collect();
+                let mut a = pargs.to_vec();
+                a.extend(ps.iter().map(|p| Expr::Ident(p.clone(), NOPOS)));
+                Expr::Lambda(ps, Expr::Call(raw(n), a).b())
+            }
+            Expr::Ident(n, _) if def(n) => {
+                if pargs.is_empty() { Expr::Ident(raw(n), NOPOS) } else { Expr::Call(raw(n), pargs.to_vec()) }
+            }
+            Expr::Call(n, args) if def(n) => {
+                let mut a = pargs.to_vec();
+                a.extend(args.iter().map(|x| self.rename(x, bound)));
+                Expr::Call(raw(n), a)
+            }
+            Expr::Quant(q, bs, body) => {
+                let inner = with(&mut bs.iter().map(|(x, _)| x));
+                Expr::Quant(*q, bs.iter().map(|(x, s)| (x.clone(), self.rename(s, bound))).collect(), self.rename(body, &inner).b())
+            }
+            Expr::SetMap(body, bs) => {
+                let inner = with(&mut bs.iter().map(|(x, _)| x));
+                Expr::SetMap(self.rename(body, &inner).b(), bs.iter().map(|(x, s)| (x.clone(), self.rename(s, bound))).collect())
+            }
+            Expr::Choose(x, s, p) => Expr::Choose(x.clone(), self.rename(s, bound).b(), self.rename(p, &with(&mut std::iter::once(x))).b()),
+            Expr::SetFilter(x, s, p) => {
+                Expr::SetFilter(x.clone(), self.rename(s, bound).b(), self.rename(p, &with(&mut std::iter::once(x))).b())
+            }
+            Expr::FunCons(x, s, p) => Expr::FunCons(x.clone(), self.rename(s, bound).b(), self.rename(p, &with(&mut std::iter::once(x))).b()),
+            Expr::Lambda(ps, body) => Expr::Lambda(ps.clone(), self.rename(body, &with(&mut ps.iter())).b()),
+            // The definitions of a LET too (map_children leaves them as they are). A recursive
+            // function `f[x \in S]` is `f#app` and `f`
+            Expr::Let(ds, b) => {
+                let names: Vec<String> = ds.iter().map(|d| d.name.strip_suffix("#app").unwrap_or(&d.name).to_string()).collect();
+                let inner = with(&mut names.iter());
+                Expr::Let(
+                    ds.iter()
+                        .map(|d| {
+                            let mut b = inner.clone();
+                            b.extend(d.params.iter().cloned());
+                            Def { body: self.rename(&d.body, &b), ..d.clone() }
+                        })
+                        .collect(),
+                    self.rename(b, &inner).b(),
+                )
+            }
+            // See ast::SUBVAR
+            Expr::Un(UOp::Enabled, x) => {
+                Expr::Un(UOp::Enabled, Expr::Label(crate::ast::ENINST.into(), vec![], self.rename(x, bound).b()).b())
+            }
+            Expr::Fair(w, v, a) => Expr::Fair(
+                *w,
+                self.rename(v, bound).b(),
+                Expr::Label(crate::ast::ENINST.into(), vec![], self.rename(a, bound).b()).b(),
+            ),
+            _ => crate::codegen::map_children(e, &|c| self.rename(c, bound)),
+        }
+    }
+}
 /// Adds the definitions of an instance of a module. Each definition D of the instantiated module
 /// becomes a hidden definition that takes the module's constants and variables as leading
 /// parameters, so that expanding a call substitutes them without capturing bound variables. The
@@ -789,49 +870,13 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
     let pargs: Vec<Expr> = params.iter().map(|(p, _)| Expr::Ident(p.clone(), NOPOS)).collect();
     // The number of parameters of each definition, for one passed as an operator argument
     let arities: HashMap<String, usize> = mm.defs.iter().map(|d| (d.name.clone(), d.params.len())).collect();
-    let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, &arities);
-    fn rename_inst(e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr], arities: &HashMap<String, usize>) -> Expr {
-        let rename = |e: &Expr, names: &HashSet<&str>, raw: &dyn Fn(&str) -> String, pargs: &[Expr]| rename_inst(e, names, raw, pargs, arities);
-        match e {
-            // A definition with parameters named without arguments is an operator argument
-            // (`Test(S, Op)`): the hidden definition with the leading parameters bound
-            Expr::Ident(n, _) if names.contains(n.as_str()) && !pargs.is_empty() && arities.get(n).is_some_and(|&k| k > 0) => {
-                let ps: Vec<String> = (0..arities[n]).map(|i| format!("{n}#arg{i}")).collect();
-                let mut a = pargs.to_vec();
-                a.extend(ps.iter().map(|p| Expr::Ident(p.clone(), NOPOS)));
-                Expr::Lambda(ps, Expr::Call(raw(n), a).b())
-            }
-            Expr::Ident(n, _) if names.contains(n.as_str()) => {
-                if pargs.is_empty() { Expr::Ident(raw(n), NOPOS) } else { Expr::Call(raw(n), pargs.to_vec()) }
-            }
-            Expr::Call(n, args) if names.contains(n.as_str()) => {
-                let mut a = pargs.to_vec();
-                a.extend(args.iter().map(|x| rename(x, names, raw, pargs)));
-                Expr::Call(raw(n), a)
-            }
-            // The definitions of a LET too (map_children leaves them as they are)
-            Expr::Let(ds, b) => Expr::Let(
-                ds.iter().map(|d| Def { body: rename(&d.body, names, raw, pargs), ..d.clone() }).collect(),
-                rename(b, names, raw, pargs).b(),
-            ),
-            // See ast::SUBVAR
-            Expr::Un(UOp::Enabled, x) => {
-                Expr::Un(UOp::Enabled, Expr::Label(crate::ast::ENINST.into(), vec![], rename(x, names, raw, pargs).b()).b())
-            }
-            Expr::Fair(w, v, a) => Expr::Fair(
-                *w,
-                rename(v, names, raw, pargs).b(),
-                Expr::Label(crate::ast::ENINST.into(), vec![], rename(a, names, raw, pargs).b()).b(),
-            ),
-            _ => crate::codegen::map_children(e, &|c| rename(c, names, raw, pargs)),
-        }
-    }
+    let renamer = InstRename { names: &names, raw: &raw, pargs: &pargs, arities: &arities };
     for d in &mm.defs {
         let mut ps: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
         ps.extend(d.params.iter().cloned());
         let mut arity: Vec<usize> = params.iter().map(|(_, a)| *a).collect();
         arity.extend(d.arity.iter().copied());
-        out.defs.push(Def { name: raw(&d.name), params: ps, arity, body: rename(&d.body, &names, &raw, &pargs) });
+        out.defs.push(Def { name: raw(&d.name), params: ps, arity, body: renamer.rename(&d.body, &d.params) });
     }
     for r in &mm.recursive {
         if names.contains(r.as_str()) {
@@ -863,16 +908,22 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
         if mm.local_defs.contains(&d.name) || d.name.contains('#') || !seen.insert(d.name.as_str()) {
             continue;
         }
+        // A parameter named like a name the substitutions read (`Shift(Base)` with `Offset <-
+        // Base`), or like a parameter of the instance, gets a name of its own, so that the
+        // substitution still reads the name here
+        let reads = |p: &str| args.iter().any(|a| a.any(&|x| matches!(x, Expr::Ident(n, _) | Expr::Call(n, _) if n == p)));
+        let own: Vec<String> =
+            d.params.iter().map(|p| if inst.params.contains(p) || reads(p) { format!("{p}#own") } else { p.clone() }).collect();
         let mut call_args = args.clone();
-        call_args.extend(d.params.iter().map(|p| Expr::Ident(p.clone(), NOPOS)));
+        call_args.extend(own.iter().map(|p| Expr::Ident(p.clone(), NOPOS)));
         let body = if call_args.is_empty() { Expr::Ident(raw(&d.name), NOPOS) } else { Expr::Call(raw(&d.name), call_args) };
         // TLC names an action inside it by the INSTANCE statement
         let body = if inst.at.is_empty() { body } else { at_pos(&inst.at, body) };
         let (name, params, arity) = match &inst.name {
-            None => (d.name.clone(), d.params.clone(), d.arity.clone()),
+            None => (d.name.clone(), own, d.arity.clone()),
             Some(n) => {
                 let mut ps = inst.params.clone();
-                ps.extend(d.params.iter().cloned());
+                ps.extend(own);
                 let mut ar = inst.arity.clone();
                 // An instance hoisted out of a LET takes the names its substitutions mention; one
                 // that names an operator with arguments is passed as that operator

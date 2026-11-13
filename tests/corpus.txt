@@ -201,7 +201,7 @@ skip specifications/cf1s-folklore/cf1s_folklore.tla specifications/cf1s-folklore
 skip specifications/chang_roberts/APChangRoberts.tla specifications/chang_roberts/APChangRoberts.cfg # symbolic mode: checked with Apalache
 check specifications/chang_roberts/MCChangRoberts.tla specifications/chang_roberts/MCChangRoberts.cfg
 check specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg
-gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs stops at depth 3 on CHOOSE in Utils' Max over an empty set, which TLC never evaluates; generating and building it takes about 15 GB
+gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs no longer stops early (InstShadow), but it did not finish level 8 of the search in 20 minutes, where TLC takes 37 s: code generation writes LET definitions and arguments out at each use, and the time goes to Descendants; generating the checker takes 100 s and 17 GB, and each of its 3 builds (sets growing from 8 to 32) about 3.5 minutes
 skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
 skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget
 check specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg
