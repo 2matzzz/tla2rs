@@ -2030,7 +2030,9 @@ fn resolve_spec(m: &Module, cfg: &Cfg, ex: &mut Expander) -> R<Result<SpecParts,
                 ex.keep_pos = false;
                 let e = e?;
                 // TLC refuses a next-state action of constant level (`tests/tlc/NoActions`)
-                if constant_level(&e, m) {
+                // (not one whose body the parser dropped: \E x : P without a set, \EE, \AA)
+                let dropped = e.any(&|x| matches!(x, Expr::Call(n, _) if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA"));
+                if constant_level(&e, m) && !dropped {
                     return Ok(Err((format!("Error: The next state action {n} cannot be a constant."), 151)));
                 }
                 Some(e)
