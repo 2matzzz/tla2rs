@@ -527,8 +527,8 @@ not the graphs. Reducing to it:
   state reached keeps its form, as in TLC. States, `Print`, `PrintT` and `ToString` use it, so `ToString(s)` makes
   `"1..2"` where TLC does, and an invariant comparing that text holds in both (`tests/tlc/IntervalToString`). Not
   followed, and printed as enumerated sets and `<<>>`: the elements of a set, function or sequence held in the state,
-  a value bound by `\E` and then assigned, CHOOSE over a set from the state, an IF whose condition prints or makes
-  strings, and the operators of the CommunityModules tla2rs provides (TLC computes many of them in Java, which
+  a value bound by `\E` and then assigned, CHOOSE over a set from the state, CASE, an IF whose condition prints, and
+  the operators of the CommunityModules tla2rs provides (TLC computes many of them in Java, which
   builds values in forms of its own; `community::defines`). For these the comparison still reads an interval as the
   set it denotes
 

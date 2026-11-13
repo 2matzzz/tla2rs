@@ -7597,11 +7597,12 @@ impl Gen<'_> {
     }
 
     /// The shape of the value `e` builds, of type t, as code (bits as `shape_slots` lays them
-    /// out). TLC holds `a..b` and DOMAIN of a tuple or sequence as intervals; a variable keeps the
-    /// shape of its value; a tuple, record or EXCEPT keeps those of its parts. Anything else is
-    /// taken as an enumerated set (0): another set operation, and also what is not followed here
-    /// (a branch of IF or CASE that differs from the others, CHOOSE, an element of a set or a
-    /// function's value)
+    /// out). TLC holds `a..b` and DOMAIN of a tuple or sequence as intervals, and a function it
+    /// builds where a sequence is expected as a function; a variable keeps the shape of its value;
+    /// a tuple, record, IF or EXCEPT keeps those of its parts; a constant has the form the
+    /// compiler finds (`const_form`). Anything else is taken as an enumerated set (0): another set
+    /// operation, and also what is not followed here (CASE, CHOOSE over a set from the state, a
+    /// value bound by `\E`, an element of a set or function from the state)
     pub fn shape_of(&mut self, e: &Expr, t: &Ty, env: &Env) -> String {
         let c = self.shape_of_built(e, t, env);
         if c != "0" || Self::shape_slots(t) == 0 {
@@ -7722,8 +7723,9 @@ impl Gen<'_> {
                 if sa == sb {
                     return sa;
                 }
-                // The condition again, when evaluating it twice changes nothing TLC shows
-                let shows = c.any(&|y| matches!(y, Expr::Call(n, _) if ["Print", "PrintT", "ToString", "Assert"].contains(&n.as_str())));
+                // The condition again, when evaluating it twice changes nothing TLC shows (a
+                // string it makes was made the first time)
+                let shows = c.any(&|y| matches!(y, Expr::Call(n, _) if ["Print", "PrintT", "Assert", "TLCSet"].contains(&n.as_str())));
                 match self.gen(c, env, Some(&Ty::Bool)) {
                     Ok((cc, Ty::Bool)) if !shows => format!("(if {cc} {{ {sa} }} else {{ {sb} }})"),
                     _ => "0".into(),
@@ -7898,7 +7900,7 @@ impl Gen<'_> {
                 Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) => true,
                 Expr::Ident(v, _) => on.contains(v),
                 Expr::Prime(x) => may(g, x, t, on),
-                Expr::If(_, a, b) => may(g, a, t, on) && may(g, b, t, on),
+                Expr::If(_, a, b) => may(g, a, t, on) || may(g, b, t, on),
                 Expr::Tuple(xs) => {
                     let fs = fields(t);
                     xs.iter().enumerate().any(|(i, x)| may(g, x, fs.get(i).map_or(t, |f| &f.1), on))
