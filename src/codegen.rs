@@ -5157,6 +5157,7 @@ impl<'a> Gen<'a> {
             Quant(true, bs, body) if open => {
                 if let Some(made) = bs.iter().find_map(|(_, s)| match self.try_const_made(s, env) {
                     (Some(v), made) if v.as_set().is_ok_and(|x| x.is_empty()) => Some(made),
+                    _ if self.empty_unread(s, env) => Some(Made::default()),
                     _ => None,
                 }) {
                     let notes = self.fold_notes(&made);
@@ -6203,7 +6204,9 @@ impl<'a> Gen<'a> {
                 }
             }
             Or(_) if open => return Ok(false),
-            Quant(true, bs, _) if open && !bs.iter().any(|(_, s)| self.mentions_state(s)) => return Ok(false),
+            Quant(true, bs, _) if open && bs.iter().all(|(_, s)| !self.mentions_state(s)) || bs.iter().any(|(_, s)| self.empty_unread(s, env)) => {
+                return Ok(false)
+            }
             RecCall(i, args) => {
                 let state = args.iter().any(|a| self.mentions_state(a));
                 if !state && open && self.rec_assigns(*i, env) && args.iter().all(|a| self.try_const(a, env).is_some()) {
@@ -6234,6 +6237,17 @@ impl<'a> Gen<'a> {
         Ok(true)
     }
 
+    /// Whether a set that depends on the state is empty without reading it: `{x \in S : P}` or
+    /// `{e : x \in S}` over a constant empty S. TLC splits Next with no state and makes no action
+    /// of an `\E` over such a set, as over a constant empty set (`tests/tlc/SplitEmpty`)
+    fn empty_unread(&self, s: &Expr, env: &Env) -> bool {
+        let empty = |d: &Expr| self.try_const(d, env).is_some_and(|v| v.as_set().is_ok_and(|x| x.is_empty())) || self.empty_unread(d, env);
+        match s.strip() {
+            Expr::SetFilter(_, d, _) => empty(d),
+            Expr::SetMap(_, bs) => bs.iter().any(|(_, d)| empty(d)),
+            _ => false,
+        }
+    }
     /// Whether `e` depends on the state (has level 1 or more for SANY)
     fn mentions_state(&self, e: &Expr) -> bool {
         e.any(&|x| {
