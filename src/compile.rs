@@ -548,6 +548,46 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
     }
 }
 
+/// The strings and model values of the cfg in the order written (true: a model value)
+fn cfg_values(cfg: &Cfg) -> Vec<(String, bool)> {
+    fn walk(e: &Expr, order: &mut Vec<(String, bool)>) {
+        match e {
+            Expr::Str(x) => order.push((x.clone(), false)),
+            Expr::Ident(n, _) => {
+                if let Some(mv) = n.strip_prefix("@model:") {
+                    order.push((mv.to_string(), true));
+                }
+            }
+            _ => {}
+        }
+        for c in e.children() {
+            walk(c, order);
+        }
+    }
+    let mut order = vec![];
+    for v in cfg.constants.iter().map(|(_, v)| v).chain(cfg.mod_values.iter().map(|(_, _, v)| v)) {
+        walk(v, &mut order);
+    }
+    order
+}
+
+/// The number TLC fingerprints each model value by (its name's `UniqueString` token): TLC numbers
+/// names from 1 as it first creates them, the strings and model values of the cfg first (measured
+/// on TLC 2.19 with `-dump dot`, whose nodes are fingerprints)
+fn tlc_model_values(cfg: &Cfg) -> String {
+    let mut names: Vec<String> = vec![];
+    let mut out = vec![];
+    for (x, model) in cfg_values(cfg) {
+        if !names.contains(&x) {
+            names.push(x.clone());
+            if model {
+                out.push(format!("({x:?}, {})", names.len()));
+            }
+        }
+    }
+    format!("static TLC_MODEL_VALUES: &[(&str, i32)] = &[{}];\n", out.join(", "))
+}
+
 /// The order in which TLC creates the strings it knows before it evaluates anything: TLC orders
 /// strings by when it first creates them. Measured on TLC 2.19: the strings and model values of
 /// the cfg; SANY's built-in names; the identifiers, keywords and numbers (as written: `007`,
@@ -556,24 +596,7 @@ fn standard_module(name: &str, how: &str) -> R<bool> {
 /// module, dependencies before the modules that use them. Strings made later (by \o, ToString,
 /// ...) follow, in the order TLC makes them (see `compile`).
 fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<String, usize> {
-    let mut order: Vec<String> = vec![];
-    fn cfg_values(e: &Expr, order: &mut Vec<String>) {
-        match e {
-            Expr::Str(x) => order.push(x.clone()),
-            Expr::Ident(n, _) => {
-                if let Some(mv) = n.strip_prefix("@model:") {
-                    order.push(mv.to_string());
-                }
-            }
-            _ => {}
-        }
-        for c in e.children() {
-            cfg_values(c, order);
-        }
-    }
-    for v in cfg.constants.iter().map(|(_, v)| v).chain(cfg.mod_values.iter().map(|(_, _, v)| v)) {
-        cfg_values(v, &mut order);
-    }
+    let mut order: Vec<String> = cfg_values(cfg).into_iter().map(|x| x.0).collect();
     for b in ["ENABLED", "UNCHANGED", "SUBSET", "UNION", "DOMAIN", "STRING", "FALSE", "TRUE", "BOOLEAN"] {
         order.push(b.into());
     }
@@ -1843,6 +1866,7 @@ fn compile_inner(
     src += &inv_code;
     src += &prop_code;
     src += &live_code;
+    src += &tlc_model_values(&cfg);
     writeln!(src, "const TYPE_INVARIANT: &str = {tname:?};").unwrap();
     writeln!(src, "const TYPE_INV_SUBSUMED: bool = {type_inv_subsumed};").unwrap();
     // Where TLC checks the type invariant among the others: the invariants listed before it

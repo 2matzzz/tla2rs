@@ -45,7 +45,7 @@ pub struct Node {
 }
 
 /// Binary formulas used by the construction: `U(a, b)` is a U b, `R(a, b)` is a R b
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum F {
     True,
     False,
@@ -84,20 +84,30 @@ struct Proto {
 const INIT: usize = usize::MAX;
 
 /// The automaton of `f` and the number of acceptance sets. Fails if the automaton grows beyond
-/// `max_nodes` states.
+/// `max_nodes` states, or its construction beyond 256 steps per such state (it can take
+/// exponentially many steps per state: a conjunction of n []<> formulas branches 2^n ways at each).
 pub fn automaton(f: &Ltl, max_nodes: usize) -> Result<(Vec<Node>, usize), String> {
     let mut done: Vec<Proto> = vec![];
+    // The node of each (old, next), so that a finished node is merged into an equal one at once
+    let mut index: std::collections::HashMap<(BTreeSet<F>, BTreeSet<F>), usize> = std::collections::HashMap::new();
     let mut work = vec![Proto { incoming: [INIT].into(), new: vec![to_f(f)], old: BTreeSet::new(), next: BTreeSet::new() }];
+    let mut steps = 0usize;
     while let Some(mut n) = work.pop() {
         if done.len() > max_nodes {
             return Err(format!("the temporal property needs more than {max_nodes} automaton states"));
         }
+        steps += 1;
+        if steps > max_nodes * 256 {
+            return Err(format!("the automaton of the temporal property takes more than {} steps to build", max_nodes * 256));
+        }
         let Some(eta) = n.new.pop() else {
-            if let Some(d) = done.iter_mut().find(|d| d.old == n.old && d.next == n.next) {
-                d.incoming.extend(n.incoming);
+            let key = (n.old.clone(), n.next.clone());
+            if let Some(&d) = index.get(&key) {
+                done[d].incoming.extend(n.incoming);
                 continue;
             }
             let id = done.len();
+            index.insert(key, id);
             let next: Vec<F> = n.next.iter().cloned().collect();
             done.push(n);
             work.push(Proto { incoming: [id].into(), new: next, old: BTreeSet::new(), next: BTreeSet::new() });

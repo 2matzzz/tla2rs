@@ -803,7 +803,7 @@ fn lp_src(e: &TExpr) -> String {
 /// numbered in TLC's order. A disjunct with another part needs TLC's tableau, which the runtime
 /// does not follow; it then gets the reason.
 fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
-    let none = |why: &str| format!("static TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
+    let none = |why: &str| format!("type TBits = u64;\nstatic TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
     if props.is_empty() {
         return none("no properties");
     }
@@ -876,17 +876,83 @@ fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
         let ea: Vec<usize> = ea.iter().map(|x| bin(&mut abin, x)).collect();
         pems.push(format!("TPem {{ ae_state: &{aes:?}, ae_action: &{aea:?}, ea_action: &{ea:?} }}"));
     }
-    if sbin.len() > 64 || abin.len() > 64 {
-        return none("more than 64 predicates");
+    if sbin.len() > 128 || abin.len() > 128 {
+        return none("more than 128 predicates");
     }
     let cs: Vec<String> = sbin.iter().map(|(_, x)| lp_src(x)).collect();
     let ca: Vec<String> = abin.iter().map(|(_, x)| lp_src(x)).collect();
+    // The predicates of a state or step as a bit mask (wider only when needed)
+    let bits = if sbin.len() > 64 || abin.len() > 64 { "u128" } else { "u64" };
     format!(
-        "static TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ check_state: &[{}], check_action: &[{}], pems: &[{}] }});\n",
+        "type TBits = {bits};\nstatic TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ check_state: &[{}], check_action: &[{}], pems: &[{}] }});\n",
         cs.join(", "),
         ca.join(", "),
         pems.join(", ")
     )
+}
+
+/// The most states an automaton may have
+const MAX_AUTOMATON: usize = 4096;
+
+/// The nodes of an automaton as the runtime's `LNode`s
+fn lnodes(nodes: &[crate::ltl::Node]) -> String {
+    let mut ns = vec![];
+    for n in nodes {
+        let (mut sp, mut sn, mut ap, mut an) = (0u64, 0u64, 0u64, 0u64);
+        for &(a, p) in &n.lits {
+            let (pos, neg, b) = if a >= ACTION_BASE { (&mut ap, &mut an, a - ACTION_BASE) } else { (&mut sp, &mut sn, a) };
+            if p {
+                *pos |= 1 << b;
+            } else {
+                *neg |= 1 << b;
+            }
+        }
+        let succ: Vec<String> = n.succ.iter().map(|x| x.to_string()).collect();
+        ns.push(format!(
+            "LNode {{ s_pos: {sp}, s_neg: {sn}, a_pos: {ap}, a_neg: {an}, succ: &[{}], init: {}, acc: {} }}",
+            succ.join(", "),
+            n.init,
+            n.acc
+        ));
+    }
+    ns.join(", ")
+}
+
+/// The disjuncts of the normal form of a simplified negation, each as the formula left for an
+/// automaton and its []<>S, []<>A and <>[]A parts. None if there is a single disjunct with nothing
+/// to take out, which splitting does not make smaller.
+#[allow(clippy::type_complexity)]
+fn split_disjuncts(neg: TExpr) -> Option<Vec<(Ltl, Vec<TExpr>, Vec<TExpr>, Vec<TExpr>)>> {
+    let dnf = match neg.to_dnf() {
+        TExpr::Bool(false) => vec![],
+        TExpr::Disj(d) => d,
+        e => vec![e],
+    };
+    let mut out = vec![];
+    let mut taken = false;
+    for d in dnf {
+        let items = match d.flatten() {
+            TExpr::Conj(xs) => xs,
+            e => vec![e],
+        };
+        let (mut rest, mut aes, mut aea, mut ea) = (vec![], vec![], vec![], vec![]);
+        for ln in items {
+            match ln {
+                TExpr::Even(b) if matches!(b.as_ref(), TExpr::All(c) if c.level() < 3) => {
+                    let TExpr::All(c) = *b else { unreachable!() };
+                    ea.push(*c);
+                }
+                TExpr::All(b) if matches!(b.as_ref(), TExpr::Even(c) if c.level() <= 2) => {
+                    let TExpr::Even(c) = *b else { unreachable!() };
+                    if c.level() <= 1 { aes.push(*c) } else { aea.push(*c) }
+                }
+                ln => rest.push(ln.tableau_bools().to_ltl()),
+            }
+        }
+        taken |= !(aes.is_empty() && aea.is_empty() && ea.is_empty());
+        out.push((Ltl::And(rest), aes, aea, ea));
+    }
+    (taken || out.len() > 1).then_some(out)
 }
 
 /// Generated code for the liveness checks: the atoms, the fairness conditions, and an automaton per
@@ -931,29 +997,27 @@ pub fn compile(
     };
     src += &tlc_live(fair, &atexprs, &texprs);
     for ((name, _, _), t) in parts.iter().zip(&texprs) {
-        let neg = TExpr::junction(atexprs.iter().cloned().chain([TExpr::Neg(t.clone().into())]), true);
-        let neg = neg.push_neg(false).simplify().tableau_bools().to_ltl();
-        let (nodes, nacc) = automaton(&neg, 4096).map_err(|m| format!("property {name}: {m}"))?;
-        let mut ns = vec![];
-        for n in &nodes {
-            let (mut sp, mut sn, mut ap, mut an) = (0u64, 0u64, 0u64, 0u64);
-            for &(a, p) in &n.lits {
-                let (pos, neg, b) = if a >= ACTION_BASE { (&mut ap, &mut an, a - ACTION_BASE) } else { (&mut sp, &mut sn, a) };
-                if p {
-                    *pos |= 1 << b;
-                } else {
-                    *neg |= 1 << b;
+        let neg = TExpr::junction(atexprs.iter().cloned().chain([TExpr::Neg(t.clone().into())]), true).push_neg(false).simplify();
+        let lp_list = |xs: &[TExpr]| format!("&[{}]", xs.iter().map(lp_src).collect::<Vec<_>>().join(", "));
+        match automaton(&neg.clone().tableau_bools().to_ltl(), MAX_AUTOMATON) {
+            Ok((nodes, nacc)) => props.push(format!("LProp {{ name: {name:?}, nodes: &[{}], nacc: {nacc}, ae_state: &[], ae_action: &[], ea: &[] }}", lnodes(&nodes))),
+            Err(m) => {
+                // Too large for one automaton: as TLC does, each disjunct of the normal form on
+                // its own, its <>[]A, []<>S and []<>A parts as conditions on components and only
+                // the rest in an automaton. Each disjunct is checked as a property of its own.
+                let alts = split_disjuncts(neg).ok_or_else(|| format!("property {name}: {m}"))?;
+                for (rest, aes, aea, ea) in alts {
+                    let (nodes, nacc) = automaton(&rest, MAX_AUTOMATON).map_err(|m| format!("property {name}: {m}"))?;
+                    props.push(format!(
+                        "LProp {{ name: {name:?}, nodes: &[{}], nacc: {nacc}, ae_state: {}, ae_action: {}, ea: {} }}",
+                        lnodes(&nodes),
+                        lp_list(&aes),
+                        lp_list(&aea),
+                        lp_list(&ea)
+                    ));
                 }
             }
-            let succ: Vec<String> = n.succ.iter().map(|x| x.to_string()).collect();
-            ns.push(format!(
-                "LNode {{ s_pos: {sp}, s_neg: {sn}, a_pos: {ap}, a_neg: {an}, succ: &[{}], init: {}, acc: {} }}",
-                succ.join(", "),
-                n.init,
-                n.acc
-            ));
         }
-        props.push(format!("LProp {{ name: {name:?}, nodes: &[{}], nacc: {nacc} }}", ns.join(", ")));
     }
     // Fairness matters only when there are properties to check
     let mut fairs = vec![];
@@ -1005,6 +1069,7 @@ pub fn compile(
     // liveness graph keeps one per state and per edge)
     writeln!(src, "type FMask = {};", if fairs.len() > 64 { "u128" } else { "u64" }).unwrap();
     writeln!(src, "static LPROPS: &[LProp] = &[{}];", props.join(", ")).unwrap();
+    writeln!(src, "const NPROPS: usize = {};", parts.len()).unwrap();
     writeln!(src, "const LIVENESS: bool = {};", !parts.is_empty()).unwrap();
     // The state atoms TLC evaluates when a state is generated (those of the tableau); it evaluates
     // the others when the state is expanded

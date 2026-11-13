@@ -79,7 +79,7 @@ It has no crate dependencies.
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does; and where SANY places each definition they export (`STD_DEFS`), for its report of a name that clashes with one |
 | `src/community_modules.rs` | The identifiers and strings of the CommunityModules' modules tla2rs provides, as TLC reads the release's files (generated from them), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
-| `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
+| `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation (with the spec's other temporal conjuncts) becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions. An automaton may have 4096 states and take 256 steps per state to build (a conjunction of n `[]<>` formulas branches 2^n ways at each state); a larger one is split as TLC splits its plan: each disjunct of the normal form is checked as a property of its own, its `[]<>S`, `[]<>A` and `<>[]A` parts as conditions on the components of the product (a state, a step in it, every step of the cycle) and only the rest in an automaton (`split_disjuncts`; `tests/tlc/LiveAssumed`: 13 `[]<>` conjuncts in the spec, for which building one automaton gave up after 400 s with more than 4096 states) |
 | `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
 | `src/trace.rs` | `--trace`: reduces the counterexample in an output of TLC or of a checker to its canonical form and hashes it |
 | `src/messages.rs` | `--messages`: reduces the messages and printed lines in an output of TLC or of a checker to their canonical form and hashes it, and its error lines (see "Messages and printed lines") |
@@ -576,7 +576,12 @@ the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What 
   the next state each time a set had to grow). Duplicates and self-loops count as puts at their place among the
   successors, since a put checks the threshold first. The fingerprint is TLC's (`FP64` over each value's bytes: a
   tag, the size, the elements in TLC's order; functions, tuples and records all as pairs; strings by their
-  characters; a model value by TLC's number for its name, which tla2rs does not know)
+  characters; a model value by the number TLC gives its name, `TLC_MODEL_VALUES`). TLC numbers names from 1 as it
+  first creates them (`UniqueString`), the strings and model values of the cfg first, in the order written (measured
+  with `-dump dot`, whose nodes are fingerprints: `P = {a, b}` gives a 1 and b 2, `Q = "zz"`, `R = idle` and then
+  `P = {b, a}` give idle 2, b 3, a 4). Under a SYMMETRY the fingerprint is that of the smallest permuted state in
+  TLC's order of values (`TLCStateMut.fingerPrint`), and a state of the lasso is rebuilt as the first successor with
+  the next node's fingerprint, so the cycle can return to another member of its start's class (`LiveSymTurn`)
 - The search (`LiveWorker.checkSccs`): from each initial state, then from each node a skipped step led to, a
   depth-first search that pushes all successors at once and keeps a low link per frame, skipping a step that breaks
   the model's EAAction (it queues the target instead). A component popped from the stack is checked if it has more
@@ -589,15 +594,14 @@ the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What 
   action that yields it. The lasso ends `Stuttering` when it ends on the start, otherwise `Back to state N`, N the
   number of the start
 
-The checker follows this when there is no tableau, no VIEW or SYMMETRY, no model value in the states, at most 64
-predicates and no `-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's `args`
+The checker follows this when there is no tableau, no VIEW, at most 128 predicates (held as `u128` bit masks when
+there are more than 64, `ManyFair-Viol`) and no `-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's `args`
 choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own, not
 TLC's", with the reason). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
-after `MATCH` (`lasso confirmed instead: <reason>`). Of the 46 liveness violations of `examples/` and `tests/tlc/`,
-34 print TLC's lasso (most by following TLC's search, some by coincidence), and 12 differ: 6 need a tableau
-(`Live-SpecNext-Starve`, `Live-SpecSpin-Starve`, `Live-SpecWeak-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`), 4 hold a model value (`Live-SpecNext-EvIdle`, `Live-SpecSpin-EvIdle`,
-`Live-SpecWeak-EvIdle`, `Live-SpecSpin-SomeCS`), 1 has a SYMMETRY (`LiveSymTurn`) and `ManyFair-Viol` has more than
-64 predicates.
+after `MATCH` (`lasso confirmed instead: <reason>`). Of the 52 liveness violations of `examples/` and `tests/tlc/`,
+44 print TLC's lasso (most by following TLC's search, some by coincidence), and the 8 that need a tableau differ
+(`Live-SpecNext-Starve`, `Live-SpecSpin-Starve`, `Live-SpecWeak-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`,
+`OptDiffTrace-Live`, `LiveConst-Leads`, `LiveAssumed-Leads`).
 
 TLC checks such a lasso as follows. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
 `.cfg` (`write_lasso_check` in the runtime, `src/lasso.rs`): a module that EXTENDS the spec with a variable for the

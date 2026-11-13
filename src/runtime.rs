@@ -4225,11 +4225,17 @@ struct LNode {
     acc: u64,
 }
 
+/// The automaton of a negated property, or of one disjunct of its normal form with its []<>S
+/// (`ae_state`), []<>A (`ae_action`) and <>[]A (`ea`) parts as conditions on cycles (see
+/// `split_disjuncts` in tla2rs's live.rs)
 struct LProp {
     #[allow(dead_code)]
     name: &'static str,
     nodes: &'static [LNode],
     nacc: u32,
+    ae_state: &'static [LP],
+    ae_action: &'static [LP],
+    ea: &'static [LP],
 }
 
 /// The label of the stuttering step every state has
@@ -4256,11 +4262,13 @@ impl Steps {
     }
 }
 
-/// The product of the state graph with the automaton of one negated property
+/// The product of the state graph with the automaton of one negated property; with `ea`, only the
+/// steps that keep the property's <>[]A parts
 struct Product<'a> {
     st: &'a Steps,
     nodes: &'static [LNode],
     q: usize,
+    ea: &'static [LP],
 }
 
 impl Product<'_> {
@@ -4269,21 +4277,28 @@ impl Product<'_> {
         b & n.s_pos == n.s_pos && b & n.s_neg == 0
     }
 
-    /// Successors of product node p: (node, label, fairness steps)
-    fn succ(&self, p: usize, out: &mut Vec<(usize, u32, FMask)>) {
+    /// Successors of product node p: (node, label, fairness steps, action atoms)
+    fn succ(&self, p: usize, out: &mut Vec<(usize, u32, FMask, u64)>) {
         out.clear();
         let (s, q) = ((p / self.q) as u32, p % self.q);
         let n = &self.nodes[q];
         for (t, l, a, f) in self.st.of(s) {
-            if a & n.a_pos != n.a_pos || a & n.a_neg != 0 {
+            if a & n.a_pos != n.a_pos || a & n.a_neg != 0 || !self.ea.iter().all(|x| self.holds(x, p, a, f)) {
                 continue;
             }
             for &q2 in n.succ {
                 if self.valid(t, q2 as usize) {
-                    out.push((t as usize * self.q + q2 as usize, l, f));
+                    out.push((t as usize * self.q + q2 as usize, l, f, a));
                 }
             }
         }
+    }
+
+    /// Whether predicate x holds of product node p's state, and of the step with action atoms a
+    /// and fairness steps f from it
+    fn holds(&self, x: &LP, p: usize, a: u64, f: FMask) -> bool {
+        let s = p / self.q;
+        x.eval(self.st.sbits[s], self.st.fen[s], a, f)
     }
 
     fn state(&self, p: usize) -> u32 {
@@ -4370,7 +4385,8 @@ enum Verdict {
     Accept { steps: Vec<usize>, off: Vec<usize> },
 }
 
-fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
+fn judge(pr: &Product, prop: &LProp, c: &[usize]) -> Verdict {
+    let nacc = prop.nacc;
     let set: std::collections::HashSet<usize> = c.iter().copied().collect();
     let mut acc = 0u64;
     for &p in c {
@@ -4380,15 +4396,25 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
     if acc & all != all {
         return Verdict::Reject;
     }
+    if !prop.ae_state.iter().all(|x| c.iter().any(|&p| pr.holds(x, p, 0, 0))) {
+        return Verdict::Reject;
+    }
     let mut taken: FMask = 0;
+    let mut ae_taken = vec![false; prop.ae_action.len()];
     let mut buf = vec![];
     for &p in c {
         pr.succ(p, &mut buf);
-        for &(v, _, f) in &buf {
+        for &(v, _, f, a) in &buf {
             if set.contains(&v) {
                 taken |= f;
+                for (j, x) in prop.ae_action.iter().enumerate() {
+                    ae_taken[j] |= pr.holds(x, p, a, f);
+                }
             }
         }
+    }
+    if ae_taken.contains(&false) {
+        return Verdict::Reject;
     }
     let mut some_off: FMask = 0;
     let mut all_off = FMask::MAX;
@@ -4421,8 +4447,8 @@ fn judge(pr: &Product, nacc: u32, c: &[usize]) -> Verdict {
 }
 
 /// Searches a component for a fair accepting cycle, narrowing it for strong fairness
-fn search(pr: &Product, nacc: u32, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
-    match judge(pr, nacc, &c) {
+fn search(pr: &Product, prop: &LProp, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    match judge(pr, prop, &c) {
         Verdict::Reject => None,
         Verdict::Accept { steps, off } => Some((c, steps, off)),
         Verdict::Narrow(keep) => {
@@ -4431,7 +4457,7 @@ fn search(pr: &Product, nacc: u32, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usi
             }
             let set: std::collections::HashSet<usize> = keep.iter().copied().collect();
             for sub in sccs(pr, &keep, &|p| set.contains(&p)) {
-                if let Some(r) = search(pr, nacc, sub) {
+                if let Some(r) = search(pr, prop, sub) {
                     return Some(r);
                 }
             }
@@ -4441,24 +4467,25 @@ fn search(pr: &Product, nacc: u32, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usi
 }
 
 /// A shortest path inside `set` from `from` (excluded) that ends at a node satisfying `goal` or with
-/// a step satisfying `edge` (on its fairness bits): [(node, label, fairness bits of the step)]
+/// a step satisfying `edge` (on the node it leaves, its fairness bits and its action atoms):
+/// [(node, label, fairness bits of the step)]
 fn path_to(
     pr: &Product,
     set: &std::collections::HashSet<usize>,
     from: usize,
     goal: &dyn Fn(usize) -> bool,
-    edge: &dyn Fn(FMask) -> bool,
+    edge: &dyn Fn(usize, FMask, u64) -> bool,
 ) -> Vec<(usize, u32, FMask)> {
     let mut prev: std::collections::HashMap<usize, (usize, u32, FMask)> = std::collections::HashMap::new();
     let mut q = std::collections::VecDeque::from([from]);
     let mut buf = vec![];
     while let Some(u) = q.pop_front() {
         pr.succ(u, &mut buf);
-        for &(v, l, f) in &buf {
+        for &(v, l, f, a) in &buf {
             if !set.contains(&v) {
                 continue;
             }
-            if goal(v) || edge(f) {
+            if goal(v) || edge(u, f, a) {
                 let mut out = vec![(v, l, f)];
                 let mut x = u;
                 while x != from {
@@ -4588,7 +4615,7 @@ fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
         print_lasso(g, &prefix, &cycle);
         return false;
     }
-    println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", LPROPS.len(), FAIRS.len(), edges);
+    println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", NPROPS, FAIRS.len(), edges);
     true
 }
 
@@ -4598,7 +4625,9 @@ type Lasso = (Vec<(u32, u32)>, Vec<(u32, u32)>);
 /// Looks for a behavior that violates one property: a fair cycle in its product with the state
 /// graph that the property's automaton accepts. None also when `quit` says to give up.
 fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) -> Option<Lasso> {
-    let pr = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1) };
+    // The path to a cycle may take any step; the cycle only steps that keep the <>[]A parts
+    let all = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1), ea: &[] };
+    let pr = Product { ea: prop.ea, ..all };
     if prop.nodes.is_empty() {
         return None;
     }
@@ -4622,8 +4651,8 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         }
         let u = order[h];
         h += 1;
-        pr.succ(u, &mut buf);
-        for &(v, l, _) in &buf {
+        all.succ(u, &mut buf);
+        for &(v, l, _, _) in &buf {
             if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
                 e.insert((u, l));
                 order.push(v);
@@ -4635,7 +4664,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         if quit() {
             return None;
         }
-        let Some((c, steps, off)) = search(&pr, prop.nacc, c) else { continue };
+        let Some((c, steps, off)) = search(&pr, prop, c) else { continue };
         let set: std::collections::HashSet<usize> = c.iter().copied().collect();
         let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
         // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
@@ -4645,7 +4674,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         let fen = |p: usize| st.fen[pr.state(p) as usize];
         let mut cyc: Vec<(usize, u32, FMask)> = vec![];
         let mut cur = entry;
-        let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
+        let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(usize, FMask, u64) -> bool| {
             let p = path_to(&pr, &set, *cur, goal, edge);
             if let Some(&(l, _, _)) = p.last() {
                 *cur = l;
@@ -4656,8 +4685,18 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         for j in 0..prop.nacc {
             let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
             if !visited(&cyc, &here) {
-                go(&mut cyc, &mut cur, &here, &|_| false);
+                go(&mut cyc, &mut cur, &here, &|_, _, _| false);
             }
+        }
+        // A state of each []<>S part, and a step of each []<>A part
+        for x in prop.ae_state {
+            let here = |p: usize| pr.holds(x, p, 0, 0);
+            if !visited(&cyc, &here) {
+                go(&mut cyc, &mut cur, &here, &|_, _, _| false);
+            }
+        }
+        for x in prop.ae_action {
+            go(&mut cyc, &mut cur, &|_| false, &|u, f, a| pr.holds(x, u, a, f));
         }
         for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
             let off_here = |p: usize| fen(p) & (1 << i) == 0;
@@ -4665,15 +4704,15 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
                 continue;
             }
             if c.iter().any(|&p| off_here(p)) {
-                go(&mut cyc, &mut cur, &off_here, &|_| false);
+                go(&mut cyc, &mut cur, &off_here, &|_, _, _| false);
             } else {
-                go(&mut cyc, &mut cur, &|_| false, &|f| f & (1 << i) != 0);
+                go(&mut cyc, &mut cur, &|_| false, &|_, f, _| f & (1 << i) != 0);
             }
         }
         loop {
             // Back to the entry (at least one step)
             if cur != entry || cyc.is_empty() {
-                go(&mut cyc, &mut cur, &|p| p == entry, &|_| false);
+                go(&mut cyc, &mut cur, &|p| p == entry, &|_, _, _| false);
             }
             let mut added = false;
             for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
@@ -4682,7 +4721,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
                 if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
                     continue;
                 }
-                go(&mut cyc, &mut cur, &|_| false, &|f| f & b != 0);
+                go(&mut cyc, &mut cur, &|_| false, &|_, f, _| f & b != 0);
                 added = true;
             }
             if !added && cur == entry {
@@ -4800,11 +4839,13 @@ fn fp_int(mut fp: u64, x: i32) -> u64 {
     fp
 }
 
-/// A value as TLC fingerprints it: functions, tuples and records alike as a list of pairs
+/// A value as TLC fingerprints it: functions, tuples and records alike as a list of pairs; a model
+/// value by the number TLC gave its name (`TLC_MODEL_VALUES`)
 enum TV {
     B(bool),
     I(i64),
     S(String),
+    M(i32),
     Set(Vec<TV>),
     Fcn(Vec<(TV, TV)>),
 }
@@ -4814,6 +4855,7 @@ impl TV {
         match self {
             TV::B(b) => fp_byte(fp_byte(fp, 0), if *b { b't' } else { b'f' }),
             TV::I(i) => fp_int(fp_byte(fp, 1), *i as i32),
+            TV::M(t) => fp_int(fp_byte(fp, 21), *t),
             TV::S(s) => {
                 let u: Vec<u16> = s.encode_utf16().collect();
                 let mut fp = fp_int(fp_byte(fp, 3), u.len() as i32);
@@ -4828,8 +4870,7 @@ impl TV {
     }
 }
 
-/// Reads a value as the checker prints it on one line. None for what TLC fingerprints by its own
-/// numbering (a model value) or a form not read here.
+/// Reads a value as the checker prints it on one line. None for a form not read here.
 struct TvParse<'a> {
     b: &'a [u8],
     i: usize,
@@ -4879,11 +4920,16 @@ impl TvParse<'_> {
     fn val(&mut self) -> Option<TV> {
         self.ws();
         let c = *self.b.get(self.i)?;
-        if self.eat("TRUE") {
-            return Some(TV::B(true));
-        }
-        if self.eat("FALSE") {
-            return Some(TV::B(false));
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let st = self.i;
+            while self.i < self.b.len() && (self.b[self.i].is_ascii_alphanumeric() || self.b[self.i] == b'_') {
+                self.i += 1;
+            }
+            return match std::str::from_utf8(&self.b[st..self.i]).ok()? {
+                "TRUE" => Some(TV::B(true)),
+                "FALSE" => Some(TV::B(false)),
+                name => TLC_MODEL_VALUES.iter().find(|m| m.0 == name).map(|m| TV::M(m.1)),
+            };
         }
         if c == b'-' || c.is_ascii_digit() {
             let lo = self.int()?;
@@ -4965,10 +5011,18 @@ impl TvParse<'_> {
     }
 }
 
-/// TLC's fingerprint of a state (TLCStateMut.fingerPrint without VIEW or SYMMETRY)
+/// TLC's fingerprint of a state (TLCStateMut.fingerPrint without VIEW): under a SYMMETRY, that of
+/// the smallest of the permuted states in TLC's order of values (as `fresh_fp` with a VIEW)
 fn tlc_fp(s: &State) -> Option<u64> {
+    let mut best = *s;
+    for p in PERMS.iter() {
+        let t = perm_state(s, p);
+        if tlc_state_cmp(&t, &best).is_lt() {
+            best = t;
+        }
+    }
     let mut fp = FP64_POLY;
-    for v in tlc_vals(s) {
+    for v in tlc_vals(&best) {
         let mut p = TvParse { b: v.as_bytes(), i: 0 };
         let tv = p.val()?;
         p.ws();
@@ -5019,8 +5073,8 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         Ok(t) => t,
         Err(m) => return Err(m),
     };
-    if HAS_VIEW || !PERMS.is_empty() {
-        return Err("VIEW or SYMMETRY");
+    if HAS_VIEW {
+        return Err("VIEW");
     }
     if flag(&OTHER_FP) {
         return Err("a fingerprint polynomial other than that of -fp 0");
@@ -5030,21 +5084,21 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     for w in &g.states {
         match tlc_fp(&unpack(w)) {
             Some(f) => tfp.push(f),
-            None => return Err("a model value, whose fingerprint depends on TLC's numbering of names"),
+            None => return Err("a value tla2rs does not fingerprint as TLC does"),
         }
     }
-    let cs: Vec<u64> = (0..n)
-        .map(|s| tl.check_state.iter().enumerate().fold(0u64, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], 0, 0) as u64) << j))
+    let cs: Vec<TBits> = (0..n)
+        .map(|s| tl.check_state.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], 0, 0) as TBits) << j))
         .collect();
-    let cact = |s: usize, ab: u64, fb: FMask| -> u64 {
-        tl.check_action.iter().enumerate().fold(0u64, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], ab, fb) as u64) << j)
+    let cact = |s: usize, ab: u64, fb: FMask| -> TBits {
+        tl.check_action.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], ab, fb) as TBits) << j)
     };
     let mut self_at: Vec<Vec<u32>> = vec![vec![]; n];
     for &(s, k) in selfs {
         self_at[s as usize].push(k);
     }
     // The transitions of each node, in TLC's order: (target, check_action bits)
-    let mut gs: Vec<Vec<(u32, u64)>> = Vec::with_capacity(n);
+    let mut gs: Vec<Vec<(u32, TBits)>> = Vec::with_capacity(n);
     let mut mult = 1usize;
     for s in 0..n {
         // The successors as TLC puts them into the set: in the order generated, then itself
@@ -5103,7 +5157,7 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     const MAX_LINK: i64 = i64::MAX;
     const MARK: i64 = -42;
     for pem in tl.pems {
-        let ea = |b: u64| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
+        let ea = |b: TBits| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
         let mut link = vec![0i64; n];
         let mut queue: std::collections::VecDeque<(u32, i64)> = inits.iter().map(|&s| (s, 0)).collect();
         let mut com: Vec<u32> = vec![];
@@ -5332,9 +5386,15 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         // action that yields it (Tool.getState)
         let _quiet = Capturing::start();
         let mut buf: Vec<(State, u32)> = vec![];
+        // Under a SYMMETRY, the first successor of the node's fingerprint, which can be another
+        // member of the class than the state the graph keeps
         let mut next = |cur: &State, to: usize| -> Option<(State, u32)> {
             let _ = successors(cur, &mut buf, true);
-            buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states[to])).copied()
+            if PERMS.is_empty() {
+                buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states[to])).copied()
+            } else {
+                buf.iter().find(|x| tlc_fp(&x.0) == Some(tfp[to])).copied()
+            }
         };
         let mut out: Vec<(State, u32)> = vec![(unpack(&g.states[prefix[0] as usize]), u32::MAX)];
         let mut at = prefix[0] as usize;
@@ -5356,7 +5416,7 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         let back = if at == start {
             None
         } else {
-            Some(next(&out[out.len() - 1].0, start).ok_or("a step TLC cannot rebuild")?.1)
+            Some(next(&out[out.len() - 1].0, start).ok_or("a step TLC cannot rebuild")?)
         };
         drop(_quiet);
         let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
@@ -5370,9 +5430,12 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
                 println!("State {}: Stuttering", cycle_no + 1);
                 write_lasso_check(&texts, None);
             }
-            Some(l) => {
+            Some((t, l)) => {
                 println!("Back to state {cycle_no}: <{}>", name(l));
-                write_lasso_check(&texts, Some((cycle_no, None)));
+                // Under a SYMMETRY the step back can reach another member of the class, which
+                // the lasso check folds into the state returned to
+                let folded = (t != out[cycle_no - 1].0).then(|| show(&t));
+                write_lasso_check(&texts, Some((cycle_no, folded)));
             }
         }
         return Ok(true);
