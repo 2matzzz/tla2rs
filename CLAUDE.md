@@ -373,7 +373,7 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
   `(SUBSET 1)..2` (TLC then fails to evaluate it). Unary minus as the operand of an infix operator whose range
   starts above 12 is refused (`a * -b`, `a ^ -b`); `~` never conflicts
 - Positional subexpression names (`Op!3`, `Op!(1, 2)`, `Op!lab`) that name nothing, in every definition and ASSUME
-  (`Expander::check_subexprs`), also in definitions nothing uses. One whose operator is not a definition (a
+  (`Expander::check_subexprs`, also of a LET definition: `RejSanySubLet*`), also in definitions nothing uses. One whose operator is not a definition (a
   CONSTANT, VARIABLE, parameter or bound variable: `Cannot take subexpression of `x'.`), or is named without the
   arguments it takes (`Op!1`, `Lab!lab`: `The operator Op requires 1 arguments.`, placed from the name to the last
   selector) is refused (`tests/tlc/RejSanySubOp`)
@@ -397,10 +397,11 @@ LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile
 in scope in the module that reads it, which may define the same name (`tests/tlc/SanyScope`, `SanyLocalRec`).
 
 Not repeated: names inside `\EE` and `\AA` (their bound variables are not kept; those of `\E x : P`, `\A x : P`
-and `CHOOSE x : P` without a set are checked from `parser::unbounded_body`, `tests/tlc/RejSanyUnbounded`); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
-a LET definition (other than one named without its arguments); what is passed to an operator of an INSTANCE with
-parameters; and SANY's checks of other kinds
-(levels outside temporal formulas). The warnings in global context are not printed when the module has errors.
+and `CHOOSE x : P` without a set are checked from `parser::unbounded_body`, `tests/tlc/RejSanyUnbounded`); the WITH
+substitutions of an INSTANCE inside LET; what is passed to an operator of an INSTANCE with parameters; and SANY's
+checks of other kinds (levels outside temporal formulas). The warnings in global context are not printed when the
+module has errors. A positional name that names nothing is reported only when the module has no other semantic
+error, and only the first one (SANY reports them all, among the others in the order of the module).
 
 ### Quantifiers and CHOOSE without a set
 

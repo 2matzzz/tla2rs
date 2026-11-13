@@ -9,8 +9,9 @@ use std::collections::HashMap;
 struct Env {
     subst: HashMap<String, Expr>,
     locals: HashMap<String, (Def, Env)>,
-    /// LET definitions bound to a name (their uses read `subst`), known only for the positional
-    /// names of their subexpressions (`M!1`). Shared, since each holds the environment before it
+    /// LET definitions known only for the positional names of their subexpressions (`Op!1`):
+    /// those bound to a name (their uses read `subst`), and those `check_subexprs` meets. Shared,
+    /// since each holds the environment before it
     lets: HashMap<String, (Def, std::rc::Rc<Env>)>,
 }
 
@@ -588,12 +589,25 @@ impl<'a> Expander<'a> {
     /// The errors SANY reports for the subexpression names in e (SANY checks every definition,
     /// used or not): those of a name whose operator is a definition of the module
     pub fn check_subexprs(&self, e: &Expr) -> R<()> {
-        let env = Env::default();
+        self.check_subexprs_in(e, &Env::default())
+    }
+
+    /// `check_subexprs` with the LET definitions in scope in `env`
+    fn check_subexprs_in(&self, e: &Expr, env: &Env) -> R<()> {
+        if let Expr::Let(defs, body) = e {
+            let mut inner = env.clone();
+            for d in defs {
+                self.check_subexprs_in(&d.body, &inner)?;
+                let before = std::rc::Rc::new(inner.clone());
+                inner.lets.insert(d.name.clone(), (d.clone(), before));
+            }
+            return self.check_subexprs_in(body, &inner);
+        }
         let r = match e {
-            Expr::Call(n, parts) if n.starts_with(crate::parser::SUBEXPR) => Some(self.subexpr_def(n, &parts[0], &parts[1..], &env)),
+            Expr::Call(n, parts) if n.starts_with(crate::parser::SUBEXPR) => Some(self.subexpr_def(n, &parts[0], &parts[1..], env)),
             // `Op!lab`
-            Expr::Ident(n, _) | Expr::Call(n, _) if n.contains('!') && !self.defs.contains_key(n.as_str()) && self.label_path(n, &env).is_some() => {
-                Some(self.subexpr_def("", e, &[], &env))
+            Expr::Ident(n, _) | Expr::Call(n, _) if n.contains('!') && !self.defs.contains_key(n.as_str()) && self.label_path(n, env).is_some() => {
+                Some(self.subexpr_def("", e, &[], env))
             }
             _ => None,
         };
@@ -602,7 +616,7 @@ impl<'a> Expander<'a> {
                 return Err(m);
             }
         }
-        e.children().into_iter().try_for_each(|c| self.check_subexprs(c))
+        e.children().into_iter().try_for_each(|c| self.check_subexprs_in(c, env))
     }
 
     /// The definition a subexpression name stands for (see `subexpr`; `call` is the name of the

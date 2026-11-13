@@ -214,8 +214,8 @@ memory.
   string escapes, LAMBDA), the level errors of temporal formulas, and the semantic errors, all of a module in SANY's
   order with the position of the declaration a name clashes with (also in a standard module), then SANY's warnings.
   A name is in scope only after the statement that introduces it, as in SANY: an operator parameter may be named
-  like a VARIABLE declared later. Not repeated: names inside `\EE` and `\AA`; positional names of LET definitions; and SANY's other checks (see CLAUDE.md, "What SANY refuses"). An
-  operator passed where a parameter takes none, or anything but an operator of the right arity where it takes some,
+  like a VARIABLE declared later. Not repeated: names inside `\EE` and `\AA`, and SANY's other checks (see CLAUDE.md,
+  "What SANY refuses"). An operator passed where a parameter takes none, or anything but an operator of the right arity where it takes some,
   is refused, and so is a subexpression of a CONSTANT, VARIABLE or parameter (`x!1`) or of an operator named without
   its arguments (`Op!1`). A CONSTANT or VARIABLE declared twice (`VARIABLE x, x`) gets SANY's warning, as in TLC
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
