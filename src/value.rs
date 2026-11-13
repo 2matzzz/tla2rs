@@ -1066,8 +1066,14 @@ impl ConstEval<'_> {
                 if r.is_empty() && !d.is_empty() {
                     return Ok(Value::Set(out));
                 }
+                // Over 1..n (the elements of d in order) the functions are tuples (see fun_value)
+                let tuples = d.iter().enumerate().all(|(i, k)| *k == Value::Int(i as i64 + 1));
                 loop {
-                    out.insert(fun_value(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect()));
+                    if tuples {
+                        out.insert(Value::Tuple(idx.iter().map(|&i| r[i].clone()).collect()));
+                    } else {
+                        out.insert(fun_value(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect()));
+                    }
                     let mut k = 0;
                     while k < idx.len() {
                         idx[k] += 1;
