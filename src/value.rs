@@ -750,8 +750,8 @@ impl ConstEval<'_> {
                         return Err(msg);
                     }
                     let mut m: BTreeMap<Value, Value> = BTreeMap::new();
+                    let mut env2 = env.clone();
                     for (k, c) in self.bag(b, env)? {
-                        let mut env2 = env.clone();
                         env2.insert(ps[0].clone(), k);
                         let y = self.eval(body, &env2)?;
                         let n = m.get(&y).map_or(Ok(0), |v| v.as_int())? + c.as_int()?;
@@ -815,8 +815,8 @@ impl ConstEval<'_> {
                 ("SelectSeq", [q, Lambda(ps, body)]) if ps.len() == 1 => {
                     let t = self.seq(q, env, "SelectSeq")?;
                     let mut out = vec![];
+                    let mut env2 = env.clone();
                     for x in t {
-                        let mut env2 = env.clone();
                         env2.insert(ps[0].clone(), x.clone());
                         if self.eval(body, &env2)?.as_bool()? {
                             out.push(x);
@@ -1007,8 +1007,8 @@ impl ConstEval<'_> {
             }
             Choose(x, s, p) => {
                 let s = self.eval(s, env)?;
+                let mut env2 = env.clone();
                 for v in s.as_set()? {
-                    let mut env2 = env.clone();
                     env2.insert(x.clone(), v.clone());
                     if self.eval(p, &env2)?.as_bool()? {
                         return Ok(v.clone());
@@ -1027,8 +1027,8 @@ impl ConstEval<'_> {
             SetFilter(x, s, p) => {
                 let s = self.eval(s, env)?;
                 let mut out = BTreeSet::new();
+                let mut env2 = env.clone();
                 for v in s.as_set()? {
-                    let mut env2 = env.clone();
                     env2.insert(x.clone(), v.clone());
                     if self.eval(p, &env2)?.as_bool()? {
                         out.insert(v.clone());
@@ -1047,8 +1047,8 @@ impl ConstEval<'_> {
             FunCons(x, s, body) => {
                 let s = self.eval(s, env)?;
                 let mut m = BTreeMap::new();
+                let mut env2 = env.clone();
                 for v in s.as_set()? {
-                    let mut env2 = env.clone();
                     env2.insert(x.clone(), v.clone());
                     m.insert(v.clone(), self.eval(body, &env2)?);
                 }
@@ -1490,8 +1490,8 @@ impl ConstEval<'_> {
         }
         let (x, s) = &bs[0];
         let s = self.eval(s, env)?;
+        let mut env2 = env.clone();
         for v in s.as_set()? {
-            let mut env2 = env.clone();
             env2.insert(x.clone(), v.clone());
             if !self.each_binding(&bs[1..], &env2, f)? {
                 return Ok(false);
