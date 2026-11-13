@@ -1,0 +1,8 @@
+key c56fe79af1199580d7f3a33ac0a483035b37dfa549095344aa39b2c9755a7795
+tlc Version 2.19
+rc 0
+No error has been found
+2000002 states generated 501500 distinct states found 0 states left on queue
+trace 0
+messages 0
+errors 0

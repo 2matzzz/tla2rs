@@ -10,11 +10,21 @@
 #   scripts/crosscheck.sh --expected X.cfg        write X's result if missing or stale (expected.sh)
 #   scripts/crosscheck.sh --expected-force X.cfg  rewrite it
 #   scripts/crosscheck.sh --expected-check X.cfg  rerun TLC and compare with the file, without writing
+#   scripts/crosscheck.sh --expected-from TLC.OUT RC X.cfg
+#                                write X's result from the output and exit code of a TLC run done before
+#                                (only for a corpus model listed as `large`; see "Large models" in CLAUDE.md)
+# For a corpus model listed as `large` in tests/corpus.txt, TLC runs without -dump and tla2rs without
+# -dumpgraph, and the state graph is not compared: everything else is.
 # Pass tla2tools.jar via TLA_TOOLS (default ~/.tla/tla2tools.jar).
 # State counts at a violation depend on search order, so TLC runs with one worker for a fixed order.
 set -euo pipefail
 mode=compare
-case "${1:-}" in --expected|--expected-force|--expected-check) mode="${1#--}"; shift ;; esac
+case "${1:-}" in
+  --expected|--expected-force|--expected-check) mode="${1#--}"; shift ;;
+  --expected-from)
+    mode=expected-from; [[ $# -ge 4 && -f "$2" && "$3" =~ ^[0-9]+$ ]] || { echo "usage: crosscheck.sh --expected-from TLC.OUT RC X.cfg" >&2; exit 1; }
+    from_out="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; from_rc="$3"; shift 3 ;;
+esac
 tla="$1"; shift
 if [[ "$tla" == *.cfg ]]; then
   cfg="$tla"; base=$(basename "$cfg" .cfg); tla="$(dirname "$cfg")/${base%%-*}.tla"
@@ -143,10 +153,16 @@ summarize() {
 # key). The parts of TLC's output that vary from run to run (times, the fingerprint seed, temporary
 # paths) are not part of the summary, so the file is the same for every TLC run. TLC runs with
 # `-fp 0`, so that its liveness counterexample, which depends on its fingerprints, is the same on
-# every run too (see "Counterexamples" in CLAUDE.md).
+# every run too (see "Counterexamples" in CLAUDE.md). A large model's summary has no state graph, so
+# its key has no -dump and no src/graph.rs.
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  { echo "v6 -workers 1 ${fp0[*]-} -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
+  { if [[ $large == 1 ]]; then
+      echo "v6 large -workers 1 ${fp0[*]-} ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1
+    else
+      echo "v6 -workers 1 ${fp0[*]-} -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1
+    fi
+    cat "$cfg_abs"
     [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
     [[ -z "$user_dump" && $view == 0 ]] || shasum -a 256 "$root/src/options.rs" | cut -d' ' -f1
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
@@ -158,6 +174,12 @@ case "$cfg_rel" in
   # A model of the corpus fetched by scripts/corpus.sh, by its path in the corpus
   target/corpus/*/specifications/*.cfg) p="${cfg_rel#target/corpus/*/specifications/}"; expected="$root/tests/expected/corpus/${p%.cfg}.txt" ;;
 esac
+# A corpus model listed as `large` in tests/corpus.txt: TLC takes minutes to hours on it, and its state
+# graph is too big to write and compare
+large=0
+if [[ -n "${p:-}" ]] && awk -v m="specifications/$p" '$1 == "large" && $3 == m {f = 1} END {exit !f}' "$root/tests/corpus.txt"; then
+  large=1
+fi
 key=$(tlc_key)
 if [[ -z "${CROSSCHECK_NO_CACHE:-}" ]]; then export TLA2RS_BUILD_CACHE="$root/target/crosscheck/build"; fi
 
@@ -189,12 +211,18 @@ run_tlc() {
   # A private java.io.tmpdir: TLC processes sharing one fail at random in SANY when run in parallel
   mkdir -p "$work/jtmp"
   local dump=(-dump dot tlc.dot)
-  [[ -z "$user_dump" ]] || dump=()
+  [[ -z "$user_dump" && $large == 0 ]] || dump=()
   java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 ${fp0[@]+"${fp0[@]}"} ${dump[@]+"${dump[@]}"} -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
   [[ -z "$user_dump" ]] || mv "$user_dump" tlc.userdump 2> /dev/null || true
-  a="$(summarize tlc.out)
-$(graphs tlc)
-$(messages tlc.out)"
+  a=$(result tlc)
+}
+# The summary of tlc.out or rs.out (and of its graph), as kept in tests/expected/
+result() {
+  if [[ $large == 1 ]]; then
+    printf '%s\n%s\n' "$(summarize "$1.out")" "$(messages "$1.out")"
+  else
+    printf '%s\n%s\n%s\n' "$(summarize "$1.out")" "$(graphs "$1")" "$(messages "$1.out")"
+  fi
 }
 # The state graph reduced to hashes of its states and its edges (see src/graph.rs).
 # CROSSCHECK_GRAPH_DIR=DIR keeps the graphs as DIR/<cfg name>.{tlc,rs}.dot (`tla2rs --graph-text`
@@ -206,8 +234,16 @@ graphs() {
   if [[ -n "$user_dump" ]]; then "$bin" --dump "$1.userdump" || echo "dump unreadable"; else graph "$1.dot"; fi
 }
 # The messages and printed lines, and the error lines among them, reduced to hashes (see
-# src/messages.rs)
-messages() { "$bin" --messages "$1" || echo "messages unreadable"; }
+# src/messages.rs). For a large model, the lines of the checkpoints TLC writes every 30 minutes (with
+# their paths and times) are left out first: only a long run has them
+messages() {
+  local f="$1"
+  if [[ $large == 1 ]]; then
+    grep -vE '^Checkpointing (of run |completed at \()' "$1" > "$1.nocp" || true
+    f="$1.nocp"
+  fi
+  "$bin" --messages "$f" || echo "messages unreadable"
+}
 keep_graph() {
   [[ -n "${CROSSCHECK_GRAPH_DIR:-}" ]] || return 0
   mkdir -p "$CROSSCHECK_GRAPH_DIR"
@@ -221,6 +257,7 @@ fresh=0
 
 if [[ $mode != compare ]]; then
   [[ -n "$expected" ]] || { echo "ERROR $cfg_rel: not in examples/, tests/tlc/ or the corpus"; exit 1; }
+  [[ $mode != expected-from || $large == 1 ]] || { echo "ERROR $cfg_rel: --expected-from is only for a model listed as large in tests/corpus.txt"; exit 1; }
   if [[ $mode == expected && $fresh == 1 ]]; then echo "fresh $cfg_rel"; exit 0; fi
 fi
 work="$(mktemp -d)"
@@ -230,7 +267,11 @@ cp "$cfg_abs" "$work/$c"
 cd "$work"
 
 if [[ $mode != compare ]]; then
-  run_tlc
+  if [[ $mode == expected-from ]]; then
+    cp "$from_out" tlc.out; rc_tlc=$from_rc; a=$(result tlc)
+  else
+    run_tlc
+  fi
   if [[ -z "$(echo "$a" | head -1)" ]]; then
     echo "ERROR $cfg_rel: no verdict from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
     exit 1
@@ -264,7 +305,7 @@ else
 fi
 s1=$(date +%s.%N)
 rs_dump=(-dumpgraph rs.dot)
-[[ -z "$user_dump" ]] || rs_dump=()
+[[ -z "$user_dump" && $large == 0 ]] || rs_dump=()
 "$bin" "$t" -config "$c" -o "$work/gen" -workers 1 ${rs_dump[@]+"${rs_dump[@]}"} -lassocheck "$work" ${extra[@]+"${extra[@]}"} ${rsonly[@]+"${rsonly[@]}"} > rs.out 2> rs.err || rc_rs=$?
 [[ -z "$user_dump" ]] || mv "$user_dump" rs.userdump 2> /dev/null || true
 s2=$(date +%s.%N)
@@ -289,9 +330,7 @@ if has_rule distinct-only; then
 fi
 
 keep_graph rs.dot rs
-b="$(summarize rs.out)
-$(graphs rs)
-$(messages rs.out)"
+b=$(result rs)
 # If TLC produced no verdict (e.g. TLC itself failed), don't treat two empty results as a match
 if [[ -z "$(echo "$a" | head -1)" ]]; then
   echo "  NO VERDICT from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out 2>/dev/null | grep -vE 'Parsing|Semantic' | head -10
@@ -317,6 +356,7 @@ fi
 # - tla2rs stopped at a successor that left its declared type while being built: TLC adds that
 #   state, but tla2rs cannot print it. Only the numbers of states and edges and the length of the
 #   counterexample are compared
+# - the model is listed as large: neither side wrote a graph
 graph_note=""
 if grep -q '^states incomplete' <<< "$a"; then
   a=$(grep -vE '^(states|edges) ' <<< "$a"); b=$(grep -vE '^(states|edges) ' <<< "$b")
@@ -325,6 +365,7 @@ elif grep -q '<a successor that tla2rs cannot represent>' rs.out; then
   a=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$a"); b=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$b")
   graph_note="; graph and counterexample sizes only: a successor tla2rs cannot represent"
 fi
+[[ $large == 0 ]] || graph_note="$graph_note; large: no state graph"
 # `\* crosscheck: error-lines (reason)` compares only the error lines among the messages, for a
 # configuration where tla2rs cannot print all of TLC's text (the reason says why; see "Messages and
 # printed lines" in CLAUDE.md)
