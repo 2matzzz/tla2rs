@@ -558,6 +558,7 @@ are for the 483 configurations at the time of writing):
 | Rule | Applies to | Compared |
 |---|---|---|
 | TLC did not end the file (automatic: no closing `}`) | 56 (stops in or before the initial states, and SANY or temporal refusals) | Not the graph; verdict, counts and exit code as before |
+| The cfg's own `-dump`, and TLC's file is empty (automatic: it stopped before writing what it had buffered) | `OptDumpInit` | Not the dump |
 | tla2rs stopped at a successor that left its declared type while `next` built it (automatic: "a successor that tla2rs cannot represent" in its output) | 1 (`SetOut`) | The numbers of states and edges and the length of the counterexample (tla2rs writes a placeholder node and state for the successor TLC adds) |
 
 `distinct-only` (three configurations) leaves the graph compared: duplicate edges collapse anyway.
