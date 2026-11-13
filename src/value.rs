@@ -1042,15 +1042,18 @@ impl ConstEval<'_> {
             }
             SetFilter(x, s, p) => {
                 let s = self.eval(s, env)?;
-                let mut out = BTreeSet::new();
+                s.as_set()?;
+                let Value::Set(s) = s else { unreachable!() };
+                // The elements kept are in order, so the set is built from them without searching
+                let mut out = vec![];
                 let mut env2 = env.clone();
-                for v in s.as_set()? {
+                for v in s {
                     env2.insert(x.clone(), v.clone());
                     if self.eval(p, &env2)?.as_bool()? {
-                        out.insert(v.clone());
+                        out.push(v);
                     }
                 }
-                Value::Set(out)
+                Value::Set(out.into_iter().collect())
             }
             SetMap(f, bs) => {
                 let mut out = BTreeSet::new();
