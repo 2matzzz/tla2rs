@@ -396,7 +396,8 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
 LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile::hide_locals`), since they are not
 in scope in the module that reads it, which may define the same name (`tests/tlc/SanyScope`, `SanyLocalRec`).
 
-Not repeated: names inside `\EE` and `\AA` (their bound variables are not kept; those of `\E x : P`, `\A x : P`
+Not repeated: names inside `\EE` and `\AA` (their bound variables are not kept, so `D == \EE y : y = Unknown` in a
+definition nothing uses passes, where SANY reports `Unknown operator`; those of `\E x : P`, `\A x : P`
 and `CHOOSE x : P` without a set are checked from `parser::unbounded_body`, `tests/tlc/RejSanyUnbounded`); the WITH
 substitutions of an INSTANCE inside LET; what is passed to an operator of an INSTANCE with parameters; and SANY's
 checks of other kinds (levels outside temporal formulas). The warnings in global context are not printed when the
