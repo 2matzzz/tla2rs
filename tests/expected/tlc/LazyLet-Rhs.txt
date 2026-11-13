@@ -1,0 +1,10 @@
+key eb3f615c20b759384c9417262a1a9cc84710ab98578408b13f473df6c1a7e92b
+tlc Version 2.19
+rc 11
+Deadlock reached
+4 states generated 4 distinct states found 0 states left on queue
+trace 4 f9b5d01ecf04377b6b7501f7fccb85b454742c8d0bf45e641853ffa6a2d6d22f
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29
+messages 18 6a670f2e2f3f9c7e013fdae003aaa22293815b0cc44ed752bf34707a8afa8b83
+errors 2 e7435d78e8bc34f8134c901382e2a0104ab86ecac2c0d6799ed6d82e236aaa21
