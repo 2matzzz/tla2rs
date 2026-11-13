@@ -76,6 +76,7 @@ It has no crate dependencies.
 | `src/compile.rs` | The overall pipeline. Types come from `x \in S` in TypeDecl / TypeOK; for variables without one (or whose S gives no type, such as `[D -> Int]`) they are inferred from Init/Next (`infer_types`; an integer range that settles within a few rounds stays finite, one that keeps growing is widened to unbounded). When the types from TypeOK fail in Init or Next (a module that extends another and adds a record field its type invariant lacks), the spec is compiled again with every type inferred (`INFER_ALL`). ASSUMEs are evaluated here. `instantiate` turns each definition of an INSTANCE'd module into a hidden definition that takes the module's constants and variables as leading parameters, so expansion substitutes them without capture (a call site's arguments are only a trace: whether it is constant is decided by its body, `Gen::is_const`). A name a definition binds (a parameter, bound variable or LET definition) stays its own where the module defines the same name later, and a parameter named like a name the substitutions read, or like a parameter of the instance, is renamed in the visible definition (`InstRename`; `tests/tlc/InstShadow`, `InstShadowParam`). `Nat <- D`, `Int <- D` and `Seq <- D` in the cfg define those operators of the standard modules, as TLC replaces them |
 | `src/community.rs` | The modules of the CommunityModules tla2rs provides (see "CommunityModules"): TLA+ source written for tla2rs, loaded by `compile::find_module` when no module of that name is next to the spec |
 | `src/std_modules.rs` | The identifiers and strings of TLC's standard modules in TLC's reading order (generated from tla2tools.jar), for ordering strings as TLC does; and where SANY places each definition they export (`STD_DEFS`), for its report of a name that clashes with one |
+| `src/community_modules.rs` | The identifiers and strings of the CommunityModules' modules tla2rs provides, as TLC reads the release's files (generated from them), for ordering strings as TLC does |
 | `src/seqlen.rs` | Without a written length bound, runs Init and Next over sequence lengths (with `Len(q) < k` tests in a conjunction as bounds) until the variables' lengths settle, giving QCAP |
 | `src/live.rs` `src/ltl.rs` | Liveness at compile time: properties become formulas over atoms (state predicates, ENABLED, action predicates), the negation becomes a Büchi automaton by tableau (`ltl.rs`), and fairness becomes per-condition ENABLED / step functions |
 | `src/graph.rs` | `--graph`: reduces a state graph file to its canonical form and hashes it (SHA-256 written out, as there are no crate dependencies) |
@@ -176,7 +177,8 @@ or instantiates, breadth first; a string equal to an identifier such as an opera
 standard module, takes that identifier's place); a few more built-in names; the string literals of each module,
 dependencies first. `tlc_string_ranks` reproduces this, with the standard modules' names and numbers in
 `src/std_modules.rs` (generated from TLC's jar; Sequences has the numbers 1 and 0, Integers 0, TLC 1, Randomization 1
-and 5). TLC orders every model value before every string (`{"zz", m1}` prints as `{m1, "zz"}`, a function over both
+and 5), and those of the CommunityModules' modules tla2rs provides in `src/community_modules.rs` (generated from the
+release's files, with the modules each reads; `CmNames`). TLC orders every model value before every string (`{"zz", m1}` prints as `{m1, "zz"}`, a function over both
 lists the model values first, CHOOSE picks `m1`; `tests/tlc/ModelStr*`), so model values get the lower atom numbers.
 
 Strings made by operations (`\o`, `Append`, `Head`, `Tail` and `SubSeq` on strings, `ToString`) come after those, in
@@ -856,8 +858,8 @@ in `crosscheck.sh` (202611060952, the one current at the corpus's commit); a spe
 key of its expected file.
 
 tla2rs provides `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`, `UndirectedGraphs`, `Bitwise`, `Relation`,
-`BagsExt`, `Graphs`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals`, `VectorClocks`, `Quorum` and `HTML`, and
-parts of `Json` and `IOUtils` (below), itself (`src/community.rs`), as TLA+ source written for tla2rs, read when no module of that name is next to the spec.
+`BagsExt`, `Graphs`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals`, `VectorClocks`, `Quorum`, `HTML` and
+`SVG`, and parts of `Json` and `IOUtils` (below), itself (`src/community.rs`), as TLA+ source written for tla2rs, read when no module of that name is next to the spec.
 Since TLC evaluates the modules' own definitions, these give the same values: CHOOSE over the same set with the
 same predicate (`SetToSeq`, `Max`, `LongestCommonPrefix`, `Inverse`, `CausalOrder`), and folds that take the elements
 in the same order (`MapThenFoldSet` applies `op(f(x), rest)` with x chosen first, so `FoldFunction` takes the
@@ -887,6 +889,15 @@ stops on in their definitions: an unbounded CHOOSE (`JsonDeserialize`, `ndJsonDe
 fills templates by replacing each `%key%` in turn, the first occurrence in the text replaced so far, and joins parts
 with a separator left out while the text built so far is empty, as the module's definitions do (`CmHtml`, in the
 constant definitions and ASSUMEs; in Init or an action too, see "Arguments written out at each use").
+`SVG`'s constructors build records whose attributes are the element's own joined with `@@` to those the caller gives
+(a record or `<<>>`), so code generation takes a record given to `@@` as the function over strings it is; the numbers
+are turned into strings in the order the module's definitions take them (`CmSvg` when TLC starts, `CmSvgRun` in
+Init, actions and invariants). A function over strings prints as a record only when every string of its domain is an
+identifier (`compile::field_name`, `StrFieldName`), so the attributes of `Image` and `SVGDoc` (`"xlink:href"`) print
+as `("x" :> "5" @@ ...)`. `NodesOfDirectedMultiGraph` (a CHOOSE over functions into records with Int fields) and
+`SVGSerialize` (IOUtils' `Serialize`) are in `community::UNSUPPORTED`. Not followed: an element printed while
+exploring (Print, PrintT) shows its empty children as `<< >>` where TLC prints `<<>>` (the graphs and counterexamples
+read both alike, see "State graphs").
 
 TLC gives the position of a CASE without OTHER when none of its conditions holds, and for a CASE in a module of the
 release that is a position in the release's file, which tla2rs's module does not have. `community::CASE_AT` holds the
@@ -901,12 +912,11 @@ release's modules only, or on tla2rs:
 | `CSV`, `CBOR` | They read or write files. Their definitions stop TLC 2.19: CHOOSE without a set (`CSVRecords`), `Assert(FALSE, ...)` (`ToCBOR`) |
 | `ShiViz` | `Host` and `Clock` read `TLCGet` and the Toolbox module; TLC 2.19 stops on `Host` ("Attempted to enumerate S \ T when S: Nat is not enumerable") |
 | `DifferentialEquations` | `Integrate` is a CHOOSE without a set over functions of reals; TLC 2.19 stops ("TLC attempted to evaluate an unbounded CHOOSE") |
-| `SVG` | No configuration compares it with TLC yet. Its constructors build records and functions over strings, which print in TLC's order of strings, and TLC creates the identifiers of the release's module when it parses it, which `tlc_string_ranks` does not read for a module tla2rs provides |
 
-Not followed: the identifiers and strings of these modules are not in `tlc_string_ranks` (TLC creates them when it
-parses the modules), so a string literal of the spec equal to one of their identifiers, and not to one of the spec's,
-may be ordered differently; no configuration has one. Errors inside the modules' definitions (Max of an empty set,
-Last of an empty sequence) are reported with positions in TLC's modules that tla2rs does not have.
+TLC creates the identifiers and strings of the release's modules when it parses them, so `tlc_string_ranks` reads
+those of the modules tla2rs provides from `src/community_modules.rs` (`CmNames`: a string equal to a name only those
+modules write comes before the spec's own strings). Not followed: errors inside the modules' definitions (Max of an
+empty set, Last of an empty sequence) are reported with positions in TLC's modules that tla2rs does not have.
 
 ### PlusCal checksums
 
