@@ -2126,6 +2126,16 @@ impl SpecWalk {
     }
 }
 
+/// Whether TLC prints a function over strings that has `s` in its domain as a record: it does
+/// when every string of the domain is an identifier as SANY reads one (letters, digits and `_`
+/// with at least one letter, and not `WF_` or `SF_` followed by more), and otherwise prints the
+/// function as `("a-b" :> 1 @@ ...)` (measured on TLC 2.19; `tests/tlc/StrFieldName`)
+pub fn field_name(s: &str) -> bool {
+    s.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && s.chars().any(|c| c.is_alphabetic())
+        && !((s.starts_with("WF_") || s.starts_with("SF_")) && s.len() > 3)
+}
+
 pub fn show_value(atoms: &Atoms, v: &Value) -> String {
     match v {
         Value::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
@@ -2137,8 +2147,8 @@ pub fn show_value(atoms: &Atoms, v: &Value) -> String {
             let fs = crate::types::sorted_fields(m.iter().map(|(k, x)| (k.clone(), x)).collect());
             format!("[{}]", fs.iter().map(|(k, x)| format!("{k} |-> {}", show_value(atoms, x))).collect::<Vec<_>>().join(", "))
         }
-        // A function over strings prints as a record
-        Value::Fun(m) if m.keys().all(|k| matches!(k, Value::Atom(a) if !atoms.is_model(*a))) => format!(
+        // A function over strings prints as a record when they are all field names
+        Value::Fun(m) if m.keys().all(|k| matches!(k, Value::Atom(a) if !atoms.is_model(*a) && field_name(&atoms.name(*a)))) => format!(
             "[{}]",
             m.iter()
                 .map(|(k, x)| format!("{} |-> {}", match k { Value::Atom(a) => atoms.name(*a), _ => unreachable!() }, show_value(atoms, x)))

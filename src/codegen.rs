@@ -5985,22 +5985,38 @@ impl<'a> Gen<'a> {
                     _ => None,
                 }
             };
+            let all_field_names = |d: &Ty| string_keys(d).is_some_and(|ks| ks.iter().all(|k| crate::compile::field_name(k)));
             let fmt_body = match &t {
                 // A function over strings prints as a record (<< >> when empty, as TLC spells an
-                // empty function)
-                Ty::Fun(d, _) | Ty::PFun(d, _) | Ty::Bag(d) if string_keys(d).is_some() => {
-                    let names: Vec<String> = string_keys(d).unwrap().iter().map(|n| format!("{n:?}")).collect();
+                // empty function), when they are all field names (see `compile::field_name`); a
+                // partial one or a bag decides by the strings it holds
+                Ty::Fun(d, _) | Ty::PFun(d, _) | Ty::Bag(d) if string_keys(d).is_some() && (all_field_names(d) || !matches!(t, Ty::Fun(..))) => {
+                    let keys = string_keys(d).unwrap();
+                    let names: Vec<String> = keys.iter().map(|n| format!("{n:?}")).collect();
                     let entry = match &t {
                         Ty::Fun(_, c) => format!("Some(fmt_{}(x))", self.ty_id(c)?),
                         Ty::PFun(_, c) => format!("if x.0 {{ Some(fmt_{}(&x.1)) }} else {{ None }}", self.ty_id(c)?),
                         _ => "if *x > 0 { Some(x.to_string()) } else { None }".into(),
                     };
-                    format!(
-                        "const K: [&str; {}] = [{}]; let ps: Vec<String> = v.iter().enumerate().filter_map(|(i, x)| {{ let e: Option<String> = {entry}; e.map(|e| format!(\"{{}} |-> {{}}\", K[i], e)) }}).collect(); \
-                         if ps.is_empty() {{ return \"<< >>\".into(); }} format!(\"[{{}}]\", ps.join(\", \"))",
-                        names.len(),
-                        names.join(", ")
-                    )
+                    if all_field_names(d) {
+                        format!(
+                            "const K: [&str; {}] = [{}]; let ps: Vec<String> = v.iter().enumerate().filter_map(|(i, x)| {{ let e: Option<String> = {entry}; e.map(|e| format!(\"{{}} |-> {{}}\", K[i], e)) }}).collect(); \
+                             if ps.is_empty() {{ return \"<< >>\".into(); }} format!(\"[{{}}]\", ps.join(\", \"))",
+                            names.len(),
+                            names.join(", ")
+                        )
+                    } else {
+                        let fields: Vec<String> = keys.iter().map(|k| crate::compile::field_name(k).to_string()).collect();
+                        format!(
+                            "const K: [&str; {n}] = [{}]; const F: [bool; {n}] = [{}]; let ps: Vec<(usize, String)> = v.iter().enumerate().filter_map(|(i, x)| {{ let e: Option<String> = {entry}; e.map(|e| (i, e)) }}).collect(); \
+                             if ps.is_empty() {{ return \"<< >>\".into(); }} \
+                             if ps.iter().all(|(i, _)| F[*i]) {{ return format!(\"[{{}}]\", ps.iter().map(|(i, e)| format!(\"{{}} |-> {{}}\", K[*i], e)).collect::<Vec<_>>().join(\", \")); }} \
+                             format!(\"({{}})\", ps.iter().map(|(i, e)| format!(\"{{:?}} :> {{}}\", K[*i], e)).collect::<Vec<_>>().join(\" @@ \"))",
+                            names.join(", "),
+                            fields.join(", "),
+                            n = names.len()
+                        )
+                    }
                 }
                 // A sparse function or bag, entry by entry in TLC's order of keys: << >> when empty
                 // (TLC's spelling for an empty function), a tuple over 1..n
