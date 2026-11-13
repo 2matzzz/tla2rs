@@ -13,8 +13,9 @@
 //! its definitions and RECURSIVE declarations), since SANY's context, and with it the order TLC
 //! prints variables in, depends on them (see `sany::var_order`). The operators listed in
 //! `UNSUPPORTED` are refused when used: TLC 2.19 cannot evaluate them without their Java overrides
-//! (they enumerate `Seq(S)`). The modules not here (files, commands, reals, animation) are listed
-//! with the reason in CLAUDE.md, "CommunityModules".
+//! (they enumerate `Seq(S)`, or read files, run commands or read the environment). Those in
+//! `CONST_ONLY` are refused on values from the state. The modules not here (files, reals,
+//! animation) are listed with the reason in CLAUDE.md, "CommunityModules".
 
 /// The source of each module, by name
 pub fn source(name: &str) -> Option<&'static str> {
