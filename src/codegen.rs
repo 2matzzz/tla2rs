@@ -5219,10 +5219,13 @@ impl<'a> Gen<'a> {
                 return Ok(());
             }
             // \A over a constant set is the conjunction over its elements, in TLC's order (the
-            // first bound variable varies fastest), so it can assign variables
+            // first bound variable varies fastest), so it can assign variables. TLC takes it apart so
+            // while a variable is unassigned even if it assigns none, and an \E or \/ in it then
+            // branches, counting a successor once per branch taken (`tests/tlc/ForallBranch`)
             Quant(false, bs, body)
                 if action && !self.only_reads_assigned(h, env)
-                    || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n))) =>
+                    || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n)))
+                    || open && !env.init && body.any(&|e| matches!(e, Quant(true, ..) | Or(_))) =>
             {
                 let mut all = Made::default();
                 let sets: Option<Vec<(String, Vec<Value>)>> = bs
@@ -5260,6 +5263,8 @@ impl<'a> Gen<'a> {
                     }
                     // In Init, a condition on what is assigned so far: evaluated as a boolean below
                     None if env.init => {}
+                    // A condition over a set from the state: evaluated as a boolean below
+                    None if !(action && !self.only_reads_assigned(h, env)) => {}
                     None => return self.gen_forall(bs, body, rest, env, out),
                 }
             }
