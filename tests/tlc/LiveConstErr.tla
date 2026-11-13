@@ -10,4 +10,6 @@ Untaken == []<>(IF {} = {} THEN x = 0 ELSE CHOOSE c \in {} : TRUE)
 Let == <>(LET s == {c \in BOOLEAN : FALSE} IN IF s = {} THEN x = 1 ELSE CHOOSE c \in s : TRUE)
 Leads == x = 0 ~> (IF x = 1 THEN TRUE ELSE CHOOSE c \in {} : TRUE)
 Taken == []<>(IF x = 0 THEN TRUE ELSE x = 1)
+\* but not inside <<A>>_v, an action of the formula
+Angle == []<><<Next /\ (IF {} = {} THEN TRUE ELSE CHOOSE c \in {} : TRUE)>>_x
 ====

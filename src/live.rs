@@ -690,6 +690,8 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
 fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<String> {
     use Expr::*;
     match e {
+        // <<A>>_v is an action of the formula, not taken apart (`tests/tlc/LiveConstErr-Angle`)
+        Label(n, ..) if n == ANGLE => return None,
         Label(n, pairs, b) if crate::ast::is_bind(n) => {
             let mut body = b.as_ref().clone();
             for p in pairs.chunks(2).rev() {
