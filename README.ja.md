@@ -159,6 +159,16 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 | `Features` | 対応範囲をなめる小さな仕様（`SeenOK` が破れる） |
 | `Liveness` | `<>` `[]<>` `<>[]` `~>`、足踏みと周回の反例 |
 
+### TLC との速さ比べ
+
+`scripts/bench.sh` は `examples/` と `tests/tlc/` の全構成（`-corpus` を付けると仕様集から選んだモデル）を TLC と tla2rs で回して、構成ごとにかかった時間と最大メモリを測る。TLC はワーカー 1 つで回す。tla2rs は、Rust のコードを生成するところ、それをビルドキャッシュを使わずにビルドするところ、できた検査器をワーカー 1 つで動かすところに分けて測る（`-auto` を付けると、TLC の `-workers auto` と検査器の既定のワーカー数でも測る）。結果は構成ごとに 1 行ずつ `target/bench/results.tsv` に書き、tla2rs のほうが遅い構成を、検査だけの時間とビルドまで含めた時間のそれぞれについて、遅い比率の大きい順に `target/bench/summary.txt` に並べる。測り終えた構成は次に回したときに飛ばすので、途中で止めても続きから測れる（`-force` で測り直す）。既定では 1 構成ずつ測る。`JOBS=N` を付けると N 構成ずつ並行に回せるが、そのぶん時間の精度は落ちる。
+
+```sh
+scripts/bench.sh                  # examples/ と tests/tlc/
+scripts/bench.sh -corpus          # 仕様集（-norun を付けると、corpus.sh では重すぎて回さないモデルも測る）
+scripts/bench.sh -corpus MCbtree  # cfg のパスに MCbtree を含むモデルだけ
+```
+
 ## これから
 
 - 列（`Sequences`）と、集合の集合

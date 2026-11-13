@@ -329,6 +329,23 @@ CLAUDE.md.
 | `Features` | A small spec that exercises the supported subset (`SeenOK` is violated) |
 | `Liveness` | `<>`, `[]<>`, `<>[]`, `~>`, with stuttering and cycling counterexamples |
 
+### Speed against TLC
+
+`scripts/bench.sh` runs every configuration in `examples/` and `tests/tlc/` (with `-corpus`, the selected models
+of the corpus) through TLC and tla2rs, and measures the wall time and peak memory of TLC with one worker and of
+tla2rs's three steps apart: generating the Rust code, building it from scratch, and running the checker alone with
+one worker (`-auto` adds TLC's `-workers auto` and the checker's default workers). It writes one row per
+configuration to `target/bench/results.tsv`, and lists in `target/bench/summary.txt`, by ratio, the configurations
+where tla2rs is slower than TLC, for the check alone and in total with the build. A second run skips the rows
+already measured, so an interrupted run resumes (`-force` measures again). It measures one configuration at a time;
+`JOBS=N` runs N at once, with less accurate times.
+
+```sh
+scripts/bench.sh                  # examples/ and tests/tlc/
+scripts/bench.sh -corpus          # the corpus (-norun adds the models too costly for corpus.sh)
+scripts/bench.sh -corpus MCbtree  # only the models whose cfg path contains MCbtree
+```
+
 ## Roadmap
 
 - Sequences (`Sequences`) and sets of sets
