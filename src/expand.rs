@@ -1077,6 +1077,15 @@ fn rec_reads(i: usize, n: &str, seen: &mut std::collections::HashSet<usize>) -> 
 pub fn subst_ident(e: &Expr, n: &str, x: &Expr) -> Expr {
     match e {
         Expr::Ident(m, _) if m == n => x.clone(),
+        // The value an EXCEPT changes, replaced by what it stands for: keep where it is written,
+        // for TLC's warning (see EXCEPT_AT)
+        Expr::Except(f, _) if matches!(f.as_ref(), Expr::Ident(m, at) if m == n && at.known()) && !matches!(x, Expr::Ident(..)) => {
+            let Expr::Ident(_, at) = f.as_ref() else { unreachable!() };
+            match crate::codegen::map_children(e, &|c| subst_ident(c, n, x)) {
+                Expr::Except(f2, ups) => Expr::Except(except_at(&at.text(), *f2).b(), ups),
+                e2 => e2,
+            }
+        }
         _ => crate::codegen::map_children(e, &|c| subst_ident(c, n, x)),
     }
 }

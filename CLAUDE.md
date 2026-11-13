@@ -621,9 +621,22 @@ when it starts. The warnings:
   with the printed lines (`except_warning`), the constant evaluator records it with them. TLC
   evaluates a definition of constant level when it starts and keeps its value, so such a definition
   with an EXCEPT warns then, and not again where it is used (`uncache_prints`); a constant invariant
-  or property warns when TLC evaluates it before exploring (`Startup::invs`). Not followed: an
-  EXCEPT of constant level inside an action or invariant, which the compiler folds, does not warn
-  in the checker
+  or property warns when TLC evaluates it before exploring (`Startup::invs`). An EXCEPT of constant
+  level inside Init, an action or an invariant, which the compiler folds, warns where it is
+  evaluated: folding notes the warnings (`Gen::try_const_made`, with the definitions TLC evaluated
+  when it started not warning again) and the folded code calls `except_warning` for each
+  (`Gen::note_folded`; also a constant condition of an action or of an IF, the set of a `\A` that
+  assigns variables, an empty set of `\E`, the arguments of a recursive operator unrolled in an
+  action; `tests/tlc/ExceptFold*`). A LET definition or an
+  argument whose constant value warns is computed where first used, as one that is not constant
+  (`Gen::gen_bind`), so it warns once for the evaluation of the LET or the call, and an argument
+  that is the value an EXCEPT changes keeps the position of the parameter
+  (`expand::subst_ident`; `tests/tlc/ExceptFoldOnce*`). The set of a `\E` that TLC splits the
+  next-state relation through is evaluated once, when TLC reads the spec, so its warnings come
+  when TLC starts, after the constant invariants and before the ASSUMEs (`Gen::split_warns`,
+  `tests/tlc/ExceptSplit*`).
+  Not followed: other places where the compiler evaluates a constant without the warnings it notes
+  (`Gen::try_const`)
 
 TLC warns that SYMMETRY and constraints are dangerous when it checks temporal properties. It prints
 these warnings after the Print and PrintT of the constant definitions and before those of the
@@ -767,7 +780,8 @@ bound variable. What TLC does, measured on TLC 2.19 with PrintT (`tests/tlc/Lazy
   use: there `LET d == PrintT(1) IN d /\ d` prints twice. Such a label stays where it is, renamed BIND_ACT, and code
   generation writes its names out as before
 
-A name is also written out where it is used when its value is constant (code generation folds it there), when TLC
+A name is also written out where it is used when its value is constant (code generation folds it there; not when
+computing it warns about an EXCEPT, see "Messages and printed lines"), when TLC
 keeps the value unevaluated so that only what is used is computed (`codegen::lazy_value`: a function constructor, a
 range, SUBSET, UNION, a set of functions, records, sequences or tuples), in Init while a variable it reads is still
 unassigned (the closure would hold the state being built), and when code generation cannot generate its value on its

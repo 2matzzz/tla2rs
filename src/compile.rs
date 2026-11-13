@@ -1041,7 +1041,7 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
 /// e with Print and PrintT removed (as TLC uses the value it computed when it started)
 /// e with the definitions in `cached` (evaluated when TLC started) not printing again, nor
 /// warning again about an EXCEPT
-fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
+pub fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
     match e {
         Expr::Label(n, a, b) if a.is_empty() && cached.contains(n) => Expr::Label(n.clone(), vec![], strip_prints(b).b()),
         _ => crate::codegen::map_children(e, &|c| uncache_prints(c, cached)),
@@ -1541,7 +1541,12 @@ fn compile_inner(
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();
     g.actions = 0;
+    g.split_warns.clear();
     g.gen_action(&[next_pos], &Gen::env_next(), &mut next_code).map_err(|e| format!("Next: {e}"))?;
+    // TLC warns about an EXCEPT in the sets it splits the next-state relation through when it
+    // reads the spec, after the constant invariants and before the ASSUMEs
+    let head = format!("{}Warning: The EXCEPT was applied to non-existing fields of the value at\n", crate::value::WARNING_MARK);
+    startup.invs.extend(g.split_warns.iter().map(|at| format!("{head}{at}")));
     let actions = g.actions;
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a

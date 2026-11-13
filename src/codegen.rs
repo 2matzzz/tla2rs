@@ -12,6 +12,15 @@ use crate::value::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
+/// What computing a constant made that TLC makes each time it evaluates the expression (see
+/// `Gen::note_folded`)
+#[derive(Default)]
+struct Made {
+    strs: Vec<u32>,
+    /// The positions of TLC's EXCEPT warnings
+    warns: Vec<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct Env {
     /// Bound variables and `@`: name -> (Rust expression, type)
@@ -86,6 +95,12 @@ pub struct Gen<'a> {
     /// Whether the checker notes a string it makes (STR_ORDER)
     pub str_notes: bool,
     tmp: usize,
+    /// While Some, the EXCEPT warnings of folded constants go here instead of into the code:
+    /// TLC evaluates the set of a `\E` it splits the next-state relation through once, when it
+    /// reads the spec (see `split_warns`)
+    split_warning: Option<Vec<String>>,
+    /// The EXCEPT warnings TLC prints while it splits the next-state relation into actions
+    pub split_warns: Vec<String>,
     /// Maximum cardinality of a sparse set (SSet)
     pub scap: usize,
     /// Maximum length of a sequence (QCAP); 0 while no bound is known
@@ -159,6 +174,8 @@ impl<'a> Gen<'a> {
             track_from: u32::MAX,
             str_notes: false,
             tmp: 0,
+            split_warning: None,
+            split_warns: vec![],
             scap: 8,
             qcap: 0,
             infer: None,
@@ -507,15 +524,23 @@ impl<'a> Gen<'a> {
     }
 
     /// The code `c` of a constant, after noting the strings made while computing it (in `made`)
-    /// that may be made while exploring: TLC makes them when it evaluates the expression (a
-    /// definition without arguments, which TLC evaluates when it starts, makes none of those)
-    fn note_folded(&mut self, c: String, made: &[u32]) -> String {
-        let notes: Vec<String> = made.iter().filter(|&&a| a >= self.track_from).map(|a| format!("str_made({a}u16); ")).collect();
-        if notes.is_empty() {
+    /// that may be made while exploring, and TLC's warnings about an EXCEPT: TLC makes and warns
+    /// when it evaluates the expression (a definition without arguments, which TLC evaluates
+    /// when it starts, makes and warns then only)
+    fn note_folded(&mut self, c: String, made: &Made) -> String {
+        let notes: Vec<String> = made.strs.iter().filter(|&&a| a >= self.track_from).map(|a| format!("str_made({a}u16); ")).collect();
+        if !notes.is_empty() {
+            self.str_notes = true;
+        }
+        let mut warns: Vec<String> = made.warns.iter().map(|at| format!("except_warning({at:?}); ")).collect();
+        if let Some(w) = &mut self.split_warning {
+            w.extend(made.warns.iter().cloned());
+            warns.clear();
+        }
+        if notes.is_empty() && warns.is_empty() {
             return c;
         }
-        self.str_notes = true;
-        format!("{{ {}{c} }}", notes.concat())
+        format!("{{ {}{}{c} }}", warns.concat(), notes.concat())
     }
 
     /// `op` (Len, Head, Tail, Append, \o) on strings from the state: a match over every string the
@@ -1237,11 +1262,27 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// `try_const`, and the strings made while computing the value (see `note_folded`)
-    fn try_const_made(&self, e: &Expr, env: &Env) -> (Option<Value>, Vec<u32>) {
+    /// `try_const`, and the strings made and the EXCEPT warnings while computing the value (see
+    /// `note_folded`)
+    fn try_const_made(&self, e: &Expr, env: &Env) -> (Option<Value>, Made) {
+        if !e.any(&|x| matches!(x, Expr::Except(..))) {
+            self.atoms.log_start();
+            let v = self.try_const(e, env);
+            return (v, Made { strs: self.atoms.log_end(), warns: vec![] });
+        }
+        if !self.is_const(e, env) {
+            return (None, Made::default());
+        }
+        // TLC warned about the definitions without arguments when it started
+        let e = crate::compile::uncache_prints(e, &self.zero_defs);
+        let saved = crate::value::PRINTED.with(|p| p.replace(Some(vec![])));
         self.atoms.log_start();
-        let v = self.try_const(e, env);
-        (v, self.atoms.log_end())
+        let v = self.ce.eval(&e, &env.vals).ok();
+        let strs = self.atoms.log_end();
+        let lines = crate::value::PRINTED.with(|p| p.replace(saved)).unwrap_or_default();
+        let head = format!("{}Warning: The EXCEPT was applied to non-existing fields of the value at\n", crate::value::WARNING_MARK);
+        let warns = lines.iter().filter_map(|l| l.first()?.strip_prefix(head.as_str()).map(str::to_string)).collect();
+        (v, Made { strs, warns })
     }
 
     // ---------------------------------------------------------------- Sets (bitmasks and SSet)
@@ -3141,8 +3182,13 @@ impl<'a> Gen<'a> {
             // A constant condition picks its branch here, so the other need not type-check (TLC
             // never evaluates it either)
             If(c, a, b) if matches!(self.try_const(c, env), Some(Value::Bool(_))) => {
-                let Some(Value::Bool(t)) = self.try_const(c, env) else { unreachable!() };
-                return self.gen(if t { a } else { b }, env, want);
+                let (Some(Value::Bool(t)), made) = self.try_const_made(c, env) else { unreachable!() };
+                let (code, t) = self.gen(if t { a } else { b }, env, want)?;
+                if made.warns.is_empty() {
+                    return Ok((code, t));
+                }
+                let warns: Vec<String> = made.warns.iter().map(|at| format!("except_warning({at:?}); ")).collect();
+                return Ok((format!("{{ {}{code} }}", warns.concat()), t));
             }
             If(c, a, b) => {
                 let c = self.gen_as(c, env, &Ty::Bool)?;
@@ -4104,7 +4150,7 @@ impl<'a> Gen<'a> {
         if !self.is_const(s, env) {
             return Ok(None);
         }
-        let mut made = vec![];
+        let mut made = Made::default();
         let Some(b) = self.big_parts(s, env, &mut made) else { return Ok(None) };
         let n = b.size();
         if n <= BIG_SET as f64 || n >= (1u64 << 62) as f64 {
@@ -4123,10 +4169,11 @@ impl<'a> Gen<'a> {
 
     /// The parts of a constant set (see `big_set_iter`); None if one is empty or cannot be
     /// computed
-    fn big_parts(&self, s: &Expr, env: &Env, made: &mut Vec<u32>) -> Option<BigSet> {
-        let lit = |e: &Expr, made: &mut Vec<u32>| -> Option<Vec<Value>> {
+    fn big_parts(&self, s: &Expr, env: &Env, made: &mut Made) -> Option<BigSet> {
+        let lit = |e: &Expr, made: &mut Made| -> Option<Vec<Value>> {
             let (v, m) = self.try_const_made(e, env);
-            made.extend(m);
+            made.strs.extend(m.strs);
+            made.warns.extend(m.warns);
             let v: Vec<Value> = v?.as_set().ok()?.iter().cloned().collect();
             (!v.is_empty()).then_some(v)
         };
@@ -4270,9 +4317,9 @@ impl<'a> Gen<'a> {
         // TLC makes the strings of a constant set when it evaluates the membership (the set is
         // evaluated here only if it has an operation that can make one: it may be large)
         let ops = ["\\o", "Append", "Head", "Tail", "SubSeq", "ToString"];
-        let made = match s.any(&|e| matches!(e, Expr::Call(f, _) if ops.contains(&f.as_str()))) {
+        let made = match s.any(&|e| matches!(e, Expr::Call(f, _) if ops.contains(&f.as_str())) || matches!(e, Expr::Except(..))) {
             true => self.try_const_made(s, env).1,
-            false => vec![],
+            false => Made::default(),
         };
         let code = self.gen_member_of(x, xt, s, env)?;
         Ok(self.note_folded(code, &made))
@@ -4809,7 +4856,13 @@ impl<'a> Gen<'a> {
                 return Ok(());
             }
             Quant(true, bs, body) if open => {
-                if bs.iter().any(|(_, s)| self.try_const(s, env).is_some_and(|v| v.as_set().is_ok_and(|x| x.is_empty()))) {
+                if let Some(made) = bs.iter().find_map(|(_, s)| match self.try_const_made(s, env) {
+                    (Some(v), made) if v.as_set().is_ok_and(|x| x.is_empty()) => Some(made),
+                    _ => None,
+                }) {
+                    for at in &made.warns {
+                        writeln!(out, "except_warning({at:?});").unwrap();
+                    }
                     return Ok(());
                 }
                 let mut env2 = env.clone();
@@ -4818,7 +4871,16 @@ impl<'a> Gen<'a> {
                 // outside and S inside. The sets cannot refer to the other variables (SANY rejects
                 // that), so the order of the loops is free
                 for (x, s) in bs.iter().rev() {
-                    let (it, et, ix) = match self.iter_of_indexed(s, &env2) {
+                    let split = env.split && !self.mentions_state(s);
+                    if split {
+                        self.split_warning = Some(vec![]);
+                    }
+                    let r = self.iter_of_indexed(s, &env2);
+                    if split {
+                        let w = self.split_warning.take().unwrap();
+                        self.split_warns.extend(w);
+                    }
+                    let (it, et, ix) = match r {
                         Ok(x) => x,
                         // During inference, proceed past sets of still-unknown type, treating the
                         // bound variable as an element of some type
@@ -4851,15 +4913,20 @@ impl<'a> Gen<'a> {
                 if action && !self.only_reads_assigned(h, env)
                     || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n))) =>
             {
+                let mut warns = vec![];
                 let sets: Option<Vec<(String, Vec<Value>)>> = bs
                     .iter()
                     .map(|(x, s)| {
-                        let v = self.try_const(s, env)?;
-                        Some((x.clone(), v.as_set().ok()?.iter().cloned().collect()))
+                        let (v, made) = self.try_const_made(s, env);
+                        warns.extend(made.warns);
+                        Some((x.clone(), v?.as_set().ok()?.iter().cloned().collect()))
                     })
                     .collect();
                 match sets {
                     Some(sets) => {
+                    for at in &warns {
+                        writeln!(out, "except_warning({at:?});").unwrap();
+                    }
                     let total: usize = sets.iter().map(|(_, v)| v.len()).product();
                     let mut env2 = env.clone();
                     let mut items = vec![];
@@ -4888,10 +4955,21 @@ impl<'a> Gen<'a> {
             // A recursive operator called with constant arguments in an action: its body, with
             // the arguments bound (as TLC evaluates it), so that it can assign variables
             RecCall(i, args) if open && self.rec_assigns(*i, env) => {
-                let vals: Option<Vec<Value>> = args.iter().map(|a| self.try_const(a, env)).collect();
+                let mut warns = vec![];
+                let vals: Option<Vec<Value>> = args
+                    .iter()
+                    .map(|a| {
+                        let (v, made) = self.try_const_made(a, env);
+                        warns.extend(made.warns);
+                        v
+                    })
+                    .collect();
                 let Some(vals) = vals else {
                     return self.gen_rec_action(*i, args, rest, env, out);
                 };
+                for at in &warns {
+                    writeln!(out, "except_warning({at:?});").unwrap();
+                }
                 if self.unroll >= 2000 {
                     return Err(format!("recursive operator `{}` in an action recurses more than 2000 levels", crate::expand::rec_def(*i).name));
                 }
@@ -4962,7 +5040,10 @@ impl<'a> Gen<'a> {
             }
             If(c, a, b) if action => {
                 // A condition known here (as in an unrolled recursive operator): only its branch
-                if let Some(Value::Bool(cv)) = self.try_const(c, env) {
+                if let (Some(Value::Bool(cv)), made) = self.try_const_made(c, env) {
+                    for at in &made.warns {
+                        writeln!(out, "except_warning({at:?});").unwrap();
+                    }
                     let e = if cv { a } else { b };
                     return self.gen_action(&with(vec![e.as_ref().clone()]), env, out);
                 }
@@ -5122,7 +5203,11 @@ impl<'a> Gen<'a> {
         }
         // Anything else is evaluated as a condition: as in TLC, reading a primed variable the action
         // has not determined yet is an error when evaluated
-        if let Some(Value::Bool(b)) = self.try_const(h, env) {
+        if let (Some(Value::Bool(b)), made) = self.try_const_made(h, env) {
+            // TLC's warnings about an EXCEPT in it, each time it is evaluated
+            for at in &made.warns {
+                writeln!(out, "except_warning({at:?});").unwrap();
+            }
             return if b { self.gen_action(rest, env, out) } else { Ok(()) };
         }
         let c = match self.gen_as(h, env, &Ty::Bool) {
@@ -5862,7 +5947,10 @@ impl<'a> Gen<'a> {
         for k in 0..pairs.len() {
             let (n, x) = pairs[k].clone();
             let all_assigned = env.primed.len() == self.vars.len();
-            let cell = !self.is_const(&x, &env2) && !x.is_action() && !lazy_value(&x) && !(env.init && !all_assigned && self.mentions_state(&x));
+            // A constant whose computation TLC warns about (an EXCEPT) is computed where first used
+            // too, so that it warns once for the evaluation, as TLC does (`tests/tlc/ExceptFold-Arg`)
+            let warns = || !self.try_const_made(&x, &env2).1.warns.is_empty();
+            let cell = (!self.is_const(&x, &env2) || warns()) && !x.is_action() && !lazy_value(&x) && !(env.init && !all_assigned && self.mentions_state(&x));
             if cell {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
