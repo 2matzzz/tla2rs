@@ -1,0 +1,10 @@
+key c19b02425980a4eefbe20192bd8de3fef85d6d75aa2727a239e955313c320d71
+tlc Version 2.19
+rc 12
+Invariant LampsOk is violated
+
+trace 0
+states incomplete
+edges incomplete
+messages 2 7a6bc5c1967bd4cdd29bc94468a72ef6a48d2b729abbd65b590853793fa2962b
+errors 1 388dcb6c3e268bf7aefc7a18645c48d5a3ecdf82bd797af10bc68e0ee4646e21

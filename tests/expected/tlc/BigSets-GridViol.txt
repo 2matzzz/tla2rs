@@ -1,0 +1,10 @@
+key f7970cd6d9e129ba5d621c70694c62b73c7961e3e5c8a7bd6bb3fddf84f39ffc
+tlc Version 2.19
+rc 12
+Invariant GridOk is violated
+
+trace 0
+states incomplete
+edges incomplete
+messages 2 6daf539093fb709e92423416dc2f3945d31e08deca17a1c3799e2dfb33cf8ece
+errors 1 fe60f67f1726cedc61e37580808e980b20b2f408c2b879b680dc5cba5382f6b3

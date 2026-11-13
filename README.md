@@ -78,7 +78,9 @@ not finish.
 3. **Types** (`types.rs`): a finite type per variable, taken from `x \in S` / `x \subseteq S` in `TypeOK`.
    Strings and model values become `u16`, integers `i64`, records and tuples Rust tuples, functions arrays (or sorted
    (key, value) pairs over a large domain type), and sets `u128` bitmasks
-4. **Code generation** (`codegen.rs`): constant subexpressions are evaluated at compile time and become literals.
+4. **Code generation** (`codegen.rs`): constant subexpressions are evaluated at compile time and become literals,
+   except that a constant set of more than 1024 elements built from `[D -> R]`, `\X`, `[a : S]` and `SUBSET` is
+   enumerated by the checker from its parts, in TLC's order, where it iterates over it.
    Actions are generated in continuation-passing style, threading "the remaining conjuncts" through; every `\/`,
    `\E`, and `IF` becomes a branch, and `x' = e` becomes a `let`
 5. **Runtime** (`runtime.rs`): BFS, level by level, with each level split across threads. States are bit-packed to fit
@@ -315,9 +317,9 @@ written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model 
 selected (the exhaustive searches that TLC 2.19 finishes, with `tla2tools.jar` and the CommunityModules' modules, in
 60 seconds or less with one worker) and, for each of the others, why it is skipped. A selected model that tla2rs does
 not match yet is listed as a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost.
-Of the 106 selected models, 104 match TLC (6 of them on everything but the generated count, which TLC counts once per
-`\/` branch). The 2 gaps are not run each time, as they cost too much (one of them matches but takes 32 minutes);
-their reasons are in `tests/corpus.txt` and CLAUDE.md.
+Of the 106 selected models, 105 match TLC (6 of them on everything but the generated count, which TLC counts once per
+`\/` branch). The 1 gap is not run each time, as it costs too much; its reason is in `tests/corpus.txt` and
+CLAUDE.md.
 
 | Example | What it is |
 |---|---|
