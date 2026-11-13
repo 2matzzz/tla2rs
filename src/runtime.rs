@@ -19,8 +19,180 @@ where
     F: FnOnce() -> T + Send + 's,
     T: Send + 's,
 {
-    let stack = (64 * std::mem::size_of::<State>()).max(16 << 20);
-    std::thread::Builder::new().stack_size(stack).spawn_scoped(sc, f).expect("cannot start a search thread")
+    std::thread::Builder::new().stack_size(worker_stack()).spawn_scoped(sc, f).expect("cannot start a search thread")
+}
+
+fn worker_stack() -> usize {
+    (64 * std::mem::size_of::<State>()).max(16 << 20)
+}
+
+/// The search threads, started once per search. A job over 0..n is cut into consecutive pieces,
+/// which the threads take one at a time: a thread that is done (or got more CPU) takes the next,
+/// so a level waits for no thread holding a fixed share. Results come back in the order of the
+/// pieces, so merging them in that order sees the states in the order of the level, as one
+/// thread would.
+struct Pool {
+    shared: std::sync::Arc<PoolShared>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct PoolShared {
+    m: std::sync::Mutex<PoolState>,
+    wake: std::sync::Condvar,
+    idle: std::sync::Condvar,
+}
+
+struct PoolState {
+    /// Counts the jobs posted, so that a thread takes each one at most once
+    seq: u64,
+    task: Option<PoolTask>,
+    /// The threads running the posted task
+    busy: usize,
+    quit: bool,
+}
+
+/// The posted task, its lifetime erased: `Pool::run_with` withdraws it, and waits until no thread
+/// runs it, before what it borrows goes away.
+#[derive(Clone, Copy)]
+struct PoolTask(*const (dyn Fn(usize) + Sync + 'static));
+
+unsafe impl Send for PoolTask {}
+
+impl Pool {
+    fn new(workers: usize) -> Self {
+        let shared = std::sync::Arc::new(PoolShared {
+            m: std::sync::Mutex::new(PoolState { seq: 0, task: None, busy: 0, quit: false }),
+            wake: std::sync::Condvar::new(),
+            idle: std::sync::Condvar::new(),
+        });
+        let threads = (0..workers.max(1))
+            .map(|wid| {
+                let sh = shared.clone();
+                std::thread::Builder::new()
+                    .stack_size(worker_stack())
+                    .spawn(move || sh.work(wid))
+                    .expect("cannot start a search thread")
+            })
+            .collect();
+        Pool { shared, threads }
+    }
+
+    fn workers(&self) -> usize {
+        self.threads.len()
+    }
+
+    /// Pieces of a job over n items: small enough that every thread takes several, so the threads
+    /// finish together, and at least `min` items each, so a piece costs more than taking it
+    fn piece(&self, n: usize, min: usize) -> usize {
+        (n / (self.workers() * 8)).max(min).max(1)
+    }
+
+    /// Runs f(thread, piece index, lo, hi) over the pieces of 0..n of `piece` items each on the
+    /// threads, and meanwhile `side` on the calling thread. Returns the results of f in the order
+    /// of the pieces. A thread's index is below `workers()`, and no two threads share one.
+    fn run_with<T: Send, R>(
+        &self,
+        n: usize,
+        piece: usize,
+        f: impl Fn(usize, usize, usize, usize) -> T + Sync,
+        side: impl FnOnce() -> R,
+    ) -> (Vec<T>, R) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let piece = piece.max(1);
+        let np = n.div_ceil(piece);
+        let next = AtomicUsize::new(0);
+        let out: Vec<std::sync::Mutex<Option<T>>> = (0..np).map(|_| std::sync::Mutex::new(None)).collect();
+        let failed: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> = std::sync::Mutex::new(None);
+        let body = |wid: usize| loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= np {
+                break;
+            }
+            let (lo, hi) = (i * piece, ((i + 1) * piece).min(n));
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(wid, i, lo, hi))) {
+                Ok(r) => *out[i].lock().unwrap() = Some(r),
+                Err(p) => {
+                    failed.lock().unwrap().get_or_insert(p);
+                    next.store(np, Relaxed);
+                }
+            }
+        };
+        let sh = &*self.shared;
+        if np > 0 {
+            let task: &(dyn Fn(usize) + Sync) = &body;
+            // Withdrawn below, before body goes out of scope
+            let task = unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(task) };
+            let mut st = sh.m.lock().unwrap();
+            st.seq += 1;
+            st.task = Some(PoolTask(task as *const _));
+            drop(st);
+            if np >= self.workers() {
+                sh.wake.notify_all();
+            } else {
+                for _ in 0..np {
+                    sh.wake.notify_one();
+                }
+            }
+        }
+        let side = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
+        if np > 0 {
+            // Every piece is taken, and no thread runs the task
+            let mut st = sh.m.lock().unwrap();
+            while next.load(Relaxed) < np || st.busy > 0 {
+                st = sh.idle.wait(st).unwrap();
+            }
+            st.task = None;
+        }
+        let side = side.unwrap_or_else(|p| std::panic::resume_unwind(p));
+        if let Some(p) = failed.into_inner().unwrap() {
+            std::panic::resume_unwind(p);
+        }
+        (out.into_iter().map(|r| r.into_inner().unwrap().unwrap()).collect(), side)
+    }
+
+    fn run<T: Send>(&self, n: usize, piece: usize, f: impl Fn(usize, usize, usize, usize) -> T + Sync) -> Vec<T> {
+        self.run_with(n, piece, f, || ()).0
+    }
+}
+
+impl PoolShared {
+    fn work(&self, wid: usize) {
+        let mut seen = 0;
+        loop {
+            let mut st = self.m.lock().unwrap();
+            let task = loop {
+                if st.quit {
+                    return;
+                }
+                if st.seq != seen {
+                    seen = st.seq;
+                    if let Some(t) = st.task {
+                        st.busy += 1;
+                        break t;
+                    }
+                }
+                st = self.wake.wait(st).unwrap();
+            };
+            drop(st);
+            // The task catches what f raises
+            unsafe { (*task.0)(wid) };
+            let mut st = self.m.lock().unwrap();
+            st.busy -= 1;
+            if st.busy == 0 {
+                self.idle.notify_all();
+            }
+        }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.shared.m.lock().unwrap().quit = true;
+        self.shared.wake.notify_all();
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 #[inline(always)]
@@ -2555,6 +2727,23 @@ struct SWork {
     acts: Vec<(usize, &'static str)>,
 }
 
+impl SWork {
+    fn new() -> Self {
+        SWork {
+            buf: Vec::with_capacity(64),
+            cand: Vec::with_capacity(64),
+            mine: Seen::new(),
+            dpend: vec![],
+            dump: String::new(),
+            held: Held::default(),
+            acts: vec![],
+        }
+    }
+}
+
+/// The fewest states in a piece of a level (see `Pool`): a smaller level runs on one thread
+const MIN_PIECE: usize = 64;
+
 /// Expands a single state, pushing newly found states onto c.next.
 fn expand_safety_one(
     w: &Packed,
@@ -2791,18 +2980,10 @@ fn expand_safety(
     seen: &Shards,
     stop: &std::sync::atomic::AtomicBool,
     opt: &Opt,
+    ws: &mut SWork,
 ) -> SChunk {
     use std::sync::atomic::Ordering::Relaxed;
     let mut c = SChunk { next: vec![], generated: 0, distinct: 0, found: None, expanded: 0 };
-    let mut ws = SWork {
-        buf: Vec::with_capacity(64),
-        cand: Vec::with_capacity(64),
-        mine: Seen::new(),
-        dpend: vec![],
-        dump: String::new(),
-        held: Held::default(),
-        acts: vec![],
-    };
     for i in lo..hi {
         if stop.load(Relaxed) {
             break;
@@ -2812,9 +2993,9 @@ fn expand_safety(
         c.expanded += 1;
         let r = if TLCGET {
             // Not again on an error: evaluating sets registers and prints
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expand_eager_one(w, *sfp, seen, opt, &mut c, &mut ws)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expand_eager_one(w, *sfp, seen, opt, &mut c, &mut *ws)))
         } else {
-            expand_caught(&mut c, |c| c.generated, |c, careful| expand_safety_one(w, *sfp, seen, opt, c, &mut ws, careful))
+            expand_caught(&mut c, |c| c.generated, |c, careful| expand_safety_one(w, *sfp, seen, opt, c, &mut *ws, careful))
         };
         if dumping() {
             // The successors examined up to the one that stopped the search, if any
@@ -2986,6 +3167,8 @@ fn run_safety(opt: &Opt) {
     );
     frontier.extend(first, opt);
     let stop = std::sync::atomic::AtomicBool::new(false);
+    let pool = Pool::new(opt.workers);
+    let work: Vec<std::sync::Mutex<SWork>> = (0..pool.workers()).map(|_| std::sync::Mutex::new(SWork::new())).collect();
     let mut depth = 1u32;
     let mut last = std::time::Instant::now();
     if tg_exiting() {
@@ -2998,7 +3181,7 @@ fn run_safety(opt: &Opt) {
         let mut found: Option<SFound> = None;
         let mut done = 0usize;
         let mut expanded = 0usize;
-        // Read the level one batch at a time and split each batch across threads for expansion.
+        // Read the level one batch at a time and split each batch into pieces for the threads.
         // While the workers expand a batch, this thread merges the previous batch's results (which
         // may spill them to disk) and reads the next batch, so up to two batches are in memory.
         // Smaller batches leave less unoverlapped work at the start and end of a level.
@@ -3017,24 +3200,17 @@ fn run_safety(opt: &Opt) {
                 cur = parts.next();
                 continue;
             }
-            let k = if n < 1024 { 1 } else { opt.workers.min(n) };
-            let per = n.div_ceil(k);
-            let (chunks, next_part) = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..k)
-                    .map(|i| {
-                        let (x, y) = (i * per, ((i + 1) * per).min(n));
-                        let (pt, seen, stop) = (&part, &seen, &stop);
-                        spawn_worker(sc, move || expand_safety(pt, x, y, seen, stop, opt))
-                    })
-                    .collect();
-                for c in pending.drain(..) {
-                    merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt, &mut expanded);
-                }
-                let next_part = parts.next();
-                let chunks: Vec<SChunk> =
-                    hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect();
-                (chunks, next_part)
-            });
+            let (chunks, next_part) = pool.run_with(
+                n,
+                pool.piece(n, MIN_PIECE),
+                |wid, _, x, y| expand_safety(&part, x, y, &seen, &stop, opt, &mut work[wid].lock().unwrap()),
+                || {
+                    for c in pending.drain(..) {
+                        merge_chunk(c, &mut generated, &mut distinct, &mut nxt, &mut found, opt, &mut expanded);
+                    }
+                    parts.next()
+                },
+            );
             pending = chunks;
             cur = next_part;
             if last.elapsed().as_secs() >= 10 {
@@ -3678,6 +3854,7 @@ fn run_safety_batched(opt: &Opt) {
     }
     frontier.extend(first, opt);
     let stop = std::sync::atomic::AtomicBool::new(false);
+    let pool = Pool::new(opt.workers);
     let parts = opt.workers;
     let mut depth = 1u32;
     let mut last = std::time::Instant::now();
@@ -3719,18 +3896,12 @@ fn run_safety_batched(opt: &Opt) {
             if let Some(part) = part.filter(|_| found_err.is_none()) {
                 let n = part.len();
                 done += n;
+                // One piece per thread, as each sees only the candidates it collected itself (see
+                // `collect_phase`): with one thread, all those of the batch
                 let k = if n < 1024 { 1 } else { opt.workers.min(n) };
-                let per = n.div_ceil(k);
                 let prev: &[Vec<Vec<Cand>>] = pending.as_ref().map_or(&[], |(b, _)| b.as_slice());
-                let collected: Vec<Collected> = std::thread::scope(|sc| {
-                    let hs: Vec<_> = (0..k)
-                        .map(|i| {
-                            let (x, y) = (i * per, ((i + 1) * per).min(n));
-                            let (pt, stop, tbl) = (&part, &stop, &tbl);
-                            spawn_worker(sc, move || collect_phase(pt, x, y, opt, stop, parts, tbl, prev))
-                        })
-                        .collect();
-                    hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+                let collected: Vec<Collected> = pool.run(n, n.div_ceil(k), |_, _, x, y| {
+                    collect_phase(&part, x, y, opt, &stop, parts, &tbl, prev)
                 });
                 // Group the per-thread arrays by owner, moving them as is rather than copying
                 // their contents.
@@ -3761,49 +3932,31 @@ fn run_safety_batched(opt: &Opt) {
             if use_gpu {
                 gpu_wait(&by_part, &mut flags, total);
             } else {
-                flags = std::thread::scope(|sc| {
-                    let hs: Vec<_> = by_part
-                        .iter()
-                        .map(|g| {
-                            let tbl = &tbl;
-                            spawn_worker(sc, move || {
-                                let mut f = vec![0u8; g.iter().map(|v| v.len()).sum()];
-                                let mut off = 0;
-                                for cs in g {
-                                    lookup_phase_cpu(cs, &mut f[off..off + cs.len()], tbl);
-                                    off += cs.len();
-                                }
-                                f
-                            })
-                        })
-                        .collect();
-                    hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+                flags = pool.run(by_part.len(), 1, |_, t, _, _| {
+                    let g = &by_part[t];
+                    let mut f = vec![0u8; g.iter().map(|v| v.len()).sum()];
+                    let mut off = 0;
+                    for cs in g {
+                        lookup_phase_cpu(cs, &mut f[off..off + cs.len()], &tbl);
+                        off += cs.len();
+                    }
+                    f
                 });
             }
             ph(1, tph);
             let tph = std::time::Instant::now();
-            let results: Vec<(Vec<Qitem>, u64)> = std::thread::scope(|sc| {
-                let hs: Vec<_> = by_part
-                    .iter()
-                    .zip(flags.iter())
-                    .enumerate()
-                    .map(|(t, (g, f))| {
-                        let tbl = &tbl;
-                        let (lo, hi) = (t * SHARDS / parts, (t + 1) * SHARDS / parts);
-                        spawn_worker(sc, move || {
-                            let mut o: (Vec<Qitem>, u64) = (vec![], 0);
-                            let mut off = 0;
-                            for cs in g {
-                                let (v, d) = insert_phase(cs, &f[off..off + cs.len()], tbl, lo, hi);
-                                off += cs.len();
-                                o.0.extend(v);
-                                o.1 += d;
-                            }
-                            o
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+            let results: Vec<(Vec<Qitem>, u64)> = pool.run(by_part.len(), 1, |_, t, _, _| {
+                let (g, f) = (&by_part[t], &flags[t]);
+                let (lo, hi) = (t * SHARDS / parts, (t + 1) * SHARDS / parts);
+                let mut o: (Vec<Qitem>, u64) = (vec![], 0);
+                let mut off = 0;
+                for cs in g {
+                    let (v, d) = insert_phase(cs, &f[off..off + cs.len()], &tbl, lo, hi);
+                    off += cs.len();
+                    o.0.extend(v);
+                    o.1 += d;
+                }
+                o
             });
             ph(2, tph);
             let mut added = 0usize;
@@ -3885,6 +4038,7 @@ fn run_liveness(opt: &Opt) {
     }
     println!("Finished computing initial states: {} distinct states generated. ({workers} workers)", g.states.len());
     let stop = std::sync::atomic::AtomicBool::new(false);
+    let pool = Pool::new(workers);
     let mut live = LiveChunk::default();
     let mut lo = 0usize;
     let mut depth = 1u32;
@@ -3894,20 +4048,10 @@ fn run_liveness(opt: &Opt) {
         if lo == hi {
             break;
         }
-        // Split the level (all states at the same depth) into contiguous chunks and expand them
-        // in parallel.
+        // Split the level (all states at the same depth) into pieces for the threads.
         let n = hi - lo;
-        let k = if n < 1024 { 1 } else { workers.min(n) };
-        let per = n.div_ceil(k);
-        let chunks: Vec<Chunk> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..k)
-                .map(|i| {
-                    let (a, b) = (lo + i * per, (lo + (i + 1) * per).min(hi));
-                    let (g, seen, stop) = (&g, &seen, &stop);
-                    spawn_worker(sc, move || expand(g, a, b, seen, stop, i, check_deadlock))
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+        let chunks: Vec<Chunk> = pool.run(n, pool.piece(n, MIN_PIECE), |_, i, a, b| {
+            expand(&g, lo + a, lo + b, &seen, &stop, i, check_deadlock)
         });
         let mut found = None;
         let mut base = vec![];
@@ -4015,7 +4159,7 @@ fn run_liveness(opt: &Opt) {
     if LIVENESS {
         let t1 = std::time::Instant::now();
         dump_finish();
-        let ok = liveness(&g, live);
+        let ok = liveness(&g, live, workers);
         println!("Checked temporal properties in {:.3}s", t1.elapsed().as_secs_f64());
         if !ok {
             exit(13);
@@ -4299,7 +4443,7 @@ fn path_to(
     vec![]
 }
 
-fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
+fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
     let n = g.states.len();
     // Fingerprint -> state index
     let cap = (n * 2).next_power_of_two().max(16);
@@ -4368,114 +4512,161 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
     drop(live);
     let inits: Vec<u32> = (0..n as u32).filter(|&i| g.parent[i as usize].0 == u32::MAX).collect();
     let edges = st.dst.len();
-    for prop in LPROPS {
-        let pr = Product { st: &st, nodes: prop.nodes, q: prop.nodes.len().max(1) };
-        if prop.nodes.is_empty() {
-            continue;
-        }
-        // Reachable product nodes, in BFS order, with their BFS parents
-        let mut par: std::collections::HashMap<usize, (usize, u32)> = std::collections::HashMap::new();
-        let mut order = vec![];
-        for &s in &inits {
-            for (q, nd) in prop.nodes.iter().enumerate() {
-                let p = s as usize * pr.q + q;
-                if nd.init && pr.valid(s, q) && !par.contains_key(&p) {
-                    par.insert(p, (usize::MAX, u32::MAX));
-                    order.push(p);
-                }
-            }
-        }
-        let mut h = 0;
-        let mut buf = vec![];
-        while h < order.len() {
-            let u = order[h];
-            h += 1;
-            pr.succ(u, &mut buf);
-            for &(v, l, _) in &buf {
-                if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
-                    e.insert((u, l));
-                    order.push(v);
-                }
-            }
-        }
-        let rank: std::collections::HashMap<usize, usize> = order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
-        for c in sccs(&pr, &order, &|_| true) {
-            let Some((c, steps, off)) = search(&pr, prop.nacc, c) else { continue };
-            let set: std::collections::HashSet<usize> = c.iter().copied().collect();
-            let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
-            // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
-            // disabled or one of its steps; for each strongly fair action that is enabled somewhere
-            // on the cycle, one of its steps; then return to the entry
-            let _ = &off;
-            let fen = |p: usize| st.fen[pr.state(p) as usize];
-            let mut cyc: Vec<(usize, u32, FMask)> = vec![];
-            let mut cur = entry;
-            let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
-                let p = path_to(&pr, &set, *cur, goal, edge);
-                if let Some(&(l, _, _)) = p.last() {
-                    *cur = l;
-                }
-                cyc.extend(p);
-            };
-            let visited = |cyc: &[(usize, u32, FMask)], f: &dyn Fn(usize) -> bool| f(entry) || cyc.iter().any(|&(p, _, _)| f(p));
-            for j in 0..prop.nacc {
-                let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
-                if !visited(&cyc, &here) {
-                    go(&mut cyc, &mut cur, &here, &|_| false);
-                }
-            }
-            for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
-                let off_here = |p: usize| fen(p) & (1 << i) == 0;
-                if !*weak || visited(&cyc, &off_here) {
-                    continue;
-                }
-                if c.iter().any(|&p| off_here(p)) {
-                    go(&mut cyc, &mut cur, &off_here, &|_| false);
-                } else {
-                    go(&mut cyc, &mut cur, &|_| false, &|f| f & (1 << i) != 0);
-                }
-            }
-            loop {
-                // Back to the entry (at least one step)
-                if cur != entry || cyc.is_empty() {
-                    go(&mut cyc, &mut cur, &|p| p == entry, &|_| false);
-                }
-                let mut added = false;
-                for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
-                    let b: FMask = 1 << i;
-                    let on = |p: usize| fen(p) & b != 0;
-                    if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
-                        continue;
+    // The properties are independent, so several threads check them, and the first one in order
+    // that is violated is reported, as when they are checked one after another. A property after
+    // one found violated is given up.
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let (next, first_bad) = (AtomicUsize::new(0), AtomicUsize::new(usize::MAX));
+    let found: Vec<Vec<(usize, Lasso)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..workers.clamp(1, LPROPS.len().max(1)))
+            .map(|_| {
+                spawn_worker(sc, || {
+                    let mut out = vec![];
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        if i >= LPROPS.len() {
+                            break;
+                        }
+                        let quit = || first_bad.load(Relaxed) < i;
+                        if quit() {
+                            continue;
+                        }
+                        if let Some(l) = check_prop(&st, &LPROPS[i], &inits, &quit) {
+                            first_bad.fetch_min(i, Relaxed);
+                            out.push((i, l));
+                        }
                     }
-                    go(&mut cyc, &mut cur, &|_| false, &|f| f & b != 0);
-                    added = true;
-                }
-                if !added && cur == entry {
-                    break;
-                }
-            }
-            let mut prefix = vec![];
-            let mut y = entry;
-            while y != usize::MAX {
-                let (p, l) = par[&y];
-                prefix.push((pr.state(y), l));
-                y = p;
-            }
-            prefix.reverse();
-            let cycle: Vec<(u32, u32)> = cyc.iter().map(|&(p, l, _)| (pr.state(p), l)).collect();
-            println!("Error: Temporal properties were violated.");
-            println!("Error: The following behavior constitutes a counter-example:");
-            match tlc_lasso(g, &st, &inits, &selfs) {
-                Ok(true) => return false,
-                Ok(false) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
-                Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
-            }
-            print_lasso(g, &prefix, &cycle);
-            return false;
+                    out
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+    });
+    if let Some((_, (prefix, cycle))) = found.into_iter().flatten().min_by_key(|x| x.0) {
+        println!("Error: Temporal properties were violated.");
+        println!("Error: The following behavior constitutes a counter-example:");
+        match tlc_lasso(g, &st, &inits, &selfs) {
+            Ok(true) => return false,
+            Ok(false) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
+            Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
         }
+        print_lasso(g, &prefix, &cycle);
+        return false;
     }
     println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", LPROPS.len(), FAIRS.len(), edges);
     true
+}
+
+/// A lasso: the steps from an initial state to the entry of the cycle, and the cycle
+type Lasso = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
+/// Looks for a behavior that violates one property: a fair cycle in its product with the state
+/// graph that the property's automaton accepts. None also when `quit` says to give up.
+fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) -> Option<Lasso> {
+    let pr = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1) };
+    if prop.nodes.is_empty() {
+        return None;
+    }
+    // Reachable product nodes, in BFS order, with their BFS parents
+    let mut par: std::collections::HashMap<usize, (usize, u32)> = std::collections::HashMap::new();
+    let mut order = vec![];
+    for &s in inits {
+        for (q, nd) in prop.nodes.iter().enumerate() {
+            let p = s as usize * pr.q + q;
+            if nd.init && pr.valid(s, q) && !par.contains_key(&p) {
+                par.insert(p, (usize::MAX, u32::MAX));
+                order.push(p);
+            }
+        }
+    }
+    let mut h = 0;
+    let mut buf = vec![];
+    while h < order.len() {
+        if h % 4096 == 0 && quit() {
+            return None;
+        }
+        let u = order[h];
+        h += 1;
+        pr.succ(u, &mut buf);
+        for &(v, l, _) in &buf {
+            if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
+                e.insert((u, l));
+                order.push(v);
+            }
+        }
+    }
+    let rank: std::collections::HashMap<usize, usize> = order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+    for c in sccs(&pr, &order, &|_| true) {
+        if quit() {
+            return None;
+        }
+        let Some((c, steps, off)) = search(&pr, prop.nacc, c) else { continue };
+        let set: std::collections::HashSet<usize> = c.iter().copied().collect();
+        let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
+        // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
+        // disabled or one of its steps; for each strongly fair action that is enabled somewhere
+        // on the cycle, one of its steps; then return to the entry
+        let _ = &off;
+        let fen = |p: usize| st.fen[pr.state(p) as usize];
+        let mut cyc: Vec<(usize, u32, FMask)> = vec![];
+        let mut cur = entry;
+        let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(FMask) -> bool| {
+            let p = path_to(&pr, &set, *cur, goal, edge);
+            if let Some(&(l, _, _)) = p.last() {
+                *cur = l;
+            }
+            cyc.extend(p);
+        };
+        let visited = |cyc: &[(usize, u32, FMask)], f: &dyn Fn(usize) -> bool| f(entry) || cyc.iter().any(|&(p, _, _)| f(p));
+        for j in 0..prop.nacc {
+            let here = |p: usize| prop.nodes[p % pr.q].acc & (1 << j) != 0;
+            if !visited(&cyc, &here) {
+                go(&mut cyc, &mut cur, &here, &|_| false);
+            }
+        }
+        for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
+            let off_here = |p: usize| fen(p) & (1 << i) == 0;
+            if !*weak || visited(&cyc, &off_here) {
+                continue;
+            }
+            if c.iter().any(|&p| off_here(p)) {
+                go(&mut cyc, &mut cur, &off_here, &|_| false);
+            } else {
+                go(&mut cyc, &mut cur, &|_| false, &|f| f & (1 << i) != 0);
+            }
+        }
+        loop {
+            // Back to the entry (at least one step)
+            if cur != entry || cyc.is_empty() {
+                go(&mut cyc, &mut cur, &|p| p == entry, &|_| false);
+            }
+            let mut added = false;
+            for (i, (weak, _, _)) in FAIRS.iter().enumerate() {
+                let b: FMask = 1 << i;
+                let on = |p: usize| fen(p) & b != 0;
+                if *weak || !steps.contains(&i) || cyc.iter().any(|&(_, _, f)| f & b != 0) || !visited(&cyc, &on) {
+                    continue;
+                }
+                go(&mut cyc, &mut cur, &|_| false, &|f| f & b != 0);
+                added = true;
+            }
+            if !added && cur == entry {
+                break;
+            }
+        }
+        let mut prefix = vec![];
+        let mut y = entry;
+        while y != usize::MAX {
+            let (p, l) = par[&y];
+            prefix.push((pr.state(y), l));
+            y = p;
+        }
+        prefix.reverse();
+        let cycle: Vec<(u32, u32)> = cyc.iter().map(|&(p, l, _)| (pr.state(p), l)).collect();
+        return Some((prefix, cycle));
+    }
+    None
+
 }
 
 /// Prints a lasso as TLC does: the states from an initial state to the entry of the cycle, then
