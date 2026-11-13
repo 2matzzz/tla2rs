@@ -1843,7 +1843,16 @@ impl<'a> Gen<'a> {
         if narrows(xt, &et) {
             // x may hold a model value stored as an integer-or-model-value: compare in the joined
             // type rather than convert x (which fails at run time on an integer)
-            let jst = Ty::Set(join(xt, &et)?.into());
+            let j = join(xt, &et)?;
+            let jst = Ty::Set(j.clone().into());
+            if is_sparse(st) && is_sparse(&jst) && self.tuple_cmp(xt, &j)? == Cmp::Normal && !self.str_meets_int(xt, &j) && !narrows(xt, &j) {
+                // Compare x with each element converted, as a membership test in the converted set
+                // would, without building and sorting that set at each test (a test in a loop over
+                // another set built it once per element there)
+                let Ok(xc) = self.coerce_soft(x.to_string(), xt, &j) else { return Ok("false".into()) };
+                let eq = self.eq_into("__e", &et, "__x", &j)?;
+                return Ok(format!("{{ let __x = {xc}; let __any = ({c}).iter().any(|__e| {eq}); __any }}"));
+            }
             let cc = self.coerce(c.to_string(), st, &jst)?;
             let v = self.fresh("s");
             let inner = self.s_has(&v, &jst, x, xt)?;
@@ -1860,6 +1869,39 @@ impl<'a> Gen<'a> {
         let eid = self.ty_id(&et)?;
         let Ok(xc) = self.coerce_soft(x.to_string(), xt, &et) else { return Ok("false".into()) };
         Ok(format!("{{ let __i = enc_{eid}({xc}); __i != u64::MAX && ({c} >> __i) & 1 == 1 }}"))
+    }
+
+    /// Whether e (of type et) equals x (of type j, which et widens to), as `coerce(e, et, j) == x`
+    /// compares, without building the converted value: a tuple against a sequence compares the
+    /// length and then element by element
+    fn eq_into(&mut self, e: &str, et: &Ty, x: &str, j: &Ty) -> R<String> {
+        if et == j {
+            return Ok(format!("({e} == {x})"));
+        }
+        if let (Some(ts), Ty::Seq(se)) = (tuple_elems(et), j) {
+            let ts: Vec<Ty> = ts.into_iter().cloned().collect();
+            let n = ts.len();
+            // Converted, a tuple longer than the sequences' capacity stops for a larger one
+            let mut parts = vec![format!("({n} > QCAP && seq_too_long(QCAP))"), format!("({x}).len == {n}")];
+            for (k, t) in ts.iter().enumerate() {
+                parts.push(self.eq_into(&format!("({e}){}", rec_field(n, k)), t, &format!("({x}).items[{k}]"), se)?);
+            }
+            return Ok(format!("(!{} && {})", parts[0], parts[1..].join(" && ")));
+        }
+        if let (Ty::Rec(a), Ty::Rec(b)) = (et, j) {
+            let plain = |t: &Ty| !matches!(t, Ty::Opt(_));
+            if a.len() == b.len() && a.iter().zip(b).all(|((m, s), (n, t))| m == n && plain(s) && plain(t)) {
+                let n = a.len();
+                let mut parts = vec![];
+                for (k, ((_, s), (_, t))) in a.iter().zip(b).enumerate() {
+                    let f = rec_field(n, k);
+                    parts.push(self.eq_into(&format!("({e}){f}"), s, &format!("({x}){f}"), t)?);
+                }
+                return Ok(format!("({})", parts.join(" && ")));
+            }
+        }
+        let ec = self.coerce(e.to_string(), et, j)?;
+        Ok(format!("({ec} == {x})"))
     }
 
     /// Type coercion that returns Err when the value might not fit the target type (e.g. a field
