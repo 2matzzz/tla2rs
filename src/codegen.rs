@@ -527,6 +527,21 @@ impl<'a> Gen<'a> {
     /// that may be made while exploring, and TLC's warnings about an EXCEPT: TLC makes and warns
     /// when it evaluates the expression (a definition without arguments, which TLC evaluates
     /// when it starts, makes and warns then only)
+    /// The statements that note what computing a constant made (see `note_folded`), for a
+    /// constant the compiler evaluates without generating code for it (a condition, the set of
+    /// an unrolled `\A`, the arguments of an unrolled recursive operator)
+    fn fold_notes(&mut self, made: &Made) -> String {
+        let mut out = String::new();
+        for at in &made.warns {
+            write!(out, "except_warning({at:?}); ").unwrap();
+        }
+        for a in made.strs.iter().filter(|&&a| a >= self.track_from) {
+            self.str_notes = true;
+            write!(out, "str_made({a}u16); ").unwrap();
+        }
+        out
+    }
+
     fn note_folded(&mut self, c: String, made: &Made) -> String {
         let notes: Vec<String> = made.strs.iter().filter(|&&a| a >= self.track_from).map(|a| format!("str_made({a}u16); ")).collect();
         if !notes.is_empty() {
@@ -3184,11 +3199,11 @@ impl<'a> Gen<'a> {
             If(c, a, b) if matches!(self.try_const(c, env), Some(Value::Bool(_))) => {
                 let (Some(Value::Bool(t)), made) = self.try_const_made(c, env) else { unreachable!() };
                 let (code, t) = self.gen(if t { a } else { b }, env, want)?;
-                if made.warns.is_empty() {
+                let notes = self.fold_notes(&made);
+                if notes.is_empty() {
                     return Ok((code, t));
                 }
-                let warns: Vec<String> = made.warns.iter().map(|at| format!("except_warning({at:?}); ")).collect();
-                return Ok((format!("{{ {}{code} }}", warns.concat()), t));
+                return Ok((format!("{{ {notes}{code} }}"), t));
             }
             If(c, a, b) => {
                 let c = self.gen_as(c, env, &Ty::Bool)?;
@@ -4860,9 +4875,8 @@ impl<'a> Gen<'a> {
                     (Some(v), made) if v.as_set().is_ok_and(|x| x.is_empty()) => Some(made),
                     _ => None,
                 }) {
-                    for at in &made.warns {
-                        writeln!(out, "except_warning({at:?});").unwrap();
-                    }
+                    let notes = self.fold_notes(&made);
+                    out.push_str(&notes);
                     return Ok(());
                 }
                 let mut env2 = env.clone();
@@ -4913,20 +4927,20 @@ impl<'a> Gen<'a> {
                 if action && !self.only_reads_assigned(h, env)
                     || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n))) =>
             {
-                let mut warns = vec![];
+                let mut all = Made::default();
                 let sets: Option<Vec<(String, Vec<Value>)>> = bs
                     .iter()
                     .map(|(x, s)| {
                         let (v, made) = self.try_const_made(s, env);
-                        warns.extend(made.warns);
+                        all.warns.extend(made.warns);
+                        all.strs.extend(made.strs);
                         Some((x.clone(), v?.as_set().ok()?.iter().cloned().collect()))
                     })
                     .collect();
                 match sets {
                     Some(sets) => {
-                    for at in &warns {
-                        writeln!(out, "except_warning({at:?});").unwrap();
-                    }
+                    let notes = self.fold_notes(&all);
+                    out.push_str(&notes);
                     let total: usize = sets.iter().map(|(_, v)| v.len()).product();
                     let mut env2 = env.clone();
                     let mut items = vec![];
@@ -4955,21 +4969,27 @@ impl<'a> Gen<'a> {
             // A recursive operator called with constant arguments in an action: its body, with
             // the arguments bound (as TLC evaluates it), so that it can assign variables
             RecCall(i, args) if open && self.rec_assigns(*i, env) => {
-                let mut warns = vec![];
+                // TLC evaluates an argument where the body first reads its parameter: noted here
+                // only for a parameter the body reads
+                let rd = crate::expand::rec_def(*i);
+                let mut all = Made::default();
                 let vals: Option<Vec<Value>> = args
                     .iter()
-                    .map(|a| {
+                    .zip(rd.params.iter().map(Some).chain(std::iter::repeat(None)))
+                    .map(|(a, p)| {
                         let (v, made) = self.try_const_made(a, env);
-                        warns.extend(made.warns);
+                        if p.is_some_and(|p| rd.body.any(&|e| matches!(e, Ident(n, _) if n == p))) {
+                            all.warns.extend(made.warns);
+                            all.strs.extend(made.strs);
+                        }
                         v
                     })
                     .collect();
                 let Some(vals) = vals else {
                     return self.gen_rec_action(*i, args, rest, env, out);
                 };
-                for at in &warns {
-                    writeln!(out, "except_warning({at:?});").unwrap();
-                }
+                let notes = self.fold_notes(&all);
+                out.push_str(&notes);
                 if self.unroll >= 2000 {
                     return Err(format!("recursive operator `{}` in an action recurses more than 2000 levels", crate::expand::rec_def(*i).name));
                 }
@@ -5041,9 +5061,8 @@ impl<'a> Gen<'a> {
             If(c, a, b) if action => {
                 // A condition known here (as in an unrolled recursive operator): only its branch
                 if let (Some(Value::Bool(cv)), made) = self.try_const_made(c, env) {
-                    for at in &made.warns {
-                        writeln!(out, "except_warning({at:?});").unwrap();
-                    }
+                    let notes = self.fold_notes(&made);
+                    out.push_str(&notes);
                     let e = if cv { a } else { b };
                     return self.gen_action(&with(vec![e.as_ref().clone()]), env, out);
                 }
@@ -5204,10 +5223,9 @@ impl<'a> Gen<'a> {
         // Anything else is evaluated as a condition: as in TLC, reading a primed variable the action
         // has not determined yet is an error when evaluated
         if let (Some(Value::Bool(b)), made) = self.try_const_made(h, env) {
-            // TLC's warnings about an EXCEPT in it, each time it is evaluated
-            for at in &made.warns {
-                writeln!(out, "except_warning({at:?});").unwrap();
-            }
+            // What TLC makes and warns about each time it evaluates it
+            let notes = self.fold_notes(&made);
+            out.push_str(&notes);
             return if b { self.gen_action(rest, env, out) } else { Ok(()) };
         }
         let c = match self.gen_as(h, env, &Ty::Bool) {

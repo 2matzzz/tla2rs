@@ -241,10 +241,10 @@ memory.
   prints `tla2rs: strings were made in another order than they were numbered in; checking again from the start with
   them in that order`, builds the checker again with that order and runs it from the start (at most 8 times; output
   printed before the line is repeated). Not followed: with several workers TLC's order depends on scheduling, and the
-  checker keeps the order it was built with; a string made by a constant expression that tla2rs evaluates while it
-  compiles, other than a value, a set a quantifier ranges over or a set tested for membership (the condition of an
-  IF, say), and the characters of a string taken apart into a tuple (`SelectSeq`, `SortSeq`, a string compared with a
-  tuple) keep the order tla2rs meets them in
+  checker keeps the order it was built with; the characters of a string taken apart into a tuple (`SelectSeq`,
+  `SortSeq`, a string compared with a tuple) keep the order tla2rs meets them in. A string made by a constant
+  expression that tla2rs evaluates while it compiles counts where TLC evaluates it (as a value, a set, the condition
+  of an IF or of an action, ...)
 - A set that TLC holds as an interval (`x = 1..3`) prints as `{1, 2, 3}`, where TLC prints `1..3` until an
   operation enumerates it. Which form TLC prints depends on how the value was built (see CLAUDE.md, "State graphs"),
   so the comparison with TLC reads an interval as the set it denotes

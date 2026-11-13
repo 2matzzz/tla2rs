@@ -207,7 +207,10 @@ number a string when it makes one. tla2rs numbers them in an order measured inst
 - The strings the checker may make while exploring are numbered from `TRACK_FROM`, first in the order a checker built
   before made them, then as the compiler meets them. Code generation notes each such string the checker makes
   (`Gen::note_made` for the operations on strings from the state and ToString, `Gen::note_folded` for a constant
-  expression TLC evaluates there: as a value, a set a quantifier ranges over, or a set tested for membership).
+  expression TLC evaluates there: as a value, a set a quantifier ranges over, or a set tested for membership;
+  `Gen::fold_notes` for one the compiler evaluates without generating code for it: a condition of an action or of
+  an IF, the set of a `\A` that assigns variables, and the argument of a recursive operator unrolled in an action
+  when its body reads the parameter, since TLC evaluates an argument only there; `StrMadeCond*`).
   When tla2rs runs the checker with one worker, it names a file in `TLA2RS_ORDER`, and the checker records the
   first time it makes each such string, where TLC would: what it makes while computing a successor counts after the
   invariants of the successors before it (held like the printed lines, see "Messages and printed lines"), and the
@@ -224,10 +227,9 @@ Not followed:
 - With several workers the order depends on thread scheduling: CHOOSE over `{ToString(n) \o "w" : n \in 1..2000}`
   after the search created those strings gave `"4w"`, `"1w"`, `"2w"` and `"4w"` in four runs with `-workers 4`, and
   `"1w"` every time with one worker. The checker notes nothing then and keeps the order it was built with
-- A string made by a constant expression that the compiler evaluates elsewhere (the condition of an IF, the set of a
-  `\A` that assigns variables in an action, ...), and the characters TLC makes when it takes a string apart
-  into a tuple (`SelectSeq`, `SortSeq`, a string compared with a tuple), are numbered as the compiler meets them and
-  not noted
+- A string made by a constant expression that the compiler evaluates elsewhere than above (the size of the set of a
+  split `\E`, say), and the characters TLC makes when it takes a string apart into a tuple (`SelectSeq`, `SortSeq`,
+  a string compared with a tuple), are numbered as the compiler meets them and not noted
 
 ### How TLC reads SPECIFICATION
 
@@ -646,7 +648,7 @@ when it starts. The warnings:
   when it started not warning again) and the folded code calls `except_warning` for each
   (`Gen::note_folded`; also a constant condition of an action or of an IF, the set of a `\A` that
   assigns variables, an empty set of `\E`, the arguments of a recursive operator unrolled in an
-  action; `tests/tlc/ExceptFold*`). A LET definition or an
+  action whose parameters its body reads; `tests/tlc/ExceptFold*`). A LET definition or an
   argument whose constant value warns is computed where first used, as one that is not constant
   (`Gen::gen_bind`), so it warns once for the evaluation of the LET or the call, and an argument
   that is the value an EXCEPT changes keeps the position of the parameter
