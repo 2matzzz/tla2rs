@@ -514,6 +514,32 @@ impl ConstEval<'_> {
         Ok(v)
     }
 
+    /// Whether `eval` computes the value of `[D -> R]` or `[f1 : S1, ...]` (e), without
+    /// enumerating it: its parts evaluate to sets, and it has at most ENUM_LIMIT elements
+    pub fn enumerable(&self, e: &Expr, env: &HashMap<String, Value>) -> bool {
+        match e {
+            Expr::FunSet(d, r) => match (self.eval(d, env), self.eval(r, env)) {
+                (Ok(Value::Set(d)), Ok(Value::Set(r))) => (r.len() as f64).powi(d.len() as i32) <= ENUM_LIMIT as f64,
+                _ => false,
+            },
+            Expr::RecSet(fs) => {
+                let mut n = 1f64;
+                for (_, s) in fs {
+                    match self.eval(s, env) {
+                        Ok(Value::Set(s)) => n *= s.len() as f64,
+                        Ok(_) if n == 0.0 => {}
+                        _ => return false,
+                    }
+                    if n > ENUM_LIMIT as f64 {
+                        return false;
+                    }
+                }
+                true
+            }
+            e => self.eval(e, env).is_ok(),
+        }
+    }
+
     pub fn eval(&self, e: &Expr, env: &HashMap<String, Value>) -> R<Value> {
         use Expr::*;
         Ok(match e {

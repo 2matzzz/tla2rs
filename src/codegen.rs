@@ -2457,7 +2457,7 @@ impl<'a> Gen<'a> {
             SetLit(_) | Tuple(_) | RecLit(_) => true,
             // TLC holds a set of functions or records it can enumerate as the set of its elements,
             // which it does not count as built there (`k \notin [{1} -> {1}]`, measured)
-            RecSet(_) | FunSet(..) => self.try_const(e, env).is_none(),
+            RecSet(_) | FunSet(..) => !(self.is_const(e, env) && self.ce.enumerable(e, &env.vals)),
             Call(f, _) => f == "\\X",
             Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.built(a, env) || self.built(b, env),
             _ => false,
