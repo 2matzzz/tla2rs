@@ -18,7 +18,7 @@ Failing == /\ Counts("n") /\ x' = x + 1 /\ 10 \div (3 - x') > 0 /\ Counts("n1")
 Exiting == /\ Counts("n") /\ x < 9 /\ x' \in {x + 2, x + 3, x + 4} /\ (x' = 2 => TLCSet("exit", TRUE)) /\ Counts("n1")
 InitExit == /\ x \in {0, 1, 2} /\ (x = 1 => TLCSet("exit", TRUE)) /\ Counts("i")
 \* A bait invariant: violated once the search is deep enough
-Bait == Level < 3
+Bait == Level < 2
 \* A next-state relation that changes with the level
 Climb == /\ Counts("c") /\ IF Level >= 2 THEN x' = x ELSE x' = x + 1
 Ok == x' <= 4
