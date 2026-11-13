@@ -768,7 +768,7 @@ not measured this way. 2 are gaps, both `norun` (each was run once on a machine 
 | Gap | Model |
 |---|---|
 | `norun`: matches TLC, but tla2rs takes about 32 minutes, nearly all of it rustc on the 65536 initial states written out as one 6 MB constant (`grid \in [Pos -> BOOLEAN]`) | `GameOfLife` |
-| `norun`: tla2rs stops at depth 3 with "no element of S satisfied P" on CHOOSE in Utils' `Max` over an empty set, which TLC never evaluates; generating and building the checker takes about 15 GB | `TLCSailfish1` |
+| `norun`: tla2rs no longer stops at depth 3 (BlockDag's `Linearize(dag, l)` read the definition `dag` the instantiating module writes after it instead of its parameter; `InstShadow`), but it did not finish level 8 of the search in 20 minutes, where TLC takes 37 s with one worker. Code generation writes LET definitions and arguments out at each use (see "Arguments written out at each use"): `Descendants` is called at 641 places in the generated code, and a profile puts the time there. Generating the checker takes 100 s and 17 GB, and each of its 3 builds (sets growing from 8 to 32 elements) about 3.5 minutes | `TLCSailfish1` |
 
 Forms the corpus showed, each with a test in `tests/tlc/`: the CommunityModules (`CmFun`, `CmSet`, `CmSeq`,
 `CmGraph`, `CmBits`, and since then `CmSeqSub`, `CmRel`, `CmDigraph`, `CmBag`, `CmMisc`; see "CommunityModules"),
@@ -784,8 +784,8 @@ inferred when TypeOK's fail (`ExtType`), an infix `&` (`AmpOp`), `name = [Module
 definitions of an instance renamed (`InstLet`), in-place EXCEPT on a function over part of a type (`PartExcept`), model
 values before strings (`ModelStr`), records compared field by field in an array (`RecNest`), up to 128 fairness
 conditions (`ManyFair`), tuples of different lengths or sets held beside model values (`SeqAtom`, `SetAtom`),
-functions over domains of different sizes (`DomGrow`), and TLC's warning that a PlusCal algorithm changed since its
-translation (`PcalSum`).
+functions over domains of different sizes (`DomGrow`), TLC's warning that a PlusCal algorithm changed since its
+translation (`PcalSum`), and a parameter of an instantiated module named like a definition written after it (`InstShadow`).
 
 ### CommunityModules
 

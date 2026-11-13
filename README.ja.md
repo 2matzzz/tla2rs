@@ -149,7 +149,7 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 
 ### 公開されている仕様集との突き合わせ
 
-上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` と CommunityModules のモジュールで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 105 モデルのうち 102 が TLC と一致する（うち 6 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。残る 3 つの差分の理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
+上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` と CommunityModules のモジュールで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 105 モデルのうち 104 が TLC と一致する（うち 6 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。差分として載せている 2 つは、回すと時間がかかりすぎるので毎回は回さない（1 つは一致するけれど 32 分かかる）。その理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
 
 | 例 | 中身 |
 |---|---|
