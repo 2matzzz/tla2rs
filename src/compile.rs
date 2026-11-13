@@ -557,15 +557,16 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
     for b in ["ENABLED", "UNCHANGED", "SUBSET", "UNION", "DOMAIN", "STRING", "FALSE", "TRUE", "BOOLEAN"] {
         order.push(b.into());
     }
-    // (identifiers, dependencies, strings) of a module, from its file next to the spec or from
-    // TLC's standard modules
+    // (identifiers, dependencies, strings) of a module, from its file next to the spec, or from
+    // TLC's standard modules or the CommunityModules' modules as TLC reads them
     let module = |src: Option<&str>, name: &str| -> (Vec<String>, Vec<String>, Vec<String>) {
         let src = match src {
             Some(x) => Some(x.to_string()),
             None => std::fs::read_to_string(dir.join(format!("{name}.tla"))).ok(),
         };
         let Some(src) = src else {
-            return match crate::std_modules::STD_MODULES.iter().find(|m| m.0 == name) {
+            let known = crate::std_modules::STD_MODULES.iter().chain(crate::community_modules::COMMUNITY_MODULES).find(|m| m.0 == name);
+            return match known {
                 Some((_, deps, ids, strs)) => (
                     ids.iter().map(|x| x.to_string()).collect(),
                     deps.iter().map(|x| x.to_string()).collect(),
@@ -574,42 +575,7 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
                 None => (vec![], vec![], vec![]),
             };
         };
-        let toks = crate::lexer::lex_module(&src).unwrap_or_default();
-        let lines: Vec<Vec<char>> = src.lines().map(|l| l.chars().collect()).collect();
-        let (mut ids, mut deps, mut strs) = (vec![], vec![], vec![]);
-        for (i, t) in toks.iter().enumerate() {
-            match &t.tok {
-                // A number as written (`007`, `\b101`), among the identifiers
-                crate::lexer::Tok::Num(_) => {
-                    if let Some(w) = lines.get(t.line - 1).and_then(|l| l.get(t.col..t.end)) {
-                        ids.push(w.iter().collect());
-                    }
-                }
-                crate::lexer::Tok::Ident(w) if w == "MODULE" => {}
-                crate::lexer::Tok::Ident(w) => {
-                    // SANY reads WF_v as WF_ and v
-                    let w = if (w.starts_with("WF_") || w.starts_with("SF_")) && w.len() > 3 { &w[3..] } else { w.as_str() };
-                    ids.push(w.to_string());
-                    let prev = |k: usize| i.checked_sub(k).and_then(|j| toks.get(j)).map(|t| &t.tok);
-                    let after_extends = {
-                        let mut j = i;
-                        loop {
-                            match j.checked_sub(1).and_then(|k| toks.get(k)).map(|t| &t.tok) {
-                                Some(crate::lexer::Tok::Sym(c)) if c == "," => j = j.saturating_sub(2),
-                                Some(crate::lexer::Tok::Ident(k)) if k == "EXTENDS" => break true,
-                                _ => break false,
-                            }
-                        }
-                    };
-                    if (after_extends || matches!(prev(1), Some(crate::lexer::Tok::Ident(k)) if k == "INSTANCE")) && !deps.contains(&w.to_string()) {
-                        deps.push(w.to_string());
-                    }
-                }
-                crate::lexer::Tok::Str(x) => strs.push(x.clone()),
-                _ => {}
-            }
-        }
-        (ids, deps, strs)
+        module_names(&src)
     };
     let root_name = crate::lexer::lex_module(root)
         .ok()
@@ -658,6 +624,48 @@ fn tlc_string_ranks(root: &str, cfg: &Cfg, dir: &std::path::Path) -> HashMap<Str
         ranks.entry(x).or_insert(i);
     }
     ranks
+}
+
+/// The identifiers, keywords and numbers (as written) of a module's text in the order they appear,
+/// the modules it extends or instantiates, and its string literals, as TLC creates them when it
+/// parses the module (see `tlc_string_ranks`)
+fn module_names(src: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let toks = crate::lexer::lex_module(src).unwrap_or_default();
+    let lines: Vec<Vec<char>> = src.lines().map(|l| l.chars().collect()).collect();
+    let (mut ids, mut deps, mut strs) = (vec![], vec![], vec![]);
+    for (i, t) in toks.iter().enumerate() {
+        match &t.tok {
+            // A number as written (`007`, `\b101`), among the identifiers
+            crate::lexer::Tok::Num(_) => {
+                if let Some(w) = lines.get(t.line - 1).and_then(|l| l.get(t.col..t.end)) {
+                    ids.push(w.iter().collect());
+                }
+            }
+            crate::lexer::Tok::Ident(w) if w == "MODULE" => {}
+            crate::lexer::Tok::Ident(w) => {
+                // SANY reads WF_v as WF_ and v
+                let w = if (w.starts_with("WF_") || w.starts_with("SF_")) && w.len() > 3 { &w[3..] } else { w.as_str() };
+                ids.push(w.to_string());
+                let prev = |k: usize| i.checked_sub(k).and_then(|j| toks.get(j)).map(|t| &t.tok);
+                let after_extends = {
+                    let mut j = i;
+                    loop {
+                        match j.checked_sub(1).and_then(|k| toks.get(k)).map(|t| &t.tok) {
+                            Some(crate::lexer::Tok::Sym(c)) if c == "," => j = j.saturating_sub(2),
+                            Some(crate::lexer::Tok::Ident(k)) if k == "EXTENDS" => break true,
+                            _ => break false,
+                        }
+                    }
+                };
+                if (after_extends || matches!(prev(1), Some(crate::lexer::Tok::Ident(k)) if k == "INSTANCE")) && !deps.contains(&w.to_string()) {
+                    deps.push(w.to_string());
+                }
+            }
+            crate::lexer::Tok::Str(x) => strs.push(x.clone()),
+            _ => {}
+        }
+    }
+    (ids, deps, strs)
 }
 
 /// RealTime: Reals (for TLC, Integers) and the variable `now`. TLC cannot check RTBound and RTnow
@@ -2118,6 +2126,16 @@ impl SpecWalk {
     }
 }
 
+/// Whether TLC prints a function over strings that has `s` in its domain as a record: it does
+/// when every string of the domain is an identifier as SANY reads one (letters, digits and `_`
+/// with at least one letter, and not `WF_` or `SF_` followed by more), and otherwise prints the
+/// function as `("a-b" :> 1 @@ ...)` (measured on TLC 2.19; `tests/tlc/StrFieldName`)
+pub fn field_name(s: &str) -> bool {
+    s.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && s.chars().any(|c| c.is_alphabetic())
+        && !((s.starts_with("WF_") || s.starts_with("SF_")) && s.len() > 3)
+}
+
 pub fn show_value(atoms: &Atoms, v: &Value) -> String {
     match v {
         Value::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
@@ -2129,8 +2147,8 @@ pub fn show_value(atoms: &Atoms, v: &Value) -> String {
             let fs = crate::types::sorted_fields(m.iter().map(|(k, x)| (k.clone(), x)).collect());
             format!("[{}]", fs.iter().map(|(k, x)| format!("{k} |-> {}", show_value(atoms, x))).collect::<Vec<_>>().join(", "))
         }
-        // A function over strings prints as a record
-        Value::Fun(m) if m.keys().all(|k| matches!(k, Value::Atom(a) if !atoms.is_model(*a))) => format!(
+        // A function over strings prints as a record when they are all field names
+        Value::Fun(m) if m.keys().all(|k| matches!(k, Value::Atom(a) if !atoms.is_model(*a) && field_name(&atoms.name(*a)))) => format!(
             "[{}]",
             m.iter()
                 .map(|(k, x)| format!("{} |-> {}", match k { Value::Atom(a) => atoms.name(*a), _ => unreachable!() }, show_value(atoms, x)))

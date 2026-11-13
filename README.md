@@ -155,24 +155,27 @@ memory.
   `UndirectedGraphs` (but `Path`, `SimplePath`, `AreConnectedIn`, `ConnectedComponents` and `IsStronglyConnected`,
   which TLC 2.19 cannot evaluate either; see below), `Graphs` (but the same operators over paths and
   `IsTreeWithRoot`), `Relation`, `BagsExt`, `Bitwise`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals`,
-  `VectorClocks`, `Quorum` and `HTML`, and what TLC 2.19 evaluates of `Json` and `IOUtils`: `ToJson`, `ToJsonArray`,
+  `VectorClocks`, `Quorum`, `HTML` and `SVG` (but `NodesOfDirectedMultiGraph` and `SVGSerialize`, on whose
+  definitions TLC 2.19 stops), and what TLC 2.19 evaluates of `Json` and `IOUtils`: `ToJson`, `ToJsonArray`,
   `ToJsonObject` and `zeroPadN` on constants only (they build strings by recursion, which a checker cannot do while
   it runs, so they are refused on values from the state), and `JsonSerialize`, `ndJsonSerialize` and `IOSerialize`,
   which are TRUE in the modules' definitions and write no file. Their operators that read files, run commands or read
   the environment (`JsonDeserialize`, `IOExec`, `IOEnv`, `atoi` and the like) are refused, with the reason TLC 2.19
   stops on their definitions. HTML's operators evaluate at once in the constant definitions and ASSUMEs, and compile
   quickly in Init, the actions and the invariants too: a LET definition or an argument is computed once, where it is
-  first used, as TLC computes it (see CLAUDE.md, "Arguments written out at each use"). Not provided: `CSV` and
-  `CBOR`, which read or write files, `ShiViz` and `DifferentialEquations`, whose definitions TLC 2.19 cannot
-  evaluate, and `SVG`, which no configuration compares with TLC yet (see CLAUDE.md, "CommunityModules").
+  first used, as TLC computes it (see CLAUDE.md, "Arguments written out at each use"). Not provided: `CSV` and `CBOR`,
+  which read or write files, and `ShiViz` and `DifferentialEquations`, whose definitions TLC 2.19 cannot evaluate (see
+  CLAUDE.md, "CommunityModules").
   TLC 2.19 cannot load the Java overrides in the CommunityModules jar, so it evaluates the modules' TLA+
   definitions, and tla2rs's give the same values (what CHOOSE picks, the order a fold takes elements in) and the
   same error (the position TLC gives for the CASE of `Interleave` in `SequencesExt` when none of its conditions
-  holds). An operator not provided is refused where it is used
+  holds). Strings equal to the names and strings of these modules are ordered as TLC orders them, which creates
+  them when it parses the release's modules. An operator not provided is refused where it is used
 - Records are ordered as TLC orders them (by their number of fields first), model values come before strings, and
   `Print` / `PrintT` break a value wider than 80 columns over lines, as TLC does
 - Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),
-  and functions over strings print as records. ToString of a value from the state interns the string of every value
+  and functions over strings print as records when every string of the domain is an identifier, and as
+  `("a-b" :> 1 @@ ...)` otherwise, as in TLC. ToString of a value from the state interns the string of every value
   of its type at compile time, so the type must have at most as many values as the 16-bit string ids leave room for
   (65536 strings and model values in all). ToString of a record whose fields the spec writes in another order than
   TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends

@@ -448,6 +448,15 @@ pub struct ConstEval<'a> {
 }
 
 impl ConstEval<'_> {
+    /// The entries of a function value, also of a tuple or a record (the function over strings it
+    /// is, its names numbered in TLC's order of names as for DOMAIN)
+    fn entries(&self, v: &Value) -> Option<BTreeMap<Value, Value>> {
+        let Value::Rec(m) = v else { return as_fun(v) };
+        let mut ks: Vec<&String> = m.keys().collect();
+        ks.sort_by(|a, b| crate::types::field_cmp(a, b));
+        Some(ks.into_iter().map(|k| (Value::Atom(self.atoms.intern(false, k)), m[k].clone())).collect())
+    }
+
     /// How TLC prints `f` when it is a function over a set TLC cannot enumerate (see
     /// `codegen::lazy_fun_string`), else None
     fn lazy_fun_shown(&self, f: &Expr, env: &HashMap<String, Value>) -> Option<String> {
@@ -595,9 +604,9 @@ impl ConstEval<'_> {
                         }
                         fun_value(a)
                     }
-                    (a, b) if as_fun(&a).is_some() && as_fun(&b).is_some() => {
-                        let mut a = as_fun(&a).unwrap();
-                        for (k, v) in as_fun(&b).unwrap() {
+                    (a, b) if self.entries(&a).is_some() && self.entries(&b).is_some() => {
+                        let mut a = self.entries(&a).unwrap();
+                        for (k, v) in self.entries(&b).unwrap() {
                             a.entry(k).or_insert(v);
                         }
                         fun_value(a)

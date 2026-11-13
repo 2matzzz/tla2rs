@@ -85,13 +85,17 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 `src/community.rs` provides modules of the CommunityModules (`Folds`, `Functions`, `FiniteSetsExt`,
 `SequencesExt`, `UndirectedGraphs`, `Bitwise`, `Relation`, `BagsExt`, `Graphs`, `Combinatorics`, `Statistics`,
-`GraphViz`, `DyadicRationals`, `VectorClocks`, `Quorum`, and parts of `Json` and `IOUtils`) for specs that extend
-or instantiate them. Their definitions are written for tla2rs from each operator's documented meaning and from TLC
+`GraphViz`, `DyadicRationals`, `VectorClocks`, `Quorum`, `HTML`, `SVG`, and parts of `Json` and `IOUtils`) for
+specs that extend or instantiate them. Their definitions are written for tla2rs from each operator's documented meaning and from TLC
 2.19's measured results on them; what is taken from the modules is their interface (the names each module exports,
 in order, with their parameters, and what it extends), so that SANY's context, and the order TLC prints variables
 in, come out the same, and the position TLC 2.19 reports for a CASE of `SequencesExt` that has no true condition
-(measured). No text of the modules and no Java code of the release is copied. Source:
-https://github.com/tlaplus/CommunityModules
+(measured). No other text of the modules and no Java code of the release is copied.
+
+`src/community_modules.rs` lists, for each of those modules as the release (202611060952) ships it, the modules it
+reads, its identifiers, keywords and numbers in the order they first appear, and its strings, so that tla2rs orders
+strings as TLC does when it parses the release's modules. It is generated from those module files; nothing else of
+their text is copied. Source: https://github.com/tlaplus/CommunityModules
 
 ```
 MIT License
