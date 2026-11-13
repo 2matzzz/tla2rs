@@ -593,9 +593,9 @@ The checker follows this when there is no tableau, no VIEW or SYMMETRY, no model
 predicates and no `-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's `args`
 choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own, not
 TLC's", with the reason). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
-after `MATCH` (`lasso confirmed instead: <reason>`). Of the 44 liveness violations of `examples/` and `tests/tlc/`, 20
-follow TLC's search. Of the 24 others, 13 print a lasso equal to TLC's anyway, and 11 differ: 5 need a tableau
-(`Live-SpecNext-Starve`, `Live-SpecSpin-Starve`, `Live-SpecWeak-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`), 4 hold a model value (`Live-SpecNext-EvIdle`, `Live-SpecSpin-EvIdle`,
+after `MATCH` (`lasso confirmed instead: <reason>`). Of the 46 liveness violations of `examples/` and `tests/tlc/`,
+34 print TLC's lasso (most by following TLC's search, some by coincidence), and 12 differ: 6 need a tableau
+(`Live-SpecNext-Starve`, `Live-SpecSpin-Starve`, `Live-SpecWeak-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`), 4 hold a model value (`Live-SpecNext-EvIdle`, `Live-SpecSpin-EvIdle`,
 `Live-SpecWeak-EvIdle`, `Live-SpecSpin-SomeCS`), 1 has a SYMMETRY (`LiveSymTurn`) and `ManyFair-Viol` has more than
 64 predicates.
 
