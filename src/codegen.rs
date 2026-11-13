@@ -4697,14 +4697,18 @@ impl<'a> Gen<'a> {
                 }
                 return self.fun_set_member(x, xt, d, r, s, env);
             }
+            // A function over part of a type: defined exactly on D, which may also have elements
+            // outside the type (the domain of `(a :> 1) @@ (b :> 2)` has the type of a and b only),
+            // so the keys are counted too
             FunSet(d, r) if matches!(xt, Ty::PFun(..)) && !is_sparse_fun(xt) => {
                 let Ty::PFun(dt, ct) = xt else { unreachable!() };
                 let did = self.ty_id(dt)?;
                 let (e, k) = (self.fresh("e"), self.fresh("k"));
                 let in_d = self.gen_member(&k, dt, d, env)?;
                 let in_r = self.gen_member(&e, ct, r, env)?;
+                let (nd, _) = self.gen(&Call("Cardinality".into(), vec![d.as_ref().clone()]), env, None)?;
                 return Ok(format!(
-                    "{{ let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __p == {in_d} && (!__p || {in_r}) }}); __all }}"
+                    "{{ let mut __n = 0i64; let __all = ({x}).iter().enumerate().all(|(__i, &(__p, {e}))| {{ let {k} = dec_{did}(__i as u64); __n += __p as i64; __p == {in_d} && (!__p || {in_r}) }}); __all && __n == ({nd}) as i64 }}"
                 ));
             }
             FunSet(d, r) => return self.fun_set_member(x, xt, d, r, s, env),
