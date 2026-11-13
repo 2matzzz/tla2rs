@@ -193,7 +193,7 @@ check specifications/byihive/VoucherRedeem.tla specifications/byihive/VoucherRed
 check specifications/byihive/VoucherTransfer.tla specifications/byihive/VoucherTransfer.cfg
 skip specifications/byzpaxos/BPConProof.tla specifications/byzpaxos/BPConProof.cfg # needs module FiniteSetTheorems (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/byzpaxos/Consensus.tla specifications/byzpaxos/Consensus.cfg # needs module FiniteSetTheorems (the proof system's library), not in tla2tools.jar nor in the CommunityModules
-skip specifications/byzpaxos/PConProof.tla specifications/byzpaxos/PConProof.cfg # manifest runtime 00:06:00: beyond the 60 s budget
+skip specifications/byzpaxos/PConProof.tla specifications/byzpaxos/PConProof.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/byzpaxos/VoteProof.tla specifications/byzpaxos/VoteProof.cfg # needs module NaturalsInduction (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/c1cs/APc1cs.tla specifications/c1cs/APc1cs.cfg # symbolic mode: checked with Apalache
 skip specifications/c1cs/c1cs.tla specifications/c1cs/c1cs.cfg # TLC 2.19 took 114 s with one worker
@@ -220,9 +220,9 @@ skip specifications/ewd840/EWD840_anim.tla specifications/ewd840/EWD840_anim.cfg
 skip specifications/ewd840/EWD840_json.tla specifications/ewd840/EWD840_json.cfg # needs module TLCExt, not in tla2tools.jar nor in the CommunityModules
 check specifications/ewd840/SyncTerminationDetection.tla specifications/ewd840/SyncTerminationDetection.cfg
 check specifications/ewd998/AsyncTerminationDetection.tla specifications/ewd998/AsyncTerminationDetection.cfg
-skip specifications/ewd998/EWD998.tla specifications/ewd998/EWD998.cfg # manifest runtime 00:50:00: beyond the 60 s budget
-skip specifications/ewd998/EWD998.tla specifications/ewd998/EWD998Small.cfg # manifest runtime 00:05:00: beyond the 60 s budget
-skip specifications/ewd998/EWD998Chan.tla specifications/ewd998/EWD998Chan.cfg # manifest runtime 00:05:00: beyond the 60 s budget
+skip specifications/ewd998/EWD998.tla specifications/ewd998/EWD998.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
+skip specifications/ewd998/EWD998.tla specifications/ewd998/EWD998Small.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
+skip specifications/ewd998/EWD998Chan.tla specifications/ewd998/EWD998Chan.cfg # needs module TLAPS (through EWD998), not in tla2tools.jar nor in the CommunityModules
 skip specifications/ewd998/EWD998ChanID.tla specifications/ewd998/EWD998ChanID.cfg # needs module TLAPS (through EWD998), not in tla2tools.jar nor in the CommunityModules
 skip specifications/ewd998/EWD998ChanID_export.tla specifications/ewd998/EWD998ChanID_export.cfg # needs module TLCExt, not in tla2tools.jar nor in the CommunityModules
 skip specifications/ewd998/EWD998ChanID_shiviz.tla specifications/ewd998/EWD998ChanID_shiviz.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")

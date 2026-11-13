@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 797 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 799 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -118,8 +118,8 @@ When a value outgrows its capacity (`capacity_exceeded` in the runtime, from `SS
 `seq_too_long`) and tla2rs runs the checker, the checker exits at once with 70 (sets) or 71 (sequences); tla2rs
 (`main.rs`) prints `tla2rs: a set grew beyond N elements; checking again from the start with room for M`, compiles
 with that capacity, builds (the build cache applies) and runs again from the start. M is twice N the first time a kind
-grows and four times N after that (a value that outgrew its capacity twice is usually far beyond it, and each build
-costs seconds), and at least what the value needs, which the checker writes to the file `TLA2RS_NEED` names: one more
+grows, four times N the second, eight times the third and so on (a value that keeps outgrowing its capacity is
+usually far beyond it, and each build costs seconds), and at least what the value needs, which the checker writes to the file `TLA2RS_NEED` names: one more
 than N, or the size of a whole union or concatenation. `TLA2RS_GROW` tells the
 checker which kinds may still grow (both stop at 65535, `types::MAX_CAP`); run directly, or at the maximum, the
 checker reports an evaluation error as before. Output before the line is repeated by the next run, so
@@ -135,9 +135,10 @@ Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and th
 | `MCCheckpointCoordinationFailure`, `ReadersWriters` `MC`, `AllocatorImplementation`, `AllocatorRefinement`, `SchedulingAllocator` | `-seqcap` 8, 6, 6, 6, 3 | No rebuild: sequences start at 8 |
 | `MCDisruptor_MPMC`, `-liveliness`, `MCDisruptor_SPMC` | `-seqcap 10` | 1 rebuild (16) |
 | `SlidingPuzzles` | `-setcap 64` | No rebuild: Init assigns a constant set of 10 |
-| `SimplifiedFastPaxos` `Paxos` | `-setcap 1024` | 5 rebuilds (256; its message set holds more than 128): about 30 s in all, but the search takes 0.5 s instead of 2.1 s with 1024 |
+| `SimplifiedFastPaxos` `Paxos` | `-setcap 1024` | 3 rebuilds (512; its message set holds more than 128): 14 s in all, the search 0.7 s (2.1 s with 1024) |
+| `SimplifiedFastPaxos` `FastPaxos` (skipped in the corpus) | | 3 rebuilds (512): 32 s in all with one worker (four builds of 7 s, the search 4.5 s), TLC 37 s; twice and then four times each time, it took 4 rebuilds to 1024 and 39 s |
 | `tests/tlc/SubBags` | `-setcap 32` | 1 rebuild (16) |
-| `tests/tlc/LongSeq` | `-seqcap 140 -setcap 140` | Sequences settle at 140 (`seqlen.rs`); `DOMAIN q` takes 5 rebuilds (sets of `1..140`, capped at 140) |
+| `tests/tlc/LongSeq` | `-seqcap 140 -setcap 140` | Sequences settle at 140 (`seqlen.rs`); `DOMAIN q` takes 3 rebuilds (sets of `1..140`, capped at 140) |
 | `tests/tlc/SeqCap` | `-seqcap 3` | No rebuild: lengths settle |
 
 Not done, measured: starting SCAP at |T| for `x \subseteq T` in TypeOK with T constant would have raised it for 15
@@ -856,9 +857,9 @@ the gaps it showed are written from scratch, reproducing only the form that fail
 `tests/corpus.txt` lists all 243 models of the corpus's manifests. Selected are the exhaustive searches that TLC 2.19
 finishes with `tla2tools.jar` and the CommunityModules' modules, in 60 s or less with one worker and `-dump dot`
 (measured; the manifest's runtimes are for several workers). Skipped, with the reason on each line: 46 symbolic
-(Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 33 that need a module
+(Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 37 that need a module
 neither in `tla2tools.jar` nor in the CommunityModules (the proof system's library: TLAPS, NaturalsInduction,
-FiniteSetTheorems; TLCExt), 35 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
+FiniteSetTheorems; TLCExt), 31 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
 refuses (an `ALIAS` section), 2 where TLC picks values at random (two TLC runs differed), 5 where TLC 2.19 stops in a
 CommunityModules definition that needs its Java override (IOUtils, and quantifiers over `Seq(S)` in Graphs and
 UndirectedGraphs), and 1 that reads `TLCGet("config")`, which TLC 2.19 does not define. That leaves 106 selected.
@@ -896,7 +897,17 @@ definitions of an instance renamed (`InstLet`), in-place EXCEPT on a function ov
 values before strings (`ModelStr`), records compared field by field in an array (`RecNest`), up to 128 fairness
 conditions (`ManyFair`), tuples of different lengths or sets held beside model values (`SeqAtom`, `SetAtom`),
 functions over domains of different sizes (`DomGrow`), TLC's warning that a PlusCal algorithm changed since its
-translation (`PcalSum`), a parameter of an instantiated module named like a definition written after it (`InstShadow`), and constant sets of many elements that the checker enumerates (`BigSets`, `BigSteps`; see "Large constant sets").
+translation (`PcalSum`), a parameter of an instantiated module named like a definition written after it (`InstShadow`), constant sets of many elements that the checker enumerates (`BigSets`, `BigSteps`; see "Large constant sets"), fairness
+under a constant guard (`\A i, j \in P : i # j => WF_v(A(i, j))`, `FairPairs`), and a pair of a record-or-model value
+and a record against pairs of records (`PairSource`).
+
+Of the models skipped for TLC's run time, measured on a Linux machine with one worker (TLC, then tla2rs with its
+generation and builds), these give the same verdict and state counts as TLC: `MCCheckpointCoordination` 204 s / 9 s,
+`MCKVSSafetySmall` 140 / 6, `MCKVSSafetyMedium` 997 / 33, `MCReachable` 77 / 10, `ElevatorSafetyMedium` 688 / 43,
+`ElevatorSafetyLarge` 2266 / 135, `ElevatorLivenessLarge` 1973 / 6, `MCNanoMedium` 19 / 8, `FastPaxos` 37 / 32,
+`SlushMedium` 242 / 20, `MCInnerSerial` 459 / 23, `aba_asyn_byz` 1238 / 42, `bcastFolklore` 3476 / 141, `bosco` 576 /
+6, `cf1s_folklore` 185 / 5, `DijkstraMutex` `Safety-4-processors` 418 / 19 and `PaxosCommit` 148 / 132. They stay
+skipped, since TLC's run time is what keeps them out of `corpus.sh`.
 
 ### CommunityModules
 
