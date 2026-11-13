@@ -1050,14 +1050,16 @@ impl<'a> Gen<'a> {
         if enabled {
             sig += "s: &State, ";
         }
+        // Arguments are passed by reference: every value type is Copy, and a set held as an array
+        // or a state's variables can be kilobytes, copied at each call and each level of recursion
         for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
-            env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
-            write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+            env.locals.insert(x.clone(), (format!("(*a{k})"), t.clone()));
+            write!(sig, "a{k}: &{}, ", t.repr()).unwrap();
         }
         for (k, (x, t)) in primes.iter().zip(&tys[names.len()..]).enumerate() {
             let a = format!("a{}", names.len() + k);
-            env.primed.insert(x.clone(), (a.clone(), t.clone()));
-            write!(sig, "{a}: {}, ", t.repr()).unwrap();
+            env.primed.insert(x.clone(), (format!("(*{a})"), t.clone()));
+            write!(sig, "{a}: &{}, ", t.repr()).unwrap();
         }
         let mut last_err = String::new();
         // The type of a call not resolved yet: a body that iterates over the result of its
@@ -3847,7 +3849,8 @@ impl<'a> Gen<'a> {
                     tys.push(vt);
                 }
                 let (name, ret) = self.rec_fn(*i, &rd, tys, &reads, &primes, enabled)?;
-                (format!("{name}({state_arg}{})", codes.join(", ")), ret)
+                let args: Vec<String> = codes.iter().map(|c| format!("&({c})")).collect();
+                (format!("{name}({state_arg}{})", args.join(", ")), ret)
             }
             // [A]_v is A \/ UNCHANGED v
             BoxAction(a, v) => return self.gen(&Or(vec![a.as_ref().clone(), Un(UOp::Unchanged, v.clone())]), env, want),
