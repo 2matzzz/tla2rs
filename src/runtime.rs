@@ -424,7 +424,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
         if let Err(i) = self.slice().binary_search(&x) {
             let n = self.len as usize;
             if n == N {
-                capacity_exceeded(CAP_SET, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
+                capacity_exceeded(CAP_SET, N + 1, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
             }
             self.items.copy_within(i..n, i + 1);
             self.items[i] = x;
@@ -443,6 +443,12 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
     // The other operand by reference: a set held as an array can be kilobytes
     fn union(self, o: &Self) -> Self {
         let mut r = self;
+        if self.len as usize + o.len as usize > N {
+            let need = self.len as usize + o.iter().filter(|x| !self.contains(x)).count();
+            if need > N {
+                capacity_exceeded(CAP_SET, need, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
+            }
+        }
         for x in o.iter() {
             r.insert(x);
         }
@@ -487,7 +493,7 @@ impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize>
             Err(i) => {
                 let n = self.len as usize;
                 if n == N {
-                    capacity_exceeded(CAP_SET, format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
+                    capacity_exceeded(CAP_SET, N + 1, format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
                 }
                 self.items.copy_within(i..n, i + 1);
                 self.items[i] = (k, v);
@@ -525,13 +531,18 @@ const CAP_EXIT: i32 = 70;
 /// was built with. TLC has no such bound, so this is not an error of the spec: when tla2rs runs the
 /// checker, it sets TLA2RS_GROW to the kinds it can raise (`s` for sets, `q` for sequences), and the
 /// checker then exits at once with CAP_EXIT + kind so that tla2rs builds it again with more room and
-/// checks from the start. Otherwise (the checker run directly, or the capacity at its maximum) it is
-/// an evaluation error.
+/// checks from the start. `need` is how many elements the value needs, at least: one more than the
+/// capacity, or all of a union's or a concatenation's; it is written to the file TLA2RS_NEED names,
+/// so that tla2rs builds with room for it at once. Otherwise (the checker run directly, or the
+/// capacity at its maximum) it is an evaluation error.
 #[cold]
-fn capacity_exceeded(kind: u8, msg: String) -> ! {
+fn capacity_exceeded(kind: u8, need: usize, msg: String) -> ! {
     let letter = if kind == CAP_SET { 's' } else { 'q' };
     if std::env::var("TLA2RS_GROW").is_ok_and(|g| g.contains(letter)) {
         use std::io::Write;
+        if let Some(f) = std::env::var_os("TLA2RS_NEED") {
+            let _ = std::fs::write(f, format!("{need}\n"));
+        }
         let _ = std::io::stdout().flush();
         std::process::exit(CAP_EXIT + kind as i32);
     }

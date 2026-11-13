@@ -8,7 +8,7 @@ It has no crate dependencies.
 - `cargo build --release` builds the compiler (`target/release/tla2rs`)
 - `target/release/tla2rs Spec.tla [-config X.cfg] [-deadlock] [-workers N] [-memlimit MB] [-notrace] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR] [--emit-only] [-o DIR]`
   - `-setcap` / `-seqcap` only set where the capacities of sets held as arrays and of sequences start; a value that
-    outgrows one makes tla2rs build the checker again with twice the room (see "Capacities")
+    outgrows one makes tla2rs build the checker again with more room (see "Capacities")
   - The generated crate goes to `<spec dir>/.tla2rs/<cfg name>/` by default; it is built with
     `cargo build --release --offline` and then run
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, `-dumpgraph`, `-lassocheck` and
@@ -116,8 +116,11 @@ fixed-size arrays, so that states stay `Copy` and pack at known widths; TLC has 
 
 When a value outgrows its capacity (`capacity_exceeded` in the runtime, from `SSet::insert`, `SSet::put` and
 `seq_too_long`) and tla2rs runs the checker, the checker exits at once with 70 (sets) or 71 (sequences); tla2rs
-(`main.rs`) prints `tla2rs: a set grew beyond N elements; checking again from the start with room for 2N`, compiles
-with that capacity doubled, builds (the build cache applies) and runs again from the start. `TLA2RS_GROW` tells the
+(`main.rs`) prints `tla2rs: a set grew beyond N elements; checking again from the start with room for M`, compiles
+with that capacity, builds (the build cache applies) and runs again from the start. M is twice N the first time a kind
+grows and four times N after that (a value that outgrew its capacity twice is usually far beyond it, and each build
+costs seconds), and at least what the value needs, which the checker writes to the file `TLA2RS_NEED` names: one more
+than N, or the size of a whole union or concatenation. `TLA2RS_GROW` tells the
 checker which kinds may still grow (both stop at 65535, `types::MAX_CAP`); run directly, or at the maximum, the
 checker reports an evaluation error as before. Output before the line is repeated by the next run, so
 `crosscheck.sh` compares only what follows the last such line, and says how many rebuilds there were. A spec that

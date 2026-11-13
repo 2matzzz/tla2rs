@@ -112,17 +112,7 @@ impl Ord for Value {
             (Fun(a), Fun(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
             // As TLC: by the number of fields, then name and value pair by pair, in TLC's order of
             // field names
-            (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| {
-                let fa = crate::types::sorted_fields(a.iter().map(|(k, v)| (k.clone(), v)).collect());
-                let fb = crate::types::sorted_fields(b.iter().map(|(k, v)| (k.clone(), v)).collect());
-                for ((ka, va), (kb, vb)) in fa.iter().zip(&fb) {
-                    let c = crate::types::field_cmp(ka, kb).then_with(|| va.cmp(vb));
-                    if c.is_ne() {
-                        return c;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            }),
+            (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| crate::types::rec_cmp(a, b)),
             (Tuple(a), Tuple(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
             _ => self.rank().cmp(&o.rank()),
         }
@@ -524,6 +514,32 @@ impl ConstEval<'_> {
         Ok(v)
     }
 
+    /// Whether `eval` computes the value of `[D -> R]` or `[f1 : S1, ...]` (e), without
+    /// enumerating it: its parts evaluate to sets, and it has at most ENUM_LIMIT elements
+    pub fn enumerable(&self, e: &Expr, env: &HashMap<String, Value>) -> bool {
+        match e {
+            Expr::FunSet(d, r) => match (self.eval(d, env), self.eval(r, env)) {
+                (Ok(Value::Set(d)), Ok(Value::Set(r))) => (r.len() as f64).powi(d.len() as i32) <= ENUM_LIMIT as f64,
+                _ => false,
+            },
+            Expr::RecSet(fs) => {
+                let mut n = 1f64;
+                for (_, s) in fs {
+                    match self.eval(s, env) {
+                        Ok(Value::Set(s)) => n *= s.len() as f64,
+                        Ok(_) if n == 0.0 => {}
+                        _ => return false,
+                    }
+                    if n > ENUM_LIMIT as f64 {
+                        return false;
+                    }
+                }
+                true
+            }
+            e => self.eval(e, env).is_ok(),
+        }
+    }
+
     pub fn eval(&self, e: &Expr, env: &HashMap<String, Value>) -> R<Value> {
         use Expr::*;
         Ok(match e {
@@ -734,8 +750,8 @@ impl ConstEval<'_> {
                         return Err(msg);
                     }
                     let mut m: BTreeMap<Value, Value> = BTreeMap::new();
+                    let mut env2 = env.clone();
                     for (k, c) in self.bag(b, env)? {
-                        let mut env2 = env.clone();
                         env2.insert(ps[0].clone(), k);
                         let y = self.eval(body, &env2)?;
                         let n = m.get(&y).map_or(Ok(0), |v| v.as_int())? + c.as_int()?;
@@ -799,8 +815,8 @@ impl ConstEval<'_> {
                 ("SelectSeq", [q, Lambda(ps, body)]) if ps.len() == 1 => {
                     let t = self.seq(q, env, "SelectSeq")?;
                     let mut out = vec![];
+                    let mut env2 = env.clone();
                     for x in t {
-                        let mut env2 = env.clone();
                         env2.insert(ps[0].clone(), x.clone());
                         if self.eval(body, &env2)?.as_bool()? {
                             out.push(x);
@@ -934,6 +950,22 @@ impl ConstEval<'_> {
                 };
                 Value::Bool(inside == matches!(op, BOp::In))
             }
+            // An integer in lo..hi: compared with the bounds, without building the interval
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(&*shape(set), Bin(BOp::Range, ..)) => {
+                let v = self.eval(x, env)?;
+                let set = shape(set);
+                let Bin(_, lo, hi) = &*set else { unreachable!() };
+                let (lo, hi) = (self.eval(lo, env)?, self.eval(hi, env)?);
+                match (&v, &lo, &hi) {
+                    (Value::Int(i), Value::Int(l), Value::Int(h)) if (*h as i128 - *l as i128) <= ENUM_LIMIT as i128 => {
+                        Value::Bool((l <= i && i <= h) == matches!(op, BOp::In))
+                    }
+                    _ => {
+                        let s = self.bin(BOp::Range, lo, hi)?;
+                        self.bin(*op, v, s)?
+                    }
+                }
+            }
             Bin(op, a, b) => {
                 let a = self.eval(a, env)?;
                 let b = self.eval(b, env)?;
@@ -991,8 +1023,8 @@ impl ConstEval<'_> {
             }
             Choose(x, s, p) => {
                 let s = self.eval(s, env)?;
+                let mut env2 = env.clone();
                 for v in s.as_set()? {
-                    let mut env2 = env.clone();
                     env2.insert(x.clone(), v.clone());
                     if self.eval(p, &env2)?.as_bool()? {
                         return Ok(v.clone());
@@ -1010,15 +1042,18 @@ impl ConstEval<'_> {
             }
             SetFilter(x, s, p) => {
                 let s = self.eval(s, env)?;
-                let mut out = BTreeSet::new();
-                for v in s.as_set()? {
-                    let mut env2 = env.clone();
+                s.as_set()?;
+                let Value::Set(s) = s else { unreachable!() };
+                // The elements kept are in order, so the set is built from them without searching
+                let mut out = vec![];
+                let mut env2 = env.clone();
+                for v in s {
                     env2.insert(x.clone(), v.clone());
                     if self.eval(p, &env2)?.as_bool()? {
-                        out.insert(v.clone());
+                        out.push(v);
                     }
                 }
-                Value::Set(out)
+                Value::Set(out.into_iter().collect())
             }
             SetMap(f, bs) => {
                 let mut out = BTreeSet::new();
@@ -1031,8 +1066,8 @@ impl ConstEval<'_> {
             FunCons(x, s, body) => {
                 let s = self.eval(s, env)?;
                 let mut m = BTreeMap::new();
+                let mut env2 = env.clone();
                 for v in s.as_set()? {
-                    let mut env2 = env.clone();
                     env2.insert(x.clone(), v.clone());
                     m.insert(v.clone(), self.eval(body, &env2)?);
                 }
@@ -1050,8 +1085,14 @@ impl ConstEval<'_> {
                 if r.is_empty() && !d.is_empty() {
                     return Ok(Value::Set(out));
                 }
+                // Over 1..n (the elements of d in order) the functions are tuples (see fun_value)
+                let tuples = d.iter().enumerate().all(|(i, k)| *k == Value::Int(i as i64 + 1));
                 loop {
-                    out.insert(fun_value(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect()));
+                    if tuples {
+                        out.insert(Value::Tuple(idx.iter().map(|&i| r[i].clone()).collect()));
+                    } else {
+                        out.insert(fun_value(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect()));
+                    }
                     let mut k = 0;
                     while k < idx.len() {
                         idx[k] += 1;
@@ -1474,8 +1515,8 @@ impl ConstEval<'_> {
         }
         let (x, s) = &bs[0];
         let s = self.eval(s, env)?;
+        let mut env2 = env.clone();
         for v in s.as_set()? {
-            let mut env2 = env.clone();
             env2.insert(x.clone(), v.clone());
             if !self.each_binding(&bs[1..], &env2, f)? {
                 return Ok(false);

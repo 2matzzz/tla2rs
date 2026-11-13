@@ -14,10 +14,16 @@ thread_local! {
     static PERMS: std::cell::RefCell<HashMap<Ty, std::rc::Rc<Vec<u32>>>> = std::cell::RefCell::new(HashMap::new());
     /// The order in which TLC creates each name (see `compile::tlc_string_ranks`)
     static FIELD_RANKS: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
+    /// The sets of field names `rec_cmp` met last (in name order), each with the positions of its
+    /// names in TLC's order, the latest first
+    static REC_ORDERS: std::cell::RefCell<Vec<(Vec<String>, Vec<u8>)>> = const { std::cell::RefCell::new(vec![]) };
 }
+
+const REC_ORDERS_MAX: usize = 8;
 
 pub fn set_field_ranks(r: HashMap<String, usize>) {
     FIELD_RANKS.with(|f| *f.borrow_mut() = r);
+    REC_ORDERS.with(|o| o.borrow_mut().clear());
 }
 
 /// The order of record fields. TLC keeps a record's fields sorted by when it first created each
@@ -69,6 +75,61 @@ pub fn disordered_error(a: &str, b: &str) -> String {
         "ToString of a record with fields `{a}` and `{b}`, which the spec writes as `{a}` before `{b}`: TLC prints a record in the order it was written \
          until it first compares it, then as `{b}` before `{a}`, so the string depends on when TLC compared it. Write `{b}` before `{a}` to make it definite"
     )
+}
+
+/// Compares two records of as many fields as TLC does: name and value pair by pair, in TLC's
+/// order of field names (`field_cmp`). Records of the same fields (the usual case) differ first
+/// at the first field in that order whose values differ; the order of a set of names is kept in
+/// REC_ORDERS, so that comparing such records reads no rank
+pub fn rec_cmp<V: Ord>(a: &std::collections::BTreeMap<String, V>, b: &std::collections::BTreeMap<String, V>) -> std::cmp::Ordering {
+    const MAX: usize = 16;
+    if a.len() <= MAX && a.keys().eq(b.keys()) {
+        let mut order = [0u8; MAX];
+        REC_ORDERS.with(|o| {
+            let mut o = o.borrow_mut();
+            let i = match o.iter().position(|(names, _)| a.keys().eq(names.iter())) {
+                Some(i) => i,
+                None => {
+                    let names: Vec<String> = a.keys().cloned().collect();
+                    let mut idx: Vec<u8> = (0..names.len() as u8).collect();
+                    idx.sort_by(|&x, &y| field_cmp(&names[x as usize], &names[y as usize]));
+                    o.truncate(REC_ORDERS_MAX - 1);
+                    o.insert(0, (names, idx));
+                    0
+                }
+            };
+            order[..a.len()].copy_from_slice(&o[i].1);
+        });
+        let mut va: [Option<&V>; MAX] = [None; MAX];
+        let mut vb: [Option<&V>; MAX] = [None; MAX];
+        for (i, (x, y)) in a.values().zip(b.values()).enumerate() {
+            va[i] = Some(x);
+            vb[i] = Some(y);
+        }
+        for &i in &order[..a.len()] {
+            let c = va[i as usize].cmp(&vb[i as usize]);
+            if c.is_ne() {
+                return c;
+            }
+        }
+        return std::cmp::Ordering::Equal;
+    }
+    fn ranked<'a, V>(f: &HashMap<String, usize>, m: &'a std::collections::BTreeMap<String, V>) -> Vec<(usize, &'a str, &'a V)> {
+        m.iter().map(|(k, v)| (f.get(k.as_str()).copied().unwrap_or(usize::MAX), k.as_str(), v)).collect()
+    }
+    let (mut fa, mut fb) = FIELD_RANKS.with(|f| {
+        let f = f.borrow();
+        (ranked(&f, a), ranked(&f, b))
+    });
+    fa.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    fb.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    for ((ra, ka, va), (rb, kb, vb)) in fa.iter().zip(&fb) {
+        let c = (ra, ka).cmp(&(rb, kb)).then_with(|| va.cmp(vb));
+        if c.is_ne() {
+            return c;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// A record's fields in TLC's order
