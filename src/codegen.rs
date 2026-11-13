@@ -2842,7 +2842,8 @@ impl<'a> Gen<'a> {
                         _ => Ty::Int(-BIG, BIG),
                     };
                     (
-                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ arith_error(format!(\"{{}}^{{}}: the exponent must be a natural number\", __a, __b)) }} match __a.checked_pow(__b as u32) {{ Some(v) => v, None => arith_error(format!(\"{{}}^{{}} overflows\", __a, __b)) }} }}"),
+                        // TLC's messages (Naturals.Expt), and its overflow beyond 32 bits
+                        format!("{{ let (__a, __b): (i64, i64) = ({ac}, {bc}); if __b < 0 {{ arith_error(format!(\"The second argument of ^ should be a natural number, but instead it is:\\n{{}}\", __b)) }} if __b == 0 && __a == 0 {{ arith_error(\"0^0 is undefined.\".to_string()) }} match u32::try_from(__b).ok().and_then(|b| __a.checked_pow(b)).filter(|v| i32::try_from(*v).is_ok()) {{ Some(v) => v, None => arith_error(format!(\"Overflow when computing {{}}^{{}}\", __a, __b)) }} }}"),
                         t,
                     )
                 }
