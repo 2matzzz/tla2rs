@@ -1,0 +1,10 @@
+key 279bce1bb1f154f8b5fd859afc6f270d8bc58e1d6a7e3d7df6e287e60c8e9ac2
+tlc Version 2.19
+rc 10
+Evaluating assumption line 8, col 8 to line 8, col 87 of module BigConstErr failed
+
+trace 0
+states incomplete
+edges incomplete
+messages 2 a764dfc737aa6fe2cc0babca7b250d8e12abcee3cf2b6f787bd490c7f9c42da8
+errors 1 bcace6d4bb239ababd508f08606b8cafcb7437a3cff183f02975790736a61483
