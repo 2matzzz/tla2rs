@@ -6215,7 +6215,9 @@ impl<'a> Gen<'a> {
             if cell {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
-                    write!(lets, "let {id} = std::cell::OnceCell::new(); let {id}f = || -> {} {{ {c} }}; ", t.repr()).unwrap();
+                    // Typed, as a use may be folded away (a comparison decided by the types)
+                    let r = t.repr();
+                    write!(lets, "let {id}: std::cell::OnceCell<{r}> = std::cell::OnceCell::new(); let {id}f = || -> {r} {{ {c} }}; ").unwrap();
                     // Every value type is Copy: read through the reference, so that a use that
                     // only reads a part (a field, an iteration) does not copy the whole value
                     env2.bind(&n, format!("(*{id}.get_or_init(&{id}f))"), t);
