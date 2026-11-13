@@ -49,7 +49,7 @@ skip specifications/FiniteMonotonic/MCReplicatedLog.tla specifications/FiniteMon
 skip specifications/FlashProtocol/APFlashWithMutex.tla specifications/FlashProtocol/APFlashWithMutex.cfg # symbolic mode: checked with Apalache
 check specifications/FlashProtocol/MCFlashWithMutex.tla specifications/FlashProtocol/MCFlashWithMutex.cfg
 check specifications/FlashProtocol/MCFlashWithMutexLive.tla specifications/FlashProtocol/MCFlashWithMutexLive.cfg
-gap specifications/GameOfLife/GameOfLife.tla specifications/GameOfLife/GameOfLife.cfg norun # the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it and was stopped
+gap specifications/GameOfLife/GameOfLife.tla specifications/GameOfLife/GameOfLife.cfg norun # matches TLC, but tla2rs takes about 32 minutes, nearly all of it rustc on the 65536 initial states written out as one 6 MB constant
 skip specifications/GermanProtocol/APGermanCMPWithMutex.tla specifications/GermanProtocol/APGermanCMPWithMutex.cfg # symbolic mode: checked with Apalache
 skip specifications/GermanProtocol/APGermanControl.tla specifications/GermanProtocol/APGermanControl.cfg # symbolic mode: checked with Apalache
 skip specifications/GermanProtocol/APGermanData.tla specifications/GermanProtocol/APGermanData.cfg # symbolic mode: checked with Apalache
@@ -184,7 +184,7 @@ skip specifications/bcastFolklore/bcastFolklore.tla specifications/bcastFolklore
 skip specifications/bosco/APbosco.tla specifications/bosco/APbosco.cfg # symbolic mode: checked with Apalache
 skip specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # manifest runtime 00:03:00: beyond the 60 s budget
 skip specifications/braf/BufferedRandomAccessFile.tla specifications/braf/BufferedRandomAccessFile.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
-skip specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg # TLC 2.19 did not finish in 67 s with one worker (257,103 distinct states by then)
+check specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg
 check specifications/btree/kvstore.tla specifications/btree/kvstore.cfg
 check specifications/byihive/VoucherCancel.tla specifications/byihive/VoucherCancel.cfg
 check specifications/byihive/VoucherIssue.tla specifications/byihive/VoucherIssue.cfg
@@ -200,8 +200,8 @@ skip specifications/c1cs/c1cs.tla specifications/c1cs/c1cs.cfg # TLC 2.19 took 1
 skip specifications/cf1s-folklore/cf1s_folklore.tla specifications/cf1s-folklore/cf1s_folklore.cfg # TLC 2.19 took 113 s with one worker
 skip specifications/chang_roberts/APChangRoberts.tla specifications/chang_roberts/APChangRoberts.cfg # symbolic mode: checked with Apalache
 check specifications/chang_roberts/MCChangRoberts.tla specifications/chang_roberts/MCChangRoberts.cfg
-gap specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg norun # not run against TLC yet; tla2rs alone evaluates its ASSUMEs in well under a second
-gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs was killed by the system (memory) in a corpus run; not run until that is fixed
+check specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg
+gap specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg norun # tla2rs stops at depth 3 on CHOOSE in Utils' Max over an empty set, which TLC never evaluates; generating and building it takes about 15 GB
 skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
 skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget
 check specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg
