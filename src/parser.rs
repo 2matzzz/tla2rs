@@ -1717,6 +1717,9 @@ impl Parser {
                 }
             }
             self.expect("]")?;
+            // Where the value is written, which TLC's warning for a missing argument or field
+            // names (an identifier keeps its own position)
+            let e = if matches!(e, Expr::Ident(..)) { e } else { except_at(&self.span_text(start, e_end - 1), e) };
             return Ok(Expr::Except(e.b(), ups));
         }
         if self.is("->") {

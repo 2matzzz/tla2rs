@@ -366,7 +366,22 @@ impl<'a> Expander<'a> {
             RecCall(i, args) => RecCall(*i, args.iter().map(|a| ex(self, a)).collect::<R<_>>()?),
             Prime(x) => Prime(ex(self, x)?.b()),
             Un(op, x) => Un(*op, ex(self, x)?.b()),
-            Bin(op, a, b) => Bin(*op, ex(self, a)?.b(), ex(self, b)?.b()),
+            Bin(op, a, b) => {
+                let (a2, b2) = (ex(self, a)?, ex(self, b)?);
+                // TLC cannot enumerate a string in `x' \in S` and gives the position of the whole
+                // expression, whose end is that of S's name, lost here when S names a definition
+                let b2 = match (op, a.as_ref(), b.as_ref()) {
+                    (BOp::In, Prime(x), Ident(_, sat)) if sat.known() && matches!(b2.strip(), Str(_)) => match x.as_ref() {
+                        Ident(_, xat) if xat.known() && xat.module == sat.module => {
+                            let whole = Pos { end_line: sat.end_line, end_col: sat.end_col, ..*xat };
+                            at_err(&whole.text(), b2)
+                        }
+                        _ => b2,
+                    },
+                    _ => b2,
+                };
+                Bin(*op, a2.b(), b2.b())
+            }
             And(xs) => And(xs.iter().map(|x| ex(self, x)).collect::<R<_>>()?),
             Or(xs) => Or(xs.iter().map(|x| ex(self, x)).collect::<R<_>>()?),
             If(c, a, b) => If(ex(self, c)?.b(), ex(self, a)?.b(), ex(self, b)?.b()),
@@ -410,7 +425,13 @@ impl<'a> Expander<'a> {
             App(f, x) => App(ex(self, f)?.b(), ex(self, x)?.b()),
             Field(r, k) => Field(ex(self, r)?.b(), k.clone()),
             Except(f, ups) => {
-                let f2 = ex(self, f)?;
+                let mut f2 = ex(self, f)?;
+                // A name replaced by what it stands for: keep where it is written (see EXCEPT_AT)
+                if let Ident(_, at) = f.as_ref() {
+                    if at.known() && !matches!(f2, Ident(..)) {
+                        f2 = except_at(&at.text(), f2);
+                    }
+                }
                 let mut out = vec![];
                 for (path, v) in ups {
                     let mut path2: Vec<Path> = path

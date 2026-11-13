@@ -616,8 +616,51 @@ thread_local! {
 fn tlc_print(line: String) {
     CAPTURE.with(|c| match &mut *c.borrow_mut() {
         Some(c) => c.lines.push((c.pushes, c.acts, line)),
-        None => println!("{line}"),
+        None => put_line(&line),
     })
+}
+
+/// What starts a held line that is one of TLC's warnings (see `put_line`)
+const WARNING_MARK: char = '\u{2}';
+
+/// TLC's warnings printed so far, as printed (TLC prints a warning only when it has not printed
+/// that text before, and the first warning of a run carries the note `NOWARNING`), and whether
+/// one was printed. Starts from the warnings among STARTUP_PRINTS
+static WARNED: std::sync::Mutex<Option<(std::collections::HashSet<String>, bool)>> = std::sync::Mutex::new(None);
+
+const NOWARNING: &str = "(Use the -nowarning option to disable this warning.)";
+
+/// Prints a line printed by the spec, or a warning (marked with WARNING_MARK) as TLC does
+fn put_line(l: &str) {
+    let Some(w) = l.strip_prefix(WARNING_MARK) else {
+        println!("{l}");
+        return;
+    };
+    let mut g = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, any) = g.get_or_insert_with(|| {
+        let mut seen = std::collections::HashSet::new();
+        let mut any = false;
+        for (i, l) in STARTUP_PRINTS.iter().enumerate() {
+            if l.starts_with("Warning: ") {
+                let noted = STARTUP_PRINTS.get(i + 1) == Some(&NOWARNING);
+                seen.insert(if noted { format!("{l}\n{NOWARNING}") } else { l.to_string() });
+                any = true;
+            }
+        }
+        (seen, any)
+    });
+    let text = if *any { w.to_string() } else { format!("{w}\n{NOWARNING}") };
+    *any = true;
+    if seen.insert(text.clone()) {
+        println!("{text}");
+    }
+}
+
+/// TLC's warning for an EXCEPT that names an argument or field the value at `at` does not have
+/// (the EXCEPT then changes nothing there)
+#[cold]
+fn except_warning(at: &str) {
+    tlc_print(format!("{WARNING_MARK}Warning: The EXCEPT was applied to non-existing fields of the value at\n{at}"));
 }
 
 /// A state pushed by `init` or `next`
@@ -702,7 +745,7 @@ impl Held {
             if *p >= n {
                 break;
             }
-            println!("{l}");
+            put_line(l);
             self.next += 1;
         }
         while let Some(&(p, a)) = self.cap.made.get(self.next_made) {
@@ -830,7 +873,7 @@ fn step_prints(s: &State, t: &State) {
     let last = held.cap.push_acts[j];
     for (_, a, l) in &held.cap.lines {
         if *a <= last {
-            println!("{l}");
+            put_line(l);
         }
     }
 }
@@ -1383,25 +1426,10 @@ fn expand_one_succ(
         held.flush(u32::MAX);
         raise_next(p);
     }
-    // After the successors, in TLC's order: the action atoms and fairness steps of each step
-    // (including stuttering), then the state atoms of this state that are not in the tableau and
-    // which fair actions are enabled, then the tableau's state atoms of the new successors
+    // After the successors, in TLC's order: which fair actions are enabled in this state and its
+    // state atoms that are not in the tableau, then the fairness steps and action atoms of each
+    // step (including stuttering), then the tableau's state atoms of the new successors
     if LIVENESS {
-        for j in 0..c.live.pend.len() {
-            let t = &buf[c.live.pend[j]].0;
-            match step_bits(&s, t) {
-                Ok((a, f)) => {
-                    let e = &mut c.live.edges[first_edge + j];
-                    e.3 = a;
-                    e.4 = f;
-                }
-                Err(m) => return Some(Found::Live(m)),
-            }
-        }
-        let stut = match step_bits(&s, &s) {
-            Ok((a, _)) => a,
-            Err(m) => return Some(Found::Live(m)),
-        };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut en: FMask = 0;
             for (i, (_, enabled, _)) in FAIRS.iter().enumerate() {
@@ -1417,6 +1445,21 @@ fn expand_one_succ(
         };
         let cbits = match state_bits(&s, !SATOMS_TABLEAU) {
             Ok(b) => b,
+            Err(m) => return Some(Found::Live(m)),
+        };
+        for j in 0..c.live.pend.len() {
+            let t = &buf[c.live.pend[j]].0;
+            match step_bits(&s, t) {
+                Ok((a, f)) => {
+                    let e = &mut c.live.edges[first_edge + j];
+                    e.3 = a;
+                    e.4 = f;
+                }
+                Err(m) => return Some(Found::Live(m)),
+            }
+        }
+        let stut = match step_bits(&s, &s) {
+            Ok((a, _)) => a,
             Err(m) => return Some(Found::Live(m)),
         };
         c.live.en.push((head as u32, en, stut, cbits));
@@ -1447,18 +1490,19 @@ fn state_bits(s: &State, mask: u64) -> Result<u64, SMsg> {
 }
 
 /// The action atoms that hold on the step s -> t, and the fairness conditions whose <<A>>_v it is
+/// (evaluated first, as TLC does)
 fn step_bits(s: &State, t: &State) -> Result<(u64, FMask), SMsg> {
     let r = std::panic::catch_unwind(|| {
-        let mut a = 0u64;
-        for (i, f) in AATOMS.iter().enumerate() {
-            if f(s, t) {
-                a |= 1 << i;
-            }
-        }
         let mut st: FMask = 0;
         for (i, (_, _, step)) in FAIRS.iter().enumerate() {
             if step(s, t) {
                 st |= 1 << i;
+            }
+        }
+        let mut a = 0u64;
+        for (i, f) in AATOMS.iter().enumerate() {
+            if f(s, t) {
+                a |= 1 << i;
             }
         }
         (a, st)

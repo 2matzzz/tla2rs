@@ -1206,7 +1206,8 @@ impl<'a> Gen<'a> {
     /// An EXCEPT step `[i]` into a tuple with i not constant: `!p[i] ... = v` becomes
     /// `!p = CASE i = 1 -> [@ EXCEPT ![1] ... = v] [] ... [] OTHER -> @`, since each element of a
     /// tuple may have its own type (an index outside the tuple leaves it unchanged, as in TLC)
-    fn split_dynamic_index(&mut self, t: &Ty, path: &[Path], val: &Expr, env: &Env) -> (Vec<Path>, Expr) {
+    /// `warn` is where the value is written, for TLC's warning about an index outside the tuple
+    fn split_dynamic_index(&mut self, t: &Ty, path: &[Path], val: &Expr, env: &Env, warn: Option<&str>) -> (Vec<Path>, Expr) {
         let mut cur = Some(t.clone());
         for (j, p) in path.iter().enumerate() {
             if let (Path::Idx(i), Some(Ty::Rec(fs))) = (p, &cur) {
@@ -1214,6 +1215,10 @@ impl<'a> Gen<'a> {
                     self.tmp += 1;
                     let at = format!("@dyn{}", self.tmp);
                     let base = Expr::Ident(at.clone(), NOPOS);
+                    let arm_base = match warn {
+                        Some(w) => except_at(w, base.clone()),
+                        None => base.clone(),
+                    };
                     let arms = (1..=fs.len())
                         .map(|k| {
                             let mut inner: Vec<Path> = vec![Path::Idx(Expr::Num(k as i64))];
@@ -1221,13 +1226,17 @@ impl<'a> Gen<'a> {
                             // Within the arm the index is k, which lets constant tests on it pick
                             // the branch meant for this element's type
                             let v = replace_expr(val, i, &Expr::Num(k as i64));
-                            let arm = Expr::Except(base.clone().b(), vec![(inner, v)]);
+                            let arm = Expr::Except(arm_base.clone().b(), vec![(inner, v)]);
                             (Expr::Bin(BOp::Eq, i.clone().b(), Expr::Num(k as i64).b()), Expr::Label("#per-element".into(), vec![], arm.b()))
                         })
                         .collect();
                     let mut outer: Vec<Path> = path[..j].to_vec();
                     outer.push(Path::Field(at));
-                    return (outer, Expr::Case(arms, Some(base.b())));
+                    let other = match warn {
+                        Some(w) => Expr::Label(format!("{EXCEPT_WARN}{w}"), vec![], base.b()),
+                        None => base,
+                    };
+                    return (outer, Expr::Case(arms, Some(other.b())));
                 }
             }
             cur = match (&cur, p) {
@@ -1432,13 +1441,15 @@ impl<'a> Gen<'a> {
     fn lazy_apply(&mut self, f: &Expr, kc: &str, kt: &Ty, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
         match f.strip() {
             Expr::FunCons(v, s, body) => {
+                // Used as a format string in the checker
+                let shown = self.lazy_fun_shown(f, env).unwrap_or_else(|| lazy_fun_text(v, s)).replace('{', "{{").replace('}', "}}");
                 let mem = self.gen_member(kc, kt, s, env)?;
                 let mut env2 = env.clone();
                 env2.locals.insert(v.clone(), (kc.to_string(), kt.clone()));
                 env2.idx.remove(v);
                 let (bc, bt) = self.gen(body, &env2, want)?;
                 let tid = self.ty_id(kt)?;
-                let msg = format!("In applying the function\n{},\nthe first argument is:\n{{}}\nwhich is not in its domain.", lazy_fun_text(v, s));
+                let msg = format!("In applying the function\n{shown},\nthe first argument is:\n{{}}\nwhich is not in its domain.");
                 Ok((format!("{{ if !({mem}) {{ eval_error(format!({msg:?}, fmt_{tid}(&{kc}))) }} {bc} }}"), bt))
             }
             Expr::Except(base, ups) => {
@@ -1467,10 +1478,17 @@ impl<'a> Gen<'a> {
                 // A key outside the domain leaves the function unchanged, as in TLC
                 let dom = self.lazy_fun_domain(f, env).unwrap().clone();
                 let in_dom = self.gen_member(&av, &at, &dom, env)?;
-                let same = format!("{} == {} && {in_dom}", self.coerce(kc.to_string(), kt, &j)?, self.coerce(av.clone(), &at, &j)?);
                 let t = Self::layout(want, join(&vt, &pt)?);
                 let (vc, pc) = (self.coerce(vc, &vt, &t)?, self.coerce(pc, &pt, &t)?);
-                Ok((format!("{{ let {av} = {ac}; if {same} {{ {vc} }} else {{ {pc} }} }}"), t))
+                let same = format!("{} == {}", self.coerce(kc.to_string(), kt, &j)?, self.coerce(av.clone(), &at, &j)?);
+                match except_pos(base) {
+                    // TLC warns about a key outside the domain when it evaluates the EXCEPT
+                    Some(p) => {
+                        let inv = self.fresh("in");
+                        Ok((format!("{{ let {av} = {ac}; let {inv} = {in_dom}; if !{inv} {{ except_warning({p:?}); }} if {same} && {inv} {{ {vc} }} else {{ {pc} }} }}"), t))
+                    }
+                    None => Ok((format!("{{ let {av} = {ac}; if {same} && {in_dom} {{ {vc} }} else {{ {pc} }} }}"), t)),
+                }
             }
             _ => unreachable!(),
         }
@@ -2232,6 +2250,13 @@ impl<'a> Gen<'a> {
     }
 
     fn gen_inner(&mut self, e: &Expr, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
+        // The index of an EXCEPT outside a tuple (see EXCEPT_WARN)
+        if let Expr::Label(n, _, b) = e {
+            if let Some(at) = n.strip_prefix(EXCEPT_WARN) {
+                let (c, t) = self.gen(b, env, want)?;
+                return Ok((format!("{{ except_warning({at:?}); {c} }}"), t));
+            }
+        }
         use Expr::*;
         // A definition of constant level: its value (see is_const)
         if matches!(e, Label(..)) {
@@ -3357,11 +3382,17 @@ impl<'a> Gen<'a> {
                 }
             }
             Except(f, ups) => {
+                // TLC warns about an argument or field the value does not have, naming where the
+                // value is written
+                let warn = match except_pos(f) {
+                    Some(at) => format!(" else {{ except_warning({at:?}); }}"),
+                    None => String::new(),
+                };
                 let (fc, ft0) = self.gen(f, env, want)?;
                 let ups: Vec<(Vec<Path>, Expr)> = ups
                     .iter()
                     .map(|(p, v)| {
-                        let (p, v) = self.split_dynamic_index(&ft0, p, v, env);
+                        let (p, v) = self.split_dynamic_index(&ft0, p, v, env, except_pos(f).as_deref());
                         Ok((self.resolve_path(&ft0, &p, env)?, v))
                     })
                     .collect::<R<_>>()?;
@@ -3474,7 +3505,7 @@ impl<'a> Gen<'a> {
                     if conds.is_empty() {
                         write!(s, "{read_at}{place} = {vc}; ").unwrap();
                     } else {
-                        write!(s, "if {} {{ {read_at}{place} = {vc}; }} ", conds.join(" && ")).unwrap();
+                        write!(s, "if {} {{ {read_at}{place} = {vc}; }}{warn} ", conds.join(" && ")).unwrap();
                     }
                 }
                 (s + &t + " }", ft)
@@ -4729,7 +4760,7 @@ impl<'a> Gen<'a> {
                     // (avoiding a copy out and back in)
                     match rhs.strip() {
                         Except(base, ups) if matches!(base.strip(), Ident(n, _) if *n == v) => {
-                            self.gen_except_into(&place, ups, &t, &env2, out)?;
+                            self.gen_except_into(&place, ups, &t, &env2, except_pos(base), out)?;
                         }
                         _ => match self.gen_set_update(&place, &v, rhs, &t, env) {
                             Some(code) => out.push_str(&code),
@@ -4761,7 +4792,8 @@ impl<'a> Gen<'a> {
                     if let Some(Value::Atom(a)) = self.try_const(s, env) {
                         if !self.atoms.is_model(a) {
                             let when = if env.init { "initial" } else { "next" };
-                            writeln!(out, "eval_error(\"In computing {when} states, the right side of \\\\IN is not enumerable.\".into());").unwrap();
+                            let msg = with_at(&format!("In computing {when} states, the right side of \\IN is not enumerable."), &err_at(s));
+                            writeln!(out, "eval_error({msg:?}.into());").unwrap();
                             return Ok(());
                         }
                     }
@@ -5212,10 +5244,16 @@ impl<'a> Gen<'a> {
         ups: &[(Vec<Path>, Expr)],
         ft: &Ty,
         env: &Env,
+        warn_at: Option<String>,
         out: &mut String,
     ) -> R<()> {
+        // TLC's warning for an argument or field the value does not have (see `Except` in `gen`)
+        let warn = match &warn_at {
+            Some(at) => format!(" else {{ except_warning({at:?}); }}"),
+            None => String::new(),
+        };
         for (path, val) in ups {
-            let (path, val) = self.split_dynamic_index(ft, path, val, env);
+            let (path, val) = self.split_dynamic_index(ft, path, val, env, warn_at.as_deref());
             let val = &val;
             let path = &self.resolve_path(ft, &path, env)?;
             let mut p = place.to_string();
@@ -5301,7 +5339,7 @@ impl<'a> Gen<'a> {
             if conds.is_empty() {
                 writeln!(out, "{read_at}{p} = {vc};").unwrap();
             } else {
-                writeln!(out, "if {} {{ {read_at}{p} = {vc}; }}", conds.join(" && ")).unwrap();
+                writeln!(out, "if {} {{ {read_at}{p} = {vc}; }}{warn}", conds.join(" && ")).unwrap();
             }
         }
         Ok(())

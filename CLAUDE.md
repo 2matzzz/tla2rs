@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 700 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 704 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -567,10 +567,40 @@ How TLC words an evaluation error depends on where it happens, measured on the `
   followed by `While working on the initial state:` and the state
 - TLC gives the position of a CASE with no true condition (`In computing next states, TLC
   encountered a CASE ...` for a CASE among the conjuncts of an action, `In computing ENABLED, ...`
-  while computing whether an action is enabled), of a CHOOSE no element satisfies, of an unbounded
+  while computing whether an action is enabled), of the whole `x' \in S` when it cannot enumerate S
+  (a string such as Real; when S names a definition, expansion keeps the end of the name in an AT
+  label around what replaces it), of a CHOOSE no element satisfies, of an unbounded
   quantifier, of a temporal formula it refuses, and names a part of a property by position. The
   parser keeps these positions in AT labels (`ast::AT`), which expansion keeps
 - tla2rs's own notes (which state it cannot represent, what it was evaluating) go to stderr
+- In the liveness checks after a state's successors, TLC computes whether each fair action is
+  enabled before it evaluates the steps, and the step of a fair action before the action predicates
+  of the properties (the same on every run; `tests/tlc/LiveErr-Fair`, `LiveOrder`), so an error in
+  both is reported from ENABLED. Between the state and the action predicates of the properties its
+  order changes from run to run (three runs each of a property `[]<><<A>>_v \/ []<>Q` and of two
+  properties gave both orders); the checker evaluates the state predicates first. Not followed: TLC
+  stops computing ENABLED at the first successor it finds, while the checker computes them all, so
+  an error in a later successor stops the checker only
+
+TLC prints a warning only when it has not printed the same text before, and its first warning of
+a run carries the note `(Use the -nowarning option to disable this warning.)`, so the same warning
+can come a second time, without the note, and then never again (measured on TLC 2.19,
+`tests/tlc/ExceptWarn*`, `SparseFun`, `LazyFun`). The checker prints warnings so (`put_line`,
+starting from those among STARTUP_PRINTS), and so does `compile::Startup::lines` for what TLC prints
+when it starts. The warnings:
+
+- An EXCEPT that names an argument or field the value does not have (of a function, a function over
+  a set TLC does not enumerate, a tuple or a record, also an inner index) changes nothing there, and
+  TLC warns `The EXCEPT was applied to non-existing fields of the value at` with the position of
+  the value the EXCEPT changes, once per such argument (two in one evaluation print it twice). The
+  parser keeps that position in an EXCEPT_AT label when the value is not an identifier, and
+  expansion when a name is replaced by what it stands for (`ast::except_pos`); the checker warns
+  with the printed lines (`except_warning`), the constant evaluator records it with them. TLC
+  evaluates a definition of constant level when it starts and keeps its value, so such a definition
+  with an EXCEPT warns then, and not again where it is used (`uncache_prints`); a constant invariant
+  or property warns when TLC evaluates it before exploring (`Startup::invs`). Not followed: an
+  EXCEPT of constant level inside an action or invariant, which the compiler folds, does not warn
+  in the checker
 
 TLC warns that SYMMETRY and constraints are dangerous when it checks temporal properties. It prints
 these warnings after the Print and PrintT of the constant definitions and before those of the
@@ -667,15 +697,12 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
 
 Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines (reason)` in the cfg
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
-compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 26
-configurations, by reason:
+compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). 17
+configurations, all for one reason:
 
 | Reason | Configurations |
 |---|---|
-| SANY's semantic errors give the position of each name involved, and tla2rs keeps positions only of identifiers in expressions (`ast::Pos`): not of bound variables, parameters, declarations and definitions (whose position is the whole statement, LOCAL included), operator symbols, operators called with arguments or selectors of subexpression names. SANY also gives the position of the declaration a name clashes with (in a standard module, or `--TLA+ BUILTINS--`), and adds follow-on errors (an operator's arity, an infix or prefix symbol it cannot resolve) and warnings (a definition repeated) | 17: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-LocalRec`, `-Minus`, `-OwnParam`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `SubexprBad` |
-| TLC gives the position of the whole `x' \in S` it cannot enumerate; when S names a definition, expansion replaces the name with the body, and the end of the position is lost | 1: `RealSet-NextE` |
-| TLC warns, with the position of the function, about an EXCEPT outside the domain only on its first evaluations: twice whether 3 or about 100 evaluations do one (measured), once when only one does, by a rule not found; `LazyFun*` also print a lazy function with the position of its body | 7: `ExceptDom`, `SparseFun`, `SparseFun-Viol`, `LazyFun`, `-Below`, `-Except`, `-Next` |
-| TLC reports the error from ENABLED of the fair action, tla2rs from the step of that action, which it evaluates first; why TLC does not is not found | 1: `LiveErr-Fair` |
+| SANY's semantic errors give the position of each name involved, and tla2rs keeps positions only of identifiers in expressions (`ast::Pos`): not of bound variables, parameters, declarations and definitions (whose position is the whole statement, LOCAL included), operator symbols, operators called with arguments or selectors of subexpression names. SANY also gives the position of the declaration a name clashes with (in a standard module as SANY reads the jar's file, such as Sequences' `Len` at line 25, col 1 to 44, or `In module --TLA+ BUILTINS--`), breaks the line of a clash after `conflicts `, and adds follow-on errors (an operator's arity at its use, `Couldn't resolve infix operator symbol` with the whole expression, where it then leaves the operands unchecked: `RejSanyTlcOps` reports `@@` and not the `:>` inside) and warnings (`*** Warnings:` after the errors, for a definition repeated). tla2rs stops at its first error, worded without positions | 17: `RejSanyBuiltin`, `-Choose`, `-DupDef`, `-ExtDef`, `-FunName`, `-InfixStd`, `-InstDef`, `-LocalRec`, `-Minus`, `-OwnParam`, `-RecParam`, `-Shadow`, `-StdName`, `-StdUnext`, `-Subexpr`, `-TlcOps`, `SubexprBad` |
 
 ### Arguments written out at each use
 
