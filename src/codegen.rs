@@ -3487,6 +3487,14 @@ impl<'a> Gen<'a> {
                 let (c, t) = self.lazy_apply(f, &k, &xt, env, want)?;
                 (format!("{{ let {k} = {xc}; {c} }}"), t)
             }
+            // A tuple of variables applied to a constant index (`dag[1]` with `dag == <<vs, es>>`):
+            // that variable, without building the tuple. Reading a variable cannot fail, so
+            // skipping the others changes nothing
+            App(f, x) if matches!(unlabel(f), Tuple(es) if self.var_tuple(es, env)) && self.try_const(x, env).is_some() => {
+                let Tuple(es) = unlabel(f) else { unreachable!() };
+                let k = self.tuple_index(x, env, es.len())?;
+                return self.gen(&es[k], env, want);
+            }
             App(f, x) => {
                 let (fc, ft) = self.gen_val(f, env)?;
                 if let Ty::Rec(fs) = &ft {
@@ -6037,7 +6045,10 @@ impl<'a> Gen<'a> {
             // A constant whose computation TLC warns about (an EXCEPT) is computed where first used
             // too, so that it warns once for the evaluation, as TLC does (`tests/tlc/ExceptFold-Arg`)
             let warns = || !self.try_const_made(&x, &env2).1.warns.is_empty();
-            let cell = (!self.is_const(&x, &env2) || warns()) && !x.is_action() && !lazy_value(&x) && !(env.init && !all_assigned && self.mentions_state(&x));
+            // A tuple of variables is written out too: a use reads one of them (see `App`), and
+            // a cell would copy every one at its first use
+            let vars = matches!(unlabel(&x), Expr::Tuple(es) if self.var_tuple(es, &env2));
+            let cell = (!self.is_const(&x, &env2) || warns()) && !x.is_action() && !lazy_value(&x) && !vars && !(env.init && !all_assigned && self.mentions_state(&x));
             if cell {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
@@ -6054,6 +6065,16 @@ impl<'a> Gen<'a> {
             body = crate::expand::subst_ident(&body, &n, &x);
         }
         Ok((lets, env2, body))
+    }
+
+    /// Whether every element is a variable, primed or not, whose value `env` has
+    fn var_tuple(&self, es: &[Expr], env: &Env) -> bool {
+        !es.is_empty()
+            && es.iter().all(|e| match unlabel(e) {
+                Expr::Ident(n, _) => self.is_var(n) && !env.locals.contains_key(n) && !(env.init && !env.primed.contains_key(n)),
+                Expr::Prime(v) => matches!(v.as_ref(), Expr::Ident(n, _) if self.is_var(n) && env.primed.contains_key(n)),
+                _ => false,
+            })
     }
 
     /// Whether `n` is the hidden definition of an INSTANCE with substitutions, which TLC does not
@@ -7095,6 +7116,14 @@ fn unbind(pairs: &[Expr], body: &Expr) -> Expr {
         }
     }
     body
+}
+
+/// e without the labels around it other than BIND labels (call sites, positions)
+fn unlabel(e: &Expr) -> &Expr {
+    match e {
+        Expr::Label(n, _, b) if !is_bind(n) => unlabel(b),
+        e => e,
+    }
 }
 
 /// Whether TLC keeps the value of e unevaluated, so that only the parts used are computed: a
