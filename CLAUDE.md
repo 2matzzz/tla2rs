@@ -757,19 +757,18 @@ match is listed as `gap` with the reason measured; `corpus.sh` still runs it and
 fails only on a `check` that differs. A gap marked `norun` is not run, as running it costs too much (see the table
 below).
 
-Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 102 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
+Results at the time of writing (`scripts/corpus.sh`, JOBS=2): 104 match, of which 6 with `distinct-only`. Only the generated count differs in those 6: TLC generates the same successor of a state
 more than once (once per `\/` branch or binding that yields it), and so does tla2rs, but not equally often. Measured
 with `-dump dot` on two of them, where the generated count is the number of edges with duplicates, plus the initial
 states and the successors a CONSTRAINT removes: `2PCwithBTM` has 5840 edges in TLC and 5290 in tla2rs, and the same
 4682 distinct edges; `MCCheckpointCoordinationFailure` has 1297994 and 1297595 edges, and the same 611225 distinct
 edges. The graph hashes compare the distinct edges, so the state space and transitions match. `StaleViewShrink` (4) is
-not measured this way. 3 are gaps, all `norun`:
+not measured this way. 2 are gaps, both `norun` (each was run once on a machine with 64 GB):
 
 | Gap | Model |
 |---|---|
-| `norun`: the generated checker is 6 MB of Rust; rustc ran for over 9 minutes on it | `GameOfLife` |
-| `norun`: not run against TLC yet; tla2rs alone evaluates its ASSUMEs in well under a second (see "Arguments written out at each use") | `BlockDagTest` |
-| `norun`: the system killed tla2rs for memory in a corpus run | `TLCSailfish1` |
+| `norun`: matches TLC, but tla2rs takes about 32 minutes, nearly all of it rustc on the 65536 initial states written out as one 6 MB constant (`grid \in [Pos -> BOOLEAN]`) | `GameOfLife` |
+| `norun`: tla2rs stops at depth 3 with "no element of S satisfied P" on CHOOSE in Utils' `Max` over an empty set, which TLC never evaluates; generating and building the checker takes about 15 GB | `TLCSailfish1` |
 
 Forms the corpus showed, each with a test in `tests/tlc/`: the CommunityModules (`CmFun`, `CmSet`, `CmSeq`,
 `CmGraph`, `CmBits`, and since then `CmSeqSub`, `CmRel`, `CmDigraph`, `CmBag`, `CmMisc`; see "CommunityModules"),
