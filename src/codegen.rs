@@ -2499,6 +2499,13 @@ impl<'a> Gen<'a> {
         // fail (see FpSource in the runtime). A string compared with a tuple fails in the string's
         // own comparison, which TLC does not report so (`<<"a">> \in {"ab"}`, measured)
         let can_fail = c.contains("eval_error") || c.contains("mixed_eq(");
+        // TLC computes a function constructor's values inside the value it keeps for it, also
+        // where an arithmetic operation fails (`tests/tlc/PowFun`)
+        let lazy_fun = |x: &Expr| matches!(x.strip(), Expr::FunCons(..));
+        let in_lazy = matches!(e.strip(), Expr::Bin(BOp::In | BOp::NotIn, a, _) if lazy_fun(a));
+        if (lazy_fun(e) || in_lazy) && (can_fail || c.contains("arith_error")) {
+            return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
+        }
         if can_fail && !c.contains("Attempted to check equality of string") && self.fp_source(e, env) {
             return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
         }

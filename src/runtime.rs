@@ -1426,6 +1426,10 @@ fn incomplete_init(st: State, null: &'static [&'static str]) -> ! {
 
 #[cold]
 fn arith_error(msg: String) -> ! {
+    // Inside a value TLC built (see FpSource): its second error follows, and TLC exits with 75
+    if FP_DEPTH.with(|d| d.get()) > 0 {
+        *FP_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.clone());
+    }
     std::panic::panic_any(EvalErr::Arith(msg))
 }
 
@@ -1450,6 +1454,7 @@ fn describe_panic(p: Box<dyn std::any::Any + Send>) -> EvalErr {
 fn eval_code(e: &EvalErr) -> i32 {
     match e {
         EvalErr::Type(_) if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) => 12,
+        EvalErr::Arith(m) if FP_ERR.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(m) => 75,
         EvalErr::Type(_) | EvalErr::Arith(_) => 255,
         EvalErr::Assert(_) => 14,
         EvalErr::Other(_) | EvalErr::Incomplete(_) => 75,
