@@ -803,7 +803,7 @@ fn lp_src(e: &TExpr) -> String {
 /// numbered in TLC's order. A disjunct with another part needs TLC's tableau, which the runtime
 /// does not follow; it then gets the reason.
 fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
-    let none = |why: &str| format!("static TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
+    let none = |why: &str| format!("type TBits = u64;\nstatic TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
     if props.is_empty() {
         return none("no properties");
     }
@@ -876,13 +876,15 @@ fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
         let ea: Vec<usize> = ea.iter().map(|x| bin(&mut abin, x)).collect();
         pems.push(format!("TPem {{ ae_state: &{aes:?}, ae_action: &{aea:?}, ea_action: &{ea:?} }}"));
     }
-    if sbin.len() > 64 || abin.len() > 64 {
-        return none("more than 64 predicates");
+    if sbin.len() > 128 || abin.len() > 128 {
+        return none("more than 128 predicates");
     }
     let cs: Vec<String> = sbin.iter().map(|(_, x)| lp_src(x)).collect();
     let ca: Vec<String> = abin.iter().map(|(_, x)| lp_src(x)).collect();
+    // The predicates of a state or step as a bit mask (wider only when needed)
+    let bits = if sbin.len() > 64 || abin.len() > 64 { "u128" } else { "u64" };
     format!(
-        "static TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ check_state: &[{}], check_action: &[{}], pems: &[{}] }});\n",
+        "type TBits = {bits};\nstatic TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ check_state: &[{}], check_action: &[{}], pems: &[{}] }});\n",
         cs.join(", "),
         ca.join(", "),
         pems.join(", ")

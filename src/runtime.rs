@@ -4800,11 +4800,13 @@ fn fp_int(mut fp: u64, x: i32) -> u64 {
     fp
 }
 
-/// A value as TLC fingerprints it: functions, tuples and records alike as a list of pairs
+/// A value as TLC fingerprints it: functions, tuples and records alike as a list of pairs; a model
+/// value by the number TLC gave its name (`TLC_MODEL_VALUES`)
 enum TV {
     B(bool),
     I(i64),
     S(String),
+    M(i32),
     Set(Vec<TV>),
     Fcn(Vec<(TV, TV)>),
 }
@@ -4814,6 +4816,7 @@ impl TV {
         match self {
             TV::B(b) => fp_byte(fp_byte(fp, 0), if *b { b't' } else { b'f' }),
             TV::I(i) => fp_int(fp_byte(fp, 1), *i as i32),
+            TV::M(t) => fp_int(fp_byte(fp, 21), *t),
             TV::S(s) => {
                 let u: Vec<u16> = s.encode_utf16().collect();
                 let mut fp = fp_int(fp_byte(fp, 3), u.len() as i32);
@@ -4828,8 +4831,7 @@ impl TV {
     }
 }
 
-/// Reads a value as the checker prints it on one line. None for what TLC fingerprints by its own
-/// numbering (a model value) or a form not read here.
+/// Reads a value as the checker prints it on one line. None for a form not read here.
 struct TvParse<'a> {
     b: &'a [u8],
     i: usize,
@@ -4879,11 +4881,16 @@ impl TvParse<'_> {
     fn val(&mut self) -> Option<TV> {
         self.ws();
         let c = *self.b.get(self.i)?;
-        if self.eat("TRUE") {
-            return Some(TV::B(true));
-        }
-        if self.eat("FALSE") {
-            return Some(TV::B(false));
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let st = self.i;
+            while self.i < self.b.len() && (self.b[self.i].is_ascii_alphanumeric() || self.b[self.i] == b'_') {
+                self.i += 1;
+            }
+            return match std::str::from_utf8(&self.b[st..self.i]).ok()? {
+                "TRUE" => Some(TV::B(true)),
+                "FALSE" => Some(TV::B(false)),
+                name => TLC_MODEL_VALUES.iter().find(|m| m.0 == name).map(|m| TV::M(m.1)),
+            };
         }
         if c == b'-' || c.is_ascii_digit() {
             let lo = self.int()?;
@@ -4965,10 +4972,18 @@ impl TvParse<'_> {
     }
 }
 
-/// TLC's fingerprint of a state (TLCStateMut.fingerPrint without VIEW or SYMMETRY)
+/// TLC's fingerprint of a state (TLCStateMut.fingerPrint without VIEW): under a SYMMETRY, that of
+/// the smallest of the permuted states in TLC's order of values (as `fresh_fp` with a VIEW)
 fn tlc_fp(s: &State) -> Option<u64> {
+    let mut best = *s;
+    for p in PERMS.iter() {
+        let t = perm_state(s, p);
+        if tlc_state_cmp(&t, &best).is_lt() {
+            best = t;
+        }
+    }
     let mut fp = FP64_POLY;
-    for v in tlc_vals(s) {
+    for v in tlc_vals(&best) {
         let mut p = TvParse { b: v.as_bytes(), i: 0 };
         let tv = p.val()?;
         p.ws();
@@ -5019,8 +5034,8 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         Ok(t) => t,
         Err(m) => return Err(m),
     };
-    if HAS_VIEW || !PERMS.is_empty() {
-        return Err("VIEW or SYMMETRY");
+    if HAS_VIEW {
+        return Err("VIEW");
     }
     if flag(&OTHER_FP) {
         return Err("a fingerprint polynomial other than that of -fp 0");
@@ -5030,21 +5045,21 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     for w in &g.states {
         match tlc_fp(&unpack(w)) {
             Some(f) => tfp.push(f),
-            None => return Err("a model value, whose fingerprint depends on TLC's numbering of names"),
+            None => return Err("a value tla2rs does not fingerprint as TLC does"),
         }
     }
-    let cs: Vec<u64> = (0..n)
-        .map(|s| tl.check_state.iter().enumerate().fold(0u64, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], 0, 0) as u64) << j))
+    let cs: Vec<TBits> = (0..n)
+        .map(|s| tl.check_state.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], 0, 0) as TBits) << j))
         .collect();
-    let cact = |s: usize, ab: u64, fb: FMask| -> u64 {
-        tl.check_action.iter().enumerate().fold(0u64, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], ab, fb) as u64) << j)
+    let cact = |s: usize, ab: u64, fb: FMask| -> TBits {
+        tl.check_action.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], ab, fb) as TBits) << j)
     };
     let mut self_at: Vec<Vec<u32>> = vec![vec![]; n];
     for &(s, k) in selfs {
         self_at[s as usize].push(k);
     }
     // The transitions of each node, in TLC's order: (target, check_action bits)
-    let mut gs: Vec<Vec<(u32, u64)>> = Vec::with_capacity(n);
+    let mut gs: Vec<Vec<(u32, TBits)>> = Vec::with_capacity(n);
     let mut mult = 1usize;
     for s in 0..n {
         // The successors as TLC puts them into the set: in the order generated, then itself
@@ -5103,7 +5118,7 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     const MAX_LINK: i64 = i64::MAX;
     const MARK: i64 = -42;
     for pem in tl.pems {
-        let ea = |b: u64| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
+        let ea = |b: TBits| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
         let mut link = vec![0i64; n];
         let mut queue: std::collections::VecDeque<(u32, i64)> = inits.iter().map(|&s| (s, 0)).collect();
         let mut com: Vec<u32> = vec![];
@@ -5332,9 +5347,15 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         // action that yields it (Tool.getState)
         let _quiet = Capturing::start();
         let mut buf: Vec<(State, u32)> = vec![];
+        // Under a SYMMETRY, the first successor of the node's fingerprint, which can be another
+        // member of the class than the state the graph keeps
         let mut next = |cur: &State, to: usize| -> Option<(State, u32)> {
             let _ = successors(cur, &mut buf, true);
-            buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states[to])).copied()
+            if PERMS.is_empty() {
+                buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states[to])).copied()
+            } else {
+                buf.iter().find(|x| tlc_fp(&x.0) == Some(tfp[to])).copied()
+            }
         };
         let mut out: Vec<(State, u32)> = vec![(unpack(&g.states[prefix[0] as usize]), u32::MAX)];
         let mut at = prefix[0] as usize;
@@ -5356,7 +5377,7 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         let back = if at == start {
             None
         } else {
-            Some(next(&out[out.len() - 1].0, start).ok_or("a step TLC cannot rebuild")?.1)
+            Some(next(&out[out.len() - 1].0, start).ok_or("a step TLC cannot rebuild")?)
         };
         drop(_quiet);
         let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
@@ -5370,9 +5391,12 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
                 println!("State {}: Stuttering", cycle_no + 1);
                 write_lasso_check(&texts, None);
             }
-            Some(l) => {
+            Some((t, l)) => {
                 println!("Back to state {cycle_no}: <{}>", name(l));
-                write_lasso_check(&texts, Some((cycle_no, None)));
+                // Under a SYMMETRY the step back can reach another member of the class, which
+                // the lasso check folds into the state returned to
+                let folded = (t != out[cycle_no - 1].0).then(|| show(&t));
+                write_lasso_check(&texts, Some((cycle_no, folded)));
             }
         }
         return Ok(true);
