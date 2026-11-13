@@ -1383,25 +1383,10 @@ fn expand_one_succ(
         held.flush(u32::MAX);
         raise_next(p);
     }
-    // After the successors, in TLC's order: the action atoms and fairness steps of each step
-    // (including stuttering), then the state atoms of this state that are not in the tableau and
-    // which fair actions are enabled, then the tableau's state atoms of the new successors
+    // After the successors, in TLC's order: which fair actions are enabled in this state and its
+    // state atoms that are not in the tableau, then the fairness steps and action atoms of each
+    // step (including stuttering), then the tableau's state atoms of the new successors
     if LIVENESS {
-        for j in 0..c.live.pend.len() {
-            let t = &buf[c.live.pend[j]].0;
-            match step_bits(&s, t) {
-                Ok((a, f)) => {
-                    let e = &mut c.live.edges[first_edge + j];
-                    e.3 = a;
-                    e.4 = f;
-                }
-                Err(m) => return Some(Found::Live(m)),
-            }
-        }
-        let stut = match step_bits(&s, &s) {
-            Ok((a, _)) => a,
-            Err(m) => return Some(Found::Live(m)),
-        };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut en: FMask = 0;
             for (i, (_, enabled, _)) in FAIRS.iter().enumerate() {
@@ -1417,6 +1402,21 @@ fn expand_one_succ(
         };
         let cbits = match state_bits(&s, !SATOMS_TABLEAU) {
             Ok(b) => b,
+            Err(m) => return Some(Found::Live(m)),
+        };
+        for j in 0..c.live.pend.len() {
+            let t = &buf[c.live.pend[j]].0;
+            match step_bits(&s, t) {
+                Ok((a, f)) => {
+                    let e = &mut c.live.edges[first_edge + j];
+                    e.3 = a;
+                    e.4 = f;
+                }
+                Err(m) => return Some(Found::Live(m)),
+            }
+        }
+        let stut = match step_bits(&s, &s) {
+            Ok((a, _)) => a,
             Err(m) => return Some(Found::Live(m)),
         };
         c.live.en.push((head as u32, en, stut, cbits));
@@ -1447,18 +1447,19 @@ fn state_bits(s: &State, mask: u64) -> Result<u64, SMsg> {
 }
 
 /// The action atoms that hold on the step s -> t, and the fairness conditions whose <<A>>_v it is
+/// (evaluated first, as TLC does)
 fn step_bits(s: &State, t: &State) -> Result<(u64, FMask), SMsg> {
     let r = std::panic::catch_unwind(|| {
-        let mut a = 0u64;
-        for (i, f) in AATOMS.iter().enumerate() {
-            if f(s, t) {
-                a |= 1 << i;
-            }
-        }
         let mut st: FMask = 0;
         for (i, (_, _, step)) in FAIRS.iter().enumerate() {
             if step(s, t) {
                 st |= 1 << i;
+            }
+        }
+        let mut a = 0u64;
+        for (i, f) in AATOMS.iter().enumerate() {
+            if f(s, t) {
+                a |= 1 << i;
             }
         }
         (a, st)
