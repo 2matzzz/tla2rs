@@ -24,11 +24,13 @@ enumerate) follow TLC 2.19's behaviour as measured and as read from its classes 
 (`ModuleNode.getVariableDecls`, `Context`, `TLCStateMut.fingerPrint`, `SetEnumValue.cup`,
 `FcnLambdaValue.toString`). They are written for tla2rs; no code of TLC is copied.
 
-`src/runtime.rs` (`tlc_lasso`, `tlc_fp`) and `src/live.rs` (`tlc_live`) follow TLC 2.19's search for a liveness
-counterexample and its fingerprints, as read from its classes (`tlc2.tool.liveness.Liveness`, `LiveCheck`,
-`LiveWorker`, `DiskGraph`, `TableauNodePtrTable`, `tlc2.util.SetOfStates`, `tlc2.util.FP64`, `tlc2.tool.Worker`,
-`TLCStateMut.fingerPrint`, `util.UniqueString`, `util.InternTable` and the `fingerPrint` methods of
-`tlc2.value.impl`, `ModelValue` among them) and measured. They are written for tla2rs; what is taken over is the
+`src/runtime.rs` (`tlc_lasso`, `tableau_graph`, `tlc_search`, `tlc_fp`) and `src/live.rs` (`tlc_live`, `tableau`)
+follow TLC 2.19's search for a liveness counterexample, its tableau and its fingerprints, as read from its classes
+(`tlc2.tool.liveness.Liveness`, `LiveCheck`, `LiveWorker`, `DiskGraph`, `TableauDiskGraph`, `TableauNodePtrTable`,
+`GraphNode`, `TBGraph`, `TBGraphNode`, `TBPar`, `TBParVec`, `LiveExprNode` and its subclasses, `OrderOfSolution`,
+`tlc2.util.SetOfStates`, `tlc2.util.FP64`, `tlc2.tool.Worker`, `TLCStateMut.fingerPrint`, `util.UniqueString`,
+`util.InternTable` and the `fingerPrint` methods of `tlc2.value.impl`, `ModelValue` among them) and measured (also
+with jdb). They are written for tla2rs; what is taken over is the
 polynomial `FP64.Polys[0]`, which TLC uses with `-fp 0`.
 
 ```

@@ -319,8 +319,8 @@ bounds the size of a model with temporal properties (one property per thread, so
   Inside a set, function or sequence held in the state, or taken from one, it prints as `{1, 2, 3}` and `<<>>`
   (see CLAUDE.md, "State graphs"), so the comparison of states with TLC reads an interval as the set it denotes
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
-  it otherwise picks at random) when the properties need no tableau in TLC (`[]<>`, `<>[]` and fairness, after
-  negation) and there is no `VIEW` (a model value is fingerprinted by the number TLC gives its name, and under
+  it otherwise picks at random), also for properties TLC checks with its tableau (such as `~>` and `<>P`), when
+  there is no `VIEW` (a model value is fingerprinted by the number TLC gives its name, and under
   `SYMMETRY` a state by its smallest permutation, as TLC does). Otherwise it is a valid lasso of tla2rs's own, which TLC checks (`-lassocheck`); the
   checker says why on stderr. Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a
   behavior; when a value the view leaves out only grows, the lasso returns to its first state of the cycle under the
