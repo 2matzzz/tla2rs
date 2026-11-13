@@ -1803,7 +1803,29 @@ pub fn show_formed(atoms: &Atoms, v: &Value, f: &Form) -> String {
     }
 }
 
+/// Whether e may build a value TLC holds in a form of its own (see `Form`), as written
+pub fn may_form(e: &Expr) -> bool {
+    fn go(e: &Expr, depth: u32) -> bool {
+        depth < 16
+            && e.any(&|y| match y {
+                Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) | Expr::FunCons(..) => true,
+                Expr::Call(n, _) => n == "SelectSeq",
+                Expr::Ident(n, _) => bound_expr(n).is_some_and(|x| go(&x, depth + 1)),
+                _ => false,
+            })
+    }
+    go(e, 0)
+}
+
 impl ConstEval<'_> {
+    /// The value of e, noting no string it makes (for what is evaluated a second time)
+    pub fn eval_quiet(&self, e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
+        let log = self.atoms.log.replace(None);
+        let v = self.eval(e, env).ok();
+        self.atoms.log.replace(log);
+        v
+    }
+
     /// The text TLC prints for the value of x (see `Form`)
     pub fn shown(&self, x: &Expr, env: &HashMap<String, Value>) -> R<String> {
         let v = self.eval(x, env)?;
