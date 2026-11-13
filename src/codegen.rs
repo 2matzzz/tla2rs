@@ -2240,6 +2240,14 @@ impl<'a> Gen<'a> {
                 return Ok((self.note_folded(c, &made), t));
             }
         }
+        // An operator of the CommunityModules evaluated only when compiling (see ast::CONST_ONLY)
+        let mut x = e;
+        while let Label(n, _, b) = x {
+            if let Some(why) = n.strip_prefix(crate::ast::CONST_ONLY) {
+                return Err(why.to_string());
+            }
+            x = b;
+        }
         // Where a CASE or CHOOSE is written, for TLC's error message (see ast::AT)
         let at = err_at(e);
         let e = e.strip();

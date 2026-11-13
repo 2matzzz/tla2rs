@@ -351,14 +351,39 @@ fn find_module(name: &str, how: &str, dir: &std::path::Path, warnings: &mut Vec<
 }
 
 /// A module of the CommunityModules, whose operators listed in `community::UNSUPPORTED` are
-/// refused where they are used
+/// refused where they are used, and those in `community::CONST_ONLY` where their value is not
+/// constant
 fn community_module(name: &str, src: &str, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
     let mut m = load_module(src, dir, warnings, depth)?;
     for &(module, op, why) in crate::community::UNSUPPORTED.iter().filter(|u| u.0 == name) {
         let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
         d.body = Expr::Call(format!("{op} of the CommunityModules' {module}, which tla2rs does not support: {why}"), vec![]);
     }
+    for &(module, op, at) in crate::community::CASE_AT.iter().filter(|u| u.0 == name) {
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
+        let done = std::cell::Cell::new(false);
+        d.body = case_at(&d.body, at, &done);
+        if !done.get() {
+            return Err(format!("{op} of {module}: no CASE"));
+        }
+    }
+    for &(module, op, why) in crate::community::CONST_ONLY.iter().filter(|u| u.0 == name) {
+        let d = m.defs.iter_mut().rev().find(|d| d.name == op).ok_or_else(|| format!("{op} of {module}: not defined"))?;
+        let msg = format!("{op} of the CommunityModules' {module} is supported only on constant arguments: {why}");
+        d.body = Expr::Label(format!("{}{msg}", crate::ast::CONST_ONLY), vec![], std::mem::replace(&mut d.body, Expr::Bool(true)).b());
+    }
     Ok(m)
+}
+
+/// e with the position of its first CASE (see `community::CASE_AT`) set to `at`
+fn case_at(e: &Expr, at: &str, done: &std::cell::Cell<bool>) -> Expr {
+    match e {
+        Expr::Label(n, _, b) if !done.get() && crate::ast::err_pos_of(n).is_some() && matches!(b.strip(), Expr::Case(..)) => {
+            done.set(true);
+            crate::ast::at_err(at, b.as_ref().clone())
+        }
+        _ => crate::codegen::map_children(e, &|c| case_at(c, at, done)),
+    }
 }
 
 fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, depth: usize) -> R<Module> {
@@ -819,8 +844,11 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
             None => return Err(format!("INSTANCE {mname}: {p} has no WITH substitution and is not declared or defined here")),
         }
     }
+    // A module the instantiated one reaches along two paths of EXTENDS (Folds, through
+    // FiniteSetsExt and Functions) has its definitions in mm.defs twice: one definition to SANY
+    let mut seen: HashSet<&str> = HashSet::new();
     for d in &mm.defs {
-        if mm.local_defs.contains(&d.name) || d.name.contains('#') {
+        if mm.local_defs.contains(&d.name) || d.name.contains('#') || !seen.insert(d.name.as_str()) {
             continue;
         }
         let mut call_args = args.clone();
@@ -1048,6 +1076,17 @@ fn compile_inner(
         crate::types::note_written_fields(&a.expr);
     }
     let mut strings: Vec<String> = (0..seen.len() as u32).filter(|&a| !seen.is_model(a)).map(|a| seen.name(a)).collect();
+    // The names of the records written in the spec are strings TLC created when it parsed them,
+    // which DOMAIN of such a record gives (`tests/tlc/CmJson`)
+    let mut fields = vec![];
+    for e in m.defs.iter().map(|d| &d.body).chain(m.assumes.iter().map(|a| &a.expr)) {
+        written_field_names(e, &mut fields);
+    }
+    for x in fields {
+        if ranks.contains_key(&x) && !strings.contains(&x) {
+            strings.push(x);
+        }
+    }
     let literals: HashSet<String> = strings.iter().cloned().collect();
     // A string made by an operation that is also a name or number of a module was created by TLC
     // when it parsed that, and takes its place (see `compile` for the order of the others)
@@ -1662,6 +1701,21 @@ fn generated_group(mut listed: Vec<Vec<u16>>) -> Vec<Vec<u16>> {
     group.retain(|p| !in_list.contains(p));
     listed.append(&mut group);
     listed
+}
+
+/// The field names of the record constructors and sets of records in e
+fn written_field_names(e: &Expr, out: &mut Vec<String>) {
+    if let Expr::RecLit(fs) | Expr::RecSet(fs) = e {
+        out.extend(fs.iter().map(|f| f.0.clone()));
+    }
+    for c in e.children() {
+        written_field_names(c, out);
+    }
+    if let Expr::Let(defs, _) = e {
+        for d in defs {
+            written_field_names(&d.body, out);
+        }
+    }
 }
 
 fn collect_strings(e: &Expr, atoms: &mut Atoms) {

@@ -259,6 +259,11 @@ pub const SPAN: &str = "#span ";
 /// `codegen::lazy_fun_string`
 pub const FN: &str = "#fn ";
 
+/// The name of the label around the body of an operator of the CommunityModules that tla2rs
+/// evaluates only when compiling (`community::CONST_ONLY`): `#const_only ` followed by why. Code
+/// generation refuses a use whose value is not constant (`Gen::gen_inner`)
+pub const CONST_ONLY: &str = "#const_only ";
+
 /// `e` wrapped in an AT label for the position `at`
 pub fn at_err(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{AT}{at}"), vec![], e.b())

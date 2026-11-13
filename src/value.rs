@@ -637,7 +637,13 @@ impl ConstEval<'_> {
                     UOp::Domain => match v {
                         Value::Fun(m) => Value::Set(m.keys().cloned().collect()),
                         Value::Tuple(t) => Value::Set((1..=t.len() as i64).map(Value::Int).collect()),
-                        Value::Rec(m) => Value::Set(m.keys().map(|k| Value::Atom(self.atoms.intern(false, k))).collect()),
+                        // The names in TLC's order of names (`types::field_cmp`), so that names not
+                        // numbered yet are numbered in that order
+                        Value::Rec(m) => {
+                            let mut ks: Vec<&String> = m.keys().collect();
+                            ks.sort_by(|a, b| crate::types::field_cmp(a, b));
+                            Value::Set(ks.into_iter().map(|k| Value::Atom(self.atoms.intern(false, k))).collect())
+                        }
                         _ => return Err("DOMAIN of a non-function".into()),
                     },
                     _ => return Err(format!("{op:?} is not a constant operator")),

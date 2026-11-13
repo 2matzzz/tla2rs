@@ -152,12 +152,21 @@ memory.
   when no module of that name is next to the spec: `Folds`, `Functions`, `FiniteSetsExt`, `SequencesExt`,
   `UndirectedGraphs` (but `Path`, `SimplePath`, `AreConnectedIn`, `ConnectedComponents` and `IsStronglyConnected`,
   which TLC 2.19 cannot evaluate either; see below), `Graphs` (but the same operators over paths and
-  `IsTreeWithRoot`), `Relation`, `BagsExt`, `Bitwise`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals`
-  and `VectorClocks`. Not provided: the modules that read or write files or run commands (`IOUtils`, `CSV`,
-  `CBOR`, `Json`), `ShiViz` and `DifferentialEquations`, whose definitions TLC 2.19 cannot evaluate, and `HTML` and
-  `SVG` (see CLAUDE.md, "CommunityModules"). TLC 2.19 cannot load the Java overrides in the CommunityModules
-  jar, so it evaluates the modules' TLA+ definitions, and tla2rs's give the same values (what CHOOSE picks, the
-  order a fold takes elements in). An operator not provided is refused where it is used
+  `IsTreeWithRoot`), `Relation`, `BagsExt`, `Bitwise`, `Combinatorics`, `Statistics`, `GraphViz`, `DyadicRationals`,
+  `VectorClocks` and `Quorum`, and what TLC 2.19 evaluates of `Json` and `IOUtils`: `ToJson`, `ToJsonArray`,
+  `ToJsonObject` and `zeroPadN` on constants only (they build strings by recursion, which a checker cannot do while
+  it runs, so they are refused on values from the state), and `JsonSerialize`, `ndJsonSerialize` and `IOSerialize`,
+  which are TRUE in the modules' definitions and write no file. Their operators that read files, run commands or read
+  the environment (`JsonDeserialize`, `IOExec`, `IOEnv`, `atoi` and the like) are refused, with the reason TLC 2.19
+  stops on their definitions. Not provided: `CSV` and `CBOR`, which read or write files, `ShiViz` and
+  `DifferentialEquations`, whose definitions TLC 2.19 cannot evaluate, and `HTML` and `SVG`. When tla2rs evaluates
+  constants it expands an operator or LET definition again at each use, so HTML's definitions, which fold strings
+  through `ReplaceFirstSubSeq`, blow up (`HTMLAttribute("color", "blue")` did not return in 60 seconds); `SVG` is
+  left for the same later stage, as no configuration compares it with TLC yet (see CLAUDE.md, "CommunityModules").
+  TLC 2.19 cannot load the Java overrides in the CommunityModules jar, so it evaluates the modules' TLA+
+  definitions, and tla2rs's give the same values (what CHOOSE picks, the order a fold takes elements in) and the
+  same error (the position TLC gives for the CASE of `Interleave` in `SequencesExt` when none of its conditions
+  holds). An operator not provided is refused where it is used
 - Records are ordered as TLC orders them (by their number of fields first), model values come before strings, and
   `Print` / `PrintT` break a value wider than 80 columns over lines, as TLC does
 - Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),
