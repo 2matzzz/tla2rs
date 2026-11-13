@@ -1353,11 +1353,14 @@ fn compile_inner(
         made_now.extend(atoms.log_end());
     }
 
-    // TLC evaluates an invariant or property of constant level once, before exploring, and
-    // refuses one that is not TRUE (one it fails to evaluate is evaluated again on each state)
+    // TLC evaluates an invariant, property, constraint or action constraint of constant level
+    // once, before exploring, and refuses one that is not TRUE (one it fails to evaluate is
+    // evaluated again on each state)
     {
         let ce = ConstEval { atoms: &atoms, constants: &constants };
         let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
+        let named = named.chain(cfg.constraints.iter().map(|n| ("constraint", n)));
+        let named = named.chain(cfg.action_constraints.iter().map(|n| ("action constraint", n)));
         for (what, name) in named {
             if !constant_level(&ex.expand_def_code(name, false)?, &m) {
                 continue;
