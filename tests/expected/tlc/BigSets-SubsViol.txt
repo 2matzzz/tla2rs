@@ -1,0 +1,10 @@
+key 30e740de71384642bb4cfc885ad6575dc582e01544a72da75a0682088a9b4c30
+tlc Version 2.19
+rc 12
+Invariant SubsOk is violated
+
+trace 0
+states incomplete
+edges incomplete
+messages 2 a09021546d6b0af1eb89027e7db21eeb1adf592a81e466d9676eb6d475f8589f
+errors 1 2d5b5d0d57248c41c3b7db74362c44b3fbd3ef5eaba3177d9c3df383422868a3
