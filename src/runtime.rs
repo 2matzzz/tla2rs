@@ -3037,6 +3037,16 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                     if !INITS_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
                         let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
                         println!("Error: Invariant {inv} is violated by the initial state:\n{}\n", init_text(&s));
+                        // TLC reports every invariant an initial state violates, a successor only the
+                        // first (`tests/tlc/OptContinueInit`)
+                        let at = INVARIANTS.iter().position(|(n, _)| *n == inv).map_or(INVARIANTS.len(), |k| k + 1);
+                        for (name, f) in &INVARIANTS[at..] {
+                            match std::panic::catch_unwind(|| f(&s)) {
+                                Ok(true) => {}
+                                Ok(false) => println!("Error: Invariant {name} is violated by the initial state:\n{}\n", init_text(&s)),
+                                Err(p) => stop(describe_panic(p), &format!("evaluating invariant {name} on an initial state"), Some(&s), generated, out.len()),
+                            }
+                        }
                     }
                 } else {
                     println!("Error: Invariant {inv} is violated by the initial state:\n{}", init_text(&s));
