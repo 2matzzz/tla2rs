@@ -10,4 +10,6 @@ NextOr == /\ \A i \in {1, 2} : (i > 0 \/ x >= 0)
           /\ x' = (x + 1) % 3
 NextLate == /\ x' = (x + 1) % 3
             /\ \A i \in {1, 2} : \E j \in {3, 4} : j > i
+NextIf == /\ IF x > 5 THEN TRUE ELSE (x >= 0 \/ x < 5)
+          /\ x' = (x + 1) % 3
 ====

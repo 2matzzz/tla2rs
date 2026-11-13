@@ -5386,7 +5386,9 @@ impl<'a> Gen<'a> {
                 out.push_str("}\n");
                 return Ok(());
             }
-            If(c, a, b) if action => {
+            // TLC takes an IF apart while a variable is unassigned even if it assigns none: an \E
+            // or \/ in a branch then branches (`tests/tlc/ForallBranch-If`)
+            If(c, a, b) if action || open && !env.init && [a, b].iter().any(|x| x.any(&|e| matches!(e, Quant(true, ..) | Or(_)))) => {
                 // A condition known here (as in an unrolled recursive operator): only its branch
                 if let (Some(Value::Bool(cv)), made) = self.try_const_made(c, env) {
                     let notes = self.fold_notes(&made);
