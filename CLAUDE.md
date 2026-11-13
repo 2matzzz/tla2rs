@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 901 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 939 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -558,6 +558,7 @@ are for the 483 configurations at the time of writing):
 | Rule | Applies to | Compared |
 |---|---|---|
 | TLC did not end the file (automatic: no closing `}`) | 56 (stops in or before the initial states, and SANY or temporal refusals) | Not the graph; verdict, counts and exit code as before |
+| The cfg's own `-dump`, and TLC's file is empty (automatic: it stopped before writing what it had buffered) | `OptDumpInit` | Not the dump |
 | tla2rs stopped at a successor that left its declared type while `next` built it (automatic: "a successor that tla2rs cannot represent" in its output) | 1 (`SetOut`) | The numbers of states and edges and the length of the counterexample (tla2rs writes a placeholder node and state for the successor TLC adds) |
 
 `distinct-only` (three configurations) leaves the graph compared: duplicate edges collapse anyway.
@@ -1223,7 +1224,7 @@ others are not). Measured on TLC 2.19 (`tests/tlc/Opt*`):
 - `-nowarning`: the warnings marked `WARNING_MARK` go (`put_line`, `STARTUP_PRINTS_NOWARN`); SANY's and the PlusCal
   warning stay
 - `-dump FILE`: `State N:` per distinct state, numbered when written (TLC's order with one worker, so not with
-  `-batched`). `-dump dot,...`: with any option TLC gives each edge `[label="...",color="black",fontcolor="black"]`
+  `-batched`). `-dump dot[,...]`: TLC 2.19 gives each edge `[label="...",color="black",fontcolor="black"]`
   (empty label without `actionlabels`) and adds `{rank = same; ...}` lines, which the comparison ignores. TLC takes
   only one `-dump`, so `crosscheck.sh` leaves out its own and compares the cfg's file with `tla2rs --dump`.
   `colorize` (`-dumpcolors`): the edge gets a placeholder (`COLOR_MARK` around its label) that `dump_write` turns into

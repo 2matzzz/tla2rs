@@ -87,12 +87,12 @@ TLC's meaning, output and exit codes (each is cross-checked against TLC by a con
 - `-nowarning` leaves out TLC's own warnings (an EXCEPT on a missing argument, SYMMETRY or constraints with temporal
   properties). The parser's warnings and the PlusCal checksum warning stay, as in TLC
 - `-dump FILE` writes the distinct states in the order found (`State N:` and the state); `-dump dot FILE` writes the
-  state graph (as `-dumpgraph`), `actionlabels` labels each edge with its action, and `snapshot` gives the edges the
-  attributes TLC then writes (TLC's snapshots during the run are not written). `colorize` gives each edge the color
-  of its action and ends the graph with a legend of the actions, as TLC does: the colors are numbered from 2 by
-  action name, in the order an edge of each is first written, and the legend lists them in the order TLC's Java hash
-  map holds them. As in TLC, `.dump` or `.dot` is added to a name without it. With one worker the order of `-dump
-  FILE` and the colors are TLC's; `-dump FILE` and `-continue` run without `-batched`
+  state graph (as `-dumpgraph`), each edge has the attributes of a label as in TLC, `actionlabels` labels it with its
+  action, and `snapshot` changes nothing (TLC's snapshots during the run are not written). `colorize` gives each edge
+  the color of its action and ends the graph with a legend of the actions, as TLC does: the colors are numbered from 2
+  by action name, in the order an edge of each is first written, and the legend lists them in the order TLC's Java
+  hash map holds them. As in TLC, `.dump` or `.dot` is added to a name without it. With one worker the order of
+  `-dump FILE` and the colors are TLC's; `-dump FILE` and `-continue` run without `-batched`
 - `-userFile FILE` writes the lines the spec prints (Print and PrintT, also in ASSUMEs and constant definitions) to
   FILE instead of the standard output, which keeps TLC's own messages and warnings. As in TLC, each value is written
   as is on one line, without the pretty-printing of the standard output
@@ -188,7 +188,8 @@ bounds the size of a model with temporal properties (one property per thread, so
 
 - **Every variable needs `x \in S` (or `x \subseteq S`) in `TypeOK`**, with `S` finite and written in terms of
   constants only. This is where the representation (bit width) comes from. If a variable leaves its type, the checker
-  stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant). A variable missing from
+  stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant), and so it does when a
+  `SYMMETRY` permutation moves a value out of its type (a type over part of the symmetric set). A variable missing from
   `TypeOK`, or whose `S` gives no type (such as `[D -> Int]`), gets a type inferred from Init and Next; an integer
   range that settles (a `Cardinality`, `x % 3`) stays finite, one that keeps growing becomes unbounded. When the
   types from `TypeOK` do not fit Init or Next (a module that extends another and adds a record field), every type is

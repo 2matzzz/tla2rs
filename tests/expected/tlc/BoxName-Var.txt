@@ -1,0 +1,10 @@
+key 6a45829caeb1ecc655b7d87ae1f3d03b88cc4f5279e68ee053c2bae3f61d47cc
+tlc Version 2.19
+rc 12
+Invariant b is violated
+3 states generated 3 distinct states found 0 states left on queue
+trace 3 42630c7294769435591f5e00b2eb34cf078b77b3c315ac26feb0d583c738b95b
+states 3 98437761e02816ba911bd3168c27a5a66cf8e81ecc18a10dcc1a6b4b86488edc
+edges 2 37b290122a29937f90202e51c35fa2d487d9cfc192ceaadf623f7c72b477a87c
+messages 2 61648ec1fbc9cc0086a0deee5c7e02096b539dddb1486a91b10c2cbd3426791f
+errors 2 61648ec1fbc9cc0086a0deee5c7e02096b539dddb1486a91b10c2cbd3426791f

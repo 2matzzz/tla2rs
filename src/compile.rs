@@ -1730,6 +1730,8 @@ fn compile_inner(
             // and a state predicate on its own only on the initial states. TLC names a part of a
             // property by its position, kept for `[]` (see ast::AT)
             let part_name = match at {
+                // Named after the operator of P in []P (see split_property)
+                _ if disp != *name && !disp.starts_with(&format!("{name} [")) => disp.clone(),
                 _ if whole && disp == *name => disp.clone(),
                 Some(p) if disp == *name => p,
                 _ => format!("{disp} (a part)"),
@@ -2400,6 +2402,12 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, a
         }
         Un(UOp::Always, p) => {
             let at = at.map(|a| a.to_string());
+            // TLC names the invariant after P when P applies an operator without arguments (a
+            // definition, TRUE or FALSE), whatever the property is called (`tests/tlc/BoxName`)
+            let (disp, at) = match zero_arity_name(g, p) {
+                Some(n) if tag.is_empty() => (n, None),
+                _ => (disp, at),
+            };
             match p.strip() {
                 p if !temporal(p) && !action_level(p) => Ok(out.push((disp, 4, p.clone(), None, env.clone(), at))),
                 // [][A]_v: every transition is an A step or leaves v unchanged (written v' = v, since
@@ -2418,6 +2426,17 @@ fn split_property(g: &Gen, e: &Expr, env: &HashMap<String, Value>, name: &str, a
     }
 }
 
+/// The name of the operator e applies when it takes no arguments: a definition (a call site is a
+/// label), a variable, or TRUE / FALSE, through the labels of positions
+fn zero_arity_name(g: &Gen, e: &Expr) -> Option<String> {
+    match e {
+        Expr::Label(n, _, b) if pos_of(n).is_some() || err_pos_of(n).is_some() => zero_arity_name(g, b),
+        Expr::Ident(n, _) if g.vars.iter().any(|(v, _)| v == n) => Some(n.clone()),
+        Expr::Label(n, args, _) if !n.starts_with('#') && !e.is_user_label() => args.is_empty().then(|| n.clone()),
+        Expr::Bool(b) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
+        _ => None,
+    }
+}
 /// Type inference. Taking the types fixed by TypeOK as given, walks Init and Next at the type level
 /// only, collecting the types of assignments, and iterates to a fixpoint. Integers whose range
 /// keeps changing are widened to unbounded (64-bit).

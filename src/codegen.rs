@@ -2294,6 +2294,19 @@ impl<'a> Gen<'a> {
                 }
                 Ok(s + "__o }")
             }
+            // A tuple as a function over part of a type (1..n in it)
+            (Ty::Rec(fs), Ty::PFun(d, c)) if is_tuple_fields(fs) && !is_sparse_fun(to) => {
+                let did = self.ty_id(d)?;
+                let r = self.fresh("r");
+                let mut s = format!("{{ let {r} = {code}; let mut __o = {}; ", Self::default_code(to));
+                for (k, (_, ft)) in fs.iter().enumerate() {
+                    let n = k as i64 + 1;
+                    let kc = self.coerce(format!("{n}i64"), &Ty::Int(n, n), d)?;
+                    let vc = self.coerce(format!("{r}{}", rec_field(fs.len(), k)), ft, c)?;
+                    s += &format!("__o[idx_{did}({kc})] = (true, {vc}); ");
+                }
+                Ok(s + "__o }")
+            }
             // A function over all of a type as one over part of it, and between partial functions
             (Ty::Fun(d1, c1), Ty::PFun(d2, c2)) if d1 != d2 => {
                 let mid = Ty::PFun(d1.clone(), c2.clone());
@@ -2486,6 +2499,13 @@ impl<'a> Gen<'a> {
         // fail (see FpSource in the runtime). A string compared with a tuple fails in the string's
         // own comparison, which TLC does not report so (`<<"a">> \in {"ab"}`, measured)
         let can_fail = c.contains("eval_error") || c.contains("mixed_eq(");
+        // TLC computes a function constructor's values inside the value it keeps for it, also
+        // where an arithmetic operation fails (`tests/tlc/PowFun`)
+        let lazy_fun = |x: &Expr| matches!(x.strip(), Expr::FunCons(..));
+        let in_lazy = matches!(e.strip(), Expr::Bin(BOp::In | BOp::NotIn, a, _) if lazy_fun(a));
+        if (lazy_fun(e) || in_lazy) && (can_fail || c.contains("arith_error")) {
+            return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
+        }
         if can_fail && !c.contains("Attempted to check equality of string") && self.fp_source(e, env) {
             return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
         }
@@ -4102,7 +4122,13 @@ impl<'a> Gen<'a> {
                         Some(_) => "true".into(),
                         None => "false".into(),
                     },
-                    _ => return Err("only `\"field\" \\in DOMAIN record` and DOMAIN of functions are supported".into()),
+                    // A function (over strings): a test of membership in its domain
+                    _ => {
+                        let (xc, xt) = self.gen(a, env, None)?;
+                        let x = self.fresh("x");
+                        let m = self.gen_member(&x, &xt, b, env)?;
+                        format!("{{ let _ = &{rc}; let {x} = {xc}; {m} }}")
+                    }
                 };
                 (if op == NotIn { format!("!{has}") } else { has }, Ty::Bool)
             }
@@ -4113,10 +4139,13 @@ impl<'a> Gen<'a> {
                 let neg = if op == NotIn { "!" } else { "" };
                 (format!("{neg}{{ let {x} = {xc}; {m} }}"), Ty::Bool)
             }
-            // A \subseteq Nat (or Int, or any set that is not a value here) is A \in SUBSET B
+            // A \subseteq Nat (or Int, or any set that is not a value here, such as records with a
+            // field in Int: `tests/tlc/SubsetInf`) is A \in SUBSET B
             Subseteq
-                if matches!(b.strip(), Expr::Ident(n, _) if n == "Nat" || n == "Int" || n == "STRING")
-                    || matches!(b.strip(), Expr::Call(f, a) if f == "Seq" && a.len() == 1) =>
+                if b.any(&|x| {
+                    matches!(x, Expr::Ident(n, _) if (n == "Nat" || n == "Int" || n == "STRING") && !env.locals.contains_key(n))
+                        || matches!(x, Expr::Call(f, a) if f == "Seq" && a.len() == 1)
+                }) =>
             {
                 let (ac, at) = self.gen(a, env, None)?;
                 let x = self.fresh("x");
@@ -5068,6 +5097,11 @@ impl<'a> Gen<'a> {
             return Ok(if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) });
         }
         let (sc, st) = self.gen_val(s, env)?;
+        // An element of a set with no elements, such as the bound variable of `{c \\in {} : x \\in c}`:
+        // the test is never evaluated
+        if st == Ty::Enum(vec![]) {
+            return Ok(format!("{{ let _ = {sc}; false }}"));
+        }
         if !matches!(st, Ty::Set(_)) {
             return Err(format!("\\in a non-set: {s:?}"));
         }
@@ -5157,6 +5191,7 @@ impl<'a> Gen<'a> {
             Quant(true, bs, body) if open => {
                 if let Some(made) = bs.iter().find_map(|(_, s)| match self.try_const_made(s, env) {
                     (Some(v), made) if v.as_set().is_ok_and(|x| x.is_empty()) => Some(made),
+                    _ if self.empty_unread(s, env) => Some(Made::default()),
                     _ => None,
                 }) {
                     let notes = self.fold_notes(&made);
@@ -5210,10 +5245,13 @@ impl<'a> Gen<'a> {
                 return Ok(());
             }
             // \A over a constant set is the conjunction over its elements, in TLC's order (the
-            // first bound variable varies fastest), so it can assign variables
+            // first bound variable varies fastest), so it can assign variables. TLC takes it apart so
+            // while a variable is unassigned even if it assigns none, and an \E or \/ in it then
+            // branches, counting a successor once per branch taken (`tests/tlc/ForallBranch`)
             Quant(false, bs, body)
                 if action && !self.only_reads_assigned(h, env)
-                    || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n))) =>
+                    || env.init && body.any(&|e| matches!(e, Ident(n, _) if self.is_var(n) && !env.primed.contains_key(n)))
+                    || open && !env.init && body.any(&|e| matches!(e, Quant(true, ..) | Or(_))) =>
             {
                 let mut all = Made::default();
                 let sets: Option<Vec<(String, Vec<Value>)>> = bs
@@ -5251,6 +5289,8 @@ impl<'a> Gen<'a> {
                     }
                     // In Init, a condition on what is assigned so far: evaluated as a boolean below
                     None if env.init => {}
+                    // A condition over a set from the state: evaluated as a boolean below
+                    None if !(action && !self.only_reads_assigned(h, env)) => {}
                     None => return self.gen_forall(bs, body, rest, env, out),
                 }
             }
@@ -5346,7 +5386,9 @@ impl<'a> Gen<'a> {
                 out.push_str("}\n");
                 return Ok(());
             }
-            If(c, a, b) if action => {
+            // TLC takes an IF apart while a variable is unassigned even if it assigns none: an \E
+            // or \/ in a branch then branches (`tests/tlc/ForallBranch-If`)
+            If(c, a, b) if action || open && !env.init && [a, b].iter().any(|x| x.any(&|e| matches!(e, Quant(true, ..) | Or(_)))) => {
                 // A condition known here (as in an unrolled recursive operator): only its branch
                 if let (Some(Value::Bool(cv)), made) = self.try_const_made(c, env) {
                     let notes = self.fold_notes(&made);
@@ -6203,7 +6245,9 @@ impl<'a> Gen<'a> {
                 }
             }
             Or(_) if open => return Ok(false),
-            Quant(true, bs, _) if open && !bs.iter().any(|(_, s)| self.mentions_state(s)) => return Ok(false),
+            Quant(true, bs, _) if open && bs.iter().all(|(_, s)| !self.mentions_state(s)) || bs.iter().any(|(_, s)| self.empty_unread(s, env)) => {
+                return Ok(false)
+            }
             RecCall(i, args) => {
                 let state = args.iter().any(|a| self.mentions_state(a));
                 if !state && open && self.rec_assigns(*i, env) && args.iter().all(|a| self.try_const(a, env).is_some()) {
@@ -6234,6 +6278,17 @@ impl<'a> Gen<'a> {
         Ok(true)
     }
 
+    /// Whether a set that depends on the state is empty without reading it: `{x \in S : P}` or
+    /// `{e : x \in S}` over a constant empty S. TLC splits Next with no state and makes no action
+    /// of an `\E` over such a set, as over a constant empty set (`tests/tlc/SplitEmpty`)
+    fn empty_unread(&self, s: &Expr, env: &Env) -> bool {
+        let empty = |d: &Expr| self.try_const(d, env).is_some_and(|v| v.as_set().is_ok_and(|x| x.is_empty())) || self.empty_unread(d, env);
+        match s.strip() {
+            Expr::SetFilter(_, d, _) => empty(d),
+            Expr::SetMap(_, bs) => bs.iter().any(|(_, d)| empty(d)),
+            _ => false,
+        }
+    }
     /// Whether `e` depends on the state (has level 1 or more for SANY)
     fn mentions_state(&self, e: &Expr) -> bool {
         e.any(&|x| {
@@ -6914,12 +6969,37 @@ impl<'a> Gen<'a> {
         let bits = self.pack_value("(*__v)", &vt, &mut body, &mut at)?;
         let vp = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let words = bits.div_ceil(64).max(1);
-        // The view as TLC prints it in a behavior with -view
+        // The view as TLC prints it in a behavior with -view. A tuple with one element per variable
+        // the view reads is printed as a state of those variables, the first element as the first
+        // of them in TLC's order, and so on, each after `/\ ` even when there is one
+        // (`tests/tlc/OptViewVars`, `OptViewOne`)
         let tid = self.ty_id(&vt)?;
+        let mut show = format!("ppr(&fmt_{tid}(__v))");
+        let mut tuple = view;
+        while let Expr::Label(n, _, b) = tuple {
+            if crate::ast::is_bind(n) {
+                break;
+            }
+            tuple = b;
+        }
+        if let Expr::Tuple(es) = tuple {
+            let read: Vec<String> =
+                self.print_order.iter().filter(|v| self.is_var(v) && view.any(&|x| matches!(x, Expr::Ident(n, _) if n == *v))).cloned().collect();
+            if read.len() == es.len() {
+                let bullet = "/\\\\ ";
+                let mut parts = vec![];
+                for (v, e) in read.iter().zip(es) {
+                    let (c, t) = self.gen(e, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
+                    let id = self.ty_id(&t)?;
+                    parts.push(format!("format!(\"{bullet}{v} = {{}}\", ppr(&fmt_{id}(&{{ {c} }})))"));
+                }
+                show = format!("{{ let _ = __v; [{}].join(\"\\n\") }}", parts.join(", "));
+            }
+        }
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
              fn key_of(s: &State) -> Option<Key> {{ let __v: &{} = &{{ {vc} }}; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn show_view(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; ppr(&fmt_{tid}(__v)) }}\n",
+             fn show_view(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; {show} }}\n",
             vt.repr(),
             vt.repr()
         ))
@@ -7395,6 +7475,15 @@ fn unbind(pairs: &[Expr], body: &Expr) -> Expr {
     body
 }
 
+/// Whether a value of type t can hold the empty tuple (a type with no fields)
+fn has_empty_tuple(t: &Ty) -> bool {
+    match t {
+        Ty::Rec(fs) => fs.is_empty() || fs.iter().any(|(_, t)| has_empty_tuple(t)),
+        Ty::Set(e) | Ty::Seq(e) | Ty::Opt(e) => has_empty_tuple(e),
+        Ty::Fun(d, c) | Ty::PFun(d, c) => has_empty_tuple(d) || has_empty_tuple(c),
+        _ => false,
+    }
+}
 /// e without the labels around it other than BIND labels (call sites, positions)
 fn unlabel(e: &Expr) -> &Expr {
     match e {
@@ -8280,6 +8369,14 @@ impl Gen<'_> {
     fn fmt_shaped(&mut self, e: &Expr, place: &str, t: &Ty, env: &Env) -> R<String> {
         if let Some((v, f)) = self.const_form(e, env) {
             return Ok(format!("{:?}.to_string()", show_formed(self.atoms, &v, &f)));
+        }
+        // A constant holding the empty tuple: TLC prints `<<>>` written as a tuple and `<< >>` for
+        // an empty function, which a type with no fields cannot tell apart (`tests/tlc/PrintEmpty`)
+        if has_empty_tuple(t) && self.is_const(e, env) {
+            if let Some(v) = self.ce.eval_quiet(e, &env.vals) {
+                let f = self.ce.form(e, &env.vals);
+                return Ok(format!("{:?}.to_string()", show_formed(self.atoms, &v, &f)));
+            }
         }
         let id = self.ty_id(t)?;
         let sh = self.shape_of(e, t, env);

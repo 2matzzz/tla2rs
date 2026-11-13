@@ -369,6 +369,11 @@ graph_note=""
 if grep -q '^states incomplete' <<< "$a"; then
   a=$(grep -vE '^(states|edges) ' <<< "$a"); b=$(grep -vE '^(states|edges) ' <<< "$b")
   graph_note="; graph not compared: TLC stopped before ending it"
+elif [[ -n "$user_dump" ]] && grep -q '^dump 0 ' <<< "$a"; then
+  # The same for the cfg's own -dump: TLC's file is empty, as it stopped before writing what it
+  # had buffered (in the initial states, or at start)
+  a=$(grep -v '^dump ' <<< "$a"); b=$(grep -v '^dump ' <<< "$b")
+  graph_note="; dump not compared: TLC stopped before writing it"
 elif grep -q '<a successor that tla2rs cannot represent>' rs.out; then
   a=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$a"); b=$(sed -E 's/^(states|edges|trace) ([0-9]+) [0-9a-f]+$/\1 \2/' <<< "$b")
   graph_note="; graph and counterexample sizes only: a successor tla2rs cannot represent"

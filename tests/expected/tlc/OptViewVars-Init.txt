@@ -1,0 +1,10 @@
+key a69e6b3e44bc6909f3f120df8605ac1b753ecd8f987b306a80d06939e6bd7243
+tlc Version 2.19
+rc 12
+Invariant Pos is violated
+
+trace 0
+states incomplete
+edges incomplete
+messages 2 03366ecac6f251e1a9301d7cd3cb8116ecd15b30262ea6f3d2c4418f9f94e55d
+errors 1 b040e96f569adc03822bf6b92f69df998ca777260255bad5bd67a763ed3b5a1f

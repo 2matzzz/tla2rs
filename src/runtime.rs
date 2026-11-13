@@ -404,6 +404,28 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
 
 /// `state_fp` without the packed state, for when there is a VIEW or a SYMMETRY. None if the key
 /// (the VIEW value, or the state without a VIEW) is out of type.
+thread_local! {
+    static IN_PERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// A state symmetric to one found that leaves the declared types (the SYMMETRY moves a value out
+/// of a type over part of the symmetric set): TLC goes on with it, tla2rs cannot represent it, and
+/// stops rather than report it as a violation of the type invariant (see Limitations in README.md)
+#[cold]
+fn perm_out_of_type() -> ! {
+    use std::io::Write;
+    println!("Error: tla2rs cannot represent a state symmetric to one found under the SYMMETRY: it leaves the type declared in {TYPE_INVARIANT}.");
+    let _ = std::io::stdout().flush();
+    std::process::exit(75);
+}
+fn perm_of(s: &State, p: &[u16]) -> State {
+    IN_PERM.with(|f| f.set(true));
+    let t = perm_state(s, p);
+    IN_PERM.with(|f| f.set(false));
+    t
+}
+fn perm_key(t: &State) -> Key {
+    key_of(t).unwrap_or_else(|| perm_out_of_type())
+}
 fn canon_fp(s: &State) -> Option<Fp> {
     fresh_fp(s, None).flatten()
 }
@@ -425,7 +447,7 @@ fn fresh_fp(s: &State, mut mine: Option<&mut Seen>) -> Option<Option<Fp>> {
         // and TLC keeps both
         let mut best = *s;
         for p in PERMS.iter() {
-            let t = perm_state(s, p);
+            let t = perm_of(s, p);
             if tlc_state_cmp(&t, &best).is_lt() {
                 best = t;
             }
@@ -435,7 +457,7 @@ fn fresh_fp(s: &State, mut mine: Option<&mut Seen>) -> Option<Option<Fp>> {
     }
     let mut best: Option<Key> = None;
     for (i, p) in PERMS.iter().enumerate() {
-        let k = if i == 0 && PERM0_IS_ID { key_of(s)? } else { key_of(&perm_state(s, p))? };
+        let k = if i == 0 && PERM0_IS_ID { key_of(s)? } else { perm_key(&perm_of(s, p)) };
         if i == 0 && by_first && !fresh(fingerprint(&k)) {
             return Some(None);
         }
@@ -690,6 +712,9 @@ impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize>
 
 #[cold]
 fn type_error(what: &str, v: &str) -> ! {
+    if IN_PERM.with(|f| f.get()) {
+        perm_out_of_type()
+    }
     std::panic::panic_any(EvalErr::Type(format!("{what} {v} is outside the type declared in TypeOK")))
 }
 
@@ -967,6 +992,11 @@ fn flag(f: &std::sync::atomic::AtomicBool) -> bool {
 /// workers find one at once
 static REPORTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The text of an initial state that violates an invariant or a property: its view with -view
+/// (and a VIEW), as in a behavior
+fn init_text(s: &State) -> String {
+    if flag(&VIEW_TRACE) && HAS_VIEW { show_view(s) } else { show(s) }
+}
 /// The text of a state in a behavior: its view with -view (and a VIEW), only the variables that
 /// changed since `prev` with -difftrace, otherwise the state. TLC prints a view without the empty
 /// line after it
@@ -1421,6 +1451,10 @@ fn incomplete_init(st: State, null: &'static [&'static str]) -> ! {
 
 #[cold]
 fn arith_error(msg: String) -> ! {
+    // Inside a value TLC built (see FpSource): its second error follows, and TLC exits with 75
+    if FP_DEPTH.with(|d| d.get()) > 0 {
+        *FP_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.clone());
+    }
     std::panic::panic_any(EvalErr::Arith(msg))
 }
 
@@ -1445,6 +1479,7 @@ fn describe_panic(p: Box<dyn std::any::Any + Send>) -> EvalErr {
 fn eval_code(e: &EvalErr) -> i32 {
     match e {
         EvalErr::Type(_) if TYPE_INV_SUBSUMED || INVARIANTS.iter().any(|(n, _)| TYPE_INVARIANT == *n) => 12,
+        EvalErr::Arith(m) if FP_ERR.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(m) => 75,
         EvalErr::Type(_) | EvalErr::Arith(_) => 255,
         EvalErr::Assert(_) => 14,
         EvalErr::Other(_) | EvalErr::Incomplete(_) => 75,
@@ -2352,6 +2387,11 @@ fn expand(g: &Graph, lo: usize, hi: usize, seen: &Shards, stop: &std::sync::atom
                 (e, false) => Found::Live(SMsg::Untraced(e)),
             }),
         };
+        // Checking liveness, TLC writes a state to `-dump FILE` again after its new successors,
+        // also one without successors (`tests/tlc/OptDumpLive`)
+        if matches!(found, None | Some(Found::Deadlock(_))) && flag(&DUMP_STATES) {
+            dump_node(&mut c.dump, &0, &g.state(head), false);
+        }
         if found.is_some() {
             c.found = found;
             stop.store(true, Relaxed);
@@ -2387,8 +2427,8 @@ fn dumping() -> bool {
 static DUMP_STATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DUMP_NO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// With -dumplabels (TLC's `-dump dot,actionlabels`), each edge is labelled with its action. With
-/// -dumpattrs (TLC's `-dump dot,` and any other option), each edge has the attributes of a label,
-/// with an empty one
+/// -dumpattrs (TLC's `-dump dot`, with or without options), each edge has the attributes of a
+/// label, with an empty one
 static DUMP_LABELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DUMP_ATTRS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// With -dumpcolors (TLC's `-dump dot,colorize`), each edge has the color of its action: the
@@ -3017,12 +3057,21 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             dump_node(&mut buf, &id, &s, true);
             dump_write(&mut buf);
         }
+        // An initial state that does not pack cannot be evaluated reliably (a test decided by the
+        // types assumes its values are in them): without the type invariant to check first, it
+        // stops the search before its invariants (see Limitations in README.md)
+        if w.is_none() && in_model && !TYPE_INV_SUBSUMED {
+            let e = EvalErr::Type("an initial state".into());
+            report_eval(&e);
+            println!("{}", show(&s));
+            exit(eval_code(&e));
+        }
         // An initial state that does not pack violates the type invariant, which TLC checks where
         // the cfg lists it
         let out_of_type = w.is_none() && TYPE_INV_SUBSUMED && !flag(&CONTINUE);
         match if out_of_type { eval_invariants_before_type(&s) } else { eval_invariants(&s) } {
             Ok(None) if out_of_type => {
-                println!("Error: Invariant {TYPE_INVARIANT} is violated by the initial state:\n{}", show(&s));
+                println!("Error: Invariant {TYPE_INVARIANT} is violated by the initial state:\n{}", init_text(&s));
                 exit(12);
             }
             Ok(None) => {}
@@ -3031,10 +3080,20 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                 if flag(&CONTINUE) {
                     if !INITS_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
                         let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
-                        println!("Error: Invariant {inv} is violated by the initial state:\n{}\n", show(&s));
+                        println!("Error: Invariant {inv} is violated by the initial state:\n{}\n", init_text(&s));
+                        // TLC reports every invariant an initial state violates, a successor only the
+                        // first (`tests/tlc/OptContinueInit`)
+                        let at = INVARIANTS.iter().position(|(n, _)| *n == inv).map_or(INVARIANTS.len(), |k| k + 1);
+                        for (name, f) in &INVARIANTS[at..] {
+                            match std::panic::catch_unwind(|| f(&s)) {
+                                Ok(true) => {}
+                                Ok(false) => println!("Error: Invariant {name} is violated by the initial state:\n{}\n", init_text(&s)),
+                                Err(p) => stop(describe_panic(p), &format!("evaluating invariant {name} on an initial state"), Some(&s), generated, out.len()),
+                            }
+                        }
                     }
                 } else {
-                    println!("Error: Invariant {inv} is violated by the initial state:\n{}", show(&s));
+                    println!("Error: Invariant {inv} is violated by the initial state:\n{}", init_text(&s));
                     exit(12);
                 }
             }
@@ -3047,7 +3106,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             match std::panic::catch_unwind(|| f(&s)) {
                 Ok(true) => {}
                 Ok(false) => {
-                    println!("Error: Property {name} is violated by the initial state:\n{}", show(&s));
+                    println!("Error: Property {name} is violated by the initial state:\n{}", init_text(&s));
                     exit(13);
                 }
                 Err(p) => stop(describe_panic(p), &format!("evaluating property {name} on an initial state"), Some(&s), generated, out.len()),
@@ -3181,8 +3240,12 @@ fn pack_failed(sfp: Fp, t: State, l: u32) -> SFound {
     SFound::new(sfp, Some((t, l)), msg)
 }
 fn pack_failed_msg(t: &State) -> SMsg {
-    let checked = if TYPE_INV_SUBSUMED { eval_invariants_before_type(t) } else { eval_invariants(t) };
-    match checked {
+    // Its invariants are evaluated only before the type invariant TLC checks too (see
+    // initial_states)
+    if !TYPE_INV_SUBSUMED {
+        return SMsg::OutOfType;
+    }
+    match eval_invariants_before_type(t) {
         Ok(Some(inv)) => SMsg::Inv(inv),
         Err((inv, e)) => SMsg::InvEval(inv, e),
         Ok(None) => SMsg::OutOfType,
