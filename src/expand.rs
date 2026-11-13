@@ -54,11 +54,18 @@ pub struct Expander<'a> {
     /// Keep the POS labels (see `ast::POS`), for the next-state relation; otherwise they are
     /// dropped
     pub keep_pos: bool,
+    /// Bind arguments and LET definitions to names (see `expand_def_bound`)
+    bind: bool,
+    /// The counter for fresh names while binding, apart from `fresh`, so that the names of what is
+    /// expanded for code generation stay as they are
+    bind_fresh: usize,
+    variables: std::collections::HashSet<String>,
 }
 
 impl<'a> Expander<'a> {
     pub fn new(m: &'a Module) -> Self {
         REC_DEFS.with(|r| r.borrow_mut().clear());
+        crate::value::clear_bound();
         Expander {
             defs: m.defs.iter().map(|d| (d.name.as_str(), d)).collect(),
             fresh: 0,
@@ -67,7 +74,51 @@ impl<'a> Expander<'a> {
             stack: vec![],
             rec_ids: HashMap::new(),
             keep_pos: false,
+            bind: false,
+            bind_fresh: 1 << 40,
+            variables: m.variables.iter().cloned().collect(),
         }
+    }
+
+    /// Like `expand_def`, for the constant evaluator only: an argument of a call that is of
+    /// constant level and not a name or literal, and a LET definition without arguments, are
+    /// expanded once and bound to a name, which the body refers to (`ast::BIND`). Writing them out
+    /// at each use repeats them in the expansion, and the evaluator would evaluate each copy, which
+    /// multiplies at each level of definitions that pass a value on (a fold whose accumulator a
+    /// definition uses several times: HTML's `HTMLFill`, the corpus's `BlockDagTest`)
+    pub fn expand_def_bound(&mut self, name: &str) -> R<Expr> {
+        self.bound(|s| s.expand_def(name))
+    }
+
+    /// `expand_top` with bindings, as `expand_def_bound`
+    pub fn expand_top_bound(&mut self, e: &Expr) -> R<Expr> {
+        self.bound(|s| s.expand_top(e))
+    }
+
+    fn bound<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = (self.bind, self.fresh);
+        self.bind = true;
+        self.fresh = self.bind_fresh;
+        let r = f(self);
+        self.bind_fresh = self.fresh;
+        (self.bind, self.fresh) = saved;
+        r
+    }
+
+    /// Whether the expanded argument `a` is bound to a name while binding: not a name or literal
+    /// (those cost nothing to write out), and of constant level, so that only the constant
+    /// evaluator meets the name (a variable, prime or temporal operator stays written out, for
+    /// the checks of levels and of what is constant)
+    fn bindable(&self, a: &Expr) -> bool {
+        self.bind
+            && !matches!(a, Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Ident(..))
+            && !a.any(&|x| match x {
+                Expr::Ident(v, _) => self.variables.contains(v),
+                Expr::Prime(_) | Expr::Un(UOp::Unchanged | UOp::Enabled | UOp::Always | UOp::Eventually, _) => true,
+                Expr::BoxAction(..) | Expr::Fair(..) | Expr::Bin(BOp::LeadsTo, ..) | Expr::Lambda(..) | Expr::At => true,
+                Expr::Label(n, ..) => n.starts_with(SUBVAR) || n == ENINST,
+                x => x.is_unchecked_temporal(),
+            })
     }
 
     pub fn has_def(&self, n: &str) -> bool {
@@ -110,7 +161,8 @@ impl<'a> Expander<'a> {
         if self.recursive.iter().any(|r| r == name) && self.stack.contains(&d.name) {
             // Operator arguments are bound in the definition, which is expanded once for each
             // combination of operators passed to it
-            let mut key = d.name.clone();
+            // Expanded with bindings, the definition is another one
+            let mut key = if self.bind { format!("{}{BIND}", d.name) } else { d.name.clone() };
             let mut args = vec![];
             for (i, (p, a)) in d.params.iter().zip(raw).enumerate() {
                 if d.arity.get(i).copied().unwrap_or(0) > 0 {
@@ -126,6 +178,7 @@ impl<'a> Expander<'a> {
             return Ok(Expr::RecCall(id, args));
         }
         let mut args = vec![];
+        let mut binds = vec![];
         for (i, (p, a)) in d.params.iter().zip(raw).enumerate() {
             let arity = d.arity.get(i).copied().unwrap_or(0);
             if arity > 0 {
@@ -138,8 +191,14 @@ impl<'a> Expander<'a> {
                     return Err(format!("`{name}`: LAMBDA passed for `{p}`, which is not an operator parameter"));
                 }
                 let a = self.expand(a, caller)?;
-                env.subst.insert(p.clone(), a.clone());
-                args.push(a);
+                if self.bindable(&a) {
+                    let n = self.bind(p, &mut env);
+                    args.push(Expr::Ident(n.clone(), NOPOS));
+                    binds.extend([Expr::Ident(n, NOPOS), a]);
+                } else {
+                    env.subst.insert(p.clone(), a.clone());
+                    args.push(a);
+                }
             }
         }
         self.depth += 1;
@@ -150,7 +209,7 @@ impl<'a> Expander<'a> {
         let body = self.expand(&d.body, &env);
         self.stack.pop();
         self.depth -= 1;
-        Ok(Expr::Label(name.into(), args, body?.b()))
+        Ok(Expr::Label(name.into(), args, with_binds(binds, body?).b()))
     }
 
     /// Whether `n` names a recursive function definition (not shadowed by a bound variable)
@@ -374,15 +433,37 @@ impl<'a> Expander<'a> {
             }
             Let(defs, body) => {
                 let mut inner = env.clone();
+                let mut binds = vec![];
                 for d in defs {
                     let snapshot = inner.clone();
                     inner.subst.remove(&d.name);
                     // A unique name tells apart same-named LET definitions on the expansion stack
                     self.fresh += 1;
                     let unique = Def { name: format!("{}#let{}", d.name, self.fresh), ..d.clone() };
+                    // While binding, a definition without arguments is expanded here, once, as a
+                    // use would expand it (not a function `f[x \in S]`, whose applications call
+                    // `f#app`); one that does not expand is left to its uses, as otherwise
+                    let app = format!("{}#app", d.name);
+                    if self.bind && d.params.is_empty() && !defs.iter().any(|x| x.name == app) {
+                        let denv = with_self(&d.name, &unique, snapshot.clone());
+                        let (depth, stack, rec_ids) = (self.depth, self.stack.len(), self.rec_ids.clone());
+                        match self.call(&d.name, &unique, denv, &[], &inner) {
+                            Ok(b) if self.bindable(&b) => {
+                                let n = self.bind(&d.name, &mut inner);
+                                inner.locals.remove(&d.name);
+                                binds.extend([Expr::Ident(n, NOPOS), b]);
+                                continue;
+                            }
+                            Ok(_) => {}
+                            // Nothing of the attempt is kept: a recursive definition whose
+                            // expansion failed is expanded again where it is used
+                            Err(_) => (self.depth, self.rec_ids) = (depth, rec_ids),
+                        }
+                        self.stack.truncate(stack);
+                    }
                     inner.locals.insert(d.name.clone(), (unique, snapshot));
                 }
-                self.expand(body, &inner)?
+                with_binds(binds, self.expand(body, &inner)?)
             }
             BoxAction(a, v) => BoxAction(ex(self, a)?.b(), ex(self, v)?.b()),
             Fair(w, v, a) => Fair(*w, ex(self, v)?.b(), ex(self, a)?.b()),
@@ -663,6 +744,11 @@ pub(crate) fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)
         ("BagOfAll", 2) => Some((0, 1)),
         _ => None,
     }
+}
+
+/// `body` under a BIND label for the names and expressions in `binds`, if any
+fn with_binds(binds: Vec<Expr>, body: Expr) -> Expr {
+    if binds.is_empty() { body } else { Expr::Label(BIND.into(), binds, body.b()) }
 }
 
 /// The environment of the LET definition `d` named `n`, with `d` itself in it, so that a LET

@@ -3,7 +3,8 @@
 
 use crate::ast::*;
 use crate::lexer::R;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 /// Strings and model values. At runtime they are u16 ids. Interning goes through a shared
 /// reference, since evaluating a constant expression can build a new string (`"ab" \o "c"`).
@@ -180,11 +181,201 @@ thread_local! {
 }
 
 fn record_print(line: Vec<String>) {
+    PRINTS.with(|n| n.set(n.get() + 1));
     PRINTED.with(|p| {
         if let Some(v) = p.borrow_mut().as_mut() {
             v.push(line);
         }
     });
+}
+
+thread_local! {
+    /// How many times Print and PrintT have printed (a value printed while it was computed is not
+    /// kept, see `eval_bound`)
+    static PRINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The expression of each name a BIND label binds (`ast::BIND`, `register_bound`)
+    static BOUND: std::cell::RefCell<HashMap<String, Rc<Expr>>> = std::cell::RefCell::new(HashMap::new());
+    /// The recursive definitions whose bodies `register_bound` has read
+    static BOUND_RECS: std::cell::RefCell<HashSet<usize>> = std::cell::RefCell::new(HashSet::new());
+    /// For each bound name, the names its value can depend on (see `free_names`)
+    static BOUND_FREE: std::cell::RefCell<HashMap<String, Rc<Vec<String>>>> = std::cell::RefCell::new(HashMap::new());
+    /// The values of bound names, by name and the values of the names each depends on
+    static BOUND_VALUES: std::cell::RefCell<HashMap<(String, Vec<Option<Value>>), Value>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Forgets the bound names and their values (the names are fresh for each expansion; the values
+/// hold atoms, which are numbered again in each compilation)
+pub fn clear_bound() {
+    BOUND.with(|b| b.borrow_mut().clear());
+    BOUND_RECS.with(|b| b.borrow_mut().clear());
+    BOUND_FREE.with(|b| b.borrow_mut().clear());
+    BOUND_VALUES.with(|b| b.borrow_mut().clear());
+}
+
+/// Notes the names the BIND labels in e bind (also in the recursive definitions e calls), before
+/// the constant evaluator evaluates e
+pub fn register_bound(e: &Expr) {
+    match e {
+        Expr::Label(n, args, body) if n == BIND => {
+            for pair in args.chunks(2) {
+                if let [Expr::Ident(x, _), a] = pair {
+                    BOUND.with(|b| b.borrow_mut().insert(x.clone(), Rc::new(a.clone())));
+                    register_bound(a);
+                }
+            }
+            register_bound(body);
+        }
+        Expr::RecCall(i, args) => {
+            if BOUND_RECS.with(|r| r.borrow_mut().insert(*i)) {
+                register_bound(&crate::expand::rec_def(*i).body);
+            }
+            for a in args {
+                register_bound(a);
+            }
+        }
+        e => {
+            for c in e.children() {
+                register_bound(c);
+            }
+        }
+    }
+}
+
+fn bound_expr(n: &str) -> Option<Rc<Expr>> {
+    BOUND.with(|b| b.borrow().get(n).cloned())
+}
+
+/// e without labels, with the expression bound to a name in place of the name
+enum Shape<'a> {
+    Ref(&'a Expr),
+    Bound(Rc<Expr>),
+}
+
+impl std::ops::Deref for Shape<'_> {
+    type Target = Expr;
+    fn deref(&self) -> &Expr {
+        match self {
+            Shape::Ref(e) => e,
+            Shape::Bound(e) => e.strip(),
+        }
+    }
+}
+
+fn shape(e: &Expr) -> Shape<'_> {
+    let Expr::Ident(n, _) = e.strip() else { return Shape::Ref(e.strip()) };
+    let Some(mut x) = bound_expr(n) else { return Shape::Ref(e.strip()) };
+    while let Some(y) = match x.strip() {
+        Expr::Ident(m, _) => bound_expr(m),
+        _ => None,
+    } {
+        x = y;
+    }
+    Shape::Bound(x)
+}
+
+/// e with the names bound along its labels and EXCEPTs replaced by their expressions, for
+/// `codegen::lazy_fun_string`, which reads how a function constructor is written
+fn unbind_spine(e: &Expr) -> Expr {
+    match e {
+        Expr::Label(n, a, b) => Expr::Label(n.clone(), a.clone(), unbind_spine(b).b()),
+        Expr::Except(b, ups) => Expr::Except(unbind_spine(b).b(), ups.clone()),
+        Expr::Ident(n, _) => match bound_expr(n) {
+            Some(x) => unbind_spine(&x),
+            None => e.clone(),
+        },
+        e => e.clone(),
+    }
+}
+
+/// The names whose values the value of the bound name n can depend on: the free names of its
+/// expression, of the expressions of the names it uses, and of the bodies of the recursive
+/// definitions these call (but their parameters). The names are unique (expansion renames bound
+/// variables), so a name the evaluator has bound when n is used has the value it had where n was
+/// bound
+fn bound_free(n: &str, x: &Expr) -> Rc<Vec<String>> {
+    if let Some(f) = BOUND_FREE.with(|b| b.borrow().get(n).cloned()) {
+        return f;
+    }
+    let mut fv = FreeNames::default();
+    fv.slots.insert(n.to_string());
+    fv.walk(x, &mut vec![]);
+    let f = Rc::new(fv.out.into_iter().collect::<Vec<_>>());
+    BOUND_FREE.with(|b| b.borrow_mut().insert(n.to_string(), f.clone()));
+    f
+}
+
+#[derive(Default)]
+struct FreeNames {
+    out: BTreeSet<String>,
+    slots: HashSet<String>,
+    recs: HashSet<usize>,
+}
+
+impl FreeNames {
+    fn walk(&mut self, e: &Expr, bound: &mut Vec<String>) {
+        use Expr::*;
+        let k = bound.len();
+        match e {
+            Ident(n, _) if bound.contains(n) => {}
+            Ident(n, _) => match bound_expr(n) {
+                Some(x) => {
+                    if self.slots.insert(n.clone()) {
+                        self.walk(&x, &mut vec![]);
+                    }
+                }
+                None => {
+                    self.out.insert(n.clone());
+                }
+            },
+            Quant(_, bs, body) | SetMap(body, bs) => {
+                for (_, s) in bs {
+                    self.walk(s, bound);
+                }
+                bound.extend(bs.iter().map(|(x, _)| x.clone()));
+                self.walk(body, bound);
+            }
+            Choose(x, s, p) | SetFilter(x, s, p) | FunCons(x, s, p) => {
+                self.walk(s, bound);
+                bound.push(x.clone());
+                self.walk(p, bound);
+            }
+            Lambda(xs, body) => {
+                bound.extend(xs.iter().cloned());
+                self.walk(body, bound);
+            }
+            Except(f, ups) => {
+                self.walk(f, bound);
+                for (path, v) in ups {
+                    for p in path {
+                        match p {
+                            Path::Idx(i) => self.walk(i, bound),
+                            Path::Field(at) if at.starts_with('@') => bound.push(at.clone()),
+                            Path::Field(_) => {}
+                        }
+                    }
+                    self.walk(v, bound);
+                    bound.truncate(k);
+                }
+            }
+            RecCall(i, args) => {
+                for a in args {
+                    self.walk(a, bound);
+                }
+                if self.recs.insert(*i) {
+                    let rd = crate::expand::rec_def(*i);
+                    self.walk(&rd.body, &mut rd.params.clone());
+                }
+            }
+            // The expressions bound are read where their names are used
+            Label(n, _, body) if n == BIND => self.walk(body, bound),
+            e => {
+                for c in e.children() {
+                    self.walk(c, bound);
+                }
+            }
+        }
+        bound.truncate(k);
+    }
 }
 
 /// TLC's messages for failures that tla2rs evaluates at compile time
@@ -248,21 +439,26 @@ impl ConstEval<'_> {
     /// How TLC prints `f` when it is a function over a set TLC cannot enumerate (see
     /// `codegen::lazy_fun_string`), else None
     fn lazy_fun_shown(&self, f: &Expr, env: &HashMap<String, Value>) -> Option<String> {
-        fn dom(e: &Expr) -> Option<&Expr> {
+        fn dom(e: &Expr) -> Option<Shape<'_>> {
             match e {
                 Expr::Label(_, _, b) | Expr::Except(b, _) => dom(b),
-                Expr::FunCons(_, d, _) => Some(d),
+                Expr::FunCons(_, d, _) => Some(Shape::Ref(d)),
+                Expr::Ident(n, _) => {
+                    let x = bound_expr(n)?;
+                    let d = dom(&x)?;
+                    Some(Shape::Bound(Rc::new(Expr::clone(&d))))
+                }
                 _ => None,
             }
         }
-        if self.eval(dom(f)?, env).is_ok() {
+        if self.eval(&*dom(f)?, env).is_ok() {
             return None;
         }
-        crate::codegen::lazy_fun_string(f, &mut |p| self.lazy_set_shown(p, env))
+        crate::codegen::lazy_fun_string(&unbind_spine(f), &mut |p| self.lazy_set_shown(p, env))
     }
 
     fn lazy_set_shown(&self, s: &Expr, env: &HashMap<String, Value>) -> Option<String> {
-        match s.strip() {
+        match &*shape(s) {
             Expr::Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
                 Some(n.clone())
             }
@@ -279,6 +475,22 @@ impl ConstEval<'_> {
         }
     }
 
+    /// The value of the bound name n, whose expression is x: evaluated where n is first used, as
+    /// the expression written out there would be, and kept for the values of the names it depends
+    /// on. A value whose computation printed is not kept, so it prints again at each use, as before
+    fn eval_bound(&self, n: &str, x: &Expr, env: &HashMap<String, Value>) -> R<Value> {
+        let key = (n.to_string(), bound_free(n, x).iter().map(|k| env.get(k).cloned()).collect::<Vec<_>>());
+        if let Some(v) = BOUND_VALUES.with(|b| b.borrow().get(&key).cloned()) {
+            return Ok(v);
+        }
+        let prints = PRINTS.with(|p| p.get());
+        let v = self.eval(x, env)?;
+        if PRINTS.with(|p| p.get()) == prints {
+            BOUND_VALUES.with(|b| b.borrow_mut().insert(key, v.clone()));
+        }
+        Ok(v)
+    }
+
     pub fn eval(&self, e: &Expr, env: &HashMap<String, Value>) -> R<Value> {
         use Expr::*;
         Ok(match e {
@@ -288,6 +500,8 @@ impl ConstEval<'_> {
             Ident(n, _) => {
                 if let Some(v) = env.get(n) {
                     v.clone()
+                } else if let Some(x) = bound_expr(n) {
+                    self.eval_bound(n, &x, env)?
                 } else if let Some(v) = self.constants.get(n) {
                     v.clone()
                 } else if let Some(m) = n.strip_prefix("@model:") {
@@ -318,7 +532,7 @@ impl ConstEval<'_> {
                     }
                     set.iter().next().unwrap().clone()
                 }
-                ("IsFiniteSet", [s]) if matches!(s.strip(), Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n)) => {
+                ("IsFiniteSet", [s]) if matches!(&*shape(s), Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n)) => {
                     Value::Bool(false)
                 }
                 ("IsFiniteSet", [s]) => {
@@ -656,7 +870,7 @@ impl ConstEval<'_> {
                 Value::Bool(inside == matches!(op, BOp::In))
             }
             // x \in [D -> R]: decided without enumerating the set of functions
-            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(set.strip(), FunSet(..)) => {
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(&*shape(set), FunSet(..)) => {
                 let v = self.eval(x, env)?;
                 Value::Bool(self.member(&v, set, env)? == matches!(op, BOp::In))
             }
@@ -668,8 +882,9 @@ impl ConstEval<'_> {
                 }
                 Value::Bool(all)
             }
-            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(set.strip(), Call(f, a) if f == "Seq" && a.len() == 1) => {
-                let Call(_, a) = set.strip() else { unreachable!() };
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) if matches!(&*shape(set), Call(f, a) if f == "Seq" && a.len() == 1) => {
+                let set = shape(set);
+                let Call(_, a) = &*set else { unreachable!() };
                 let inside = match self.eval(x, env)? {
                     Value::Tuple(t) => {
                         let s = self.eval(&a[0], env)?;
@@ -841,8 +1056,9 @@ impl ConstEval<'_> {
             }
             // [y \in S |-> e][x] is e at x, without the rest of the function (as TLC evaluates it,
             // so S may be Nat)
-            App(f, x) if matches!(f.strip(), FunCons(..)) => {
-                let FunCons(y, s, body) = f.strip() else { unreachable!() };
+            App(f, x) if matches!(&*shape(f), FunCons(..)) => {
+                let f = shape(f);
+                let FunCons(y, s, body) = &*f else { unreachable!() };
                 let x = self.eval(x, env)?;
                 if !self.member(&x, s, env)? {
                     return Err("function applied outside its domain".into());
@@ -1002,7 +1218,8 @@ impl ConstEval<'_> {
     /// and tuples included) is in it when its domain is D and its values are in R. TLC answers FALSE
     /// for a model value and stops with an error for any other value that is not a function.
     fn member(&self, v: &Value, set: &Expr, env: &HashMap<String, Value>) -> R<bool> {
-        match set.strip() {
+        let shaped = shape(set);
+        match &*shaped {
             Expr::FunSet(d, r) => {
                 let m: BTreeMap<Value, Value> = match v {
                     Value::Rec(m) => m.iter().map(|(k, x)| (Value::Atom(self.atoms.intern(false, k)), x.clone())).collect(),
@@ -1076,7 +1293,7 @@ impl ConstEval<'_> {
     /// Whether `set` cannot be built because it is, or is made with `\`, `\cup`, `\cap` or a filter
     /// from, Nat, Int, STRING or TLC's Any
     fn lazy_set(&self, set: &Expr, env: &HashMap<String, Value>) -> bool {
-        match set.strip() {
+        match &*shape(set) {
             Expr::Ident(n, _) => ["Nat", "Int", "STRING", "Any"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n),
             Expr::Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.lazy_set(a, env) || self.lazy_set(b, env),
             Expr::SetFilter(_, s, _) => self.lazy_set(s, env),

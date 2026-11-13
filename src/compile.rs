@@ -1024,10 +1024,17 @@ fn has_prints(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Call(n, _) if n == "PrintT" || n == "Print"))
 }
 
-/// Evaluates e with Print and PrintT recorded, adding the lines printed to `out`
+/// Evaluates e, expanded with bindings (`Expander::expand_def_bound`)
+fn eval_const(ce: &ConstEval, e: &Expr) -> R<Value> {
+    crate::value::register_bound(e);
+    ce.eval(e, &HashMap::new())
+}
+
+/// Evaluates e (expanded with bindings) with Print and PrintT recorded, adding the lines printed
+/// to `out`
 fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
     PRINTED.with(|p| *p.borrow_mut() = Some(vec![]));
-    let r = ce.eval(e, &HashMap::new());
+    let r = eval_const(ce, e);
     let lines = PRINTED.with(|p| p.borrow_mut().take()).unwrap_or_default();
     for l in lines {
         // TLC pretty-prints each value printed (80 columns)
@@ -1146,9 +1153,9 @@ fn compile_inner(
         let mut left = vec![];
         let mut last_err = String::new();
         for (c, def) in pending.iter() {
-            let e = ex.expand_def(def).map_err(|e| format!("cfg: {c} <- {def}: {e}"))?;
+            let e = ex.expand_def_bound(def).map_err(|e| format!("cfg: {c} <- {def}: {e}"))?;
             let ce = ConstEval { atoms: &atoms, constants: &constants };
-            match ce.eval(&e, &HashMap::new()) {
+            match eval_const(&ce, &e) {
                 Ok(v) => {
                     constants.insert(c.clone(), v);
                 }
@@ -1173,7 +1180,7 @@ fn compile_inner(
     // SANY checks the level rules of temporal formulas in every definition, used or not (a
     // definition with arguments is checked as written, without what it refers to)
     for d in &m.defs {
-        let e = if d.params.is_empty() { ex.expand_def(&d.name).ok() } else { Some(d.body.clone()) };
+        let e = if d.params.is_empty() { ex.expand_def_bound(&d.name).ok() } else { Some(d.body.clone()) };
         if let Some(Err(msg)) = e.as_ref().map(crate::live::sany_level) {
             // As SANY reports it, with the position of the formula it refuses: the root module is
             // parsed again with the positions of temporal formulas (see `parse_module_spans`), and
@@ -1198,7 +1205,7 @@ fn compile_inner(
         let names: Vec<String> = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
         atoms.log_start();
         for n in names {
-            let Ok(e) = ex.expand_def(&n) else { continue };
+            let Ok(e) = ex.expand_def_bound(&n) else { continue };
             if !constant_level(&e, &m) {
                 continue;
             }
@@ -1209,7 +1216,7 @@ fn compile_inner(
                 }
             } else if makes_strings(&e, &constants, &atoms) {
                 // For the strings it makes; its value is computed again where it is used
-                let _ = ce.eval(&e, &HashMap::new());
+                let _ = eval_const(&ce, &e);
             }
         }
         made_now.extend(atoms.log_end());
@@ -1221,12 +1228,12 @@ fn compile_inner(
         let ce = ConstEval { atoms: &atoms, constants: &constants };
         let named = cfg.invariants.iter().map(|n| ("invariant", n)).chain(cfg.properties.iter().map(|n| ("property", n)));
         for (what, name) in named {
-            let e = ex.expand_def(name)?;
+            let e = ex.expand_def_bound(name)?;
             if !constant_level(&e, &m) {
                 continue;
             }
             atoms.log_start();
-            let r = ce.eval(&e, &HashMap::new());
+            let r = eval_const(&ce, &e);
             made_now.extend(atoms.log_end());
             match r {
                 Ok(Value::Bool(true)) | Err(_) => {}
@@ -1256,7 +1263,7 @@ fn compile_inner(
         for a in &m.assumes {
             let (l1, c1, l2, c2) = a.span;
             let at = format!("line {l1}, col {c1} to line {l2}, col {c2} of module {}", a.module);
-            let e = ex.expand_top(&a.expr).map_err(|e| format!("ASSUME at {at}: {e}"))?;
+            let e = ex.expand_top_bound(&a.expr).map_err(|e| format!("ASSUME at {at}: {e}"))?;
             atoms.log_start();
             let r = eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.assumes);
             made_now.extend(atoms.log_end());
@@ -1419,7 +1426,7 @@ fn compile_inner(
     // order of the lines printed (see PRINT_ORDER in the runtime)
     let print_order = has_prints(&init)
         || has_prints(&next_pos)
-        || cfg.invariants.iter().any(|n| ex.expand_def(n).is_ok_and(|e| has_prints(&e)));
+        || cfg.invariants.iter().any(|n| ex.expand_def_bound(n).is_ok_and(|e| has_prints(&e)));
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
     let mut next_code = String::new();

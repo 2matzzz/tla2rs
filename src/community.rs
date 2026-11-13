@@ -37,6 +37,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "Quorum" => QUORUM,
         "Json" => JSON,
         "IOUtils" => IO_UTILS,
+        "HTML" => HTML,
         _ => return None,
     })
 }
@@ -510,3 +511,62 @@ zeroPadN(n, width) ==
   IN FoldLeft(LAMBDA a, b : a \o b, "", pad) \o s
 ====
 "#;
+
+/// HTML text built from templates: each `%key%` of a template is replaced in turn by its value, the
+/// first occurrence only and in the text as replaced so far (`ReplaceFirstSubSeq` in a fold from the
+/// left), and parts are joined with a separator that is left out after an empty text built so far,
+/// as the module's definitions do; the strings are made in the order those definitions make them
+const HTML: &str = r##"
+---- MODULE HTML ----
+LOCAL INSTANCE Sequences
+LOCAL INSTANCE SequencesExt
+HTMLFill(template, pairs) == FoldLeft(LAMBDA text, p : ReplaceFirstSubSeq(p[2], p[1], text), template, pairs)
+LOCAL Joined(parts, sep) == FoldLeft(LAMBDA text, part : IF text = "" THEN part ELSE text \o sep \o part, "", parts)
+HTMLDocument(head, body, scripts) ==
+  Joined(<<"<!DOCTYPE html>", "<html>", head, body, Joined(scripts, "\n"), "</html>">>, "\n")
+HTMLClass(name, attrs) == Joined(<<ReplaceFirstSubSeq(name, "%classname%", "%classname% {"), Joined(attrs, "\n"), "}">>, "\n")
+HTMLAttribute(key, val) == HTMLFill("%name%: %value%;", <<<<"%name%", key>>, <<"%value%", val>>>>)
+HTMLDefaultStyle ==
+  Joined(<<HTMLClass(".default_grid", <<HTMLAttribute("display", "grid")>>),
+           HTMLClass(".default_box", <<HTMLAttribute("border", "1px solid black")>>),
+           HTMLClass(".default_circle", <<HTMLAttribute("border-radius", "50%")>>)>>, "\n")
+HTMLStyleSheet(classes) == Joined(<<"<style type=\"text/css\">", HTMLDefaultStyle, Joined(classes, "\n"), "</style>">>, "\n")
+HTMLScriptFile(src) == HTMLFill("<script src=\"%name%\"></script>", <<<<"%name%", src>>>>)
+HTMLScript(lines) == Joined(<<"<script>", Joined(lines, "\n"), "</script>">>, "\n")
+HTMLLink(href, rel) == HTMLFill("<link href=\"%name%\" rel=\"%type%\"/>", <<<<"%name%", href>>, <<"%type%", rel>>>>)
+HTMLHeader(title, links, classes) ==
+  Joined(<<"<head>", "<meta charset=\"UTF-8\">", ReplaceFirstSubSeq(title, "%title%", "<title>%title%</title>"),
+           Joined(links, "\n"), HTMLStyleSheet(classes), "</head>">>, "\n")
+HTMLBody(inner) == Joined(<<"<body>", inner, "</body>">>, "\n")
+HTMLFrame(id, inner) == Joined(<<ReplaceFirstSubSeq(id, "%id%", "<div id=\"%id%\">"), Joined(inner, "\n"), "</div>">>, "\n")
+HTMLGridContainer(id, classes, inner) ==
+  Joined(<<HTMLFill("<div id=\"%id%\" class=\"default_grid %class_list%\">", <<<<"%id%", id>>, <<"%class_list%", Joined(classes, " ")>>>>),
+           Joined(inner, "\n"), "</div>">>, "\n")
+HTMLBox(id, classes, size, inner) ==
+  Joined(<<HTMLFill("<div id=\"%id%\" class=\"default_box %class_list%\" style=\"%size%\">",
+                    <<<<"%id%", id>>, <<"%class_list%", Joined(classes, " ")>>, <<"%size%", size>>>>),
+           Joined(inner, "\n"), "</div>">>, "\n")
+HTMLCircle(id, classes, size, inner) == HTMLBox(id, <<"default_circle">> \o classes, size, inner)
+HTMLText(id, text) == Joined(<<ReplaceFirstSubSeq(id, "%id%", "<span id=\"%id%\">"), text, "</span>">>, "\n")
+HTMLSVG(id, box, size, svg) ==
+  Joined(<<HTMLFill("<svg id=\"%id%\" viewBox=\"%viewBox%\" style=\"%size%\">", <<<<"%id%", id>>, <<"%viewBox%", box>>, <<"%size%", size>>>>),
+           svg, "</svg>">>, "\n")
+HTMLSize(w, h) == Joined(<<HTMLAttribute("width", w), HTMLAttribute("height", h)>>, " ")
+HTMLNewLine == "<br>"
+HTMLFlexCenterAttributes ==
+  Joined(<<HTMLAttribute("display", "flex"), HTMLAttribute("align-items", "center"), HTMLAttribute("justify-content", "center")>>, "\n")
+HTMLJSLineElems(from, to) ==
+  HTMLFill("document.getElementById(\"%id1%\"), document.getElementById(\"%id2%\")", <<<<"%id1%", from>>, <<"%id2%", to>>>>)
+HTMLJSLine(from, to, color, size) ==
+  HTMLFill("new LeaderLine(%elems%, {color: '%color%', size: %size%})",
+           <<<<"%elems%", HTMLJSLineElems(from, to)>>, <<"%color%", color>>, <<"%size%", size>>>>)
+HTMLJSLineDash(from, to, color, size) ==
+  HTMLFill("new LeaderLine(%elems%,  {color: '%color%', size: %size%, dash: true})",
+           <<<<"%elems%", HTMLJSLineElems(from, to)>>, <<"%color%", color>>, <<"%size%", size>>>>)
+HTMLJSKeyListener(events) ==
+  Joined(<<"window.onkeyup = function(event) {", "let key = event.key.toUpperCase();", Joined(events, "\n"), "}">>, "\n")
+HTMLJSNavigationKey(key, file) ==
+  Joined(<<ReplaceFirstSubSeq(key, "%key%", "if(key == '%key%'){"),
+           ReplaceFirstSubSeq(file, "%file%", "window.location.replace(\"%file%\");"), "}">>, "\n")
+====
+"##;

@@ -264,6 +264,13 @@ pub const FN: &str = "#fn ";
 /// generation refuses a use whose value is not constant (`Gen::gen_inner`)
 pub const CONST_ONLY: &str = "#const_only ";
 
+/// The name of the label `Expander::expand_def_bound` puts where it binds the arguments of a call
+/// and the LET definitions without arguments to names instead of writing them out at each use:
+/// its arguments are pairs, the name (an `Ident`) and the expression it stands for, and the body
+/// refers to the names. Only the constant evaluator reads such expressions (`value::register_bound`):
+/// it evaluates the expression of a name where the name is first used and keeps the value
+pub const BIND: &str = "#bind";
+
 /// `e` wrapped in an AT label for the position `at`
 pub fn at_err(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{AT}{at}"), vec![], e.b())
