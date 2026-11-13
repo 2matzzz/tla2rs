@@ -596,14 +596,32 @@ the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What 
 `tlc2.tool.liveness` and measured on the liveness violations of `examples/` and `tests/tlc/`:
 
 - Its plan (`Liveness.processLiveness`): fairness /\ ~(the properties) in disjunctive normal form, each disjunct a
-  possible error model of `<>[]A` parts (EAAction), `[]<>S` parts (AEState) and `[]<>A` parts (AEAction); any other
-  part goes to a tableau. Without a tableau there is one order of solution, and its models are searched in turn
+  possible error model of `<>[]A` parts (EAAction), `[]<>S` parts (AEState) and `[]<>A` parts (AEAction), the
+  conjunction of its other parts a formula for a tableau. The disjuncts with equal tableau formulas (or none) make an
+  order of solution, in the order first met, with predicates numbered of its own; the orders are searched in turn,
+  and within one its models. TLC numbers each state predicate it makes from the formula (`tagExpr`), and two are
+  equal only when their numbers are, also when written alike (the second field of `TExpr::State` in `src/live.rs`)
+- The tableau (`TBGraph`, `TBPar`; `tableau` in `src/live.rs`): the formula made binary (`makeBinary`: a junction
+  split into halves), its particles (`particleClosure`: the alpha rules of `/\` and `[]`, then the first beta rule
+  of `\/` or `<>` that applies splits it in two, the particles of the first branch not among the second's coming
+  first), then for each particle in turn the particles of the bodies of its `()` formulas, each new one appended.
+  A node pairs a state with a particle whose state predicates hold in it (boolean constants are ignored). The
+  promises are the `<>` subformulas; a particle fulfils `<>P` when it lacks `<>P` or has `P`
 - The liveness graph: the initial states in the order found; each state, expanded in BFS order, gets one transition
   per distinct successor in the model and one to itself (stuttering), in the order of the slots of a hash table of
   states (`SetOfStates`: linear probing from `(int) fp & 0x7FFFFFFF` modulo the length, which starts at 16 times a
   multiplier and grows to 2n+1 when half full, by inserting the old slots in order; the multiplier grows by one for
   the next state each time a set had to grow). Duplicates and self-loops count as puts at their place among the
-  successors, since a put checks the threshold first. The fingerprint is TLC's (`FP64` over each value's bytes: a
+  successors, since a put checks the threshold first. With a tableau (`LiveCheck.TableauLiveChecker`,
+  `tableau_graph` in the runtime) the initial nodes are each initial state with each of the formula's particles
+  that hold in it; each state, expanded in BFS order, gives each of its nodes recorded so far (in the order
+  recorded) a transition per successor in the set's order and per particle that can follow and holds in it, unless
+  the node has that transition already. A node new to a state already expanded gets its transitions at once, depth
+  first: the stuttering step first, then the successors in the order the actions generate them
+  (`Tool.getNextStates`, without the set); TLC writes it only if it has some, and leaves a node it did not write out
+  of the search. The dot file of `-dump dot` shows the latter dotted but not the stuttering ones (read with jdb in
+  `LiveWorker`: `tests/tlc/Live-SpecSpin-Starve` ends on such a step).
+  The fingerprint is TLC's (`FP64` over each value's bytes: a
   tag, the size, the elements in TLC's order; functions, tuples and records all as pairs; strings by their
   characters; a model value by the number TLC gives its name, `TLC_MODEL_VALUES`). TLC numbers names from 1 as it
   first creates them (`UniqueString`), the strings and model values of the cfg first, in the order written (measured
@@ -615,22 +633,26 @@ the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What 
   depth-first search that pushes all successors at once and keeps a low link per frame, skipping a step that breaks
   the model's EAAction (it queues the target instead). A component popped from the stack is checked if it has more
   than one node or its node's self-loop keeps EAAction; the first one with every AEState and AEAction (on steps
-  within it that keep EAAction) is the counterexample
-- The path to it (`DiskGraph.getPath`): breadth first from the initial states, successors in slot order
+  within it that keep EAAction), with every promise fulfilled by a node of it, is the counterexample
+- The path to it (`DiskGraph.getPath`, `TableauDiskGraph.getPath`): breadth first from the initial nodes,
+  successors in slot order, a node's step to itself skipped
 - The cycle (`LiveWorker.dfsPostFix`, then `bfsPostFix`): from the component's start, take the first step that
-  fulfils a []<> part not yet fulfilled, else go on to an unvisited node (backtracking when there is none), until
-  all are fulfilled; then breadth first back to the start. Each state is rebuilt from the one before by the first
-  action that yields it. The lasso ends `Stuttering` when it ends on the start, otherwise `Back to state N`, N the
+  fulfils a []<> part not yet fulfilled (a node fulfils []<>S parts and promises), else go on to an unvisited node
+  (backtracking when there is none), until all are fulfilled; then breadth first back to the start, over states:
+  each state takes the steps of all its nodes in the component, and a state is entered when any node of it is in
+  the component. A cycle that comes back to the start's state on another node prints as stuttering
+  (`tests/tlc/LiveTab-NestedEv`). Each state is rebuilt from the one before by the first action that yields it. The lasso ends `Stuttering` when it ends on the start, otherwise `Back to state N`, N the
   number of the start
 
-The checker follows this when there is no tableau, no VIEW, at most 128 predicates (held as `u128` bit masks when
-there are more than 64, `ManyFair-Viol`) and no `-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's `args`
+The checker follows this when there is no VIEW, at most 128 predicates in an order of solution (held as `u128` bit
+masks when there are more than 64, `ManyFair-Viol`), a tableau of at most 4096 particles and 64 promises, and no
+`-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's `args`
 choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own, not
 TLC's", with the reason). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
-after `MATCH` (`lasso confirmed instead: <reason>`). Of the 52 liveness violations of `examples/` and `tests/tlc/`,
-44 print TLC's lasso (most by following TLC's search, some by coincidence), and the 8 that need a tableau differ
-(`Live-SpecNext-Starve`, `Live-SpecSpin-Starve`, `Live-SpecWeak-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`,
-`OptDiffTrace-Live`, `LiveConst-Leads`, `LiveAssumed-Leads`).
+after `MATCH` (`lasso confirmed instead: <reason>`). All 60 liveness violations of `examples/` and `tests/tlc/` print
+TLC's lasso (most by following TLC's search, some by coincidence), 15 of them through a tableau (`LiveTab`,
+`LiveTabSym`, `Live-Spec*-Starve`, `Live-SpillNext-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`,
+`LiveConst-Leads`, `LiveAssumed-Leads`).
 
 TLC checks such a lasso as follows. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
 `.cfg` (`write_lasso_check` in the runtime, `src/lasso.rs`): a module that EXTENDS the spec with a variable for the
