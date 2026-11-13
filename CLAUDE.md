@@ -250,7 +250,7 @@ Measured on TLC 2.19 (`tests/tlc/SpecConj*`, `SpecShape*`, `SpecInst*`, `RtSpec*
   be a constant.`, exit 151; `[][FALSE]_x` in a SPECIFICATION is not, and deadlocks). A next-state relation that TLC
   splits into no action (`\E` over an empty constant set, also in `[][...]_v`) is not refused: TLC computes and
   checks the initial states and then stops with `No next state actions defined to generate successor states
-  from.` (exit 75), which the checker's `next` prints when it is generated for no action (`tests/tlc/NoActions*`)
+  from.` (exit 75), as for a spec without a next-state action (`NO_NEXT` in the checker; `tests/tlc/NoActions*`)
 - A module without variables, with a cfg that has no SPECIFICATION, INIT or NEXT (one that only checks its ASSUMEs),
   is not refused: TLC evaluates the ASSUMEs and reports no error with no states, and writes an empty state graph
   (`compile::NO_BEHAVIOR`, `tests/tlc/NoBehavior*`). With variables, it is refused for lack of an initial predicate
@@ -396,8 +396,8 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
 LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile::hide_locals`), since they are not
 in scope in the module that reads it, which may define the same name (`tests/tlc/SanyScope`, `SanyLocalRec`).
 
-Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
-(their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
+Not repeated: names inside `\EE` and `\AA` (their bound variables are not kept; those of `\E x : P`, `\A x : P`
+and `CHOOSE x : P` without a set are checked from `parser::unbounded_body`, `tests/tlc/RejSanyUnbounded`); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
 a LET definition (other than one named without its arguments); what is passed to an operator of an INSTANCE with
 parameters; and SANY's checks of other kinds
 (levels outside temporal formulas). The warnings in global context are not printed when the module has errors.

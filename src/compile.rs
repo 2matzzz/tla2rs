@@ -1583,11 +1583,6 @@ fn compile_inner(
         made_split_at += 1;
     }
     let actions = g.actions;
-    if actions == 0 && !no_next {
-        // TLC splits the next-state relation into no action at all (\E over an empty set): it
-        // computes the initial states and stops (`tests/tlc/NoActions`)
-        next_code = "println!(\"Error: No next state actions defined to generate successor states from.\");\nexit(75);\n".into();
-    }
 
     // Invariants. If this is the invariant the types came from and every conjunct was read as a
     // type declaration, there is no need to check it at runtime: pack performs the same check while
@@ -1818,7 +1813,9 @@ fn compile_inner(
     writeln!(show, "const ACTIONS: usize = {actions};").unwrap();
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
-    writeln!(src, "const NO_NEXT: bool = {no_next};").unwrap();
+    // A next-state relation that TLC splits into no action (\E over an empty set) ends the same
+    // way: TLC computes and checks the initial states and stops (`tests/tlc/NoActions`)
+    writeln!(src, "const NO_NEXT: bool = {};", no_next || actions == 0).unwrap();
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
     writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
