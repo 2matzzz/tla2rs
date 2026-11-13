@@ -30,8 +30,9 @@ It has no crate dependencies.
   one worker, and it compares the verdict, generated and distinct state counts, the states left on
   TLC's queue (see "The states left on queue"), the counterexample (its states and
   the action of each step; see "Counterexamples"), exit code, the messages and printed lines (see "Messages and
-  printed lines"), and the state graph (the set of states and the set of transitions; see "State graphs"). A liveness counterexample is instead checked by TLC (it runs TLC on the
-  `-lassocheck` output). If TLC produces no verdict, the check fails. `all.sh` prints, after `ok`, the rule that
+  printed lines"), and the state graph (the set of states and the set of transitions; see "State graphs"). TLC runs with `-fp 0`, so its liveness counterexample is the same on every run and is
+  compared too; where the checker prints a lasso of its own (see "Counterexamples"), TLC checks it instead (it runs
+  TLC on the `-lassocheck` output). If TLC produces no verdict, the check fails. `all.sh` prints, after `ok`, the rule that
   narrowed a comparison, if any
 - TLC's summary for each configuration (verdict, counts, the length and hash of its counterexample, exit code, the
   hashes of its state graph and of its messages, and a key hashing the jar, cfg, arguments, the modules the spec
@@ -557,10 +558,47 @@ The parser keeps these positions in POS labels; expansion drops them except whil
 `\E` is split further by TLC (the argument is a constant to it), while tla2rs names the call after the operator at
 the position of its body; no configuration has this.
 
-A liveness counterexample (lasso) cannot be compared with TLC's: TLC takes the successors of a state in its liveness
+A liveness counterexample (lasso) depends on TLC's fingerprints: TLC takes the successors of a state in its liveness
 graph out of a hash set keyed by fingerprint (`tlc2.util.SetOfStates`), and picks the fingerprint polynomial at
-random on each run. For `tests/tlc/LiveForms-NoneImplies.cfg`, ten runs gave 5 states eight times and 4 states
-twice. TLC checks tla2rs's lasso instead. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
+random on each run (for `tests/tlc/LiveForms-NoneImplies.cfg`, ten runs gave 5 states eight times and 4 states
+twice). With `-fp 0` it is the same on every run, so `crosscheck.sh` runs TLC that way and compares the lasso like
+any other counterexample. The checker follows TLC's search on its own graph to print the same lasso (`tlc_lasso` in
+the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What TLC 2.19 does, read from
+`tlc2.tool.liveness` and measured on the liveness violations of `examples/` and `tests/tlc/`:
+
+- Its plan (`Liveness.processLiveness`): fairness /\ ~(the properties) in disjunctive normal form, each disjunct a
+  possible error model of `<>[]A` parts (EAAction), `[]<>S` parts (AEState) and `[]<>A` parts (AEAction); any other
+  part goes to a tableau. Without a tableau there is one order of solution, and its models are searched in turn
+- The liveness graph: the initial states in the order found; each state, expanded in BFS order, gets one transition
+  per distinct successor in the model and one to itself (stuttering), in the order of the slots of a hash table of
+  states (`SetOfStates`: linear probing from `(int) fp & 0x7FFFFFFF` modulo the length, which starts at 16 times a
+  multiplier and grows to 2n+1 when half full, by inserting the old slots in order; the multiplier grows by one for
+  the next state each time a set had to grow). Duplicates and self-loops count as puts at their place among the
+  successors, since a put checks the threshold first. The fingerprint is TLC's (`FP64` over each value's bytes: a
+  tag, the size, the elements in TLC's order; functions, tuples and records all as pairs; strings by their
+  characters; a model value by TLC's number for its name, which tla2rs does not know)
+- The search (`LiveWorker.checkSccs`): from each initial state, then from each node a skipped step led to, a
+  depth-first search that pushes all successors at once and keeps a low link per frame, skipping a step that breaks
+  the model's EAAction (it queues the target instead). A component popped from the stack is checked if it has more
+  than one node or its node's self-loop keeps EAAction; the first one with every AEState and AEAction (on steps
+  within it that keep EAAction) is the counterexample
+- The path to it (`DiskGraph.getPath`): breadth first from the initial states, successors in slot order
+- The cycle (`LiveWorker.dfsPostFix`, then `bfsPostFix`): from the component's start, take the first step that
+  fulfils a []<> part not yet fulfilled, else go on to an unvisited node (backtracking when there is none), until
+  all are fulfilled; then breadth first back to the start. Each state is rebuilt from the one before by the first
+  action that yields it. The lasso ends `Stuttering` when it ends on the start, otherwise `Back to state N`, N the
+  number of the start
+
+The checker follows this when there is no tableau, no VIEW or SYMMETRY, no model value in the states and at most 64
+predicates, and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own, not
+TLC's", with the reason). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
+after `MATCH` (`lasso confirmed instead: <reason>`). Of the 44 liveness violations of `examples/` and `tests/tlc/`, 20
+follow TLC's search. Of the 24 others, 13 print a lasso equal to TLC's anyway, and 11 differ: 5 need a tableau
+(`Live-SpecNext-Starve`, `Live-SpecSpin-Starve`, `Live-SpecWeak-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`), 4 hold a model value (`Live-SpecNext-EvIdle`, `Live-SpecSpin-EvIdle`,
+`Live-SpecWeak-EvIdle`, `Live-SpecSpin-SomeCS`), 1 has a SYMMETRY (`LiveSymTurn`) and `ManyFair-Viol` has more than
+64 predicates.
+
+TLC checks such a lasso as follows. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
 `.cfg` (`write_lasso_check` in the runtime, `src/lasso.rs`): a module that EXTENDS the spec with a variable for the
 position on the lasso, whose initial predicate is the first state and the spec's own, whose next-state relation
 moves to the next position's state (from the last back to where the lasso returns, or to itself when it ends
@@ -584,8 +622,8 @@ lasso then returns to its entry under the VIEW only. Its last step goes to the a
 the cfg gets the spec's VIEW with the position added (`Tla2rsView == <<tla2rsAt, V>>`, and the spec's SYMMETRY if it
 has one), so TLC folds that successor into the entry as its own search does. A step with no successor of the right
 fingerprint (TLC cannot rebuild such a behavior either, tlaplus/tlaplus#1045) leaves the states the graph keeps,
-which TLC then refuses. `crosscheck.sh` runs this for each of the 44
-liveness violations (about a second of TLC each) and fails if TLC does not confirm it, or if the spec's parts cannot
+which TLC then refuses. `crosscheck.sh` runs this for each liveness violation whose lasso differs from TLC's
+(about a second of TLC each) and fails if TLC does not confirm it, or if the spec's parts cannot
 be written out (`lasso::tla` refuses a SPECIFICATION split inside an INSTANCE, and LET or LAMBDA in its conjuncts).
 
 ### Messages and printed lines
@@ -599,8 +637,8 @@ for diffing.
 Measured on TLC 2.19, two runs of every configuration with one worker (as `expected.sh -check`,
 each with its own random fingerprint seed) gave the same canonical text for all of them. What varies
 between runs is in lines that are dropped anyway: the banner (fingerprint seed, process id), the
-temporary paths of the modules TLC parses, times and dates, and the shape of a liveness
-counterexample. No configuration printed a Java stack trace. The rules:
+temporary paths of the modules TLC parses, times and dates, and (without `-fp`) the shape of a
+liveness counterexample. No configuration printed a Java stack trace. The rules:
 
 | Part of the output | Rule |
 |---|---|
@@ -778,6 +816,24 @@ Where tla2rs cannot print all of TLC's text, a line `\* crosscheck: error-lines 
 makes `crosscheck.sh` compare the error lines only, and `all.sh` says so. Without it everything is
 compared. The error lines leave out TLC's `Error: TLC was unable to fingerprint.` (above). No
 configuration needs it now.
+
+### TLCGet and TLCSet
+
+Not supported; the checker refuses both. What TLC 2.19 defines, read from `tlc2.module.TLC` and measured with one
+worker on a spec that prints them in Init, the next-state relation and an invariant:
+
+| Form | TLC 2.19 | Deterministic with one worker |
+|---|---|---|
+| `TLCGet(i)`, `TLCSet(i, v)` (i a natural) | A register per worker thread; reading an unset one is an error | Yes, in TLC's order of evaluation |
+| `TLCGet("level")` | The level of the state being expanded (an initial state's is 1), also in an invariant of its successor; 0 in Init and on the initial states | Yes |
+| `TLCGet("diameter")`, `("distinct")`, `("queue")` | The search's counts when evaluated | Yes, but they also change the values TLC computes when it evaluates the next-state relation again to rebuild a counterexample (before a deadlock at 2 levels and 3 distinct states, the rebuild read 3 and 3) |
+| `TLCGet("duration")` | Seconds since the start | No |
+| `TLCGet("generated")`, `("config")`, `("stats")`, `("action")`, `("spec")` | Undefined (`TLCGet(config) was undefined.`) | - |
+| `TLCSet("exit", TRUE)`, `TLCSet("pause", TRUE)` | Stop the search; wait for a key | - |
+
+The deterministic ones depend on when TLC evaluates each expression, including the evaluations again while it
+rebuilds a counterexample, which each search path of the checker would have to follow; that is not done. The
+corpus's `MCDieHardest` reads `TLCGet("config")`, which TLC 2.19 does not define, so it stays skipped.
 
 ### Arguments written out at each use
 
