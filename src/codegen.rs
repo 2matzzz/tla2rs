@@ -2459,7 +2459,9 @@ impl<'a> Gen<'a> {
             if is_bind(n) {
                 let (lets, env2, body) = self.gen_bind(pairs, body, env)?;
                 let (c, t) = self.gen(&body, &env2, want)?;
-                return Ok((if lets.is_empty() { c } else { format!("{{ {lets}{c} }}") }, t));
+                // The value is kept in a variable: a temporary at the end of the block that
+                // borrows a cell (an iterator over the bound set) would outlive it
+                return Ok((if lets.is_empty() { c } else { format!("{{ {lets}let __bv = {c}; __bv }}") }, t));
             }
         }
         // An operator of the CommunityModules evaluated only when compiling (see ast::CONST_ONLY)
@@ -6028,7 +6030,9 @@ impl<'a> Gen<'a> {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
                     write!(lets, "let {id} = std::cell::OnceCell::new(); let {id}f = || -> {} {{ {c} }}; ", t.repr()).unwrap();
-                    env2.bind(&n, format!("{id}.get_or_init(&{id}f).clone()"), t);
+                    // Every value type is Copy: read through the reference, so that a use that
+                    // only reads a part (a field, an iteration) does not copy the whole value
+                    env2.bind(&n, format!("(*{id}.get_or_init(&{id}f))"), t);
                     continue;
                 }
             }
