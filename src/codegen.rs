@@ -381,6 +381,13 @@ impl<'a> Gen<'a> {
             }
             return Ok(Cmp::Normal);
         }
+        // An optional field (of a record among records of other fields) compares as its value
+        if let (Ty::Opt(x), y) | (y, Ty::Opt(x)) = (a, b) {
+            return Ok(match self.tuple_cmp(x, y)? {
+                Cmp::Fails(m) => Cmp::Fails(m),
+                _ => Cmp::Normal,
+            });
+        }
         if let (Ty::Seq(_), t) | (t, Ty::Seq(_)) = (a, b) {
             if seq_elems(t).is_none() && !matches!(t, Ty::Enum(v) if v.is_empty()) {
                 return self.tuple_vs(t).map(|c| if c == Cmp::Normal { Cmp::Normal } else { c });
@@ -401,13 +408,8 @@ impl<'a> Gen<'a> {
                         .filter_map(|(n, s)| y.iter().find(|(m, _)| m == n).map(|(_, t)| self.tuple_cmp(s, t)))
                         .collect::<R<_>>()?,
                 ),
-                // Only an error carries over: empty sets or absent fields can still be equal
-                (Ty::Opt(_), _) | (_, Ty::Opt(_)) | (Ty::Set(_), Ty::Set(_)) | (Ty::Fun(..), Ty::Fun(..)) => {
-                    let (x, y): (&Ty, &Ty) = match (a, b) {
-                        (Ty::Opt(x), y) | (y, Ty::Opt(x)) => (x, y),
-                        (Ty::Set(x), Ty::Set(y)) | (Ty::Fun(_, x), Ty::Fun(_, y)) => (x, y),
-                        _ => unreachable!(),
-                    };
+                // Only an error carries over: empty sets can still be equal
+                (Ty::Set(x), Ty::Set(y)) | (Ty::Fun(_, x), Ty::Fun(_, y)) => {
                     match self.tuple_cmp(x, y)? {
                         Cmp::Fails(m) => Cmp::Fails(m),
                         _ => Cmp::Normal,
