@@ -242,8 +242,12 @@ memory.
   state's lines before its checks, nothing past the state that stops the search, and the lines TLC prints again
   while it rebuilds a counterexample (see CLAUDE.md, "Messages and printed lines"). Such specs are searched without
   `-batched`
-- Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
-  reason; what TLC 2.19 defines of them is listed in CLAUDE.md, "TLCGet and TLCSet"), sets that may hold both strings and integers (a set of strings compared with a set of integers is
+- `TLCGet` / `TLCSet` with one worker, with the values TLC 2.19 gives, also where it evaluates again to rebuild a
+  counterexample: the registers `TLCGet(i)` / `TLCSet(i, v)` holding integers, `TLCGet("level")`, `("diameter")`,
+  `("distinct")`, `("queue")` and `TLCSet("exit", TRUE)` (see CLAUDE.md, "TLCGet and TLCSet"). With them, several
+  workers and temporal properties are refused
+- Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet("duration")`, the forms of `TLCGet` /
+  `TLCSet` TLC 2.19 does not define, and `TLCSet("pause", ...)` (each is rejected with a reason), sets that may hold both strings and integers (a set of strings compared with a set of integers is
   supported: unequal when the sizes differ, an evaluation error otherwise, as in TLC), `Name <- [Module] Def` for a
   CONSTANT (TLC rejects it too), and `Op!@`
 - Specs that SANY refuses stop with exit 150, as in TLC, for these reasons: operators of overlapping precedence next

@@ -820,21 +820,44 @@ configuration needs it now.
 
 ### TLCGet and TLCSet
 
-Not supported; the checker refuses both. What TLC 2.19 defines, read from `tlc2.module.TLC` and measured with one
-worker on a spec that prints them in Init, the next-state relation and an invariant:
+What TLC 2.19 gives with one worker, measured on `tests/tlc/TlcGet*` and `TlcGetReg*` (each value printed with
+PrintT in the ASSUMEs, Init, the actions, the invariants and the CONSTRAINT), and what the checker does:
 
-| Form | TLC 2.19 | Deterministic with one worker |
+| Form | TLC 2.19 | tla2rs |
 |---|---|---|
-| `TLCGet(i)`, `TLCSet(i, v)` (i a natural) | A register per worker thread; reading an unset one is an error | Yes, in TLC's order of evaluation |
-| `TLCGet("level")` | The level of the state being expanded (an initial state's is 1), also in an invariant of its successor; 0 in Init and on the initial states | Yes |
-| `TLCGet("diameter")`, `("distinct")`, `("queue")` | The search's counts when evaluated | Yes, but they also change the values TLC computes when it evaluates the next-state relation again to rebuild a counterexample (before a deadlock at 2 levels and 3 distinct states, the rebuild read 3 and 3) |
-| `TLCGet("duration")` | Seconds since the start | No |
-| `TLCGet("generated")`, `("config")`, `("stats")`, `("action")`, `("spec")` | Undefined (`TLCGet(config) was undefined.`) | - |
-| `TLCSet("exit", TRUE)`, `TLCSet("pause", TRUE)` | Stop the search; wait for a key | - |
+| `TLCGet(i)`, `TLCSet(i, v)` | One store of registers, which the ASSUMEs, Init, the actions, the invariants and the constraints share in TLC's order of evaluation, also while it shows a behavior; reading one never set is TLC's own error, `TLCGet(3) was undefined.` | Supported for integer registers and values (`tg_get`, `tg_set`); what the ASSUMEs set is where the checker starts (`REG_INIT`) |
+| `TLCGet("level")` | The level of the state being expanded (an initial state's is 1); 0 in the ASSUMEs, in Init and in the checks of an initial state; a successor's CONSTRAINT and invariants see the level of the state it comes from | Supported |
+| `TLCGet("distinct")` | The states added so far: a state counts from after its CONSTRAINT and before its invariants | Supported |
+| `TLCGet("queue")` | The states waiting to be expanded: an initial state is queued before its invariants are checked, a successor after them | Supported |
+| `TLCGet("diameter")` | The largest level of a state added so far, 1 before any (in the ASSUMEs too) | Supported |
+| `TLCSet("exit", TRUE)` | The search ends without an error once Init, or the expansion of the state being expanded, is done, with the states left on queue | Supported (`tg_exit`) |
+| `TLCGet("duration")` | Seconds since the start | Refused: no two runs agree |
+| `TLCGet("generated")`, `("config")`, `("stats")`, `("action")`, `("spec")` | Undefined (`TLCGet(config) was undefined.`) | Refused |
+| `TLCSet("pause", TRUE)` | Waits for a key | Refused |
 
-The deterministic ones depend on when TLC evaluates each expression, including the evaluations again while it
-rebuilds a counterexample, which each search path of the checker would have to follow; that is not done. The
-corpus's `MCDieHardest` reads `TLCGet("config")`, which TLC 2.19 does not define, so it stays skipped.
+A definition of constant level that reads them is not evaluated once when TLC starts (`Level == TLCGet("level")`
+changes from state to state), so neither the compiler nor code generation folds them (`constant_level`,
+`Gen::is_const`). When TLC shows a behavior, the counts stay where the search stopped (`queue` is the number of
+states left on queue), the level is that of the state each step starts from (0 for Init, and for the step
+evaluated once more after an evaluation error), and the registers go on changing as TLC evaluates again.
+
+The values depend on when TLC handles each state: as soon as Init or an action computes it, before the rest of the
+action is evaluated. A spec that uses them (`TLCGET` in the generated checker, which implies `PRINT_ORDER`) is checked
+so: the generated code calls `pushed` after each state it computes, and the runtime adds and checks that state
+there (`expand_eager_one`, and the initial states in `initial_states`); the step to a state that stops the search
+unwinds out of the action. To show a behavior, each step evaluates the actions in order up to the one that yields
+the next state and stops at the start of the next action (`step_prints`, `mark_action`); the checker's own
+replays of a behavior leave the registers as they were (`tg_quiet`). With TLCGET an invariant is evaluated once
+per state (`eval_invariants`), and an expansion that fails is not evaluated again (`expand_caught`).
+
+Refused at run time: several workers (TLC's counts and registers are then those of its threads and shared queue),
+and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
+`-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
+
+Not followed: after an evaluation error in an invariant, TLC evaluates the step to the failing state once more
+(after an error on an initial state, Init), printing again; the checker does not, with or without TLCGet (the
+`UnsetInv` probe in `TlcGetReg` was dropped for this). None of the corpus's models becomes checkable: the skipped
+ones that read them use TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
 
 ### Arguments written out at each use
 
