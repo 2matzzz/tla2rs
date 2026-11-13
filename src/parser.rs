@@ -267,6 +267,18 @@ pub fn is_infix_name(name: &str) -> bool {
 /// `CHOOSE`, a space and its position
 pub const UNBOUNDED: &str = "#unbounded";
 
+thread_local! {
+    /// The bound variables and body of each `\E x : P`, `\A x : P` and `CHOOSE x : P` without a
+    /// set, by the name of the call it parses into (which has its position), for SANY's checks of
+    /// the names in them (sany.rs); the tree keeps neither
+    static UNBOUNDED_BODIES: std::cell::RefCell<std::collections::HashMap<String, (Vec<String>, Expr)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// See UNBOUNDED_BODIES
+pub fn unbounded_body(call: &str) -> Option<(Vec<String>, Expr)> {
+    UNBOUNDED_BODIES.with(|b| b.borrow().get(call).cloned())
+}
+
 /// TLC's error when it evaluates the unbounded quantifier or CHOOSE named `call` (see UNBOUNDED)
 pub fn unbounded_error(call: &str) -> Option<String> {
     let (kind, at) = call.strip_prefix(UNBOUNDED)?.split_once(' ')?;
@@ -1201,10 +1213,16 @@ impl Parser {
         }
         // The position runs from the quantifier to the end of its body
         let start = self.pos - 1;
+        let vars: Vec<String> = (self.pos..=i).step_by(2).filter_map(|k| match &self.toks[k].tok {
+            Tok::Ident(x) => Some(self.tagged(x.clone(), k)),
+            _ => None,
+        }).collect();
         self.pos = i + 2;
-        self.expr(0)?;
+        let body = self.expr(0)?;
         let at = self.span_text(start, self.pos - 1);
-        Ok(Some(Expr::Call(format!("{UNBOUNDED}{kind} {at}"), vec![])))
+        let call = format!("{UNBOUNDED}{kind} {at}");
+        UNBOUNDED_BODIES.with(|b| b.borrow_mut().insert(call.clone(), (vars, body)));
+        Ok(Some(Expr::Call(call, vec![])))
     }
 
     /// The operand of the prefix operator `op` (by its name in `sany_range`), parsed at

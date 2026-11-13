@@ -903,7 +903,18 @@ impl<'a> Walker<'a> {
                 self.resolve(untag(n).0, &at.text_if_known(), false);
             }
             Call(n, args) => {
-                if n.starts_with(crate::parser::UNBOUNDED) || n == "\\EE" || n == "\\AA" {
+                if n.starts_with(crate::parser::UNBOUNDED) {
+                    if let Some((vars, body)) = crate::parser::unbounded_body(n) {
+                        self.scoped(|w| {
+                            for x in &vars {
+                                w.bind_var(x);
+                            }
+                            w.expr(&body)
+                        });
+                    }
+                    return;
+                }
+                if n == "\\EE" || n == "\\AA" {
                     // Their bound variables are not kept
                     return;
                 }
