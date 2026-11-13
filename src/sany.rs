@@ -97,6 +97,8 @@ fn error(at: &str, msg: String) {
 thread_local! {
     /// See `take_warnings`
     static WARNED: RefCell<Vec<String>> = const { RefCell::new(vec![]) };
+    /// SANY's warnings "in global context" for the module being checked
+    static GLOBAL: RefCell<Vec<(String, String)>> = const { RefCell::new(vec![]) };
 }
 
 fn warning(at: &str, msg: String) {
@@ -326,10 +328,18 @@ fn duplicate(x: &str, other: &str) -> String {
 /// have been loaded) and the modules nested in it, and records what they export
 pub fn check(m: &Module) -> R<()> {
     DIAG.with(|d| *d.borrow_mut() = Diag::default());
+    GLOBAL.with(|g| g.borrow_mut().clear());
     let ex = module(m, vec![], true);
+    let global = GLOBAL.with(|g| std::mem::take(&mut *g.borrow_mut()));
     EXPORTS.with(|e| e.borrow_mut().insert(m.name.clone(), ex));
     let take = || DIAG.with(|d| std::mem::take(&mut *d.borrow_mut()));
     let d = take();
+    if d.errors.is_empty() && !global.is_empty() {
+        let item = |(at, msg): &(String, String)| format!("{at}\n\n{msg}\n\n\n");
+        let mut s = format!("Semantic errors in global context:\n\n*** Warnings: {}\n\n", global.len());
+        s.extend(global.iter().map(item));
+        WARNED.with(|w| w.borrow_mut().push(s));
+    }
     if d.errors.is_empty() && d.warnings.is_empty() {
         return Ok(());
     }
@@ -426,6 +436,12 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                         out.push(s.clone());
                     }
                     if !scope.syms.contains(&s) {
+                        // Another definition of the name from another extended module: SANY
+                        // warns "in global context"
+                        if let Some(old) = scope.get(&s.name).filter(|o| !o.decl && !s.decl) {
+                            let msg = format!("Warning: the definition of '{}' conflicts with \nits definition at {}.", s.name, old.at);
+                            GLOBAL.with(|g| g.borrow_mut().push((s.at.clone(), msg)));
+                        }
                         scope.push(s);
                     }
                 }
@@ -487,8 +503,9 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                 ctx.add(n, Kind::Def, true);
                 // Exported even when the definition is LOCAL (measured: a module that extends
                 // one with `RECURSIVE F(_)` and `LOCAL F(n) == ...` may not define F)
-                scope.push(own(n, false, at, vec![0; arity]));
-                out.push(own(n, false, at, vec![0; arity]));
+                // What its parameters take is known once it is defined
+                scope.push(own(n, false, at, vec![usize::MAX; arity]));
+                out.push(own(n, false, at, vec![usize::MAX; arity]));
             }
             Unit::Assume(i) => Walker::new(&scope, known, &m.recursive).expr(&m.assumes[*i].expr),
             Unit::Def(i, fun) => {
@@ -514,6 +531,7 @@ fn module(m: &Module, base: Vec<Sym>, mut known: bool) -> Option<Vec<Sym>> {
                         // SANY places the symbol at its definition from now on
                         for s in scope.syms.iter_mut().chain(out.iter_mut()).filter(|s| s.name == d.name && s.origin == format!("{}.{}", m.name, d.name)) {
                             s.at = at.to_string();
+                            s.params = params_of(d);
                         }
                         true
                     }
@@ -714,7 +732,7 @@ impl<'a> Walker<'a> {
     /// a parameter takes no arguments is refused, and so is anything but an operator of as many
     /// parameters where it takes some (measured on SANY 2.19, `tests/tlc/RejSanyOpArg*`)
     fn args(&mut self, n: &str, args: &[Expr], at_name: &str, at_all: &str) {
-        let Some((_, params)) = self.op_info(n).filter(|(_, p)| p.len() == args.len()) else {
+        let Some((_, params)) = self.op_info(n).filter(|(_, p)| p.len() == args.len() && !p.contains(&usize::MAX)) else {
             return args.iter().for_each(|a| self.arg(arg_at(a).0));
         };
         // From the operator's name to the closing parenthesis
@@ -731,7 +749,8 @@ impl<'a> Walker<'a> {
                 Expr::Ident(x, xat) => {
                     let x = untag(x).0;
                     let xat = xat.text_if_known();
-                    if !self.resolve(x, &xat, true) {
+                    // An operator symbol passed as an argument (`SortSeq(s, <)`) is not checked
+                    if !self.resolve(x, &xat, true) || !x.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
                         continue;
                     }
                     let Some((k, _)) = self.op_info(x).or_else(|| self.place(x).map(|p| (p.2, vec![]))) else { continue };

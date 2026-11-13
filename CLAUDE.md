@@ -348,7 +348,9 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
   definition reached twice is one symbol: a module extended along two paths, or a module without constants or
   variables both extended and instantiated (or instantiated twice). An INSTANCE of a module with constants or
   variables gives new definitions, so instantiating it twice without names is refused. Two different definitions
-  of one name in two extended modules are only a warning for SANY, and are not refused
+  of one name in two extended modules are only a warning for SANY (`Semantic errors in global context:`, before the
+  module's own warnings, and again for each module that extends that one), and TLC uses the one extended first
+  (`tests/tlc/SanyTwoDefs*`; `compile::load_parsed` keeps it)
 - A label `l(p, q) :: e` must list exactly the bound variables introduced between it and the enclosing label or
   definition, each once; a LET definition starts afresh, and operator parameters and LET names do not count. LAMBDA
   is accepted only as an argument of an operator or in a WITH substitution
@@ -390,7 +392,7 @@ Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a s
 (their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
 a LET definition (other than one named without its arguments); what is passed to an operator of an INSTANCE with
 parameters; and SANY's checks of other kinds
-(levels outside temporal formulas, the warning for two definitions of one name in two extended modules).
+(levels outside temporal formulas). The warnings in global context are not printed when the module has errors.
 
 ### Quantifiers and CHOOSE without a set
 

@@ -439,7 +439,10 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
                 out.extends.extend(sub.extends);
                 out.constants.extend(sub.constants);
                 out.variables.extend(sub.variables);
-                out.defs.extend(sub.defs);
+                // Of two definitions of one name in two extended modules (SANY warns), TLC uses the
+                // one extended first (`tests/tlc/SanyTwoDefs`)
+                let have: HashSet<String> = out.defs.iter().map(|d| d.name.clone()).collect();
+                out.defs.extend(sub.defs.into_iter().filter(|d| !have.contains(&d.name)));
                 out.assumes.extend(sub.assumes);
                 out.modules.extend(sub.modules);
                 out.op_constants.extend(sub.op_constants);
