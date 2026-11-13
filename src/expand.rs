@@ -9,6 +9,9 @@ use std::collections::HashMap;
 struct Env {
     subst: HashMap<String, Expr>,
     locals: HashMap<String, (Def, Env)>,
+    /// LET definitions bound to a name (their uses read `subst`), known only for the positional
+    /// names of their subexpressions (`M!1`). Shared, since each holds the environment before it
+    lets: HashMap<String, (Def, std::rc::Rc<Env>)>,
 }
 
 /// A recursive operator, expanded once with its parameters as fresh bound variables. Its calls
@@ -231,10 +234,12 @@ impl<'a> Expander<'a> {
                 let a = self.expand(a, caller)?;
                 if self.bindable(&a) {
                     let n = self.bind(p, &mut env);
-                    // For code generation the call site keeps the argument as written out, which
-                    // it reads to name actions (`Gen::gen_split`)
-                    args.push(if self.bind == BIND_CODE { a.clone() } else { Expr::Ident(n.clone(), NOPOS) });
-
+                    // For code generation the call site keeps the names the argument reads from
+                    // outside, which tell whether it depends on the state, to name actions
+                    // (`Gen::gen_split`). Not the argument written out: it holds the call sites
+                    // of the calls in it, each with its own argument, so it would double at each
+                    // call that passes the value on (`tests/tlc/ArgShare`)
+                    args.push(if self.bind == BIND_CODE { Expr::Tuple(free_idents(&a)) } else { Expr::Ident(n.clone(), NOPOS) });
                     binds.extend([Expr::Ident(n, NOPOS), a]);
                 } else {
                     env.subst.insert(p.clone(), a.clone());
@@ -513,6 +518,8 @@ impl<'a> Expander<'a> {
                             Ok(b) if self.bindable(&b) => {
                                 let n = self.bind(&d.name, &mut inner);
                                 inner.locals.remove(&d.name);
+                                // A positional name `M!1` still finds the definition (`tests/tlc/SubLet`)
+                                inner.lets.insert(d.name.clone(), (unique.clone(), std::rc::Rc::new(snapshot)));
                                 binds.extend([Expr::Ident(n, NOPOS), b]);
                                 continue;
                             }
@@ -563,7 +570,7 @@ impl<'a> Expander<'a> {
         let parts: Vec<&str> = n.split('!').collect();
         (1..parts.len()).rev().find_map(|i| {
             let op = parts[..i].join("!");
-            (env.locals.contains_key(&op) || self.defs.contains_key(op.as_str()))
+            (env.locals.contains_key(&op) || env.lets.contains_key(&op) || self.defs.contains_key(op.as_str()))
                 .then(|| (op, parts[i..].iter().map(|l| l.to_string()).collect()))
         })
     }
@@ -609,14 +616,15 @@ impl<'a> Expander<'a> {
             _ => return Err("a subexpression name must start with an operator".into()),
         };
         // Labels written as part of the name (`Op!lab`) come first
-        let (op, labels) = if env.locals.contains_key(&name) || self.defs.contains_key(name.as_str()) {
+        let (op, labels) = if env.locals.contains_key(&name) || env.lets.contains_key(&name) || self.defs.contains_key(name.as_str()) {
             (name.clone(), vec![])
         } else {
             self.label_path(&name, env).ok_or(format!("unknown operator `{name}`"))?
         };
-        let (d, denv) = match env.locals.get(&op) {
-            Some((d, denv)) => (d.clone(), with_self(&op, d, denv.clone())),
-            None => ((*self.defs[op.as_str()]).clone(), Env::default()),
+        let (d, denv) = match (env.locals.get(&op), env.lets.get(&op)) {
+            (Some((d, denv)), _) => (d.clone(), with_self(&op, d, denv.clone())),
+            (None, Some((d, denv))) => (d.clone(), with_self(&op, d, (**denv).clone())),
+            (None, None) => ((*self.defs[op.as_str()]).clone(), Env::default()),
         };
         if args.len() < d.params.len() {
             return Err(format!("`{name}`: `{op}` expects {} arguments", d.params.len()));
@@ -812,6 +820,53 @@ pub(crate) fn builtin_op_param(name: &str, args: usize) -> Option<(usize, usize)
 
 const BIND_CONST: u8 = 1;
 const BIND_CODE: u8 = 2;
+
+/// The identifiers e reads from outside it, each once, in the order first read
+fn free_idents(e: &Expr) -> Vec<Expr> {
+    fn walk(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<Expr>) {
+        use Expr::*;
+        let n = bound.len();
+        match e {
+            Ident(x, _) => {
+                if !bound.contains(x) && !out.iter().any(|o| matches!(o, Ident(y, _) if y == x)) {
+                    out.push(e.clone());
+                }
+            }
+            // A BIND label binds its names in the expressions after them and in its body
+            Label(l, a, b) if is_bind(l) => {
+                for p in a.chunks(2) {
+                    if let [Ident(x, _), v] = p {
+                        walk(v, bound, out);
+                        bound.push(x.clone());
+                    }
+                }
+                walk(b, bound, out);
+            }
+            _ => {
+                match e {
+                    Quant(_, bs, _) | SetMap(_, bs) => bound.extend(bs.iter().map(|(x, _)| x.clone())),
+                    Choose(x, ..) | SetFilter(x, ..) | FunCons(x, ..) => bound.push(x.clone()),
+                    Lambda(ps, _) => bound.extend(ps.iter().cloned()),
+                    Let(ds, _) => bound.extend(ds.iter().flat_map(|d| std::iter::once(&d.name).chain(&d.params).cloned())),
+                    Except(_, ups) => bound.extend(ups.iter().flat_map(|(p, _)| {
+                        p.iter().filter_map(|s| match s {
+                            Path::Field(k) if k.starts_with('@') => Some(k.clone()),
+                            _ => None,
+                        })
+                    })),
+                    _ => {}
+                }
+                for c in e.children() {
+                    walk(c, bound, out);
+                }
+            }
+        }
+        bound.truncate(n);
+    }
+    let mut out = vec![];
+    walk(e, &mut vec![], &mut out);
+    out
+}
 
 /// `body` under a BIND label for the names and expressions in `binds`, if any
 
