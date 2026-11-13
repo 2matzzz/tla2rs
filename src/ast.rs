@@ -286,6 +286,37 @@ pub fn at_pos(at: &str, e: Expr) -> Expr {
     Expr::Label(format!("{POS}{at}"), vec![], e.b())
 }
 
+/// The name of the label around the value an EXCEPT changes, when that is not an identifier
+/// (which keeps its own position, see `Pos`): `#exat ` followed by where the value is written, as
+/// TLC prints it in its warning for an argument or field the value does not have. It changes
+/// nothing else
+pub const EXCEPT_AT: &str = "#exat ";
+
+/// The name of the label around the value an EXCEPT leaves as it is because the index is outside
+/// the tuple (`Gen::split_dynamic_index`): `#exwarn ` followed by where the tuple is written. The
+/// checker warns as TLC does when it evaluates it
+pub const EXCEPT_WARN: &str = "#exwarn ";
+
+/// `e` wrapped in an EXCEPT_AT label for the position `at`
+pub fn except_at(at: &str, e: Expr) -> Expr {
+    Expr::Label(format!("{EXCEPT_AT}{at}"), vec![], e.b())
+}
+
+/// Where the value `f` an EXCEPT changes is written (see EXCEPT_AT), if known
+pub fn except_pos(f: &Expr) -> Option<String> {
+    let mut x = f;
+    loop {
+        match x {
+            Expr::Label(n, _, b) => match n.strip_prefix(EXCEPT_AT) {
+                Some(at) => return Some(at.to_string()),
+                None => x = b,
+            },
+            Expr::Ident(_, p) if p.known() => return Some(p.text()),
+            _ => return None,
+        }
+    }
+}
+
 /// The name of the label around what a variable of an instantiated module stands for, when an
 /// INSTANCE substitutes another expression for it: `#var ` followed by the variable's name. It
 /// changes nothing, except where TLC computes whether an action is enabled in an ENABLED or a

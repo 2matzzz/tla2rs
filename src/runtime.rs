@@ -616,8 +616,51 @@ thread_local! {
 fn tlc_print(line: String) {
     CAPTURE.with(|c| match &mut *c.borrow_mut() {
         Some(c) => c.lines.push((c.pushes, c.acts, line)),
-        None => println!("{line}"),
+        None => put_line(&line),
     })
+}
+
+/// What starts a held line that is one of TLC's warnings (see `put_line`)
+const WARNING_MARK: char = '\u{2}';
+
+/// TLC's warnings printed so far, as printed (TLC prints a warning only when it has not printed
+/// that text before, and the first warning of a run carries the note `NOWARNING`), and whether
+/// one was printed. Starts from the warnings among STARTUP_PRINTS
+static WARNED: std::sync::Mutex<Option<(std::collections::HashSet<String>, bool)>> = std::sync::Mutex::new(None);
+
+const NOWARNING: &str = "(Use the -nowarning option to disable this warning.)";
+
+/// Prints a line printed by the spec, or a warning (marked with WARNING_MARK) as TLC does
+fn put_line(l: &str) {
+    let Some(w) = l.strip_prefix(WARNING_MARK) else {
+        println!("{l}");
+        return;
+    };
+    let mut g = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, any) = g.get_or_insert_with(|| {
+        let mut seen = std::collections::HashSet::new();
+        let mut any = false;
+        for (i, l) in STARTUP_PRINTS.iter().enumerate() {
+            if l.starts_with("Warning: ") {
+                let noted = STARTUP_PRINTS.get(i + 1) == Some(&NOWARNING);
+                seen.insert(if noted { format!("{l}\n{NOWARNING}") } else { l.to_string() });
+                any = true;
+            }
+        }
+        (seen, any)
+    });
+    let text = if *any { w.to_string() } else { format!("{w}\n{NOWARNING}") };
+    *any = true;
+    if seen.insert(text.clone()) {
+        println!("{text}");
+    }
+}
+
+/// TLC's warning for an EXCEPT that names an argument or field the value at `at` does not have
+/// (the EXCEPT then changes nothing there)
+#[cold]
+fn except_warning(at: &str) {
+    tlc_print(format!("{WARNING_MARK}Warning: The EXCEPT was applied to non-existing fields of the value at\n{at}"));
 }
 
 /// A state pushed by `init` or `next`
@@ -702,7 +745,7 @@ impl Held {
             if *p >= n {
                 break;
             }
-            println!("{l}");
+            put_line(l);
             self.next += 1;
         }
         while let Some(&(p, a)) = self.cap.made.get(self.next_made) {
@@ -830,7 +873,7 @@ fn step_prints(s: &State, t: &State) {
     let last = held.cap.push_acts[j];
     for (_, a, l) in &held.cap.lines {
         if *a <= last {
-            println!("{l}");
+            put_line(l);
         }
     }
 }

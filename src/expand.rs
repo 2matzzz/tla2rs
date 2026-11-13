@@ -425,7 +425,13 @@ impl<'a> Expander<'a> {
             App(f, x) => App(ex(self, f)?.b(), ex(self, x)?.b()),
             Field(r, k) => Field(ex(self, r)?.b(), k.clone()),
             Except(f, ups) => {
-                let f2 = ex(self, f)?;
+                let mut f2 = ex(self, f)?;
+                // A name replaced by what it stands for: keep where it is written (see EXCEPT_AT)
+                if let Ident(_, at) = f.as_ref() {
+                    if at.known() && !matches!(f2, Ident(..)) {
+                        f2 = except_at(&at.text(), f2);
+                    }
+                }
                 let mut out = vec![];
                 for (path, v) in ups {
                     let mut path2: Vec<Path> = path

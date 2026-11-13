@@ -33,6 +33,8 @@ pub struct Startup {
     pub pcal: Vec<String>,
     pub consts: Vec<String>,
     pub warnings: Vec<String>,
+    /// TLC's warnings while it evaluates the invariants and properties of constant level
+    pub invs: Vec<String>,
     pub assumes: Vec<String>,
     /// The strings that operations made while TLC evaluated the constants, the definitions of
     /// constant level, the constant invariants and properties and the ASSUMEs, in the order made
@@ -47,14 +49,24 @@ impl Startup {
     pub fn lines(&self) -> Vec<String> {
         // TLC prints the PlusCal warnings itself, not as the messages its note follows
         let mut v = self.pcal.clone();
-        v.extend(self.consts.iter().cloned());
-        for (i, w) in self.warnings.iter().enumerate() {
-            v.push(w.clone());
-            if i == 0 {
-                v.push(NOWARNING.into());
+        let mark = |w: &String| format!("{}{w}", crate::value::WARNING_MARK);
+        let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
+        // TLC prints a warning only when it has not printed the same text before, and the first
+        // warning of a run carries its note (so the same warning can come once more without it)
+        let mut seen = HashSet::new();
+        for l in lines {
+            let Some(w) = l.strip_prefix(crate::value::WARNING_MARK) else {
+                v.push(l);
+                continue;
+            };
+            let text = if seen.is_empty() { format!("{w}\n{NOWARNING}") } else { w.to_string() };
+            if seen.insert(text) {
+                v.push(w.to_string());
+                if seen.len() == 1 {
+                    v.push(NOWARNING.into());
+                }
             }
         }
-        v.extend(self.assumes.iter().cloned());
         v
     }
 
@@ -969,19 +981,36 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
 }
 
 /// e with Print and PrintT removed (as TLC uses the value it computed when it started)
-fn strip_prints(e: &Expr) -> Expr {
-    match e {
-        Expr::Call(n, a) if n == "PrintT" && a.len() == 1 => Expr::Bool(true),
-        Expr::Call(n, a) if n == "Print" && a.len() == 2 => strip_prints(&a[1]),
-        _ => crate::codegen::map_children(e, &strip_prints),
-    }
-}
-
-/// e with the definitions in `cached` (evaluated when TLC started) not printing again
+/// e with the definitions in `cached` (evaluated when TLC started) not printing again, nor
+/// warning again about an EXCEPT
 fn uncache_prints(e: &Expr, cached: &HashSet<String>) -> Expr {
     match e {
         Expr::Label(n, a, b) if a.is_empty() && cached.contains(n) => Expr::Label(n.clone(), vec![], strip_prints(b).b()),
         _ => crate::codegen::map_children(e, &|c| uncache_prints(c, cached)),
+    }
+}
+
+fn strip_prints(e: &Expr) -> Expr {
+    match e {
+        Expr::Call(n, a) if n == "PrintT" && a.len() == 1 => Expr::Bool(true),
+        Expr::Call(n, a) if n == "Print" && a.len() == 2 => strip_prints(&a[1]),
+        // Without the position TLC's warning names, nothing warns (see `ast::except_pos`)
+        Expr::Except(f, ups) => {
+            let mut f = f.as_ref();
+            while let Expr::Label(n, _, b) = f {
+                if !n.starts_with(crate::ast::EXCEPT_AT) {
+                    break;
+                }
+                f = b;
+            }
+            let f = match f {
+                Expr::Ident(n, _) => Expr::Ident(n.clone(), NOPOS),
+                f => strip_prints(f),
+            };
+            let ups = ups.iter().map(|(p, v)| (p.clone(), strip_prints(v))).collect();
+            Expr::Except(f.b(), ups)
+        }
+        _ => crate::codegen::map_children(e, &strip_prints),
     }
 }
 
@@ -1024,6 +1053,10 @@ fn has_prints(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Call(n, _) if n == "PrintT" || n == "Print"))
 }
 
+fn has_except(e: &Expr) -> bool {
+    e.any(&|x| matches!(x, Expr::Except(..)))
+}
+
 /// Evaluates e, expanded with bindings (`Expander::expand_def_bound`)
 fn eval_const(ce: &ConstEval, e: &Expr) -> R<Value> {
     crate::value::register_bound(e);
@@ -1037,6 +1070,13 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
     let r = eval_const(ce, e);
     let lines = PRINTED.with(|p| p.borrow_mut().take()).unwrap_or_default();
     for l in lines {
+        // One of TLC's warnings (see `value::WARNING_MARK`), kept marked for `Startup::lines`
+        if let [w] = l.as_slice() {
+            if w.starts_with(crate::value::WARNING_MARK) {
+                out.push(w.clone());
+                continue;
+            }
+        }
         // TLC pretty-prints each value printed (80 columns)
         out.push(l.iter().map(|v| crate::ppr::ppr(v)).collect::<Vec<_>>().join("  "));
     }
@@ -1209,8 +1249,9 @@ fn compile_inner(
             if !constant_level(&e, &m) {
                 continue;
             }
-            if has_prints(&e) {
-                // TLC ignores a definition it fails to evaluate here
+            if has_prints(&e) || has_except(&e) {
+                // TLC ignores a definition it fails to evaluate here (and may warn about an
+                // EXCEPT, see `value::except_warning`)
                 if eval_printing(&ce, &uncache_prints(&e, &cached), &mut startup.consts).is_ok() {
                     cached.insert(n);
                 }
@@ -1233,7 +1274,10 @@ fn compile_inner(
                 continue;
             }
             atoms.log_start();
-            let r = eval_const(&ce, &e);
+            // Only TLC's warnings are kept of what it prints here
+            let mut printed = vec![];
+            let r = if has_except(&e) { eval_printing(&ce, &uncache_prints(&e, &cached), &mut printed) } else { eval_const(&ce, &e) };
+            startup.invs.extend(printed.into_iter().filter(|l| l.starts_with(crate::value::WARNING_MARK)));
             made_now.extend(atoms.log_end());
             match r {
                 Ok(Value::Bool(true)) | Err(_) => {}

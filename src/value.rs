@@ -180,6 +180,16 @@ thread_local! {
     pub static PRINTED: std::cell::RefCell<Option<Vec<Vec<String>>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// What starts a line recorded in PRINTED that is one of TLC's warnings, as it prints it (not a
+/// value)
+pub const WARNING_MARK: char = '\u{2}';
+
+/// TLC's warning for an EXCEPT that names an argument or field the value at `at` does not have,
+/// recorded with the lines printed (TLC prints it then, unless it printed it before)
+fn except_warning(at: &str) {
+    record_print(vec![format!("{WARNING_MARK}Warning: The EXCEPT was applied to non-existing fields of the value at\n{at}")]);
+}
+
 fn record_print(line: Vec<String>) {
     PRINTS.with(|n| n.set(n.get() + 1));
     PRINTED.with(|p| {
@@ -1067,6 +1077,12 @@ impl ConstEval<'_> {
                 env2.insert(y.clone(), x);
                 self.eval(body, &env2)?
             }
+            // [[y \in S |-> e] EXCEPT ![k] = v][x] with S not enumerable: as above, with TLC's
+            // warning for a key outside S
+            App(f, x) if self.lazy_except(f, env) => {
+                let x = self.eval(x, env)?;
+                self.lazy_except_apply(f, &x, env, true)?
+            }
             App(f, x) => {
                 let f = self.eval(f, env)?;
                 let x = self.eval(x, env)?;
@@ -1091,6 +1107,7 @@ impl ConstEval<'_> {
             Tuple(xs) => Value::Tuple(xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?),
             Except(f, ups) => {
                 let mut v = self.eval(f, env)?;
+                let warn = except_pos(f);
                 for (path, val) in ups {
                     // The expander appends the name of this update's @ as a field step starting with @
                     let at = path.iter().find_map(|p| match p {
@@ -1098,7 +1115,7 @@ impl ConstEval<'_> {
                         _ => None,
                     });
                     let steps: Vec<&Path> = path.iter().filter(|p| !matches!(p, Path::Field(k) if k.starts_with('@'))).collect();
-                    v = self.except_at(v, &steps, val, at.as_deref(), env)?;
+                    v = self.except_at(v, &steps, val, at.as_deref(), env, warn.as_deref())?;
                 }
                 v
             }
@@ -1126,9 +1143,77 @@ impl ConstEval<'_> {
         })
     }
 
+    /// Whether f is `[[y \in S |-> e] EXCEPT ![k] = v, ...]` (EXCEPT one or more times, one key
+    /// per update) with S a set TLC does not enumerate
+    fn lazy_except(&self, f: &Expr, env: &HashMap<String, Value>) -> bool {
+        let f = shape(f);
+        let Expr::Except(base, ups) = &*f else { return false };
+        let one_key = ups.iter().all(|(p, _)| p.iter().filter(|s| !matches!(s, Path::Field(k) if k.starts_with('@'))).count() == 1 && matches!(p.first(), Some(Path::Idx(_))));
+        one_key && (self.lazy_except(base, env) || matches!(&*shape(base), Expr::FunCons(_, s, _) if self.lazy_set(s, env)))
+    }
+
+    /// `f[x]` for f as `lazy_except` accepts: TLC evaluates each update's key (and warns when it
+    /// is outside the domain), then applies the function
+    /// (with `warn` false, as the value before an update, whose keys were evaluated already)
+    fn lazy_except_apply(&self, f: &Expr, x: &Value, env: &HashMap<String, Value>, warn: bool) -> R<Value> {
+        let f = shape(f);
+        match &*f {
+            Expr::FunCons(y, s, body) => {
+                if !self.member(x, s, env)? {
+                    // Not folded: the checker reports it with TLC's message (`Gen::lazy_apply`)
+                    return Err("a function over a set TLC does not enumerate applied outside its domain".into());
+                }
+                let mut env2 = env.clone();
+                env2.insert(y.clone(), x.clone());
+                self.eval(body, &env2)
+            }
+            Expr::Except(base, ups) => {
+                let mut dom = base.as_ref().clone();
+                while let Expr::Except(b, _) = &*shape(&dom) {
+                    dom = b.as_ref().clone();
+                }
+                let Expr::FunCons(_, s, _) = &*shape(&dom) else { return Err("not a function".into()) };
+                let s = s.as_ref().clone();
+                let at = except_pos(base).filter(|_| warn);
+                let mut hit = None;
+                for (i, (path, _)) in ups.iter().enumerate() {
+                    let Some(Path::Idx(k)) = path.first() else { unreachable!() };
+                    let k = self.eval(k, env)?;
+                    if !self.member(&k, &s, env)? {
+                        if let Some(w) = &at {
+                            except_warning(w);
+                        }
+                    } else if k == *x {
+                        hit = Some(i);
+                    }
+                }
+                match hit {
+                    None => self.lazy_except_apply(base, x, env, warn),
+                    Some(i) => {
+                        let (path, val) = &ups[i];
+                        let prev = if i == 0 { base.as_ref().clone() } else { Expr::Except(base.clone(), ups[..i].to_vec()) };
+                        let mut env2 = env.clone();
+                        if let Some(Path::Field(a)) = path.iter().find(|p| matches!(p, Path::Field(k) if k.starts_with('@'))) {
+                            if val.any(&|e| matches!(e, Expr::Ident(n, _) if n == a)) {
+                                env2.insert(a.clone(), self.lazy_except_apply(&prev, x, env, false)?);
+                            }
+                        }
+                        self.eval(val, &env2)
+                    }
+                }
+            }
+            _ => Err("not a function".into()),
+        }
+    }
+
     /// `[v EXCEPT !<steps> = val]` for one update. As in TLC, an index outside the domain leaves the
     /// value unchanged
-    fn except_at(&self, v: Value, steps: &[&Path], val: &Expr, at: Option<&str>, env: &HashMap<String, Value>) -> R<Value> {
+    fn except_at(&self, v: Value, steps: &[&Path], val: &Expr, at: Option<&str>, env: &HashMap<String, Value>, warn: Option<&str>) -> R<Value> {
+        let missing = || {
+            if let Some(w) = warn {
+                except_warning(w);
+            }
+        };
         let Some((step, rest)) = steps.split_first() else {
             let mut env2 = env.clone();
             if let Some(a) = at {
@@ -1139,8 +1224,11 @@ impl ConstEval<'_> {
         Ok(match (step, v) {
             (Path::Idx(i), Value::Fun(mut m)) => {
                 let k = self.eval(i, env)?;
-                if let Some(old) = m.remove(&k) {
-                    m.insert(k, self.except_at(old, rest, val, at, env)?);
+                match m.remove(&k) {
+                    Some(old) => {
+                        m.insert(k, self.except_at(old, rest, val, at, env, warn)?);
+                    }
+                    None => missing(),
                 }
                 Value::Fun(m)
             }
@@ -1148,13 +1236,18 @@ impl ConstEval<'_> {
                 let k = self.eval(i, env)?.as_int()?;
                 if k >= 1 && (k as usize) <= t.len() {
                     let old = t[k as usize - 1].clone();
-                    t[k as usize - 1] = self.except_at(old, rest, val, at, env)?;
+                    t[k as usize - 1] = self.except_at(old, rest, val, at, env, warn)?;
+                } else {
+                    missing();
                 }
                 Value::Tuple(t)
             }
             (Path::Field(n), Value::Rec(mut m)) => {
-                if let Some(old) = m.remove(n) {
-                    m.insert(n.clone(), self.except_at(old, rest, val, at, env)?);
+                match m.remove(n) {
+                    Some(old) => {
+                        m.insert(n.clone(), self.except_at(old, rest, val, at, env, warn)?);
+                    }
+                    None => missing(),
                 }
                 Value::Rec(m)
             }
