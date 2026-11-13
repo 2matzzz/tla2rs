@@ -1472,20 +1472,205 @@ fn report_eval(e: &EvalErr) {
     report_eval_as(e, !tlc_eval_exception(e))
 }
 
+// ---------------------------------------------------------------- the state graph of a liveness check
+/// The bytes the columns of the state graph hold in memory, how many they may hold (`-memlimit`)
+/// before a column that grows moves to a file in `-tmpdir`, and the bytes written to such files
+static COL_MEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COL_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static COL_SPILLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COL_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+/// How many elements a column that is in a file collects before writing them out
+const COL_BUF: usize = 8 << 20;
+#[cfg(unix)]
+extern "C" {
+    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+    fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+}
+/// Maps the first `bytes` bytes of f for reading (PROT_READ, MAP_SHARED: the same values on Linux
+/// and macOS)
+#[cfg(unix)]
+fn map_file(f: &std::fs::File, bytes: usize) -> Option<*const u8> {
+    use std::os::fd::AsRawFd;
+    let p = unsafe { mmap(std::ptr::null_mut(), bytes, 1, 1, f.as_raw_fd(), 0) };
+    (p as isize != -1).then_some(p as *const u8)
+}
+#[cfg(not(unix))]
+fn map_file(_: &std::fs::File, _: usize) -> Option<*const u8> {
+    None
+}
+#[cfg(unix)]
+fn unmap_file(p: *const u8, bytes: usize) {
+    unsafe { munmap(p as *mut std::ffi::c_void, bytes) };
+}
+#[cfg(not(unix))]
+fn unmap_file(_: *const u8, _: usize) {}
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+/// Gives the memory the threads freed back to the system (glibc keeps it for each thread otherwise)
+fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        malloc_trim(0);
+    }
+}
+/// An array of plain values that only grows: a column of the state graph. It stays in memory until
+/// the columns together hold more than `-memlimit`; a column that grows after that moves to a file
+/// (unlinked as soon as it is opened), which is mapped into memory for reading, so the kernel keeps
+/// in its page cache what fits and reads the rest back from the disk, as TLC keeps its liveness
+/// graph on disk.
+struct Col<T: Copy> {
+    /// The elements after the first `written`, which are in the file
+    mem: Vec<T>,
+    file: Option<std::fs::File>,
+    map: *const T,
+    written: usize,
+    /// The bytes of `mem` counted in COL_MEM
+    counted: usize,
+}
+unsafe impl<T: Copy + Send> Send for Col<T> {}
+unsafe impl<T: Copy + Sync> Sync for Col<T> {}
+impl<T: Copy> Col<T> {
+    fn new() -> Self {
+        Col { mem: vec![], file: None, map: std::ptr::null(), written: 0, counted: 0 }
+    }
+    fn len(&self) -> usize {
+        self.written + self.mem.len()
+    }
+    #[inline]
+    fn get(&self, i: usize) -> T {
+        if i < self.written {
+            unsafe { *self.map.add(i) }
+        } else {
+            self.mem[i - self.written]
+        }
+    }
+    /// All the elements, once they are either all in memory or all in the file (see `finish`)
+    fn as_slice(&self) -> &[T] {
+        if self.written == 0 {
+            &self.mem
+        } else {
+            assert!(self.mem.is_empty(), "a column read before it is finished");
+            unsafe { std::slice::from_raw_parts(self.map, self.written) }
+        }
+    }
+    #[inline]
+    fn push(&mut self, x: T) {
+        self.mem.push(x);
+        if self.mem.len() & 0xFFFF == 0 {
+            self.grew();
+        }
+    }
+    fn extend_from_slice(&mut self, xs: &[T]) {
+        self.mem.extend_from_slice(xs);
+        self.grew();
+    }
+    fn bytes(n: usize) -> usize {
+        n * std::mem::size_of::<T>()
+    }
+    fn grew(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.file.is_some() {
+            if Self::bytes(self.mem.len()) >= COL_BUF {
+                self.flush();
+            }
+            return;
+        }
+        let now = Self::bytes(self.mem.len());
+        let total = COL_MEM.fetch_add(now - self.counted, Relaxed) + now - self.counted;
+        self.counted = now;
+        if total > COL_LIMIT.load(Relaxed) {
+            self.spill();
+        }
+    }
+    /// Moves the column to a file
+    fn spill(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = COL_DIR.lock().unwrap().clone().unwrap_or_else(std::env::temp_dir);
+        let seq = SPILL_SEQ.fetch_add(1, Relaxed);
+        let path = dir.join(format!("tla2rs-{}-{seq}.g", std::process::id()));
+        let opened = std::fs::File::options().create_new(true).read(true).write(true).open(&path);
+        match opened {
+            Ok(f) if cfg!(unix) => {
+                let _ = std::fs::remove_file(&path);
+                COL_MEM.fetch_sub(self.counted, Relaxed);
+                self.counted = 0;
+                self.file = Some(f);
+                self.flush();
+            }
+            r => {
+                if r.is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                // Better to try in memory than to stop
+                eprintln!("warning: cannot spill the state graph to {}", path.display());
+                COL_LIMIT.store(usize::MAX, Relaxed);
+            }
+        }
+    }
+    /// Writes the elements in memory to the file and maps all of it
+    fn flush(&mut self) {
+        let Some(f) = self.file.as_mut() else { return };
+        if self.mem.is_empty() {
+            return;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(self.mem.as_ptr() as *const u8, Self::bytes(self.mem.len())) };
+        use std::io::Write;
+        // As with the queue, carrying on without part of the graph could report "no error"
+        if let Err(e) = f.write_all(bytes) {
+            eval_error(format!("cannot write the state graph to the disk: {e}"));
+        }
+        COL_SPILLED.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if self.written > 0 {
+            unmap_file(self.map as *const u8, Self::bytes(self.written));
+        }
+        self.written += self.mem.len();
+        self.mem.clear();
+        match map_file(f, Self::bytes(self.written)) {
+            Some(p) => self.map = p as *const T,
+            None => eval_error("cannot map the state graph from the disk".into()),
+        }
+    }
+    /// Done growing: with a file, everything goes to it
+    fn finish(&mut self) {
+        self.flush();
+        self.mem.shrink_to_fit();
+    }
+}
+impl<T: Copy> Default for Col<T> {
+    fn default() -> Self {
+        Col::new()
+    }
+}
+impl<T: Copy> Drop for Col<T> {
+    fn drop(&mut self) {
+        COL_MEM.fetch_sub(self.counted, std::sync::atomic::Ordering::Relaxed);
+        if self.written > 0 {
+            unmap_file(self.map as *const u8, Self::bytes(self.written));
+        }
+    }
+}
+
 struct Graph {
-    states: Vec<Packed>,
+    states: Col<Packed>,
     /// (parent index, label). Initial states have (u32::MAX, u32::MAX).
-    parent: Vec<(u32, u32)>,
-    /// Per state, bit i: state atom i of the temporal properties holds (liveness only)
-    sbits: Vec<u64>,
+    parent: Col<(u32, u32)>,
+    /// Per state, bit i: state atom i of the temporal properties, among those of the tableau, holds
+    /// (evaluated when the state is found; liveness only)
+    sbits: Col<u64>,
 }
 
 impl Graph {
+    fn state(&self, i: usize) -> State {
+        unpack(&self.states.get(i))
+    }
+
     fn trace_len(&self, mut id: u32) -> usize {
         let mut n = 0;
         while id != u32::MAX {
             n += 1;
-            id = self.parent[id as usize].0;
+            id = self.parent.get(id as usize).0;
         }
         n
     }
@@ -1495,11 +1680,11 @@ impl Graph {
         let mut ids = vec![];
         while id != u32::MAX {
             ids.push(id);
-            id = self.parent[id as usize].0;
+            id = self.parent.get(id as usize).0;
         }
         if PRINT_ORDER {
             let trace: Vec<(State, u32)> =
-                ids.iter().rev().map(|i| (unpack(&self.states[*i as usize]), self.parent[*i as usize].1)).collect();
+                ids.iter().rev().map(|i| (self.state(*i as usize), self.parent.get(*i as usize).1)).collect();
             print_states_tlc(&trace, trace.len() - succ as usize, extra.map(|(s, l)| (*s, l)));
             return;
         }
@@ -1509,15 +1694,138 @@ impl Graph {
         let len = ids.len() + extra.is_some() as usize;
         for id in ids.iter().rev() {
             n += 1;
-            let l = self.parent[*id as usize].1;
+            let l = self.parent.get(*id as usize).1;
             let name = if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
-            let s = unpack(&self.states[*id as usize]);
+            let s = self.state(*id as usize);
             print_step(&format!("State {n}: <{name}>"), &s, diff_prev(n - 1, len, prev.as_ref()));
             prev = Some(s);
         }
         if let Some((s, l)) = extra {
             print_step(&format!("State {}: <{}>", n + 1, LABELS[l as usize]), s, diff_prev(n, len, prev.as_ref()));
         }
+    }
+}
+
+/// Numbers the distinct values of a kind (the classes of edges or of states, see `LiveGraph`)
+struct Classes<K: Copy + Eq + std::hash::Hash> {
+    list: Vec<K>,
+    ix: std::collections::HashMap<K, u32>,
+}
+impl<K: Copy + Eq + std::hash::Hash> Default for Classes<K> {
+    fn default() -> Self {
+        Classes { list: vec![], ix: std::collections::HashMap::new() }
+    }
+}
+impl<K: Copy + Eq + std::hash::Hash> Classes<K> {
+    #[inline]
+    fn id(&mut self, k: K) -> u32 {
+        if let Some(&i) = self.ix.get(&k) {
+            return i;
+        }
+        let i = self.list.len() as u32;
+        self.list.push(k);
+        self.ix.insert(k, i);
+        i
+    }
+}
+/// What a step adds to the liveness search: (label, action atoms that hold on it, fairness
+/// conditions whose <<A>>_v it is)
+type EClass = (u32, u64, FMask);
+/// What a state adds: (state atoms that hold in it, fairness conditions whose <<A>>_v is enabled
+/// there, action atoms that hold on its stuttering step)
+type SClass = (u64, FMask, u64);
+/// The edges of the state graph as the search finds them. Each state and each edge has a class,
+/// a number in a table of the distinct combinations, which are few.
+#[derive(Default)]
+struct LiveGraph {
+    /// Per expanded state (states are expanded in the order of their numbers): the number of its
+    /// first edge, and one more at the end with the number of edges
+    off: Col<u64>,
+    cls: ClassCol,
+    /// Per edge: the target's fingerprint and the class
+    tfp: Col<Fp>,
+    ecls: ClassCol,
+    /// (state, number of its edges before it) of each self-loop a successor makes, kept apart for
+    /// TLC's order of successors (see `tlc_lasso`)
+    selfs: Col<(u32, u32)>,
+    ec: Classes<EClass>,
+    sc: Classes<SClass>,
+}
+/// A column of class numbers, a byte each while they fit
+enum ClassCol {
+    Byte(Col<u8>),
+    Word(Col<u32>),
+}
+impl Default for ClassCol {
+    fn default() -> Self {
+        ClassCol::Byte(Col::new())
+    }
+}
+impl ClassCol {
+    fn len(&self) -> usize {
+        match self {
+            ClassCol::Byte(c) => c.len(),
+            ClassCol::Word(c) => c.len(),
+        }
+    }
+    #[inline]
+    fn get(&self, i: usize) -> u32 {
+        match self {
+            ClassCol::Byte(c) => c.get(i) as u32,
+            ClassCol::Word(c) => c.get(i),
+        }
+    }
+    fn widen(&mut self) {
+        if let ClassCol::Byte(c) = self {
+            let mut w = Col::new();
+            for i in 0..c.len() {
+                w.push(c.get(i) as u32);
+            }
+            *self = ClassCol::Word(w);
+        }
+    }
+    fn push(&mut self, x: u32) {
+        if x > u8::MAX as u32 {
+            self.widen();
+        }
+        match self {
+            ClassCol::Byte(c) => c.push(x as u8),
+            ClassCol::Word(c) => c.push(x),
+        }
+    }
+    fn extend(&mut self, xs: &[u32]) {
+        if xs.iter().any(|&x| x > u8::MAX as u32) {
+            self.widen();
+        }
+        match self {
+            ClassCol::Byte(c) => c.extend_from_slice(&xs.iter().map(|&x| x as u8).collect::<Vec<u8>>()),
+            ClassCol::Word(c) => c.extend_from_slice(xs),
+        }
+    }
+    fn finish(&mut self) {
+        match self {
+            ClassCol::Byte(c) => c.finish(),
+            ClassCol::Word(c) => c.finish(),
+        }
+    }
+}
+impl LiveGraph {
+    /// Adds what a piece of a level found, its classes numbered anew
+    fn add(&mut self, c: &mut LiveChunk) {
+        let em: Vec<u32> = c.ec.list.iter().map(|&k| self.ec.id(k)).collect();
+        let sm: Vec<u32> = c.sc.list.iter().map(|&k| self.sc.id(k)).collect();
+        let mut e = self.tfp.len() as u64;
+        for &(k, s) in &c.en {
+            self.off.push(e);
+            self.cls.push(sm[s as usize]);
+            e += k as u64;
+        }
+        self.tfp.extend_from_slice(&c.tfp);
+        for x in c.ecls.iter_mut() {
+            *x = em[*x as usize];
+        }
+        self.ecls.extend(&c.ecls);
+        self.selfs.extend_from_slice(&c.selfs);
     }
 }
 
@@ -1734,16 +2042,17 @@ enum Found {
     Deadlock(u32),
 }
 
-/// Liveness data collected during expansion.
+/// Liveness data collected during expansion (see `LiveGraph`), with classes numbered in the piece
 #[derive(Default)]
 struct LiveChunk {
-    /// (source, target fingerprint, label, action atoms that hold on the step, fairness conditions
-    /// whose <<A>>_v the step is). Self-loops are left out: the stuttering step every state has
-    /// covers them.
-    edges: Vec<(u32, Fp, u32, u64, FMask)>,
-    /// (state, fairness conditions whose <<A>>_v is enabled there, action atoms that hold on its
-    /// stuttering step, state atoms evaluated when it is expanded)
-    en: Vec<(u32, FMask, u64, u64)>,
+    /// Per edge: the target's fingerprint, and the class. Self-loops are left out: the stuttering
+    /// step every state has covers them.
+    tfp: Vec<Fp>,
+    ecls: Vec<u32>,
+    /// Per expanded state: its number of edges and its class
+    en: Vec<(u32, u32)>,
+    ec: Classes<EClass>,
+    sc: Classes<SClass>,
     /// Working storage: the successors of the state being expanded that became edges, and those
     /// that are new
     pend: Vec<usize>,
@@ -1780,7 +2089,7 @@ fn expand_one(
     buf: &mut Vec<(State, u32)>,
     careful: bool,
 ) -> Option<Found> {
-    let s = unpack(&g.states[head]);
+    let s = g.state(head);
     let cap = Capturing::start();
     let failed = successors(&s, buf, careful);
     let mut held = cap.finish();
@@ -1810,9 +2119,10 @@ fn expand_one_succ(
         held.flush(u32::MAX);
         return Some(Found::Deadlock(head as u32));
     }
-    let sfp = if LIVENESS { state_fp(&s, &g.states[head]) } else { 0 };
-    let sfp_dump = if dumping() { state_fp(&s, &g.states[head]) } else { 0 };
-    let first_edge = c.live.edges.len();
+    let w = g.states.get(head);
+    let sfp = if LIVENESS { state_fp(&s, &w) } else { 0 };
+    let sfp_dump = if dumping() { state_fp(&s, &w) } else { 0 };
+    let first_edge = c.live.tfp.len();
     c.live.pend.clear();
     c.live.newk.clear();
     for (k, &(t, l)) in buf.iter().enumerate() {
@@ -1837,11 +2147,11 @@ fn expand_one_succ(
             dump_edge(&mut c.dump, sfp_dump, &tfp, l);
         }
         if LIVENESS && tfp == sfp {
-            c.live.selfs.push((head as u32, (c.live.edges.len() - first_edge) as u32));
+            c.live.selfs.push((head as u32, (c.live.tfp.len() - first_edge) as u32));
         }
         if LIVENESS && tfp != sfp {
             // Its atoms are evaluated with fairness, after the successors (as TLC does)
-            c.live.edges.push((head as u32, tfp, l, 0, 0));
+            c.live.tfp.push(tfp);
             c.live.pend.push(k);
         }
         let new = seen.insert(tfp);
@@ -1905,12 +2215,11 @@ fn expand_one_succ(
             Err(m) => return Some(Found::Live(m)),
         };
         for j in 0..c.live.pend.len() {
-            let t = &buf[c.live.pend[j]].0;
+            let (t, l) = &buf[c.live.pend[j]];
             match step_bits(&s, t) {
                 Ok((a, f)) => {
-                    let e = &mut c.live.edges[first_edge + j];
-                    e.3 = a;
-                    e.4 = f;
+                    let id = c.live.ec.id((*l, a, f));
+                    c.live.ecls.push(id);
                 }
                 Err(m) => return Some(Found::Live(m)),
             }
@@ -1919,7 +2228,8 @@ fn expand_one_succ(
             Ok((a, _)) => a,
             Err(m) => return Some(Found::Live(m)),
         };
-        c.live.en.push((head as u32, en, stut, cbits));
+        let id = c.live.sc.id((g.sbits.get(head) | cbits, en, stut));
+        c.live.en.push(((c.live.tfp.len() - first_edge) as u32, id));
         for j in 0..c.live.newk.len() {
             match state_bits(&buf[c.live.newk[j]].0, SATOMS_TABLEAU) {
                 Ok(b) => c.sbits.push(b),
@@ -2203,6 +2513,33 @@ fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
     dump_write(&mut out);
 }
 
+/// Where the checker spills when `-tmpdir` is not given: the system's temp dir, unless it is a tmpfs
+/// (as `/tmp` is on many Linux systems), whose files take memory as much as the data they hold; then
+/// the directory of the checker's executable
+fn default_tmpdir() -> std::path::PathBuf {
+    let t = std::env::temp_dir();
+    if on_tmpfs(&t) {
+        if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            return d;
+        }
+    }
+    t
+}
+/// Whether p is on a tmpfs: the type of the mount with the longest mount point above it (Linux)
+fn on_tmpfs(p: &std::path::Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else { return false };
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mount = mounts
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(' ');
+            let (_, at, kind) = (f.next()?, f.next()?, f.next()?);
+            Some((at.replace("\\040", " "), kind))
+        })
+        .filter(|(at, _)| p.starts_with(at))
+        .max_by_key(|(at, _)| at.len());
+    mount.is_some_and(|(_, kind)| kind == "tmpfs")
+}
 fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().collect();
@@ -2233,7 +2570,7 @@ fn main() {
             .position(|a| a == "-tmpdir")
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir),
+            .unwrap_or_else(default_tmpdir),
         workers: args
             .iter()
             .position(|a| a == "-workers")
@@ -4033,12 +4370,17 @@ fn run_safety_batched(opt: &Opt) {
     finish(opt, t0, generated, distinct, depth, 0);
 }
 
+/// The most states of a level the threads expand before what they found is merged (see
+/// `run_liveness`)
+const LEVEL_SLICE: usize = 1 << 20;
 fn run_liveness(opt: &Opt) {
     let check_deadlock = opt.check_deadlock;
     let workers = opt.workers;
     let t0 = std::time::Instant::now();
     // TLC's warning that the search runs on the graph folded by symmetry is among STARTUP_PRINTS
-    let mut g = Graph { states: Vec::new(), parent: Vec::new(), sbits: Vec::new() };
+    COL_LIMIT.store(opt.mem_limit, std::sync::atomic::Ordering::Relaxed);
+    *COL_DIR.lock().unwrap() = Some(opt.tmpdir.clone());
+    let mut g = Graph { states: Col::new(), parent: Col::new(), sbits: Col::new() };
     let seen = Shards::new(false);
     let (inits, mut generated) = initial_states();
     // TLC evaluates the tableau's state atoms on the initial states once they are all computed
@@ -4074,7 +4416,7 @@ fn run_liveness(opt: &Opt) {
     println!("Finished computing initial states: {} distinct states generated. ({workers} workers)", g.states.len());
     let stop = std::sync::atomic::AtomicBool::new(false);
     let pool = Pool::new(workers);
-    let mut live = LiveChunk::default();
+    let mut live = LiveGraph::default();
     let mut lo = 0usize;
     let mut depth = 1u32;
     let mut last = std::time::Instant::now();
@@ -4083,90 +4425,93 @@ fn run_liveness(opt: &Opt) {
         if lo == hi {
             break;
         }
-        // Split the level (all states at the same depth) into pieces for the threads.
-        let n = hi - lo;
-        let chunks: Vec<Chunk> = pool.run(n, pool.piece(n, MIN_PIECE), |_, i, a, b| {
-            expand(&g, lo + a, lo + b, &seen, &stop, i, check_deadlock)
-        });
-        let mut found = None;
-        let mut base = vec![];
-        let (mut expanded, mut unqueued) = (0usize, false);
-        for (i, mut c) in chunks.into_iter().enumerate() {
-            dump_write(&mut c.dump);
-            generated += c.generated;
-            expanded += c.expanded;
-            base.push(g.states.len());
-            live.edges.extend(c.live.edges);
-            live.en.extend(c.live.en);
-            live.selfs.extend(c.live.selfs);
-            g.sbits.extend(c.sbits);
-            g.states.extend(c.states);
-            g.parent.extend(c.parent);
-            if found.is_none() {
-                found = c.found.map(|f| (i, f));
-                unqueued = c.unqueued && found.is_some();
+        // The level (all states at the same depth) a slice at a time, so that what the threads
+        // find before it is merged stays small, each slice split into pieces for the threads
+        let mut expanded = 0usize;
+        for from in (lo..hi).step_by(LEVEL_SLICE) {
+            let to = (from + LEVEL_SLICE).min(hi);
+            let n = to - from;
+            let chunks: Vec<Chunk> = pool.run(n, pool.piece(n, MIN_PIECE), |_, i, a, b| {
+                expand(&g, from + a, from + b, &seen, &stop, i, check_deadlock)
+            });
+            let mut found = None;
+            let mut base = vec![];
+            let mut unqueued = false;
+            for (i, mut c) in chunks.into_iter().enumerate() {
+                dump_write(&mut c.dump);
+                generated += c.generated;
+                expanded += c.expanded;
+                base.push(g.states.len());
+                live.add(&mut c.live);
+                g.sbits.extend_from_slice(&c.sbits);
+                g.states.extend_from_slice(&c.states);
+                g.parent.extend_from_slice(&c.parent);
+                if found.is_none() {
+                    found = c.found.map(|f| (i, f));
+                    unqueued = c.unqueued && found.is_some();
+                }
             }
-        }
-        if let Some((_, f)) = found {
-            let mut distinct = g.states.len();
-            let code = match f {
-                Found::New(w, idx, msg) => {
-                    if dumping() && matches!(msg, SMsg::InvEval(..)) {
-                        let p = g.parent[base[w] + idx].0 as usize;
-                        let s = unpack(&g.states[p]);
-                        dump_replay(&s, state_fp(&s, &g.states[p]), &|fp| seen.contains(fp));
+            if let Some((_, f)) = found {
+                let mut distinct = g.states.len();
+                let code = match f {
+                    Found::New(w, idx, msg) => {
+                        if dumping() && matches!(msg, SMsg::InvEval(..)) {
+                            let p = g.parent.get(base[w] + idx).0 as usize;
+                            let s = g.state(p);
+                            dump_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
+                        }
+                        let code = report_msg(&msg, true);
+                        g.print_trace((base[w] + idx) as u32, None, true);
+                        if let SMsg::InvEval(_, e) = &msg {
+                            fp_note(e);
+                        }
+                        continued_inv_eval(&msg, true).unwrap_or(code)
                     }
-                    let code = report_msg(&msg, true);
-                    g.print_trace((base[w] + idx) as u32, None, true);
-                    if let SMsg::InvEval(_, e) = &msg {
-                        fp_note(e);
+                    Found::Deadlock(id) => {
+                        println!("Error: Deadlock reached.");
+                        g.print_trace(id, None, false);
+                        11
                     }
-                    continued_inv_eval(&msg, true).unwrap_or(code)
-                }
-                Found::Deadlock(id) => {
-                    println!("Error: Deadlock reached.");
-                    g.print_trace(id, None, false);
-                    11
-                }
-                Found::Succ(p, t, l, msg, in_model) => {
-                    // A new state that could not be packed counts as one state too (to match TLC).
-                    if in_model && matches!(msg, SMsg::Inv(_) | SMsg::InvEval(..) | SMsg::OutOfType) {
-                        distinct += 1;
+                    Found::Succ(p, t, l, msg, in_model) => {
+                        // A new state that could not be packed counts as one state too (to match TLC).
+                        if in_model && matches!(msg, SMsg::Inv(_) | SMsg::InvEval(..) | SMsg::OutOfType) {
+                            distinct += 1;
+                        }
+                        let code = report_msg(&msg, in_model);
+                        g.print_trace(p, Some((&t, l)), false);
+                        code
                     }
-                    let code = report_msg(&msg, in_model);
-                    g.print_trace(p, Some((&t, l)), false);
-                    code
-                }
-                // TLC shows no behavior for these
-                Found::Live(m) => report_msg(&m, true),
-                Found::Eval(p, e) => {
-                    let pseudo = matches!(e, EvalErr::Type(_));
-                    let unassigned = matches!(e, EvalErr::Incomplete(_));
-                    let again = e.clone();
-                    let code = report_msg(&SMsg::Eval(e), true);
-                    g.print_trace(p, None, false);
-                    eval_again_prints(&unpack(&g.states[p as usize]), &again);
-                    fp_note(&again);
-                    if unassigned {
-                        generated += show_incomplete(g.trace_len(p));
+                    // TLC shows no behavior for these
+                    Found::Live(m) => report_msg(&m, true),
+                    Found::Eval(p, e) => {
+                        let pseudo = matches!(e, EvalErr::Type(_));
+                        let unassigned = matches!(e, EvalErr::Incomplete(_));
+                        let again = e.clone();
+                        let code = report_msg(&SMsg::Eval(e), true);
+                        g.print_trace(p, None, false);
+                        eval_again_prints(&g.state(p as usize), &again);
+                        fp_note(&again);
+                        if unassigned {
+                            generated += show_incomplete(g.trace_len(p));
+                        }
+                        if pseudo {
+                            // As in TLC, the out-of-type successor counts as one state (its contents
+                            // can't be represented).
+                            dump_unrepresentable(state_fp(&g.state(p as usize), &g.states.get(p as usize)));
+                            generated += 1;
+                            distinct += 1;
+                            println!("State {}: <a successor that tla2rs cannot represent>\n", g.trace_len(p) + 1);
+                        }
+                        code
                     }
-                    if pseudo {
-                        // As in TLC, the out-of-type successor counts as one state (its contents
-                        // can't be represented).
-                        dump_unrepresentable(state_fp(&unpack(&g.states[p as usize]), &g.states[p as usize]));
-                        generated += 1;
-                        distinct += 1;
-                        println!("State {}: <a successor that tla2rs cannot represent>\n", g.trace_len(p) + 1);
-                    }
-                    code
-                }
-            };
-            // As in `run_safety`
-            println!(
-                "{generated} states generated, {distinct} distinct states found, {} states left on queue.",
-                (hi - lo - expanded) + (g.states.len() - hi) - unqueued as usize
-            );
-            exit(code);
+                };
+                // As in `run_safety`
+                println!(
+                    "{generated} states generated, {distinct} distinct states found, {} states left on queue.",
+                    (hi - lo - expanded) + (g.states.len() - hi) - unqueued as usize
+                );
+                exit(code);
+            }
         }
         lo = hi;
         if g.states.len() > lo {
@@ -4194,8 +4539,20 @@ fn run_liveness(opt: &Opt) {
     if LIVENESS {
         let t1 = std::time::Instant::now();
         dump_finish();
+        // The classes of the states hold their state atoms now
+        drop(seen);
+        g.sbits = Col::new();
+        trim_heap();
         let ok = liveness(&g, live, workers);
         println!("Checked temporal properties in {:.3}s", t1.elapsed().as_secs_f64());
+        let spilled = COL_SPILLED.load(std::sync::atomic::Ordering::Relaxed);
+        if spilled > 0 {
+            eprintln!(
+                "tla2rs: the state graph spilled {:.0} MB to {} (-memlimit MB raises the in-memory part)",
+                spilled as f64 / (1u64 << 20) as f64,
+                opt.tmpdir.display()
+            );
+        }
         if !ok {
             exit(13);
         }
@@ -4240,28 +4597,60 @@ struct LProp {
 
 /// The label of the stuttering step every state has
 const STUTTER: u32 = u32::MAX - 1;
-
-/// The state graph for the liveness search. The steps of a state are its edges plus stuttering.
+/// The state graph for the liveness search, in columns (see `LiveGraph`). The steps of a state are
+/// its edges plus stuttering.
 struct Steps {
-    off: Vec<usize>,
-    dst: Vec<u32>,
-    label: Vec<u32>,
-    abits: Vec<u64>,
-    fbits: Vec<FMask>,
-    sbits: Vec<u64>,
-    fen: Vec<FMask>,
-    stut: Vec<u64>,
+    /// Per state, the number of its first edge, and the number of edges at the end
+    off: Col<u64>,
+    /// Per edge, the target and the class
+    dst: Col<u32>,
+    ecls: ClassCol,
+    ec: Vec<EClass>,
+    /// Per state, the class
+    scls: ClassCol,
+    sc: Vec<SClass>,
 }
-
 impl Steps {
-    /// (target, label, action atoms, fairness steps) of each step from s, stuttering last
-    fn of(&self, s: u32) -> impl Iterator<Item = (u32, u32, u64, FMask)> + '_ {
-        let r = self.off[s as usize]..self.off[s as usize + 1];
-        r.map(move |e| (self.dst[e], self.label[e], self.abits[e], self.fbits[e]))
-            .chain(std::iter::once((s, STUTTER, self.stut[s as usize], 0)))
+    fn n(&self) -> usize {
+        self.scls.len()
+    }
+    #[inline]
+    fn class(&self, s: usize) -> SClass {
+        self.sc[self.scls.get(s) as usize]
+    }
+    fn sbits(&self, s: usize) -> u64 {
+        self.class(s).0
+    }
+    fn fen(&self, s: usize) -> FMask {
+        self.class(s).1
+    }
+    fn stut(&self, s: usize) -> u64 {
+        self.class(s).2
+    }
+    /// The edges of s
+    #[inline]
+    fn edges(&self, s: usize) -> std::ops::Range<usize> {
+        self.off.get(s) as usize..self.off.get(s + 1) as usize
+    }
+    /// (target, label, action atoms, fairness steps) of edge e
+    #[inline]
+    fn edge(&self, e: usize) -> (u32, u32, u64, FMask) {
+        let (l, a, f) = self.ec[self.ecls.get(e) as usize];
+        (self.dst.get(e), l, a, f)
     }
 }
-
+/// Where an enumeration of the successors of product node (s, q) is: the step (an edge; the end of
+/// the state's edges is the stuttering step) and the successor of the automaton's node. On the stack
+/// of `sccs` (one per node, so kept small), also the node's number there and whether it has a
+/// self-loop.
+struct At {
+    e: usize,
+    s: u32,
+    j: u32,
+    id: u32,
+    q: u16,
+    selfloop: bool,
+}
 /// The product of the state graph with the automaton of one negated property; with `ea`, only the
 /// steps that keep the property's <>[]A parts
 struct Product<'a> {
@@ -4270,112 +4659,179 @@ struct Product<'a> {
     q: usize,
     ea: &'static [LP],
 }
-
 impl Product<'_> {
     fn valid(&self, s: u32, q: usize) -> bool {
-        let (b, n) = (self.st.sbits[s as usize], &self.nodes[q]);
+        let (b, n) = (self.st.sbits(s as usize), &self.nodes[q]);
         b & n.s_pos == n.s_pos && b & n.s_neg == 0
     }
-
+    fn start(&self, p: usize, id: u32) -> At {
+        let (s, q) = ((p / self.q) as u32, (p % self.q) as u16);
+        At { e: self.st.edges(s as usize).start, s, j: 0, id, q, selfloop: false }
+    }
+    fn node(&self, at: &At) -> usize {
+        at.s as usize * self.q + at.q as usize
+    }
+    /// The next successor of a product node: (node, label, fairness steps, action atoms)
+    #[inline]
+    fn next(&self, at: &mut At) -> Option<(usize, u32, FMask, u64)> {
+        let n = &self.nodes[at.q as usize];
+        let end = self.st.edges(at.s as usize).end;
+        while at.e <= end {
+            let (t, l, a, f) = if at.e < end { self.st.edge(at.e) } else { (at.s, STUTTER, self.st.stut(at.s as usize), 0) };
+            if a & n.a_pos == n.a_pos && a & n.a_neg == 0 && self.ea.iter().all(|x| self.holds(x, self.node(at), a, f)) {
+                while (at.j as usize) < n.succ.len() {
+                    let q2 = n.succ[at.j as usize] as usize;
+                    at.j += 1;
+                    if self.valid(t, q2) {
+                        return Some((t as usize * self.q + q2, l, f, a));
+                    }
+                }
+            }
+            at.e += 1;
+            at.j = 0;
+        }
+        None
+    }
     /// Successors of product node p: (node, label, fairness steps, action atoms)
     fn succ(&self, p: usize, out: &mut Vec<(usize, u32, FMask, u64)>) {
         out.clear();
-        let (s, q) = ((p / self.q) as u32, p % self.q);
-        let n = &self.nodes[q];
-        for (t, l, a, f) in self.st.of(s) {
-            if a & n.a_pos != n.a_pos || a & n.a_neg != 0 || !self.ea.iter().all(|x| self.holds(x, p, a, f)) {
-                continue;
-            }
-            for &q2 in n.succ {
-                if self.valid(t, q2 as usize) {
-                    out.push((t as usize * self.q + q2 as usize, l, f, a));
-                }
-            }
+        let mut at = self.start(p, 0);
+        while let Some(x) = self.next(&mut at) {
+            out.push(x);
         }
     }
-
     /// Whether predicate x holds of product node p's state, and of the step with action atoms a
     /// and fairness steps f from it
     fn holds(&self, x: &LP, p: usize, a: u64, f: FMask) -> bool {
         let s = p / self.q;
-        x.eval(self.st.sbits[s], self.st.fen[s], a, f)
+        x.eval(self.st.sbits(s), self.st.fen(s), a, f)
     }
-
     fn state(&self, p: usize) -> u32 {
         (p / self.q) as u32
     }
 }
-
-/// Strongly connected components of the product nodes for which `inside` holds, reachable from
-/// `roots` without leaving them (iterative Tarjan). Trivial components without a self-loop are
-/// left out.
-fn sccs(pr: &Product, roots: &[usize], inside: &dyn Fn(usize) -> bool) -> Vec<Vec<usize>> {
-    let mut index: std::collections::HashMap<usize, (u32, u32, bool)> = std::collections::HashMap::new();
-    let mut out = vec![];
+/// The number of each product node the search reaches, in the order it reaches them: an array over
+/// all product nodes when the automaton is small, otherwise a hash map
+enum Rank {
+    Dense(Vec<u32>),
+    Sparse(std::collections::HashMap<usize, u32>),
+}
+impl Rank {
+    fn new(total: usize, q: usize) -> Self {
+        if q <= 16 {
+            Rank::Dense(vec![u32::MAX; total])
+        } else {
+            Rank::Sparse(std::collections::HashMap::new())
+        }
+    }
+    #[inline]
+    fn get(&self, p: usize) -> Option<u32> {
+        match self {
+            Rank::Dense(v) => Some(v[p]).filter(|&r| r != u32::MAX),
+            Rank::Sparse(m) => m.get(&p).copied(),
+        }
+    }
+    fn set(&mut self, p: usize, r: u32) {
+        assert!(r < u32::MAX, "more product nodes than the liveness search can number");
+        match self {
+            Rank::Dense(v) => v[p] = r,
+            Rank::Sparse(m) => {
+                m.insert(p, r);
+            }
+        }
+    }
+}
+/// A set of product nodes: a bitmap over all of them when it is large, otherwise a hash set
+enum Members {
+    Bits(Vec<u64>),
+    Hash(std::collections::HashSet<usize>),
+}
+impl Members {
+    fn new(of: &[usize], total: usize) -> Self {
+        if of.len() * 64 >= total {
+            let mut b = vec![0u64; total.div_ceil(64)];
+            for &p in of {
+                b[p / 64] |= 1 << (p % 64);
+            }
+            Members::Bits(b)
+        } else {
+            Members::Hash(of.iter().copied().collect())
+        }
+    }
+    #[inline]
+    fn contains(&self, p: usize) -> bool {
+        match self {
+            Members::Bits(b) => b[p / 64] >> (p % 64) & 1 == 1,
+            Members::Hash(h) => h.contains(&p),
+        }
+    }
+}
+/// Strongly connected components of the product nodes that `id` numbers (from 0 to below `count`;
+/// None: left out), reachable from `roots` without leaving them (iterative Tarjan), handed to `f`
+/// as they complete until it returns true. Trivial components without a self-loop are left out.
+fn sccs(pr: &Product, roots: &[usize], count: usize, id: &dyn Fn(usize) -> Option<u32>, f: &mut dyn FnMut(Vec<usize>) -> bool) {
+    const NEW: u32 = u32::MAX;
+    let mut index = vec![NEW; count];
+    let mut low = vec![0u32; count];
+    let mut on = vec![false; count];
     let mut stack: Vec<usize> = vec![];
+    let mut call: Vec<At> = vec![];
     let mut idx = 0u32;
-    let mut buf = vec![];
     for &root in roots {
-        if !inside(root) || index.contains_key(&root) {
+        let Some(r) = id(root) else { continue };
+        if index[r as usize] != NEW {
             continue;
         }
-        pr.succ(root, &mut buf);
-        let mut call: Vec<(usize, Vec<usize>, usize)> = vec![(root, buf.iter().map(|x| x.0).collect(), 0)];
-        index.insert(root, (idx, idx, true));
+        index[r as usize] = idx;
+        low[r as usize] = idx;
+        on[r as usize] = true;
         idx += 1;
         stack.push(root);
-        while let Some((u, ref succ, ref mut i)) = call.last_mut() {
-            let u = *u;
-            if *i < succ.len() {
-                let v = succ[*i];
-                *i += 1;
-                if !inside(v) {
-                    continue;
+        call.push(pr.start(root, r));
+        while let Some(fr) = call.last_mut() {
+            let (u, ui) = (pr.node(fr), fr.id as usize);
+            if let Some((v, _, _, _)) = pr.next(fr) {
+                if v == u {
+                    fr.selfloop = true;
                 }
-                match index.get(&v).copied() {
-                    None => {
-                        index.insert(v, (idx, idx, true));
-                        idx += 1;
-                        stack.push(v);
-                        pr.succ(v, &mut buf);
-                        call.push((v, buf.iter().map(|x| x.0).collect(), 0));
-                    }
-                    Some((vi, _, true)) => {
-                        let e = index.get_mut(&u).unwrap();
-                        e.1 = e.1.min(vi);
-                    }
-                    _ => {}
+                let Some(vi) = id(v) else { continue };
+                let vi = vi as usize;
+                if index[vi] == NEW {
+                    index[vi] = idx;
+                    low[vi] = idx;
+                    on[vi] = true;
+                    idx += 1;
+                    stack.push(v);
+                    call.push(pr.start(v, vi as u32));
+                } else if on[vi] {
+                    low[ui] = low[ui].min(index[vi]);
                 }
                 continue;
             }
-            let succ_u = std::mem::take(&mut call.last_mut().unwrap().1);
+            let selfloop = fr.selfloop;
             call.pop();
-            let (ui, ul, _) = index[&u];
-            if let Some((p, _, _)) = call.last() {
-                let p = *p;
-                let e = index.get_mut(&p).unwrap();
-                e.1 = e.1.min(ul);
+            if let Some(p) = call.last() {
+                let pi = p.id as usize;
+                low[pi] = low[pi].min(low[ui]);
             }
-            if ul != ui {
+            if low[ui] != index[ui] {
                 continue;
             }
             let mut members = vec![];
             loop {
                 let w = stack.pop().unwrap();
-                index.get_mut(&w).unwrap().2 = false;
+                on[id(w).unwrap() as usize] = false;
                 members.push(w);
                 if w == u {
                     break;
                 }
             }
-            if members.len() > 1 || succ_u.contains(&u) {
-                out.push(members);
+            if (members.len() > 1 || selfloop) && f(members) {
+                return;
             }
         }
     }
-    out
 }
-
 /// What a fair accepting cycle in component `c` must visit: (acceptance set, node predicate) or
 /// (fairness condition, step). None if `c` has no such cycle; Some(Err(c')) if strong fairness
 /// requires leaving out the states where an action is enabled.
@@ -4384,10 +4840,8 @@ enum Verdict {
     Narrow(Vec<usize>),
     Accept { steps: Vec<usize>, off: Vec<usize> },
 }
-
-fn judge(pr: &Product, prop: &LProp, c: &[usize]) -> Verdict {
+fn judge(pr: &Product, prop: &LProp, c: &[usize], total: usize) -> Verdict {
     let nacc = prop.nacc;
-    let set: std::collections::HashSet<usize> = c.iter().copied().collect();
     let mut acc = 0u64;
     for &p in c {
         acc |= pr.nodes[p % pr.q].acc;
@@ -4399,13 +4853,14 @@ fn judge(pr: &Product, prop: &LProp, c: &[usize]) -> Verdict {
     if !prop.ae_state.iter().all(|x| c.iter().any(|&p| pr.holds(x, p, 0, 0))) {
         return Verdict::Reject;
     }
+    let set = Members::new(c, total);
     let mut taken: FMask = 0;
     let mut ae_taken = vec![false; prop.ae_action.len()];
     let mut buf = vec![];
     for &p in c {
         pr.succ(p, &mut buf);
         for &(v, _, f, a) in &buf {
-            if set.contains(&v) {
+            if set.contains(v) {
                 taken |= f;
                 for (j, x) in prop.ae_action.iter().enumerate() {
                     ae_taken[j] |= pr.holds(x, p, a, f);
@@ -4419,7 +4874,7 @@ fn judge(pr: &Product, prop: &LProp, c: &[usize]) -> Verdict {
     let mut some_off: FMask = 0;
     let mut all_off = FMask::MAX;
     for &p in c {
-        let en = pr.st.fen[pr.state(p) as usize];
+        let en = pr.st.fen(pr.state(p) as usize);
         some_off |= !en;
         all_off &= !en;
     }
@@ -4440,38 +4895,36 @@ fn judge(pr: &Product, prop: &LProp, c: &[usize]) -> Verdict {
         }
     }
     if strong_bad != 0 {
-        let keep: Vec<usize> = c.iter().copied().filter(|&p| pr.st.fen[pr.state(p) as usize] & strong_bad == 0).collect();
+        let keep: Vec<usize> = c.iter().copied().filter(|&p| pr.st.fen(pr.state(p) as usize) & strong_bad == 0).collect();
         return Verdict::Narrow(keep);
     }
     Verdict::Accept { steps, off }
 }
-
 /// Searches a component for a fair accepting cycle, narrowing it for strong fairness
-fn search(pr: &Product, prop: &LProp, c: Vec<usize>) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
-    match judge(pr, prop, &c) {
+fn search(pr: &Product, prop: &LProp, c: Vec<usize>, total: usize) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    match judge(pr, prop, &c, total) {
         Verdict::Reject => None,
         Verdict::Accept { steps, off } => Some((c, steps, off)),
         Verdict::Narrow(keep) => {
             if keep.is_empty() {
                 return None;
             }
-            let set: std::collections::HashSet<usize> = keep.iter().copied().collect();
-            for sub in sccs(pr, &keep, &|p| set.contains(&p)) {
-                if let Some(r) = search(pr, prop, sub) {
-                    return Some(r);
-                }
-            }
-            None
+            let ids: std::collections::HashMap<usize, u32> = keep.iter().enumerate().map(|(i, &p)| (p, i as u32)).collect();
+            let mut found = None;
+            sccs(pr, &keep, keep.len(), &|p| ids.get(&p).copied(), &mut |sub| {
+                found = search(pr, prop, sub, total);
+                found.is_some()
+            });
+            found
         }
     }
 }
-
 /// A shortest path inside `set` from `from` (excluded) that ends at a node satisfying `goal` or with
 /// a step satisfying `edge` (on the node it leaves, its fairness bits and its action atoms):
 /// [(node, label, fairness bits of the step)]
 fn path_to(
     pr: &Product,
-    set: &std::collections::HashSet<usize>,
+    set: &Members,
     from: usize,
     goal: &dyn Fn(usize) -> bool,
     edge: &dyn Fn(usize, FMask, u64) -> bool,
@@ -4482,7 +4935,7 @@ fn path_to(
     while let Some(u) = q.pop_front() {
         pr.succ(u, &mut buf);
         for &(v, l, f, a) in &buf {
-            if !set.contains(&v) {
+            if !set.contains(v) {
                 continue;
             }
             if goal(v) || edge(u, f, a) {
@@ -4504,26 +4957,43 @@ fn path_to(
     }
     vec![]
 }
-
-fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
+/// f over lo..hi on `threads` threads, in order
+fn par_map<T: Send>(lo: usize, hi: usize, threads: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    let per = (hi - lo).div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (lo..hi)
+            .step_by(per)
+            .map(|a| spawn_worker(sc, move || (a..(a + per).min(hi)).map(f).collect::<Vec<T>>()))
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+    })
+}
+fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
     let n = g.states.len();
-    // Fingerprint -> state index
-    let cap = (n * 2).next_power_of_two().max(16);
+    // Fingerprint -> state index (at most 3/4 full, as the visited set)
+    let cap = (n + n / 3 + 1).next_power_of_two().max(16);
     let mut keys = vec![0 as Fp; cap];
     let mut vals = vec![u32::MAX; cap];
     let mut zero_id = u32::MAX;
-    for (i, w) in g.states.iter().enumerate() {
-        let fp = state_fp(&unpack(w), w);
-        if fp == 0 {
-            zero_id = i as u32;
-            continue;
+    // The fingerprints and the edges' targets are worked out by the threads, a block at a time
+    const BLOCK: usize = 1 << 22;
+    for lo in (0..n).step_by(BLOCK) {
+        let fps = par_map(lo, (lo + BLOCK).min(n), workers, &|i| {
+            let w = g.states.get(i);
+            state_fp(&unpack(&w), &w)
+        });
+        for (i, fp) in (lo..).zip(fps) {
+            if fp == 0 {
+                zero_id = i as u32;
+                continue;
+            }
+            let mut k = (fp as usize) & (cap - 1);
+            while keys[k] != 0 {
+                k = (k + 1) & (cap - 1);
+            }
+            keys[k] = fp;
+            vals[k] = i as u32;
         }
-        let mut k = (fp as usize) & (cap - 1);
-        while keys[k] != 0 {
-            k = (k + 1) & (cap - 1);
-        }
-        keys[k] = fp;
-        vals[k] = i as u32;
     }
     let lookup = |fp: Fp| -> u32 {
         if fp == 0 {
@@ -4540,40 +5010,26 @@ fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
             k = (k + 1) & (cap - 1);
         }
     };
-    live.edges.sort_by_key(|e| e.0);
-    let mut st = Steps {
-        off: vec![0; n + 1],
-        dst: vec![],
-        label: vec![],
-        abits: vec![],
-        fbits: vec![],
-        sbits: g.sbits.clone(),
-        fen: vec![0; n],
-        stut: vec![0; n],
-    };
-    for &(s, tfp, l, a, f) in &live.edges {
-        let t = lookup(tfp);
-        if t == u32::MAX {
-            continue;
-        }
-        st.off[s as usize + 1] += 1;
-        st.dst.push(t);
-        st.label.push(l);
-        st.abits.push(a);
-        st.fbits.push(f);
+    let edges = live.tfp.len();
+    let mut dst: Col<u32> = Col::new();
+    for lo in (0..edges).step_by(BLOCK) {
+        let ts = par_map(lo, (lo + BLOCK).min(edges), workers, &|e| lookup(live.tfp.get(e)));
+        // Every target was found new by some expansion
+        assert!(!ts.contains(&u32::MAX), "an edge of the state graph leads to a state it does not have");
+        dst.extend_from_slice(&ts);
     }
-    for i in 0..n {
-        st.off[i + 1] += st.off[i];
-    }
-    for &(s, en, stut, cbits) in &live.en {
-        st.fen[s as usize] = en;
-        st.stut[s as usize] = stut;
-        st.sbits[s as usize] |= cbits;
-    }
-    let selfs = std::mem::take(&mut live.selfs);
-    drop(live);
-    let inits: Vec<u32> = (0..n as u32).filter(|&i| g.parent[i as usize].0 == u32::MAX).collect();
-    let edges = st.dst.len();
+    drop((keys, vals));
+    live.tfp = Col::new();
+    live.off.push(edges as u64);
+    dst.finish();
+    live.off.finish();
+    live.ecls.finish();
+    live.cls.finish();
+    live.selfs.finish();
+    let st = Steps { off: live.off, dst, ecls: live.ecls, ec: live.ec.list, scls: live.cls, sc: live.sc.list };
+    let selfs = live.selfs;
+    // The initial states come first
+    let inits: Vec<u32> = (0..n as u32).take_while(|&i| g.parent.get(i as usize).0 == u32::MAX).collect();
     // The properties are independent, so several threads check them, and the first one in order
     // that is violated is reported, as when they are checked one after another. A property after
     // one found violated is given up.
@@ -4607,7 +5063,7 @@ fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
     if let Some((_, (prefix, cycle))) = found.into_iter().flatten().min_by_key(|x| x.0) {
         println!("Error: Temporal properties were violated.");
         println!("Error: The following behavior constitutes a counter-example:");
-        match tlc_lasso(g, &st, &inits, &selfs) {
+        match tlc_lasso(g, &st, &inits, selfs.as_slice()) {
             Ok(true) => return false,
             Ok(false) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
             Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
@@ -4618,10 +5074,8 @@ fn liveness(g: &Graph, mut live: LiveChunk, workers: usize) -> bool {
     println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", NPROPS, FAIRS.len(), edges);
     true
 }
-
 /// A lasso: the steps from an initial state to the entry of the cycle, and the cycle
 type Lasso = (Vec<(u32, u32)>, Vec<(u32, u32)>);
-
 /// Looks for a behavior that violates one property: a fair cycle in its product with the state
 /// graph that the property's automaton accepts. None also when `quit` says to give up.
 fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) -> Option<Lasso> {
@@ -4631,15 +5085,19 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
     if prop.nodes.is_empty() {
         return None;
     }
-    // Reachable product nodes, in BFS order, with their BFS parents
-    let mut par: std::collections::HashMap<usize, (usize, u32)> = std::collections::HashMap::new();
-    let mut order = vec![];
+    assert!(pr.q <= 1 << 16, "an automaton too large for the liveness search");
+    let total = st.n() * pr.q;
+    // Reachable product nodes, in BFS order, with the number of their BFS parents in that order
+    let mut rank = Rank::new(total, pr.q);
+    let mut order: Vec<usize> = vec![];
+    let mut par: Vec<u32> = vec![];
     for &s in inits {
         for (q, nd) in prop.nodes.iter().enumerate() {
             let p = s as usize * pr.q + q;
-            if nd.init && pr.valid(s, q) && !par.contains_key(&p) {
-                par.insert(p, (usize::MAX, u32::MAX));
+            if nd.init && pr.valid(s, q) && rank.get(p).is_none() {
+                rank.set(p, order.len() as u32);
                 order.push(p);
+                par.push(u32::MAX);
             }
         }
     }
@@ -4650,28 +5108,29 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
             return None;
         }
         let u = order[h];
-        h += 1;
         all.succ(u, &mut buf);
-        for &(v, l, _, _) in &buf {
-            if let std::collections::hash_map::Entry::Vacant(e) = par.entry(v) {
-                e.insert((u, l));
+        for &(v, _, _, _) in &buf {
+            if rank.get(v).is_none() {
+                rank.set(v, order.len() as u32);
                 order.push(v);
+                par.push(h as u32);
             }
         }
+        h += 1;
     }
-    let rank: std::collections::HashMap<usize, usize> = order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
-    for c in sccs(&pr, &order, &|_| true) {
+    let mut lasso = None;
+    sccs(&pr, &order, order.len(), &|p| rank.get(p), &mut |c| {
         if quit() {
-            return None;
+            return true;
         }
-        let Some((c, steps, off)) = search(&pr, prop, c) else { continue };
-        let set: std::collections::HashSet<usize> = c.iter().copied().collect();
-        let entry = *c.iter().min_by_key(|p| rank[p]).unwrap();
+        let Some((c, steps, off)) = search(&pr, prop, c, total) else { return false };
+        let set = Members::new(&c, total);
+        let entry = *c.iter().min_by_key(|p| rank.get(**p)).unwrap();
         // The cycle: visit each acceptance set; for each weakly fair action, a state where it is
         // disabled or one of its steps; for each strongly fair action that is enabled somewhere
         // on the cycle, one of its steps; then return to the entry
         let _ = &off;
-        let fen = |p: usize| st.fen[pr.state(p) as usize];
+        let fen = |p: usize| st.fen(pr.state(p) as usize);
         let mut cyc: Vec<(usize, u32, FMask)> = vec![];
         let mut cur = entry;
         let go = |cyc: &mut Vec<(usize, u32, FMask)>, cur: &mut usize, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(usize, FMask, u64) -> bool| {
@@ -4728,21 +5187,27 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
                 break;
             }
         }
+        // Each step of the path from an initial state, by the first step the BFS reached it by
         let mut prefix = vec![];
-        let mut y = entry;
-        while y != usize::MAX {
-            let (p, l) = par[&y];
-            prefix.push((pr.state(y), l));
-            y = p;
+        let mut y = rank.get(entry).unwrap();
+        while y != u32::MAX {
+            let (py, v) = (par[y as usize], order[y as usize]);
+            let l = if py == u32::MAX {
+                u32::MAX
+            } else {
+                all.succ(order[py as usize], &mut buf);
+                buf.iter().find(|x| x.0 == v).unwrap().1
+            };
+            prefix.push((pr.state(v), l));
+            y = py;
         }
         prefix.reverse();
         let cycle: Vec<(u32, u32)> = cyc.iter().map(|&(p, l, _)| (pr.state(p), l)).collect();
-        return Some((prefix, cycle));
-    }
-    None
-
+        lasso = Some((prefix, cycle));
+        true
+    });
+    lasso
 }
-
 /// Prints a lasso as TLC does: the states from an initial state to the entry of the cycle, then
 /// the cycle, ending with "Back to state N" (or "Stuttering" if it never leaves the entry state).
 /// Stuttering steps inside are not shown.
@@ -5081,17 +5546,17 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     }
     let n = g.states.len();
     let mut tfp = Vec::with_capacity(n);
-    for w in &g.states {
-        match tlc_fp(&unpack(w)) {
+    for i in 0..n {
+        match tlc_fp(&g.state(i)) {
             Some(f) => tfp.push(f),
             None => return Err("a value tla2rs does not fingerprint as TLC does"),
         }
     }
     let cs: Vec<TBits> = (0..n)
-        .map(|s| tl.check_state.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], 0, 0) as TBits) << j))
+        .map(|s| tl.check_state.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits(s), st.fen(s), 0, 0) as TBits) << j))
         .collect();
     let cact = |s: usize, ab: u64, fb: FMask| -> TBits {
-        tl.check_action.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], ab, fb) as TBits) << j)
+        tl.check_action.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(st.sbits(s), st.fen(s), ab, fb) as TBits) << j)
     };
     let mut self_at: Vec<Vec<u32>> = vec![vec![]; n];
     for &(s, k) in selfs {
@@ -5103,21 +5568,22 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
     for s in 0..n {
         // The successors as TLC puts them into the set: in the order generated, then itself
         let mut puts: Vec<(u32, u64, FMask)> = vec![];
-        let r = st.off[s]..st.off[s + 1];
+        let r = st.edges(s);
         let mut k = 0u32;
         let mut sa = self_at[s].iter().peekable();
         for e in r.clone() {
             while sa.peek().is_some_and(|&&x| x == k) {
-                puts.push((s as u32, st.stut[s], 0));
+                puts.push((s as u32, st.stut(s), 0));
                 sa.next();
             }
-            puts.push((st.dst[e], st.abits[e], st.fbits[e]));
+            let (t, _, a, f) = st.edge(e);
+            puts.push((t, a, f));
             k += 1;
         }
         for _ in sa {
-            puts.push((s as u32, st.stut[s], 0));
+            puts.push((s as u32, st.stut(s), 0));
         }
-        puts.push((s as u32, st.stut[s], 0));
+        puts.push((s as u32, st.stut(s), 0));
         let mut len = mult * 16;
         let mut tab: Vec<Option<usize>> = vec![None; len];
         let mut count = 0usize;
@@ -5391,12 +5857,12 @@ fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Resu
         let mut next = |cur: &State, to: usize| -> Option<(State, u32)> {
             let _ = successors(cur, &mut buf, true);
             if PERMS.is_empty() {
-                buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states[to])).copied()
+                buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states.get(to))).copied()
             } else {
                 buf.iter().find(|x| tlc_fp(&x.0) == Some(tfp[to])).copied()
             }
         };
-        let mut out: Vec<(State, u32)> = vec![(unpack(&g.states[prefix[0] as usize]), u32::MAX)];
+        let mut out: Vec<(State, u32)> = vec![(g.state(prefix[0] as usize), u32::MAX)];
         let mut at = prefix[0] as usize;
         for &y in &prefix[1..] {
             if y as usize != at {
@@ -5503,7 +5969,7 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
 #[allow(clippy::type_complexity)]
 fn lasso_states(g: &Graph, path: &[(u32, u32)], entry: usize, back: Option<u32>) -> (Vec<(State, u32)>, Option<(usize, u32, Option<State>)>) {
     let kept = || {
-        let states: Vec<(State, u32)> = path.iter().map(|&(s, l)| (unpack(&g.states[s as usize]), l)).collect();
+        let states: Vec<(State, u32)> = path.iter().map(|&(s, l)| (g.state(s as usize), l)).collect();
         (states, back.map(|l| (entry, l, None)))
     };
     if !HAS_VIEW && PERMS.is_empty() {
@@ -5511,8 +5977,8 @@ fn lasso_states(g: &Graph, path: &[(u32, u32)], entry: usize, back: Option<u32>)
     }
     let _quiet = Capturing::start();
     let fp_of = |s: u32| {
-        let w = &g.states[s as usize];
-        state_fp(&unpack(w), w)
+        let w = g.states.get(s as usize);
+        state_fp(&unpack(&w), &w)
     };
     let mut buf: Vec<(State, u32)> = vec![];
     let mut step = |cur: &State, want: Fp, l: u32| -> Option<(State, u32)> {
@@ -5520,7 +5986,7 @@ fn lasso_states(g: &Graph, path: &[(u32, u32)], entry: usize, back: Option<u32>)
         let fits = |t: &State| pack(t).is_some_and(|w| state_fp(t, &w) == want);
         buf.iter().find(|x| x.1 == l && fits(&x.0)).or_else(|| buf.iter().find(|x| fits(&x.0))).copied()
     };
-    let mut out = vec![(unpack(&g.states[path[0].0 as usize]), path[0].1)];
+    let mut out = vec![(g.state(path[0].0 as usize), path[0].1)];
     for &(s, l) in &path[1..] {
         let Some(t) = step(&out[out.len() - 1].0, fp_of(s), l) else { return kept() };
         out.push(t);
