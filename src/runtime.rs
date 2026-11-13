@@ -404,6 +404,28 @@ fn state_fp(s: &State, w: &Packed) -> Fp {
 
 /// `state_fp` without the packed state, for when there is a VIEW or a SYMMETRY. None if the key
 /// (the VIEW value, or the state without a VIEW) is out of type.
+thread_local! {
+    static IN_PERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// A state symmetric to one found that leaves the declared types (the SYMMETRY moves a value out
+/// of a type over part of the symmetric set): TLC goes on with it, tla2rs cannot represent it, and
+/// stops rather than report it as a violation of the type invariant (see Limitations in README.md)
+#[cold]
+fn perm_out_of_type() -> ! {
+    use std::io::Write;
+    println!("Error: tla2rs cannot represent a state symmetric to one found under the SYMMETRY: it leaves the type declared in {TYPE_INVARIANT}.");
+    let _ = std::io::stdout().flush();
+    std::process::exit(75);
+}
+fn perm_of(s: &State, p: &[u16]) -> State {
+    IN_PERM.with(|f| f.set(true));
+    let t = perm_state(s, p);
+    IN_PERM.with(|f| f.set(false));
+    t
+}
+fn perm_key(t: &State) -> Key {
+    key_of(t).unwrap_or_else(|| perm_out_of_type())
+}
 fn canon_fp(s: &State) -> Option<Fp> {
     fresh_fp(s, None).flatten()
 }
@@ -425,7 +447,7 @@ fn fresh_fp(s: &State, mut mine: Option<&mut Seen>) -> Option<Option<Fp>> {
         // and TLC keeps both
         let mut best = *s;
         for p in PERMS.iter() {
-            let t = perm_state(s, p);
+            let t = perm_of(s, p);
             if tlc_state_cmp(&t, &best).is_lt() {
                 best = t;
             }
@@ -435,7 +457,7 @@ fn fresh_fp(s: &State, mut mine: Option<&mut Seen>) -> Option<Option<Fp>> {
     }
     let mut best: Option<Key> = None;
     for (i, p) in PERMS.iter().enumerate() {
-        let k = if i == 0 && PERM0_IS_ID { key_of(s)? } else { key_of(&perm_state(s, p))? };
+        let k = if i == 0 && PERM0_IS_ID { key_of(s)? } else { perm_key(&perm_of(s, p)) };
         if i == 0 && by_first && !fresh(fingerprint(&k)) {
             return Some(None);
         }
@@ -690,6 +712,9 @@ impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize>
 
 #[cold]
 fn type_error(what: &str, v: &str) -> ! {
+    if IN_PERM.with(|f| f.get()) {
+        perm_out_of_type()
+    }
     std::panic::panic_any(EvalErr::Type(format!("{what} {v} is outside the type declared in TypeOK")))
 }
 

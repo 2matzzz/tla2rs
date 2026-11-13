@@ -188,7 +188,8 @@ bounds the size of a model with temporal properties (one property per thread, so
 
 - **Every variable needs `x \in S` (or `x \subseteq S`) in `TypeOK`**, with `S` finite and written in terms of
   constants only. This is where the representation (bit width) comes from. If a variable leaves its type, the checker
-  stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant). A variable missing from
+  stops with a type error right there (TLC only stops if `TypeOK` is listed as an invariant), and so it does when a
+  `SYMMETRY` permutation moves a value out of its type (a type over part of the symmetric set). A variable missing from
   `TypeOK`, or whose `S` gives no type (such as `[D -> Int]`), gets a type inferred from Init and Next; an integer
   range that settles (a `Cardinality`, `x % 3`) stays finite, one that keeps growing becomes unbounded. When the
   types from `TypeOK` do not fit Init or Next (a module that extends another and adds a record field), every type is
