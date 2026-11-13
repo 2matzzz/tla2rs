@@ -474,20 +474,6 @@ impl ConstEval<'_> {
         crate::codegen::lazy_fun_string(&unbind_spine(f), &mut |p| self.lazy_set_shown(p, env))
     }
 
-    /// The text TLC prints for the value of `x` when it holds it as an interval: `a..b` as
-    /// written, and DOMAIN of a tuple or sequence (`{}` when empty; see `codegen::interval_text`)
-    fn interval_shown(&self, x: &Expr, env: &HashMap<String, Value>) -> Option<String> {
-        let (a, b) = match &*shape(x) {
-            Expr::Bin(BOp::Range, a, b) => (self.eval(a, env).ok()?.as_int().ok()?, self.eval(b, env).ok()?.as_int().ok()?),
-            Expr::Un(UOp::Domain, t) => match self.eval(t, env).ok()? {
-                Value::Tuple(xs) => (1, xs.len() as i64),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        Some(if a <= b { format!("{a}..{b}") } else { "{}".into() })
-    }
-
     fn lazy_set_shown(&self, s: &Expr, env: &HashMap<String, Value>) -> Option<String> {
         match &*shape(s) {
             Expr::Ident(n, _) if ["Nat", "Int", "STRING"].contains(&n.as_str()) && !env.contains_key(n) && !self.constants.contains_key(n) => {
@@ -695,16 +681,13 @@ impl ConstEval<'_> {
                     let s = self.lazy_fun_shown(x, env).unwrap();
                     Value::Atom(self.atoms.made(self.atoms.intern(false, &s)))
                 }
-                ("ToString", [x]) if self.interval_shown(x, env).is_some() => {
-                    let s = self.interval_shown(x, env).unwrap();
-                    Value::Atom(self.atoms.made(self.atoms.intern(false, &s)))
-                }
                 ("ToString", [x]) => {
                     let v = self.eval(x, env)?;
                     if let Some((a, b)) = disordered_in(&v) {
                         return Err(crate::types::disordered_error(&a, &b));
                     }
-                    Value::Atom(self.atoms.made(self.atoms.intern(false, &crate::compile::show_value(self.atoms, &v))))
+                    let s = show_formed(self.atoms, &v, &self.form(x, env));
+                    Value::Atom(self.atoms.made(self.atoms.intern(false, &s)))
                 }
                 ("TLCEval", [x]) => self.eval(x, env)?,
                 // Bags: functions from elements to their (positive) counts
@@ -880,9 +863,9 @@ impl ConstEval<'_> {
                     Value::Bool(true)
                 }
                 ("PrintT", [x]) => {
-                    let x = match self.lazy_fun_shown(x, env).or_else(|| self.interval_shown(x, env)) {
+                    let x = match self.lazy_fun_shown(x, env) {
                         Some(s) => s,
-                        None => crate::compile::show_value(self.atoms, &self.eval(x, env)?),
+                        None => self.shown(x, env)?,
                     };
                     record_print(vec![x]);
                     Value::Bool(true)
@@ -890,11 +873,11 @@ impl ConstEval<'_> {
                 ("Print", [x, v]) => {
                     let x = match self.lazy_fun_shown(x, env) {
                         Some(s) => s,
-                        None => crate::compile::show_value(self.atoms, &self.eval(x, env)?),
+                        None => self.shown(x, env)?,
                     };
-                    let v = self.eval(v, env)?;
-                    record_print(vec![x, crate::compile::show_value(self.atoms, &v)]);
-                    v
+                    let w = self.eval(v, env)?;
+                    record_print(vec![x, show_formed(self.atoms, &w, &self.form(v, env))]);
+                    w
                 }
                 ("\\X", parts) => {
                     let mut out: Vec<Vec<Value>> = vec![vec![]];
@@ -1690,5 +1673,425 @@ pub fn floor_div(a: i64, b: i64) -> i64 {
         q - 1
     } else {
         q
+    }
+}
+
+// ---------------------------------------------------------------- How TLC holds a value
+//
+// TLC prints a value in the form it holds it, which depends on how the value was built, not on
+// the value (measured on TLC 2.19, `tests/tlc/IntervalConst`, `EmptySeqShow`). `a..b` and DOMAIN
+// of a tuple are intervals, printed `a..b`, also inside a tuple, record, function or set and when
+// taken out of one again (by application, CHOOSE, a bound variable or a sequence operator); a
+// function built by `[x \in S |-> e]`, `:>` or `@@` prints `<< >>` when empty, where an empty tuple
+// prints `<<>>` (from `<<>>`, Tail, SubSeq, `\o` or SelectSeq). A set keeps the first of equal
+// elements as written. Any other operation builds a value printed as the set or tuple it is.
+
+/// How TLC holds a value, where that changes how it prints
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Form {
+    #[default]
+    Plain,
+    /// A set of integers held as an interval
+    Interval,
+    /// A function TLC holds as a function (not a tuple), with the forms of its parts
+    Fcn(Box<Form>),
+    /// The forms of the parts: a set's elements and a tuple's in order, a record's fields in the
+    /// order of their names, a function's keys and values in turn
+    Parts(Vec<Form>),
+}
+
+impl Form {
+    fn parts(fs: Vec<Form>) -> Form {
+        if fs.iter().all(|f| *f == Form::Plain) {
+            Form::Plain
+        } else {
+            Form::Parts(fs)
+        }
+    }
+
+    pub fn part(&self, i: usize) -> Form {
+        match self {
+            Form::Parts(fs) => fs.get(i).cloned().unwrap_or_default(),
+            Form::Fcn(f) => f.part(i),
+            _ => Form::Plain,
+        }
+    }
+
+    fn all_parts(&self, n: usize) -> Vec<Form> {
+        (0..n).map(|i| self.part(i)).collect()
+    }
+}
+
+/// The form of the element x of the set s whose form is f
+pub fn elem_form(s: &Value, f: &Form, x: &Value) -> Form {
+    match s {
+        Value::Set(xs) => xs.iter().position(|y| y == x).map_or(Form::Plain, |i| f.part(i)),
+        _ => Form::Plain,
+    }
+}
+
+/// The form of the value of the function, tuple or record v at k, if v's form is f
+fn entry_form(v: &Value, f: &Form, k: &Value, atoms: &Atoms) -> Form {
+    match v {
+        Value::Tuple(xs) => match k {
+            Value::Int(i) if *i >= 1 && (*i as usize) <= xs.len() => f.part(*i as usize - 1),
+            _ => Form::Plain,
+        },
+        Value::Fun(m) => m.keys().position(|y| y == k).map_or(Form::Plain, |i| f.part(2 * i + 1)),
+        Value::Rec(m) => match k {
+            Value::Atom(a) => m.keys().position(|n| *n == atoms.name(*a)).map_or(Form::Plain, |i| f.part(i)),
+            _ => Form::Plain,
+        },
+        _ => Form::Plain,
+    }
+}
+
+/// The form of the function v, from the forms of its keys and values
+fn fun_form(v: &Value, entries: &BTreeMap<Value, (Form, Form)>, atoms: &Atoms) -> Form {
+    let get = |k: &Value| entries.get(k).cloned().unwrap_or_default();
+    match v {
+        Value::Tuple(xs) => Form::parts((1..=xs.len()).map(|i| get(&Value::Int(i as i64)).1).collect()),
+        Value::Fun(m) => Form::parts(m.keys().flat_map(|k| {
+            let (a, b) = get(k);
+            [a, b]
+        }).collect()),
+        Value::Rec(m) => Form::parts(m.keys().map(|k| atoms.get(false, k).map_or(Form::Plain, |a| get(&Value::Atom(a)).1)).collect()),
+        _ => Form::Plain,
+    }
+}
+
+/// The forms of the keys and values of the function v whose form is f
+fn fun_entries(v: &Value, f: &Form, atoms: &Atoms) -> BTreeMap<Value, (Form, Form)> {
+    match v {
+        Value::Tuple(xs) => (0..xs.len()).map(|i| (Value::Int(i as i64 + 1), (Form::Plain, f.part(i)))).collect(),
+        Value::Fun(m) => m.keys().enumerate().map(|(i, k)| (k.clone(), (f.part(2 * i), f.part(2 * i + 1)))).collect(),
+        Value::Rec(m) => m.keys().enumerate().filter_map(|(i, k)| Some((Value::Atom(atoms.get(false, k)?), (Form::Plain, f.part(i))))).collect(),
+        _ => BTreeMap::new(),
+    }
+}
+
+/// The text TLC prints for v held in the form f
+pub fn show_formed(atoms: &Atoms, v: &Value, f: &Form) -> String {
+    use crate::compile::show_value;
+    let join = |xs: Vec<String>, sep: &str| xs.join(sep);
+    match (f, v) {
+        (Form::Plain, _) => show_value(atoms, v),
+        (Form::Interval, _) => crate::codegen::interval_text(v).unwrap_or_else(|| show_value(atoms, v)),
+        (Form::Fcn(_), Value::Tuple(t)) if t.is_empty() => "<< >>".into(),
+        (Form::Fcn(inner), _) => show_formed(atoms, v, inner),
+        (Form::Parts(fs), Value::Set(s)) => format!("{{{}}}", join(s.iter().zip(fs).map(|(x, f)| show_formed(atoms, x, f)).collect(), ", ")),
+        (Form::Parts(fs), Value::Tuple(t)) => format!("<<{}>>", join(t.iter().zip(fs).map(|(x, f)| show_formed(atoms, x, f)).collect(), ", ")),
+        (Form::Parts(fs), Value::Rec(m)) => {
+            let fields = crate::types::sorted_fields(m.iter().zip(fs).map(|((k, x), f)| (k.clone(), (x, f))).collect());
+            format!("[{}]", join(fields.iter().map(|(k, (x, f))| format!("{k} |-> {}", show_formed(atoms, x, f))).collect(), ", "))
+        }
+        (Form::Parts(_), Value::Fun(m)) => {
+            let fs = f.all_parts(2 * m.len());
+            let named = m.keys().all(|k| matches!(k, Value::Atom(a) if !atoms.is_model(*a) && crate::compile::field_name(&atoms.name(*a))));
+            if named {
+                let parts = m.iter().enumerate().map(|(i, (k, x))| {
+                    let Value::Atom(a) = k else { unreachable!() };
+                    format!("{} |-> {}", atoms.name(*a), show_formed(atoms, x, &fs[2 * i + 1]))
+                });
+                format!("[{}]", join(parts.collect(), ", "))
+            } else {
+                let parts = m.iter().enumerate().map(|(i, (k, x))| format!("{} :> {}", show_formed(atoms, k, &fs[2 * i]), show_formed(atoms, x, &fs[2 * i + 1])));
+                format!("({})", join(parts.collect(), " @@ "))
+            }
+        }
+        _ => show_value(atoms, v),
+    }
+}
+
+/// Whether e may build a value TLC holds in a form of its own (see `Form`), as written
+pub fn may_form(e: &Expr) -> bool {
+    fn go(e: &Expr, depth: u32) -> bool {
+        depth < 16
+            && e.any(&|y| match y {
+                Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) | Expr::FunCons(..) => true,
+                Expr::Call(n, _) => n == "SelectSeq",
+                Expr::Ident(n, _) => bound_expr(n).is_some_and(|x| go(&x, depth + 1)),
+                _ => false,
+            })
+    }
+    go(e, 0)
+}
+
+impl ConstEval<'_> {
+    /// The value of e, noting no string it makes (for what is evaluated a second time)
+    pub fn eval_quiet(&self, e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
+        let log = self.atoms.log.replace(None);
+        let v = self.eval(e, env).ok();
+        self.atoms.log.replace(log);
+        v
+    }
+
+    /// The text TLC prints for the value of x (see `Form`)
+    pub fn shown(&self, x: &Expr, env: &HashMap<String, Value>) -> R<String> {
+        let v = self.eval(x, env)?;
+        Ok(show_formed(self.atoms, &v, &self.form(x, env)))
+    }
+
+    /// How TLC holds the value of e (see `Form`). It evaluates parts of e again, so it is not
+    /// asked of what prints or sets registers
+    pub fn form(&self, e: &Expr, env: &HashMap<String, Value>) -> Form {
+        let quiet = !e.any(&|y| matches!(y, Expr::Call(n, _) if ["Print", "PrintT", "Assert", "TLCSet"].contains(&n.as_str())));
+        if !quiet {
+            return Form::Plain;
+        }
+        // What evaluating again makes was made before
+        let log = self.atoms.log.replace(None);
+        let f = self.form_in(e, env, &HashMap::new(), 0);
+        self.atoms.log.replace(log);
+        f
+    }
+
+    fn form_in(&self, e: &Expr, env: &HashMap<String, Value>, fe: &HashMap<String, Form>, depth: u32) -> Form {
+        use Expr::*;
+        if depth > 64 {
+            return Form::Plain;
+        }
+        let val = |x: &Expr| self.eval(x, env).ok();
+        let form = |x: &Expr| self.form_in(x, env, fe, depth + 1);
+        match e {
+            Label(n, _, _) if crate::community::defines(n) => Form::Plain,
+            Label(_, _, b) | Let(_, b) => form(b),
+            Ident(n, _) => {
+                if env.contains_key(n) {
+                    fe.get(n).cloned().unwrap_or_default()
+                } else if let Some(x) = bound_expr(n) {
+                    form(&x)
+                } else {
+                    Form::Plain
+                }
+            }
+            Bin(BOp::Range, a, b) => match (val(a), val(b)) {
+                (Some(Value::Int(a)), Some(Value::Int(b))) if a <= b => Form::Interval,
+                _ => Form::Plain,
+            },
+            Un(UOp::Domain, t) => match val(t) {
+                Some(Value::Tuple(xs)) if !xs.is_empty() && !matches!(form(t), Form::Fcn(_)) => Form::Interval,
+                _ => Form::Plain,
+            },
+            Tuple(xs) => Form::parts(xs.iter().map(form).collect()),
+            RecLit(fs) => {
+                let mut fs: Vec<&(String, Expr)> = fs.iter().collect();
+                fs.sort_by(|a, b| a.0.cmp(&b.0));
+                Form::parts(fs.iter().map(|(_, x)| form(x)).collect())
+            }
+            SetLit(xs) => {
+                let mut m: BTreeMap<Value, Form> = BTreeMap::new();
+                for x in xs {
+                    let Some(v) = val(x) else { return Form::Plain };
+                    if !m.contains_key(&v) {
+                        m.insert(v, form(x));
+                    }
+                }
+                Form::parts(m.into_values().collect())
+            }
+            SetMap(body, bs) => {
+                // The forms of the bound names whose sets do not depend on the names before
+                let outer: Vec<Option<(Value, Form)>> = bs.iter().map(|(_, s)| val(s).map(|v| (v, form(s)))).collect();
+                let mut m: BTreeMap<Value, Form> = BTreeMap::new();
+                let r = self.each_binding(bs, env, &mut |env2| {
+                    let mut fe2 = fe.clone();
+                    for ((x, _), o) in bs.iter().zip(&outer) {
+                        if let (Some((sv, sf)), Some(v)) = (o, env2.get(x)) {
+                            fe2.insert(x.clone(), elem_form(sv, sf, v));
+                        }
+                    }
+                    let v = self.eval(body, env2)?;
+                    if !m.contains_key(&v) {
+                        let f = self.form_in(body, env2, &fe2, depth + 1);
+                        m.insert(v, f);
+                    }
+                    Ok(true)
+                });
+                if r.is_err() {
+                    return Form::Plain;
+                }
+                Form::parts(m.into_values().collect())
+            }
+            SetFilter(_, s, _) | Choose(_, s, _) => {
+                let (Some(sv), Some(v)) = (val(s), val(e)) else { return Form::Plain };
+                let sf = form(s);
+                match (&v, e) {
+                    (Value::Set(xs), SetFilter(..)) => Form::parts(xs.iter().map(|x| elem_form(&sv, &sf, x)).collect()),
+                    _ => elem_form(&sv, &sf, &v),
+                }
+            }
+            FunCons(x, s, body) => {
+                let (Some(sv), Some(v)) = (val(s), val(e)) else { return Form::Plain };
+                let Value::Set(xs) = &sv else { return Form::Plain };
+                let sf = form(s);
+                let mut entries = BTreeMap::new();
+                let (mut env2, mut fe2) = (env.clone(), fe.clone());
+                for k in xs {
+                    let kf = elem_form(&sv, &sf, k);
+                    env2.insert(x.clone(), k.clone());
+                    fe2.insert(x.clone(), kf.clone());
+                    entries.insert(k.clone(), (kf, self.form_in(body, &env2, &fe2, depth + 1)));
+                }
+                Form::Fcn(Box::new(fun_form(&v, &entries, self.atoms)))
+            }
+            App(f, a) => match (val(f), val(a)) {
+                (Some(fv), Some(av)) => entry_form(&fv, &form(f), &av, self.atoms),
+                _ => Form::Plain,
+            },
+            Field(r, n) => match val(r) {
+                Some(Value::Rec(m)) => m.keys().position(|f| f == n).map_or(Form::Plain, |i| form(r).part(i)),
+                Some(rv) => match self.atoms.get(false, n) {
+                    Some(a) => entry_form(&rv, &form(r), &Value::Atom(a), self.atoms),
+                    None => Form::Plain,
+                },
+                None => Form::Plain,
+            },
+            If(c, a, b) => match val(c) {
+                Some(Value::Bool(true)) => form(a),
+                Some(Value::Bool(false)) => form(b),
+                _ => Form::Plain,
+            },
+            Case(arms, other) => {
+                for (c, x) in arms {
+                    match val(c) {
+                        Some(Value::Bool(true)) => return form(x),
+                        Some(Value::Bool(false)) => {}
+                        _ => return Form::Plain,
+                    }
+                }
+                other.as_ref().map_or(Form::Plain, |x| form(x))
+            }
+            Except(base, ups) => {
+                let Some(bv) = val(base) else { return Form::Plain };
+                let bf = form(base);
+                let (fcn, inner) = match &bf {
+                    Form::Fcn(i) => (true, (**i).clone()),
+                    f => (false, f.clone()),
+                };
+                let n = match &bv {
+                    Value::Tuple(xs) => xs.len(),
+                    Value::Rec(m) => m.len(),
+                    Value::Fun(m) => 2 * m.len(),
+                    _ => return Form::Plain,
+                };
+                let mut parts = inner.all_parts(n);
+                for (path, x) in ups {
+                    // The expander names each update's @ in a last field step
+                    let at_name = path.iter().find_map(|p| match p {
+                        Path::Field(k) if k.starts_with('@') => Some(k.clone()),
+                        _ => None,
+                    });
+                    let is_at = |y: &Expr| matches!(y, Expr::At) || matches!(y, Expr::Ident(n, _) if Some(n) == at_name.as_ref());
+                    let uses_at = x.any(&is_at);
+                    let steps: Vec<&Path> = path.iter().filter(|p| !matches!(p, Path::Field(k) if k.starts_with('@'))).collect();
+                    let key = match steps.as_slice() {
+                        [Path::Idx(i)] => val(i),
+                        [Path::Field(f)] => match &bv {
+                            Value::Rec(m) => m.keys().position(|g| g == f).map(|i| Value::Int(i as i64)),
+                            _ => self.atoms.get(false, f).map(Value::Atom),
+                        },
+                        _ => None,
+                    };
+                    let at = key.and_then(|k| match &bv {
+                        Value::Tuple(xs) => match k {
+                            Value::Int(i) if i >= 1 && i as usize <= xs.len() => Some(i as usize - 1),
+                            _ => None,
+                        },
+                        Value::Rec(_) => match (k, steps.as_slice()) {
+                            (Value::Int(i), [Path::Field(_)]) => Some(i as usize),
+                            _ => None,
+                        },
+                        Value::Fun(m) => m.keys().position(|y| *y == k).map(|i| 2 * i + 1),
+                        _ => None,
+                    });
+                    // An update whose value reads @ or goes deeper builds a value of its own
+                    if let Some(at) = at {
+                        parts[at] = match (uses_at, steps.len()) {
+                            (false, 1) => form(x),
+                            (true, 1) if is_at(x.strip()) => parts[at].clone(),
+                            _ => Form::Plain,
+                        };
+                    } else if steps.len() != 1 {
+                        return Form::Plain;
+                    }
+                }
+                let f = Form::parts(parts);
+                if fcn {
+                    Form::Fcn(Box::new(f))
+                } else {
+                    f
+                }
+            }
+            Bin(op @ (BOp::Cup | BOp::Cap | BOp::SetMinus), a, b) => {
+                let (Some(av), Some(bv), Some(Value::Set(xs))) = (val(a), val(b), val(e)) else { return Form::Plain };
+                let (af, bf) = (form(a), if *op == BOp::Cup { form(b) } else { Form::Plain });
+                let Value::Set(ax) = &av else { return Form::Plain };
+                Form::parts(xs.iter().map(|x| if ax.contains(x) { elem_form(&av, &af, x) } else { elem_form(&bv, &bf, x) }).collect())
+            }
+            Call(f, args) => match (f.as_str(), args.as_slice()) {
+                ("Append", [s, x]) => match val(s) {
+                    Some(Value::Tuple(xs)) => {
+                        let mut fs = form(s).all_parts(xs.len());
+                        fs.push(form(x));
+                        Form::parts(fs)
+                    }
+                    _ => Form::Plain,
+                },
+                ("Head", [s]) => form(s).part(0),
+                ("Tail", [s]) => match val(s) {
+                    Some(Value::Tuple(xs)) if !xs.is_empty() => Form::parts(form(s).all_parts(xs.len()).split_off(1)),
+                    _ => Form::Plain,
+                },
+                ("SubSeq", [s, m, n]) => match (val(s), val(m), val(n)) {
+                    (Some(Value::Tuple(xs)), Some(Value::Int(m)), Some(Value::Int(n))) if m >= 1 && n >= m && (n as usize) <= xs.len() => {
+                        Form::parts(form(s).all_parts(xs.len())[m as usize - 1..n as usize].to_vec())
+                    }
+                    _ => Form::Plain,
+                },
+                ("\\o", [s, t]) => match (val(s), val(t)) {
+                    (Some(Value::Tuple(xs)), Some(Value::Tuple(ys))) => {
+                        let mut fs = form(s).all_parts(xs.len());
+                        fs.extend(form(t).all_parts(ys.len()));
+                        Form::parts(fs)
+                    }
+                    _ => Form::Plain,
+                },
+                // The elements kept, in order, as they were held
+                ("SelectSeq", [s, _]) => match (val(s), val(e)) {
+                    (Some(Value::Tuple(xs)), Some(Value::Tuple(ys))) => {
+                        let fs = form(s).all_parts(xs.len());
+                        let mut kept = vec![];
+                        let mut i = 0;
+                        for y in &ys {
+                            while i < xs.len() && xs[i] != *y {
+                                i += 1;
+                            }
+                            kept.push(fs.get(i).cloned().unwrap_or_default());
+                            i += 1;
+                        }
+                        Form::parts(kept)
+                    }
+                    _ => Form::Plain,
+                },
+                (":>", [d, x]) => match val(e) {
+                    Some(v) => match val(d) {
+                        Some(k) => Form::Fcn(Box::new(fun_form(&v, &[(k, (form(d), form(x)))].into(), self.atoms))),
+                        None => Form::Plain,
+                    },
+                    None => Form::Plain,
+                },
+                // f @@ g takes f where both are defined
+                ("@@", [f, g]) => match (val(f), val(g), val(e)) {
+                    (Some(fv), Some(gv), Some(v)) => {
+                        let mut entries = fun_entries(&gv, &form(g), self.atoms);
+                        entries.extend(fun_entries(&fv, &form(f), self.atoms));
+                        Form::Fcn(Box::new(fun_form(&v, &entries, self.atoms)))
+                    }
+                    _ => Form::Plain,
+                },
+                _ => Form::Plain,
+            },
+            _ => Form::Plain,
+        }
     }
 }
