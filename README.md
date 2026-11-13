@@ -108,8 +108,7 @@ TLC's meaning, output and exit codes (each is cross-checked against TLC by a con
   debugging output. `-recover` resumes from a checkpoint in TLC's own format, which tla2rs does not write.
   `-coverage` counts how often TLC's interpreter evaluated each subexpression; a compiled checker evaluates
   constants once and fuses expressions, so the counts depend on TLC's evaluator. `-terse` prints sets in the lazy
-  form TLC holds them in (`SUBSET S`, `[S -> T]`), which a compiled checker does not keep (as with intervals, see
-  Limitations). `-maxSetSize` bounds the sets TLC's interpreter enumerates, and where its error appears depends on
+  form TLC holds them in (`SUBSET S`, `[S -> T]`), which a compiled checker does not keep. `-maxSetSize` bounds the sets TLC's interpreter enumerates, and where its error appears depends on
   where the interpreter enumerates
 
 ## Speed
@@ -323,10 +322,12 @@ bounds the size of a model with temporal properties (one property per thread, so
   a function, their order shows nowhere, and the checker is built once
 - A set that TLC holds as an interval (`x = 1..3`) prints as `1..3`, and an empty function built by `[x \in S |->
   e]` as `<< >>` where an empty tuple prints `<<>>`, as in TLC, where tla2rs follows how the value was built: in what
-  the compiler evaluates (ASSUMEs, constants, also inside tuples, records, functions and sets), assigned to a
-  variable, in a field of a record or tuple, and taken from a constant set (also by `\E`) or a constant function.
-  Inside a set, function or sequence held in the state, or taken from one, it prints as `{1, 2, 3}` and `<<>>`
-  (see CLAUDE.md, "State graphs"), so the comparison of states with TLC reads an interval as the set it denotes
+  the compiler evaluates (ASSUMEs, constants, also inside tuples, records, functions and sets), and in the state: in
+  variables, in the fields of records and tuples, in the elements of sequences, of functions over integers or model
+  values and of sets of sets of integers, and in what is taken out of them or of a constant set. Elsewhere (a set of
+  records holding intervals, a sequence too long for the 64 bits a state keeps for these forms, the operators of the
+  CommunityModules) it prints as `{1, 2, 3}` and `<<>>` (see CLAUDE.md, "State graphs"). The comparison with TLC
+  reads intervals as printed
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
   it otherwise picks at random), also for properties TLC checks with its tableau (such as `~>` and `<>P`), when
   there is no `VIEW` (a model value is fingerprinted by the number TLC gives its name, and under

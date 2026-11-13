@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 876 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 878 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -515,35 +515,42 @@ not the graphs. Reducing to it:
   does not
 - Duplicate edges collapse, and dashed stuttering edges are dropped (they are not transitions of the next-state
   relation)
-- An interval `a..b` outside strings is read as the set it denotes. TLC prints a value in the form it holds it, so a
-  variable assigned `1..3` prints as `1..3` until an operation turns it into an enumerated set (measured on the
-  corpus's `DiningPhilosophers`). This applies to a variable printed on one line whose value fits in 80 columns once
-  expanded, where TLC's pretty printer would also keep it on one line; a longer one is kept as printed and then
-  differs (no configuration has one). The form depends on how the value was built, not on the value. Measured on TLC
-  2.19 (`tests/tlc/IntervalShow`): `s = 1..3` prints `1..3` and, after `s' = {1, 2, 3}`, the same value prints `{1,
-  2, 3}`; a function built as `[i \in 1..2 |-> 1..i]` prints `<<1..1, 1..2>>`, and keeps `1..2` through an EXCEPT of
+- Intervals are compared as printed. TLC prints a value in the form it holds it, so a variable assigned `1..3`
+  prints as `1..3` until an operation turns it into an enumerated set (measured on the corpus's
+  `DiningPhilosophers`). The form depends on how the value was built, not on the value. Measured on TLC 2.19
+  (`tests/tlc/IntervalShow`): `s = 1..3` prints `1..3` and, after `s' = {1, 2, 3}`, the same value prints `{1, 2,
+  3}`; a function built as `[i \in 1..2 |-> 1..i]` prints `<<1..1, 1..2>>`, and keeps `1..2` through an EXCEPT of
   the other entry; `s \cup {4}` enumerates; an empty interval prints `{}`. A state graph labels each state by the
   first way it was reached. More measured on TLC 2.19 (`tests/tlc/IntervalConst`, `EmptySeqShow`): an interval
   keeps its form inside a tuple, record, function or set and when taken out again (application, CHOOSE, a bound
   variable, Head, Tail, SubSeq, `\o`, SelectSeq); a set keeps the first of equal elements as written (`{1..2, {1,
   2}}` prints `{1..2}`, `\cup` keeps the left one); `(1..2) \cap (1..2)` enumerates, and so does DOMAIN of a function
   built by `[x \in S |-> e]`; an empty function built by `[x \in S |-> e]`, `:>` or `@@` prints `<< >>`, and an empty
-  tuple from `<<>>`, Tail, SubSeq, `\o` or SelectSeq prints `<<>>`. The compiler follows these forms for the values it
-  evaluates (`value::Form`): what TLC prints when it starts, ToString of a constant, and a constant printed while
-  exploring. A checker follows them for the variables that some assignment may give such a value
-  (`Gen::plan_shapes`): beside each state it keeps a shape, one bit per set of integers in those variables (set
-  while TLC holds it as an interval) and one per sequence (set while TLC holds it as a function), also in the fields
-  of a record or tuple. A variable gets its shape from the expression assigned, also from a constant (a constant
-  function's value, CHOOSE over a constant set) and, for `x' \in S` and a name bound by `\E` over S, from the
-  element taken when S is constant (or, for `x' \in S`, written as a set of elements; `tests/tlc/IntervalElem`,
-  `IntervalExists`). The shape is no part of the fingerprint, so the first
-  state reached keeps its form, as in TLC. States, `Print`, `PrintT` and `ToString` use it, so `ToString(s)` makes
-  `"1..2"` where TLC does, and an invariant comparing that text holds in both (`tests/tlc/IntervalToString`). Not
-  followed, and printed as enumerated sets and `<<>>`: the elements of a set, function or sequence held in the state,
-  a value bound by `\E` over a set from the state, CHOOSE over a set from the state, CASE, an IF whose condition prints, and
-  the operators of the CommunityModules tla2rs provides (TLC computes many of them in Java, which
-  builds values in forms of its own; `community::defines`). For these the comparison still reads an interval as the
-  set it denotes
+  tuple from `<<>>`, Tail, SubSeq, `\o` or SelectSeq prints `<<>>`. The same holds inside the values a state holds
+  (`tests/tlc/IntervalHeld`, `IntervalCase`): an interval in a function, sequence or set keeps its form through
+  EXCEPT (also one that reads `@`), Append, Tail, SubSeq, `\o`, `\cup`, `\cap`, `\` and a filter (`\cup` and `\cap`
+  keep the elements of their left side), and when taken out again (application, Head, CHOOSE, `\E`, `\in`); CASE
+  gives the form of the arm taken. The compiler follows these forms for the values it evaluates (`value::Form`):
+  what TLC prints when it starts, ToString of a constant, and a constant printed while exploring. A checker follows
+  them for the variables that some assignment may give such a value (`Gen::plan_shapes`): beside each state it keeps
+  a shape of at most 64 bits, laid out by `Gen::shape_slots`: one per set of integers (set while TLC holds it as an
+  interval); one per sequence (set while TLC holds it as a function), then those of its elements up to QCAP when
+  they fit; those of each value of a function over integers or model values; one per interval a set of sets of
+  integers may hold (when its elements range over at most 10 integers); and those of the fields of a record or
+  tuple. A variable gets its shape from the expression assigned, also from a constant (a constant function's value,
+  CHOOSE over a constant set) and, for `x' \in S`, CHOOSE from S and a name bound by `\E` over S, from the element
+  taken when S is constant, written as a set of elements or a set of sets of integers from the state
+  (`tests/tlc/IntervalElem`, `IntervalExists`). An IF whose condition prints is evaluated once for both the value
+  and its shape. The shape is no part of the fingerprint, so the first state reached keeps its form, as in TLC.
+  States, `Print`, `PrintT` and `ToString` use it, so `ToString(s)` makes `"1..2"` where TLC does, and an invariant
+  comparing that text holds in both (`tests/tlc/IntervalToString`); a tuple written out in `Print` or `PrintT` whose
+  parts have more bits than one shape holds prints part by part. Not followed, and printed as enumerated sets and
+  `<<>>`: the elements of a set held in the state that are not sets of integers (records, tuples, sequences) or that
+  range over more than 10 integers, the elements of a sequence or function whose bits do not fit in the shape with
+  those of the other variables, functions over strings and partial functions, SelectSeq of a sequence from the
+  state, an IF whose condition prints inside another value, and the operators of the CommunityModules tla2rs
+  provides (TLC computes many of them in Java, which builds values in forms of its own; `community::defines`). No
+  configuration has one of these
 
 Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
 are for the 483 configurations at the time of writing):
