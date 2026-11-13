@@ -220,18 +220,19 @@ fn int_count(lo: i64, hi: i64) -> Option<u64> {
     u64::try_from((hi as i128 - lo as i128 + 1).max(0)).ok()
 }
 
-/// Whether coercing `from` to `to` turns an integer-or-model-value into a model value somewhere.
-/// That conversion fails at run time on an integer, so a comparison has to be made in the joined
-/// type instead.
+/// Whether coercing `from` to `to` turns an integer-or-model-value into a model value somewhere,
+/// or an optional field of a record into a field it always has (as in a pair of a record-or-model
+/// value and a record, compared with pairs of records). That conversion fails at run time on an
+/// integer or an absent field, so a comparison has to be made in the joined type instead.
 pub fn narrows(from: &Ty, to: &Ty) -> bool {
     match (from, to) {
         (Ty::IntAtom(..), Ty::Enum(_)) => true,
+        (Ty::Opt(_), t) if !matches!(t, Ty::Opt(_)) => true,
         // A sequence converted to a tuple or a function over 1..n fails unless the length matches
         (Ty::Seq(_), t) if !matches!(t, Ty::Seq(_)) => true,
         (Ty::Seq(a), Ty::Seq(b)) => narrows(a, b),
         (Ty::Rec(a), Ty::Rec(b)) => a.iter().any(|(n, t)| b.iter().find(|(m, _)| m == n).is_some_and(|(_, u)| narrows(t, u))),
         (Ty::Opt(a), Ty::Opt(b)) => narrows(a, b),
-        (Ty::Opt(a), b) => narrows(a, b),
         (a, Ty::Opt(b)) => narrows(a, b),
         (Ty::Fun(_, a), Ty::Fun(_, b)) | (Ty::Set(a), Ty::Set(b)) => narrows(a, b),
         _ => false,
