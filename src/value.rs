@@ -403,12 +403,19 @@ pub fn nat_div(a: i64, b: i64) -> i64 {
 }
 pub const MOD_NONPOS: &str = "The second argument of % should be a positive number, but instead it is:";
 pub const CASE_NONE: &str = "Attempted to evaluate a CASE with no conditions true.";
+/// TLC's error when it has to build a set of more elements than its limit (`-maxSetSize`, 1000000
+/// by default): for CHOOSE over `[D -> R]`, `\X` or `[f : S]`, and for `{e : x \in S}` over any of
+/// these or SUBSET (measured on TLC 2.19; it enumerates them without building them in `\E`, `\A`
+/// and `{x \in S : P}`, and CHOOSE over SUBSET too, see `BigSet`)
+pub const TOO_MANY: &str = "Attempted to construct a set with too many elements (>1000000).";
+const TLC_MAX_SET: f64 = 1_000_000.0;
 pub const CHOOSE_NONE: &str = "Attempted to compute the value of an expression of form\nCHOOSE x \\in S: P, but no element of S satisfied P.";
 
 /// The starts of the error messages for failures that TLC raises too when it evaluates the same
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
-const EVAL_FAILURES: [&str; 11] = [
+const EVAL_FAILURES: [&str; 12] = [
     "Attempted to check equality of string ",
+    TOO_MANY,
     "The first argument of BagOfAll should be an operator",
     "Attempted to check if ",
     DIV_ZERO,
@@ -435,6 +442,100 @@ pub fn bag_of_all_literal(atoms: &Atoms, body: &Expr) -> Option<String> {
 /// Whether an error from `ConstEval::eval` is an evaluation failure of the spec itself.
 pub fn is_eval_failure(e: &str) -> bool {
     EVAL_FAILURES.iter().any(|p| e.starts_with(p))
+}
+
+/// A set of functions, tuples, records or subsets by its parts, which can be gone through without
+/// building it. The elements come in the order of `Value` (TLC's order): `[D -> R]` with the value
+/// at the last element of D varying fastest, `\X` with the last part fastest, records with the
+/// last field in TLC's order of names fastest, and the subsets of S by size, then in the order of
+/// their elements. TLC goes through one of more than its limit of elements in the same order,
+/// without building it (measured on TLC 2.19: `tests/tlc/BigConst`)
+enum BigSet {
+    /// The elements of D and of R, and whether D is 1..n (the functions are then tuples)
+    Fun(Vec<Value>, Vec<Value>, bool),
+    Prod(Vec<Vec<Value>>),
+    /// The fields in TLC's order of names
+    Rec(Vec<(String, Vec<Value>)>),
+    Subset(Vec<Value>),
+}
+
+impl BigSet {
+    fn size(&self) -> f64 {
+        match self {
+            BigSet::Fun(d, r, _) => (r.len() as f64).powi(d.len() as i32),
+            BigSet::Prod(ps) => ps.iter().map(|p| p.len() as f64).product(),
+            BigSet::Rec(fs) => fs.iter().map(|(_, p)| p.len() as f64).product(),
+            BigSet::Subset(s) => 2f64.powi(s.len() as i32),
+        }
+    }
+
+    /// Calls f on each element in order until it returns false (and then returns false)
+    fn each(&self, f: &mut dyn FnMut(Value) -> R<bool>) -> R<bool> {
+        match self {
+            BigSet::Fun(d, r, tuples) => {
+                let parts = vec![r.as_slice(); d.len()];
+                each_index(&parts, &mut |idx| {
+                    f(if *tuples {
+                        Value::Tuple(idx.iter().map(|&i| r[i].clone()).collect())
+                    } else {
+                        fun_value(d.iter().cloned().zip(idx.iter().map(|&i| r[i].clone())).collect())
+                    })
+                })
+            }
+            BigSet::Prod(ps) => {
+                let parts: Vec<&[Value]> = ps.iter().map(|p| p.as_slice()).collect();
+                each_index(&parts, &mut |idx| f(Value::Tuple(idx.iter().zip(ps).map(|(&i, p)| p[i].clone()).collect())))
+            }
+            BigSet::Rec(fs) => {
+                let parts: Vec<&[Value]> = fs.iter().map(|(_, p)| p.as_slice()).collect();
+                each_index(&parts, &mut |idx| f(Value::Rec(idx.iter().zip(fs).map(|(&i, (k, p))| (k.clone(), p[i].clone())).collect())))
+            }
+            // The subsets of k elements for k = 0, 1, ..., each size in the order of the indices
+            // of their elements
+            BigSet::Subset(s) => {
+                let n = s.len();
+                for k in 0..=n {
+                    let mut idx: Vec<usize> = (0..k).collect();
+                    loop {
+                        if !f(Value::Set(idx.iter().map(|&i| s[i].clone()).collect()))? {
+                            return Ok(false);
+                        }
+                        let Some(j) = (0..k).rev().find(|&j| idx[j] < n - k + j) else { break };
+                        idx[j] += 1;
+                        for m in j + 1..k {
+                            idx[m] = idx[m - 1] + 1;
+                        }
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// Calls f on each tuple of indices into `parts`, the last varying fastest, until it returns false
+fn each_index(parts: &[&[Value]], f: &mut dyn FnMut(&[usize]) -> R<bool>) -> R<bool> {
+    if parts.iter().any(|p| p.is_empty()) {
+        return Ok(true);
+    }
+    let mut idx = vec![0usize; parts.len()];
+    loop {
+        if !f(&idx)? {
+            return Ok(false);
+        }
+        let mut k = parts.len();
+        loop {
+            if k == 0 {
+                return Ok(true);
+            }
+            k -= 1;
+            idx[k] += 1;
+            if idx[k] < parts[k].len() {
+                break;
+            }
+            idx[k] = 0;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1004,6 +1105,8 @@ impl ConstEval<'_> {
                     }
                 }
             }
+            // As in TLC, the consequent only when the antecedent holds
+            Bin(BOp::Implies, a, b) => Value::Bool(!self.eval(a, env)?.as_bool()? || self.eval(b, env)?.as_bool()?),
             Bin(op, a, b) => {
                 let a = self.eval(a, env)?;
                 let b = self.eval(b, env)?;
@@ -1060,6 +1163,23 @@ impl ConstEval<'_> {
                 Value::Bool(found)
             }
             Choose(x, s, p) => {
+                // TLC builds the set to choose from, except SUBSET S, which it enumerates
+                if let Some(b) = self.set_parts(s, env).filter(|b| b.size() > TLC_MAX_SET) {
+                    if !matches!(b, BigSet::Subset(_)) {
+                        return Err(TOO_MANY.into());
+                    }
+                    let mut env2 = env.clone();
+                    let mut found = None;
+                    b.each(&mut |v| {
+                        env2.insert(x.clone(), v.clone());
+                        if self.eval(p, &env2)?.as_bool()? {
+                            found = Some(v);
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    return found.ok_or_else(|| CHOOSE_NONE.into());
+                }
                 let s = self.eval(s, env)?;
                 let mut env2 = env.clone();
                 for v in s.as_set()? {
@@ -1078,6 +1198,19 @@ impl ConstEval<'_> {
                 }
                 Value::Set(vs.into_iter().collect())
             }
+            // Over a set TLC enumerates without building it, element by element (see `BigSet`)
+            SetFilter(x, s, p) if self.streams(s, env, false) => {
+                let mut out = vec![];
+                let mut env2 = env.clone();
+                self.each_elem(s, env, &mut |v| {
+                    env2.insert(x.clone(), v.clone());
+                    if self.eval(p, &env2)?.as_bool()? {
+                        out.push(v);
+                    }
+                    Ok(true)
+                })?;
+                Value::Set(out.into_iter().collect())
+            }
             SetFilter(x, s, p) => {
                 let s = self.eval(s, env)?;
                 s.as_set()?;
@@ -1095,7 +1228,7 @@ impl ConstEval<'_> {
             }
             SetMap(f, bs) => {
                 let mut out = BTreeSet::new();
-                self.each_binding(bs, env, &mut |env2| {
+                self.each_binding_in(bs, env, true, &mut |env2| {
                     out.insert(self.eval(f, env2)?);
                     Ok(true)
                 })?;
@@ -1548,15 +1681,113 @@ impl ConstEval<'_> {
         env: &HashMap<String, Value>,
         f: &mut dyn FnMut(&HashMap<String, Value>) -> R<bool>,
     ) -> R<bool> {
+        self.each_binding_in(bs, env, false, f)
+    }
+
+    /// As `each_binding`; with `map` (for `{e : x \in S}`), a set of more than TLC's limit that
+    /// TLC enumerates elsewhere without building it is TLC's error instead
+    pub fn each_binding_in(
+        &self,
+        bs: &[(String, Expr)],
+        env: &HashMap<String, Value>,
+        map: bool,
+        f: &mut dyn FnMut(&HashMap<String, Value>) -> R<bool>,
+    ) -> R<bool> {
         if bs.is_empty() {
             return f(env);
         }
         let (x, s) = &bs[0];
-        let s = self.eval(s, env)?;
+        if map && self.set_parts(s, env).is_some_and(|b| b.size() > TLC_MAX_SET) {
+            return Err(TOO_MANY.into());
+        }
         let mut env2 = env.clone();
+        if bs.len() > 1 {
+            return self.each_elem(s, env, &mut |v| {
+                env2.insert(x.clone(), v);
+                self.each_binding_in(&bs[1..], &env2, map, f)
+            });
+        }
+        // TLC takes the next element before it evaluates the body for one, which shows where
+        // taking it evaluates the condition of a filter (`each_elem`)
+        let mut pending = None;
+        let mut stopped = false;
+        self.each_elem(s, env, &mut |v| {
+            if let Some(p) = pending.replace(v) {
+                env2.insert(x.clone(), p);
+                if !f(&env2)? {
+                    stopped = true;
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        match pending {
+            Some(p) if !stopped => {
+                env2.insert(x.clone(), p);
+                f(&env2)
+            }
+            _ => Ok(!stopped),
+        }
+    }
+
+    /// `[D -> R]`, `S1 \X ... \X Sn`, `[f1 : S1, ...]` or `SUBSET S` by its parts, when they
+    /// evaluate to sets
+    fn set_parts(&self, s: &Expr, env: &HashMap<String, Value>) -> Option<BigSet> {
+        let set = |e: &Expr| match self.eval(e, env) {
+            Ok(Value::Set(s)) => Some(s.into_iter().collect::<Vec<_>>()),
+            _ => None,
+        };
+        Some(match &*shape(s) {
+            Expr::FunSet(d, r) => {
+                let (d, r) = (set(d)?, set(r)?);
+                let tuples = d.iter().enumerate().all(|(i, k)| *k == Value::Int(i as i64 + 1));
+                BigSet::Fun(d, r, tuples)
+            }
+            Expr::Call(f, parts) if f == "\\X" => BigSet::Prod(parts.iter().map(set).collect::<Option<_>>()?),
+            Expr::RecSet(fs) => {
+                let mut fs: Vec<(String, Vec<Value>)> = fs.iter().map(|(k, s)| Some((k.clone(), set(s)?))).collect::<Option<_>>()?;
+                fs.sort_by(|a, b| crate::types::field_cmp(&a.0, &b.0));
+                BigSet::Rec(fs)
+            }
+            Expr::Un(UOp::Subset, x) => BigSet::Subset(set(x)?),
+            _ => return None,
+        })
+    }
+
+    /// Whether s is a set that TLC enumerates without building it, or a filter of one: one of
+    /// more than TLC's limit, or with `small`, any `BigSet` but a name a BIND label binds (whose
+    /// value tla2rs keeps once computed, `eval_bound`)
+    fn streams(&self, s: &Expr, env: &HashMap<String, Value>, small: bool) -> bool {
+        let small = small && !matches!(shape(s), Shape::Bound(_));
+        match &*shape(s) {
+            Expr::SetFilter(_, b, _) => self.streams(b, env, small),
+            _ => self.set_parts(s, env).is_some_and(|b| small || b.size() > TLC_MAX_SET),
+        }
+    }
+
+    /// Calls f on each element of the set s in TLC's order until f returns false (and then
+    /// returns false). A `BigSet` is enumerated from its parts, as TLC goes through one, and a
+    /// filter of one goes through it element by element, evaluating its condition on each in turn
+    /// (TLC builds a filter of an interval or of a set it holds element by element first)
+    fn each_elem(&self, s: &Expr, env: &HashMap<String, Value>, f: &mut dyn FnMut(Value) -> R<bool>) -> R<bool> {
+        if self.streams(s, env, true) {
+            if let Expr::SetFilter(x, b, p) = &*shape(s) {
+                let mut env2 = env.clone();
+                return self.each_elem(b, env, &mut |v| {
+                    env2.insert(x.clone(), v.clone());
+                    if self.eval(p, &env2)?.as_bool()? {
+                        return f(v);
+                    }
+                    Ok(true)
+                });
+            }
+            if let Some(b) = self.set_parts(s, env) {
+                return b.each(f);
+            }
+        }
+        let s = self.eval(s, env)?;
         for v in s.as_set()? {
-            env2.insert(x.clone(), v.clone());
-            if !self.each_binding(&bs[1..], &env2, f)? {
+            if !f(v.clone())? {
                 return Ok(false);
             }
         }
@@ -1893,7 +2124,7 @@ impl ConstEval<'_> {
                 // The forms of the bound names whose sets do not depend on the names before
                 let outer: Vec<Option<(Value, Form)>> = bs.iter().map(|(_, s)| val(s).map(|v| (v, form(s)))).collect();
                 let mut m: BTreeMap<Value, Form> = BTreeMap::new();
-                let r = self.each_binding(bs, env, &mut |env2| {
+                let r = self.each_binding_in(bs, env, true, &mut |env2| {
                     let mut fe2 = fe.clone();
                     for ((x, _), o) in bs.iter().zip(&outer) {
                         if let (Some((sv, sf)), Some(v)) = (o, env2.get(x)) {
