@@ -4229,6 +4229,33 @@ impl<'a> Gen<'a> {
             let (bc, (_, bhi)) = self.gen_int(b, env)?;
             return Ok((format!("({ac}..={bc})"), Ty::Int(alo, bhi), None));
         }
+        // A constant set too large to fold, such as the filter of a large set of records: computed
+        // once, into a vector, as an array of limited capacity cannot hold more than MAX_CAP
+        // elements. Iterated in the order of such an array (see `s_iter`)
+        if let Expr::SetFilter(x, inner, p) = s {
+            if self.is_const(s, env) {
+                let (it, et, ix) = self.iter_of_indexed(inner, env)?;
+                let st = Ty::Set(et.clone().into());
+                if is_sparse(&st) {
+                    let mut env2 = env.clone();
+                    let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                    let pc = self.gen_as(p, &env2, &Ty::Bool)?;
+                    let elem = env2.locals[x].0.clone();
+                    let tr = et.repr();
+                    let order = if needs_tlc_order(&et) {
+                        format!("__v.sort_by(|x, y| {});", self.tlc_cmp(&et, "x", "y")?)
+                    } else {
+                        String::new()
+                    };
+                    let code = format!(
+                        "{{ static __S: std::sync::OnceLock<Vec<{tr}>> = std::sync::OnceLock::new(); \
+                         __S.get_or_init(|| {{ let mut __v: Vec<{tr}> = Vec::new(); for {lx} in {it} {{ if {pc} {{ __v.push({elem}); }} }} \
+                         __v.sort(); __v.dedup(); {order} __v }}).iter().copied() }}"
+                    );
+                    return Ok((code, et, None));
+                }
+            }
+        }
         let (c, t) = self.gen_val(s, env)?;
         let Ty::Set(et) = &t else { return Err(format!("cannot iterate over {t:?}")) };
         let it = self.s_iter(&c, &t)?;
