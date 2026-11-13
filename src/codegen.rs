@@ -1050,14 +1050,16 @@ impl<'a> Gen<'a> {
         if enabled {
             sig += "s: &State, ";
         }
+        // Arguments are passed by reference: every value type is Copy, and a set held as an array
+        // or a state's variables can be kilobytes, copied at each call and each level of recursion
         for (k, (x, t)) in names.iter().zip(&tys).enumerate() {
-            env.locals.insert(x.clone(), (format!("a{k}"), t.clone()));
-            write!(sig, "a{k}: {}, ", t.repr()).unwrap();
+            env.locals.insert(x.clone(), (format!("(*a{k})"), t.clone()));
+            write!(sig, "a{k}: &{}, ", t.repr()).unwrap();
         }
         for (k, (x, t)) in primes.iter().zip(&tys[names.len()..]).enumerate() {
             let a = format!("a{}", names.len() + k);
-            env.primed.insert(x.clone(), (a.clone(), t.clone()));
-            write!(sig, "{a}: {}, ", t.repr()).unwrap();
+            env.primed.insert(x.clone(), (format!("(*{a})"), t.clone()));
+            write!(sig, "{a}: &{}, ", t.repr()).unwrap();
         }
         let mut last_err = String::new();
         // The type of a call not resolved yet: a body that iterates over the result of its
@@ -1843,7 +1845,16 @@ impl<'a> Gen<'a> {
         if narrows(xt, &et) {
             // x may hold a model value stored as an integer-or-model-value: compare in the joined
             // type rather than convert x (which fails at run time on an integer)
-            let jst = Ty::Set(join(xt, &et)?.into());
+            let j = join(xt, &et)?;
+            let jst = Ty::Set(j.clone().into());
+            if is_sparse(st) && is_sparse(&jst) && self.tuple_cmp(xt, &j)? == Cmp::Normal && !self.str_meets_int(xt, &j) && !narrows(xt, &j) {
+                // Compare x with each element converted, as a membership test in the converted set
+                // would, without building and sorting that set at each test (a test in a loop over
+                // another set built it once per element there)
+                let Ok(xc) = self.coerce_soft(x.to_string(), xt, &j) else { return Ok("false".into()) };
+                let eq = self.eq_into("__e", &et, "__x", &j)?;
+                return Ok(format!("{{ let __x = {xc}; let __any = ({c}).iter().any(|__e| {eq}); __any }}"));
+            }
             let cc = self.coerce(c.to_string(), st, &jst)?;
             let v = self.fresh("s");
             let inner = self.s_has(&v, &jst, x, xt)?;
@@ -1860,6 +1871,39 @@ impl<'a> Gen<'a> {
         let eid = self.ty_id(&et)?;
         let Ok(xc) = self.coerce_soft(x.to_string(), xt, &et) else { return Ok("false".into()) };
         Ok(format!("{{ let __i = enc_{eid}({xc}); __i != u64::MAX && ({c} >> __i) & 1 == 1 }}"))
+    }
+
+    /// Whether e (of type et) equals x (of type j, which et widens to), as `coerce(e, et, j) == x`
+    /// compares, without building the converted value: a tuple against a sequence compares the
+    /// length and then element by element
+    fn eq_into(&mut self, e: &str, et: &Ty, x: &str, j: &Ty) -> R<String> {
+        if et == j {
+            return Ok(format!("({e} == {x})"));
+        }
+        if let (Some(ts), Ty::Seq(se)) = (tuple_elems(et), j) {
+            let ts: Vec<Ty> = ts.into_iter().cloned().collect();
+            let n = ts.len();
+            // Converted, a tuple longer than the sequences' capacity stops for a larger one
+            let mut parts = vec![format!("({n} > QCAP && seq_too_long(QCAP))"), format!("({x}).len == {n}")];
+            for (k, t) in ts.iter().enumerate() {
+                parts.push(self.eq_into(&format!("({e}){}", rec_field(n, k)), t, &format!("({x}).items[{k}]"), se)?);
+            }
+            return Ok(format!("(!{} && {})", parts[0], parts[1..].join(" && ")));
+        }
+        if let (Ty::Rec(a), Ty::Rec(b)) = (et, j) {
+            let plain = |t: &Ty| !matches!(t, Ty::Opt(_));
+            if a.len() == b.len() && a.iter().zip(b).all(|((m, s), (n, t))| m == n && plain(s) && plain(t)) {
+                let n = a.len();
+                let mut parts = vec![];
+                for (k, ((_, s), (_, t))) in a.iter().zip(b).enumerate() {
+                    let f = rec_field(n, k);
+                    parts.push(self.eq_into(&format!("({e}){f}"), s, &format!("({x}){f}"), t)?);
+                }
+                return Ok(format!("({})", parts.join(" && ")));
+            }
+        }
+        let ec = self.coerce(e.to_string(), et, j)?;
+        Ok(format!("({ec} == {x})"))
     }
 
     /// Type coercion that returns Err when the value might not fit the target type (e.g. a field
@@ -1880,9 +1924,9 @@ impl<'a> Gen<'a> {
     fn s_bin(&mut self, op: BOp, a: &str, b: &str, st: &Ty) -> String {
         if is_sparse(st) {
             match op {
-                BOp::Cup => format!("({a}).union({b})"),
-                BOp::Cap => format!("({a}).inter({b})"),
-                _ => format!("({a}).minus({b})"),
+                BOp::Cup => format!("({a}).union(&{b})"),
+                BOp::Cap => format!("({a}).inter(&{b})"),
+                _ => format!("({a}).minus(&{b})"),
             }
         } else {
             match op {
@@ -2417,7 +2461,9 @@ impl<'a> Gen<'a> {
             if is_bind(n) {
                 let (lets, env2, body) = self.gen_bind(pairs, body, env)?;
                 let (c, t) = self.gen(&body, &env2, want)?;
-                return Ok((if lets.is_empty() { c } else { format!("{{ {lets}{c} }}") }, t));
+                // The value is kept in a variable: a temporary at the end of the block that
+                // borrows a cell (an iterator over the bound set) would outlive it
+                return Ok((if lets.is_empty() { c } else { format!("{{ {lets}let __bv = {c}; __bv }}") }, t));
             }
         }
         // An operator of the CommunityModules evaluated only when compiling (see ast::CONST_ONLY)
@@ -3441,6 +3487,14 @@ impl<'a> Gen<'a> {
                 let (c, t) = self.lazy_apply(f, &k, &xt, env, want)?;
                 (format!("{{ let {k} = {xc}; {c} }}"), t)
             }
+            // A tuple of variables applied to a constant index (`dag[1]` with `dag == <<vs, es>>`):
+            // that variable, without building the tuple. Reading a variable cannot fail, so
+            // skipping the others changes nothing
+            App(f, x) if matches!(unlabel(f), Tuple(es) if self.var_tuple(es, env)) && self.try_const(x, env).is_some() => {
+                let Tuple(es) = unlabel(f) else { unreachable!() };
+                let k = self.tuple_index(x, env, es.len())?;
+                return self.gen(&es[k], env, want);
+            }
             App(f, x) => {
                 let (fc, ft) = self.gen_val(f, env)?;
                 if let Ty::Rec(fs) = &ft {
@@ -3803,7 +3857,8 @@ impl<'a> Gen<'a> {
                     tys.push(vt);
                 }
                 let (name, ret) = self.rec_fn(*i, &rd, tys, &reads, &primes, enabled)?;
-                (format!("{name}({state_arg}{})", codes.join(", ")), ret)
+                let args: Vec<String> = codes.iter().map(|c| format!("&({c})")).collect();
+                (format!("{name}({state_arg}{})", args.join(", ")), ret)
             }
             // [A]_v is A \/ UNCHANGED v
             BoxAction(a, v) => return self.gen(&Or(vec![a.as_ref().clone(), Un(UOp::Unchanged, v.clone())]), env, want),
@@ -3870,6 +3925,15 @@ impl<'a> Gen<'a> {
                     // A string and an integer: TLC stops with an error when it compares them
                     let neg = if op == Eq { "" } else { "!" };
                     return Ok((format!("{neg}mixed_eq({ac}, {bc})"), Ty::Bool));
+                }
+                // A comparison with the empty set or sequence reads the length, rather than build
+                // an empty array of the capacity's width and compare every slot
+                if is_sparse(&t) || matches!(t, Ty::Seq(_)) {
+                    let empty = if is_sparse(&t) { self.s_empty(&t)? } else { format!("{}::from_slice(&[])", t.repr().replace('<', "::<")) };
+                    let other = if bc == empty { Some(&ac) } else if ac == empty { Some(&bc) } else { None };
+                    if let Some(o) = other {
+                        return Ok((format!("(({o}).len {} 0)", if op == Eq { "==" } else { "!=" }), Ty::Bool));
+                    }
                 }
                 (format!("({ac} {} {bc})", if op == Eq { "==" } else { "!=" }), Ty::Bool)
             }
@@ -5981,12 +6045,17 @@ impl<'a> Gen<'a> {
             // A constant whose computation TLC warns about (an EXCEPT) is computed where first used
             // too, so that it warns once for the evaluation, as TLC does (`tests/tlc/ExceptFold-Arg`)
             let warns = || !self.try_const_made(&x, &env2).1.warns.is_empty();
-            let cell = (!self.is_const(&x, &env2) || warns()) && !x.is_action() && !lazy_value(&x) && !(env.init && !all_assigned && self.mentions_state(&x));
+            // A tuple of variables is written out too: a use reads one of them (see `App`), and
+            // a cell would copy every one at its first use
+            let vars = matches!(unlabel(&x), Expr::Tuple(es) if self.var_tuple(es, &env2));
+            let cell = (!self.is_const(&x, &env2) || warns()) && !x.is_action() && !lazy_value(&x) && !vars && !(env.init && !all_assigned && self.mentions_state(&x));
             if cell {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
                     write!(lets, "let {id} = std::cell::OnceCell::new(); let {id}f = || -> {} {{ {c} }}; ", t.repr()).unwrap();
-                    env2.bind(&n, format!("{id}.get_or_init(&{id}f).clone()"), t);
+                    // Every value type is Copy: read through the reference, so that a use that
+                    // only reads a part (a field, an iteration) does not copy the whole value
+                    env2.bind(&n, format!("(*{id}.get_or_init(&{id}f))"), t);
                     continue;
                 }
             }
@@ -5996,6 +6065,16 @@ impl<'a> Gen<'a> {
             body = crate::expand::subst_ident(&body, &n, &x);
         }
         Ok((lets, env2, body))
+    }
+
+    /// Whether every element is a variable, primed or not, whose value `env` has
+    fn var_tuple(&self, es: &[Expr], env: &Env) -> bool {
+        !es.is_empty()
+            && es.iter().all(|e| match unlabel(e) {
+                Expr::Ident(n, _) => self.is_var(n) && !env.locals.contains_key(n) && !(env.init && !env.primed.contains_key(n)),
+                Expr::Prime(v) => matches!(v.as_ref(), Expr::Ident(n, _) if self.is_var(n) && env.primed.contains_key(n)),
+                _ => false,
+            })
     }
 
     /// Whether `n` is the hidden definition of an INSTANCE with substitutions, which TLC does not
@@ -7037,6 +7116,14 @@ fn unbind(pairs: &[Expr], body: &Expr) -> Expr {
         }
     }
     body
+}
+
+/// e without the labels around it other than BIND labels (call sites, positions)
+fn unlabel(e: &Expr) -> &Expr {
+    match e {
+        Expr::Label(n, _, b) if !is_bind(n) => unlabel(b),
+        e => e,
+    }
 }
 
 /// Whether TLC keeps the value of e unevaluated, so that only the parts used are computed: a
