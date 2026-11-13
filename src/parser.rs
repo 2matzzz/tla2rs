@@ -483,7 +483,12 @@ impl Parser {
     /// parsed from the token at `start` to the last one consumed, in an OP_AT label in a tree from
     /// `parse_module_sany`
     fn op_at(&self, op: usize, start: usize, e: Expr) -> Expr {
-        if sany_pos() { Expr::Label(format!("{OP_AT}{}\u{1}{}", self.span_text(op, op), self.span_text(start, self.pos - 1)), vec![], e.b()) } else { e }
+        if sany_pos() { self.op_at_text(op, self.span_text(start, self.pos - 1), e) } else { e }
+    }
+
+    /// `op_at` with the position of the whole expression as given
+    fn op_at_text(&self, op: usize, all: String, e: Expr) -> Expr {
+        if sany_pos() { Expr::Label(format!("{OP_AT}{}\u{1}{all}", self.span_text(op, op)), vec![], e.b()) } else { e }
     }
 
     /// `e`, parsed from the token at `start` to the last one consumed, in a SPAN label
@@ -1613,7 +1618,8 @@ impl Parser {
                 // A positional subexpression name: `Op!1!2`, `Op!<<`, `Op!(e)`, `Op!:`, also
                 // followed by labels
                 if !(self.is("!") && is_selector(self.peek2())) {
-                    return Ok(if call { self.op_at(id_tok, id_tok, base) } else { base });
+                    // SANY places a call by its arguments, parentheses included
+                    return Ok(if call { self.op_at_text(id_tok, self.pos_of(id_tok + 1, self.pos - 1).text(), base) } else { base });
                 }
                 let mut parts = vec![base];
                 let mut call = SUBEXPR.to_string();

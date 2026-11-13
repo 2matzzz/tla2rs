@@ -326,7 +326,8 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
   minus as `-.`, `:>`). SANY does not look at the arguments of an operator it cannot find (`(1 :> 0) @@ (2 :> 0)`
   without TLC reports `@@` only). The sets of `\E x \in S, y \in T` are read outside the quantifier, so T cannot
   use x. An operator that takes arguments, named without them, is refused (`The operator F requires 1 arguments.`),
-  except as an argument; a RECURSIVE declaration needs a definition
+  except as an argument, and so is a call with another number of arguments, whose arguments SANY then does not look
+  at; a RECURSIVE declaration needs a definition
 - No declaration, definition, parameter, LET definition, bound variable or LAMBDA parameter may reuse a name in
   scope. A definition is checked once its parameters are in scope (`F(F)` is refused: `Operator F already defined
   or declared.`, and `f[f \in S] == e` gives `Function name`), then its body; after the body, a clash with a
@@ -359,8 +360,7 @@ in scope in the module that reads it, which may define the same name (`tests/tlc
 
 Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
 (their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
-a LET definition; and SANY's checks of other kinds (the number of arguments of a call, an operator passed where a
-parameter takes none, `Op!1` of an operator that takes arguments, levels outside temporal formulas, the warning for
+a LET definition; and SANY's checks of other kinds (an operator passed where a parameter takes none, `Op!1` of an operator that takes arguments, levels outside temporal formulas, the warning for
 two definitions of one name in two extended modules). Two declarations of one name (`VARIABLE x, x`) are refused,
 where SANY only warns.
 

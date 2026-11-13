@@ -204,14 +204,14 @@ memory.
   unary minus); a declaration, definition, parameter, LET definition or bound variable named like something in
   scope at that point (also a definition of an extended or instantiated module, or of a standard module extended);
   labels that do not list the bound variables around them; LAMBDA anywhere but as an argument; wrong positional
-  subexpression names, also in definitions nothing uses; an operator that takes arguments named without them; invalid
-  string escapes. These are reported in SANY's words with its positions: parse errors (precedence, string escapes,
-  LAMBDA), the level errors of temporal formulas, and the semantic errors, all of a module in SANY's order with the
-  position of the declaration a name clashes with (also in a standard module), then SANY's warnings. A name is in
-  scope only after the
-  statement that introduces it, as in SANY: an operator parameter may be named like a VARIABLE declared later. Not
-  repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and `\AA`; positional names of LET
-  definitions; the number of arguments of a call; and SANY's other checks (see CLAUDE.md, "What SANY refuses")
+  subexpression names, also in definitions nothing uses; an operator used with another number of arguments than it
+  takes; invalid string escapes. These are reported in SANY's words with its positions: parse errors (precedence,
+  string escapes, LAMBDA), the level errors of temporal formulas, and the semantic errors, all of a module in SANY's
+  order with the position of the declaration a name clashes with (also in a standard module), then SANY's warnings.
+  A name is in scope only after the statement that introduces it, as in SANY: an operator parameter may be named
+  like a VARIABLE declared later. Not repeated: names inside `\E x : P`, `CHOOSE x : P` without a set, `\EE` and
+  `\AA`; positional names of LET definitions; an operator passed where a parameter takes none; and SANY's other
+  checks (see CLAUDE.md, "What SANY refuses")
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning

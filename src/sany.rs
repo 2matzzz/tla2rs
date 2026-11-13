@@ -13,7 +13,8 @@
 //! - Every name used must be in scope (`Unknown operator`), also operator symbols such as `+`,
 //!   unary minus (`-.`) and `\o`, and also in definitions nothing uses. SANY does not look at the
 //!   arguments of an operator it cannot find. An operator that takes arguments, named without
-//!   them where it is not an argument, is refused (`The operator F requires 1 arguments.`)
+//!   them where it is not an argument, is refused (`The operator F requires 1 arguments.`), and
+//!   so is a call with another number of arguments, whose arguments SANY then does not look at
 //! - A declaration, operator parameter or bound variable may not reuse a name in scope
 //!   (`Multiply-defined symbol`, with where the other one is). A definition named like something
 //!   in scope or like one of its own parameters is refused (`Operator F already defined or
@@ -756,14 +757,15 @@ impl<'a> Walker<'a> {
                     return;
                 }
                 let word = n.starts_with(|c: char| c.is_alphanumeric() || c == '_');
-                let found = if word || args.len() != 2 {
-                    self.resolve(n, &op_at.map(|a| a.0).unwrap_or_default(), true)
-                } else {
-                    self.resolve_sym(n, "infix", op_at)
-                };
-                // SANY does not look at the arguments of an operator it cannot find
-                if found {
-                    args.iter().for_each(|a| self.arg(a));
+                let (at_name, at_all) = op_at.clone().unwrap_or_default();
+                let found = if word || args.len() != 2 { self.resolve(n, &at_name, true) } else { self.resolve_sym(n, "infix", op_at) };
+                // SANY does not look at the arguments of an operator it cannot find, or of one
+                // called with as many arguments as it takes
+                let arity = if word && self.known && !n.contains('!') { self.place(n).map(|p| p.2) } else { None };
+                match arity {
+                    _ if !found => {}
+                    Some(k) if k != args.len() => error(&at_all, format!("The operator {n} requires {k} arguments.")),
+                    _ => args.iter().for_each(|a| self.arg(a)),
                 }
             }
             Un(op, x) => {
