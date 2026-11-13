@@ -7473,6 +7473,15 @@ fn unbind(pairs: &[Expr], body: &Expr) -> Expr {
     body
 }
 
+/// Whether a value of type t can hold the empty tuple (a type with no fields)
+fn has_empty_tuple(t: &Ty) -> bool {
+    match t {
+        Ty::Rec(fs) => fs.is_empty() || fs.iter().any(|(_, t)| has_empty_tuple(t)),
+        Ty::Set(e) | Ty::Seq(e) | Ty::Opt(e) => has_empty_tuple(e),
+        Ty::Fun(d, c) | Ty::PFun(d, c) => has_empty_tuple(d) || has_empty_tuple(c),
+        _ => false,
+    }
+}
 /// e without the labels around it other than BIND labels (call sites, positions)
 fn unlabel(e: &Expr) -> &Expr {
     match e {
@@ -8358,6 +8367,14 @@ impl Gen<'_> {
     fn fmt_shaped(&mut self, e: &Expr, place: &str, t: &Ty, env: &Env) -> R<String> {
         if let Some((v, f)) = self.const_form(e, env) {
             return Ok(format!("{:?}.to_string()", show_formed(self.atoms, &v, &f)));
+        }
+        // A constant holding the empty tuple: TLC prints `<<>>` written as a tuple and `<< >>` for
+        // an empty function, which a type with no fields cannot tell apart (`tests/tlc/PrintEmpty`)
+        if has_empty_tuple(t) && self.is_const(e, env) {
+            if let Some(v) = self.ce.eval_quiet(e, &env.vals) {
+                let f = self.ce.form(e, &env.vals);
+                return Ok(format!("{:?}.to_string()", show_formed(self.atoms, &v, &f)));
+            }
         }
         let id = self.ty_id(t)?;
         let sh = self.shape_of(e, t, env);
