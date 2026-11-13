@@ -4761,7 +4761,8 @@ impl<'a> Gen<'a> {
                     if let Some(Value::Atom(a)) = self.try_const(s, env) {
                         if !self.atoms.is_model(a) {
                             let when = if env.init { "initial" } else { "next" };
-                            writeln!(out, "eval_error(\"In computing {when} states, the right side of \\\\IN is not enumerable.\".into());").unwrap();
+                            let msg = with_at(&format!("In computing {when} states, the right side of \\IN is not enumerable."), &err_at(s));
+                            writeln!(out, "eval_error({msg:?}.into());").unwrap();
                             return Ok(());
                         }
                     }
