@@ -689,7 +689,20 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
 /// of an IF that the condition does not take (`tests/tlc/LiveConstErr`)
 fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<String> {
     use Expr::*;
+    let reads_state = e.any(&|x| match x {
+        Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
+        Prime(_) | Un(UOp::Enabled | UOp::Unchanged, _) => true,
+        _ => false,
+    });
     match e {
+        // A call of a definition of constant level is evaluated whole, as TLC evaluates it: the
+        // branch of an IF in it that the condition does not take is not (`tests/tlc/LiveConstErr-Call`)
+        Label(n, _, _)
+            if !reads_state
+                && !n.starts_with('#')
+                && crate::ast::pos_of(n).is_none()
+                && crate::ast::err_pos_of(n).is_none()
+                && !e.is_user_label() => {}
         // <<A>>_v is an action of the formula, not taken apart (`tests/tlc/LiveConstErr-Angle`)
         Label(n, ..) if n == ANGLE => return None,
         Label(n, pairs, b) if crate::ast::is_bind(n) => {
@@ -710,11 +723,6 @@ fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<S
         If(c, a, b) => return [c, a, b].into_iter().find_map(|x| live_const_error(g, x, env)),
         _ => {}
     }
-    let reads_state = e.any(&|x| match x {
-        Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
-        Prime(_) | Un(UOp::Enabled | UOp::Unchanged, _) => true,
-        _ => false,
-    });
     if reads_state {
         return None;
     }

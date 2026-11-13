@@ -12,4 +12,7 @@ Leads == x = 0 ~> (IF x = 1 THEN TRUE ELSE CHOOSE c \in {} : TRUE)
 Taken == []<>(IF x = 0 THEN TRUE ELSE x = 1)
 \* but not inside <<A>>_v, an action of the formula
 Angle == []<><<Next /\ (IF {} = {} THEN TRUE ELSE CHOOSE c \in {} : TRUE)>>_x
+\* A call of a definition of constant level is evaluated whole: the branch its IF does not take is not
+Pick(s) == IF s = {} THEN TRUE ELSE CHOOSE c \in s : TRUE
+Call == [](Pick({}) => <>(x = 1))
 ====
