@@ -162,12 +162,15 @@ fn main() {
                 let a = args.get(i).unwrap_or_else(|| usage());
                 let dot = a == "dot" || a.starts_with("dot,");
                 if dot {
+                    // TLC 2.19 writes the attributes of a label on every edge, an empty one without
+                    // actionlabels (`tests/tlc/OptDump-Dot`)
+                    pass.push("-dumpattrs".into());
                     for o in a.split(',').skip(1) {
                         match o {
                             "actionlabels" => pass.push("-dumplabels".into()),
                             // Snapshots of the graph written while the search runs: the final file
-                            // is the same, with the edges as with any option
-                            "snapshot" => pass.push("-dumpattrs".into()),
+                            // is the same
+                            "snapshot" => {}
                             "colorize" => pass.push("-dumpcolors".into()),
                             _ => {
                                 eprintln!("tla2rs: -dump dot,{o} is not supported (only actionlabels, colorize and snapshot)");

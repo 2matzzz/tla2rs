@@ -2387,8 +2387,8 @@ fn dumping() -> bool {
 static DUMP_STATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DUMP_NO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// With -dumplabels (TLC's `-dump dot,actionlabels`), each edge is labelled with its action. With
-/// -dumpattrs (TLC's `-dump dot,` and any other option), each edge has the attributes of a label,
-/// with an empty one
+/// -dumpattrs (TLC's `-dump dot`, with or without options), each edge has the attributes of a
+/// label, with an empty one
 static DUMP_LABELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DUMP_ATTRS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// With -dumpcolors (TLC's `-dump dot,colorize`), each edge has the color of its action: the

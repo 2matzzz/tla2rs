@@ -1223,7 +1223,7 @@ others are not). Measured on TLC 2.19 (`tests/tlc/Opt*`):
 - `-nowarning`: the warnings marked `WARNING_MARK` go (`put_line`, `STARTUP_PRINTS_NOWARN`); SANY's and the PlusCal
   warning stay
 - `-dump FILE`: `State N:` per distinct state, numbered when written (TLC's order with one worker, so not with
-  `-batched`). `-dump dot,...`: with any option TLC gives each edge `[label="...",color="black",fontcolor="black"]`
+  `-batched`). `-dump dot[,...]`: TLC 2.19 gives each edge `[label="...",color="black",fontcolor="black"]`
   (empty label without `actionlabels`) and adds `{rank = same; ...}` lines, which the comparison ignores. TLC takes
   only one `-dump`, so `crosscheck.sh` leaves out its own and compares the cfg's file with `tla2rs --dump`.
   `colorize` (`-dumpcolors`): the edge gets a placeholder (`COLOR_MARK` around its label) that `dump_write` turns into
