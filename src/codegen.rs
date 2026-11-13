@@ -25,6 +25,9 @@ struct Made {
 pub struct Env {
     /// Bound variables and `@`: name -> (Rust expression, type)
     locals: HashMap<String, (String, Ty)>,
+    /// Bound variables taken from a constant set some of whose elements TLC holds in a form of
+    /// their own: name -> (the shape of the value as code, its type; see `Gen::shape_of`)
+    shapes: HashMap<String, (String, Ty)>,
     /// Primed variables that have already been assigned
     primed: HashMap<String, (String, Ty)>,
     init: bool,
@@ -5183,6 +5186,10 @@ impl<'a> Gen<'a> {
                         Err(e) => return Err(e),
                     };
                     let (lx, _) = self.bind_iter(&mut env2, x, &et, ix.is_some())?;
+                    match self.elem_shape(s, &env2.locals[x].0.clone(), &et, &env2)? {
+                        Some(c) => env2.shapes.insert(x.clone(), (c, et.clone())),
+                        None => env2.shapes.remove(x),
+                    };
                     writeln!(out, "for {lx} in {it} {{").unwrap();
                     closes += 1;
                     // Renew on every iteration so writes from the previous one do not carry over
@@ -7650,6 +7657,25 @@ impl Gen<'_> {
         }
     }
 
+    /// The shape of the element `p` (of type t) of the constant set s, when TLC holds some of its
+    /// elements in a form of their own
+    fn elem_shape(&mut self, s: &Expr, p: &str, t: &Ty, env: &Env) -> R<Option<String>> {
+        if self.infer.is_some() || self.shaped.is_empty() || Self::shape_slots(t) == 0 {
+            return Ok(None);
+        }
+        let Some((sv @ Value::Set(_), sf)) = self.const_form(s, env) else { return Ok(None) };
+        let Value::Set(xs) = &sv else { unreachable!() };
+        let mut code = None;
+        for x in xs.iter().rev() {
+            let b = Self::form_bits(x, &elem_form(&sv, &sf, x), t);
+            if b != 0 {
+                let l = self.lit(x, t)?;
+                code = Some(format!("if {p} == {l} {{ {b}u64 }} else {{ {} }}", code.as_deref().unwrap_or("0")));
+            }
+        }
+        Ok(code)
+    }
+
     /// After `v` is assigned the element `p` of the set s in the state under construction `w`:
     /// the shape TLC holds that element in, when s is a constant or a set written element by
     /// element (otherwise 0: an element of a set from the state is not followed)
@@ -7686,6 +7712,7 @@ impl Gen<'_> {
     /// `shape_of` for what is built from parts
     fn shape_of_built(&mut self, e: &Expr, t: &Ty, env: &Env) -> String {
         let n = Self::shape_slots(t);
+        let n_slots = n;
         if n == 0 {
             return "0".into();
         }
@@ -7710,6 +7737,14 @@ impl Gen<'_> {
             Expr::Un(UOp::Domain, x) if Self::int_set(t) => {
                 if matches!(x.strip(), Expr::Tuple(_)) || self.is_seq_or_tuple(x) {
                     "1".into()
+                } else {
+                    "0".into()
+                }
+            }
+            Expr::Ident(n, _) if env.shapes.contains_key(n) => {
+                let (c, et) = &env.shapes[n];
+                if same(et, t) && Self::shape_slots(et) == n_slots {
+                    c.clone()
                 } else {
                     "0".into()
                 }
@@ -7881,9 +7916,23 @@ impl Gen<'_> {
         }
         walk(init, true, &self.vars, &mut assigns);
         walk(next, false, &self.vars, &mut assigns);
+        // The sets the names bound by \E range over (names are unique after expansion)
+        fn bound(e: &Expr, out: &mut HashMap<String, Expr>) {
+            if let Expr::Quant(true, bs, _) = e {
+                for (x, s) in bs {
+                    out.insert(x.clone(), s.clone());
+                }
+            }
+            for c in e.children() {
+                bound(c, out);
+            }
+        }
+        let mut exists: HashMap<String, Expr> = HashMap::new();
+        bound(init, &mut exists);
+        bound(next, &mut exists);
         // Whether e may build a value TLC holds as an interval (mirrors `shape_of`)
         // (t: the type of the value, which decides whether a function built may matter)
-        fn may(g: &Gen, e: &Expr, t: &Ty, on: &BTreeSet<String>) -> bool {
+        fn may(g: &Gen, e: &Expr, t: &Ty, on: &BTreeSet<String>, ex: &HashMap<String, Expr>) -> bool {
             let fields = |t: &Ty| -> Vec<(String, Ty)> {
                 match t {
                     Ty::Rec(fs) => fs.clone(),
@@ -7894,28 +7943,38 @@ impl Gen<'_> {
             // TLC computes the operators of the CommunityModules in forms of their own (see
             // `community::defines`); only intervals are looked for there
             if let Expr::Label(n, _, b) = e {
-                return may(g, b, if crate::community::defines(n) { &Ty::Bool } else { t }, on);
+                return may(g, b, if crate::community::defines(n) { &Ty::Bool } else { t }, on, ex);
             }
             match e.strip() {
                 Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) => true,
-                Expr::Ident(v, _) => on.contains(v),
-                Expr::Prime(x) => may(g, x, t, on),
-                Expr::If(_, a, b) => may(g, a, t, on) || may(g, b, t, on),
+                // A name bound by \E over a constant set holding such values
+                Expr::Ident(v, _) => {
+                    on.contains(v)
+                        || ex.get(v).is_some_and(|s| match g.const_form(s, &Env::default()) {
+                            Some((sv @ Value::Set(_), f)) => {
+                                let Value::Set(xs) = &sv else { unreachable!() };
+                                xs.iter().any(|x| Gen::form_bits(x, &elem_form(&sv, &f, x), t) != 0)
+                            }
+                            _ => false,
+                        })
+                }
+                Expr::Prime(x) => may(g, x, t, on, ex),
+                Expr::If(_, a, b) => may(g, a, t, on, ex) || may(g, b, t, on, ex),
                 Expr::Tuple(xs) => {
                     let fs = fields(t);
-                    xs.iter().enumerate().any(|(i, x)| may(g, x, fs.get(i).map_or(t, |f| &f.1), on))
+                    xs.iter().enumerate().any(|(i, x)| may(g, x, fs.get(i).map_or(t, |f| &f.1), on, ex))
                 }
                 // A function over a domain that may be empty prints << >> then, where a sequence is
                 // expected
                 Expr::FunCons(_, d, b) => {
                     let fs = fields(t);
-                    (if fs.is_empty() { may(g, b, t, on) } else { fs.iter().any(|(_, ft)| may(g, b, ft, on)) })
+                    (if fs.is_empty() { may(g, b, t, on, ex) } else { fs.iter().any(|(_, ft)| may(g, b, ft, on, ex)) })
                         || matches!(t, Ty::Seq(_))
                             && (!g.is_const(d, &Env::default()) || matches!(g.ce.eval_quiet(d, &HashMap::new()), Some(Value::Set(xs)) if xs.is_empty()))
                 }
-                Expr::RecLit(xs) => xs.iter().any(|(f, x)| may(g, x, &field(t, f), on)),
+                Expr::RecLit(xs) => xs.iter().any(|(f, x)| may(g, x, &field(t, f), on, ex)),
                 Expr::Except(b, ups) => {
-                    may(g, b, t, on)
+                    may(g, b, t, on, ex)
                         || ups.iter().any(|(path, x)| {
                             let ft = match path.as_slice() {
                                 [Path::Field(f), ..] if !f.starts_with('@') => field(t, f),
@@ -7925,10 +7984,10 @@ impl Gen<'_> {
                                 },
                                 _ => t.clone(),
                             };
-                            may(g, x, &ft, on)
+                            may(g, x, &ft, on, ex)
                         })
                 }
-                Expr::Field(b, _) | Expr::App(b, _) => may(g, b, t, on),
+                Expr::Field(b, _) | Expr::App(b, _) => may(g, b, t, on, ex),
                 _ => false,
             }
         }
@@ -7948,8 +8007,8 @@ impl Gen<'_> {
                     None => false,
                 };
                 let built = || match rhs.strip() {
-                    _ if !*is_in => may(self, rhs, &t, &on) || known(),
-                    Expr::SetLit(xs) => xs.iter().any(|x| may(self, x, &t, &on)) || known(),
+                    _ if !*is_in => may(self, rhs, &t, &on, &exists) || known(),
+                    Expr::SetLit(xs) => xs.iter().any(|x| may(self, x, &t, &on, &exists)) || known(),
                     _ => known(),
                 };
                 if !on.contains(v) && Self::shape_slots(&self.var_ty(v)) > 0 && built() {

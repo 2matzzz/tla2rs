@@ -522,12 +522,13 @@ not the graphs. Reducing to it:
   (`Gen::plan_shapes`): beside each state it keeps a shape, one bit per set of integers in those variables (set
   while TLC holds it as an interval) and one per sequence (set while TLC holds it as a function), also in the fields
   of a record or tuple. A variable gets its shape from the expression assigned, also from a constant (a constant
-  function's value, CHOOSE over a constant set) and, for `x' \in S`, from the element taken when S is constant or
-  written as a set of elements (`tests/tlc/IntervalElem`). The shape is no part of the fingerprint, so the first
+  function's value, CHOOSE over a constant set) and, for `x' \in S` and a name bound by `\E` over S, from the
+  element taken when S is constant (or, for `x' \in S`, written as a set of elements; `tests/tlc/IntervalElem`,
+  `IntervalExists`). The shape is no part of the fingerprint, so the first
   state reached keeps its form, as in TLC. States, `Print`, `PrintT` and `ToString` use it, so `ToString(s)` makes
   `"1..2"` where TLC does, and an invariant comparing that text holds in both (`tests/tlc/IntervalToString`). Not
   followed, and printed as enumerated sets and `<<>>`: the elements of a set, function or sequence held in the state,
-  a value bound by `\E` and then assigned, CHOOSE over a set from the state, CASE, an IF whose condition prints, and
+  a value bound by `\E` over a set from the state, CHOOSE over a set from the state, CASE, an IF whose condition prints, and
   the operators of the CommunityModules tla2rs provides (TLC computes many of them in Java, which
   builds values in forms of its own; `community::defines`). For these the comparison still reads an interval as the
   set it denotes

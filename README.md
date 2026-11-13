@@ -300,8 +300,8 @@ memory.
 - A set that TLC holds as an interval (`x = 1..3`) prints as `1..3`, and an empty function built by `[x \in S |->
   e]` as `<< >>` where an empty tuple prints `<<>>`, as in TLC, where tla2rs follows how the value was built: in what
   the compiler evaluates (ASSUMEs, constants, also inside tuples, records, functions and sets), assigned to a
-  variable, in a field of a record or tuple, and taken from a constant set or a constant function. Inside a set,
-  function or sequence held in the state, or bound by `\E` and then assigned, it prints as `{1, 2, 3}` and `<<>>`
+  variable, in a field of a record or tuple, and taken from a constant set (also by `\E`) or a constant function.
+  Inside a set, function or sequence held in the state, or taken from one, it prints as `{1, 2, 3}` and `<<>>`
   (see CLAUDE.md, "State graphs"), so the comparison of states with TLC reads an interval as the set it denotes
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
   it otherwise picks at random) when the properties need no tableau in TLC (`[]<>`, `<>[]` and fairness, after
