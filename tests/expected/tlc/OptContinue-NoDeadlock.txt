@@ -1,0 +1,10 @@
+key 60b1ec0c4ad7cc1dd4ae4f165cc97f507c708a93642b733ee1b459ce5445fe70
+tlc Version 2.19
+rc 0
+Invariant NotThree is violated
+19 states generated 12 distinct states found 0 states left on queue
+trace 8 631798321c1c7f4aac19d0a2570ea27fa8970309adaa1b1b3b62ccfae29950b9
+states 12 4d772d514c634b9982bbda6fd2418806f7c49ca89998f534fd3db092b57c16a5
+edges 17 642d7e6afc0e3e97e68f312a0b35903884c49eff7edc064a4e54eecba4e5671d
+messages 6 f8cd8af0867b73d2b3322bd67c28d5e92e15f167bde680532c776ac6e7620068
+errors 6 f8cd8af0867b73d2b3322bd67c28d5e92e15f167bde680532c776ac6e7620068

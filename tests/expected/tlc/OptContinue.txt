@@ -1,0 +1,10 @@
+key 75ec94ed442cecdcc62deb11f0af13fa5da74e84d5c787cafebeb5032bcc88cc
+tlc Version 2.19
+rc 11
+Invariant NotTwo is violated
+19 states generated 12 distinct states found 0 states left on queue
+trace 15 5f05c9693bfa84dd8760fecf5e0163b561285890a4f471da28e3ae540cbd45c9
+states 12 4d772d514c634b9982bbda6fd2418806f7c49ca89998f534fd3db092b57c16a5
+edges 17 642d7e6afc0e3e97e68f312a0b35903884c49eff7edc064a4e54eecba4e5671d
+messages 12 9e0e5912e92dc06fd92291e02b60a1bee6c5a33d05e6f314e065672793b30466
+errors 11 198789ececa4db96659fb7567c8870d73028d9c0a972c2163def6838cf67f414
