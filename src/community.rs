@@ -38,6 +38,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "Json" => JSON,
         "IOUtils" => IO_UTILS,
         "HTML" => HTML,
+        "SVG" => SVG,
         _ => return None,
     })
 }
@@ -65,6 +66,8 @@ pub const UNSUPPORTED: &[(&str, &str, &str)] = &[
     ("IOUtils", "IOEnvExecTemplate", "it runs a command; TLC 2.19 stops on its definition (a CHOOSE over records with an Int field)"),
     ("IOUtils", "IOEnv", "it reads the environment; TLC 2.19 stops on its definition (a CHOOSE over [STRING -> STRING])"),
     ("IOUtils", "atoi", "TLC 2.19 stops on its definition (a CHOOSE over Int)"),
+    ("SVG", "NodesOfDirectedMultiGraph", "TLC 2.19 stops on its definition (a CHOOSE over functions into records with Int fields)"),
+    ("SVG", "SVGSerialize", "it writes a file; TLC 2.19 stops on its definition (IOUtils' Serialize, a CHOOSE over records with an Int field)"),
 ];
 
 /// The operators of each module that tla2rs evaluates only when compiling, with the reason: their
@@ -570,3 +573,35 @@ HTMLJSNavigationKey(key, file) ==
            ReplaceFirstSubSeq(file, "%file%", "window.location.replace(\"%file%\");"), "}">>, "\n")
 ====
 "##;
+
+/// SVG elements as records of a tag, its attributes (a function from names to strings, those
+/// given by the caller overriding none of the element's own: `@@`), its children and its text. The
+/// numbers are turned into strings with ToString in the order the module's definitions take them,
+/// which is the order TLC makes those strings in. Drawing and writing files are not done
+const SVG: &str = r#"
+---- MODULE SVG ----
+LOCAL INSTANCE Sequences
+LOCAL INSTANCE Integers
+LOCAL INSTANCE TLC
+SVGElem(tag, as, kids, txt) == [name |-> tag, attrs |-> as, children |-> kids, innerText |-> txt]
+Line(a, b, c, d, as) ==
+  SVGElem("line", [x1 |-> ToString(a), y1 |-> ToString(b), x2 |-> ToString(c), y2 |-> ToString(d)] @@ as, <<>>, "")
+Circle(a, b, c, as) == SVGElem("circle", [cx |-> ToString(a), cy |-> ToString(b), r |-> ToString(c)] @@ as, <<>>, "")
+Rect(a, b, c, d, as) ==
+  SVGElem("rect", [x |-> ToString(a), y |-> ToString(b), width |-> ToString(c), height |-> ToString(d)] @@ as, <<>>, "")
+Text(a, b, txt, as) == SVGElem("text", [x |-> ToString(a), y |-> ToString(b)] @@ as, <<>>, txt)
+Image(a, b, c, d, src, as) ==
+  SVGElem("image", ("xlink:href" :> src) @@ ("x" :> ToString(a)) @@ ("y" :> ToString(b))
+                     @@ ("width" :> ToString(c)) @@ ("height" :> ToString(d)) @@ as, <<>>, "")
+Group(kids, as) == SVGElem("g", as, kids, "")
+Svg(kids, as) == SVGElem("svg", as, kids, "")
+SVGDoc(kids, a, b, c, d, as) ==
+  Svg(<<kids>>, ("xmlns:xlink" :> "http://www.w3.org/1999/xlink") @@ ("xmlns" :> "http://www.w3.org/2000/svg")
+                  @@ ("viewBox" :> ToString(a) \o " " \o ToString(b) \o " " \o ToString(c) \o " " \o ToString(d)) @@ as)
+SVGElemToString(e) == TRUE
+NodeOfRingNetwork(a, b, c, n, m) == [x |-> 0, y |-> 0]
+NodesOfDirectedMultiGraph(ns, es, opts) == FALSE
+PointOnLine(p, q, k) == [x |-> p.x + ((q.x - p.x) \div k), y |-> p.y + ((q.y - p.y) \div k)]
+SVGSerialize(e, prefix, n) == FALSE
+====
+"#;

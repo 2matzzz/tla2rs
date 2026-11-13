@@ -366,6 +366,8 @@ macro_rules! const_default_tuple {
         }
     };
 }
+// The empty tuple: a value of a type with no fields (an element's << >> inside a sequence)
+const_default_tuple!();
 const_default_tuple!(A);
 const_default_tuple!(A B);
 const_default_tuple!(A B C);

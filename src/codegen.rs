@@ -1389,6 +1389,33 @@ impl<'a> Gen<'a> {
     /// Statement setting the value at key `k` of `acc`, a function over part of a type or a bag of
     /// type `ft` (a count of 0 takes the element out of a bag). `k` is in the key type's
     /// representation.
+    /// A record whose fields are all present (code `c` of type `t`) as the function over strings
+    /// it is: a function over part of the type of its names. Any other value is left as it is
+    fn rec_as_fun(&mut self, c: String, t: Ty, env: &Env) -> R<(String, Ty)> {
+        let Ty::Rec(fs) = &t else { return Ok((c, t)) };
+        if fs.is_empty() || fs.iter().any(|(n, ft)| !crate::compile::field_name(n) || matches!(ft, Ty::Opt(_))) {
+            return Ok((c, t));
+        }
+        let mut keys = vec![];
+        let (mut dt, mut ct) = (Ty::Enum(vec![]), fs[0].1.clone());
+        for (n, ft) in fs {
+            let (kc, kt) = self.gen(&Expr::Str(n.clone()), env, None)?;
+            dt = join(&dt, &kt)?;
+            ct = join(&ct, ft)?;
+            keys.push((kc, kt));
+        }
+        let pt = Ty::PFun(dt.clone().into(), ct.clone().into());
+        self.ty_id(&pt)?;
+        let mut b = format!("{{ let __r = {c}; let mut __o = {}; ", Self::default_code(&pt));
+        for (i, ((kc, kt), (_, ft))) in keys.into_iter().zip(fs).enumerate() {
+            let k = self.coerce(kc, &kt, &dt)?;
+            let v = self.coerce(format!("__r{}", crate::types::rec_field(fs.len(), i)), ft, &ct)?;
+            b += &self.fun_put("__o", &k, &v, &pt)?;
+            b += " ";
+        }
+        Ok((b + "__o }", pt))
+    }
+
     fn fun_put(&mut self, acc: &str, k: &str, v: &str, ft: &Ty) -> R<String> {
         let (kt, _) = fun_kv(ft);
         Ok(match ft {
@@ -2546,7 +2573,9 @@ impl<'a> Gen<'a> {
                 // f @@ g: f where it is defined, g elsewhere
                 ("@@", [a, b]) => {
                     let (ac, at) = self.gen(a, env, None)?;
+                    let (ac, at) = self.rec_as_fun(ac, at, env)?;
                     let (bc, bt) = self.gen(b, env, None)?;
+                    let (bc, bt) = self.rec_as_fun(bc, bt, env)?;
                     let (ad, acod) = pfun_parts(&at).ok_or(format!("@@ of {at:?}, which is not a function"))?;
                     let (bd, bcod) = pfun_parts(&bt).ok_or(format!("@@ of {bt:?}, which is not a function"))?;
                     let ft = Ty::PFun(join(&ad, &bd)?.into(), join(&acod, &bcod)?.into());
