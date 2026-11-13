@@ -6956,7 +6956,8 @@ impl<'a> Gen<'a> {
         let words = bits.div_ceil(64).max(1);
         // The view as TLC prints it in a behavior with -view. A tuple with one element per variable
         // the view reads is printed as a state of those variables, the first element as the first
-        // of them in TLC's order, and so on (`tests/tlc/OptView-Vars`)
+        // of them in TLC's order, and so on, each after `/\ ` even when there is one
+        // (`tests/tlc/OptViewVars`, `OptViewOne`)
         let tid = self.ty_id(&vt)?;
         let mut show = format!("ppr(&fmt_{tid}(__v))");
         let mut tuple = view;
@@ -6970,7 +6971,7 @@ impl<'a> Gen<'a> {
             let read: Vec<String> =
                 self.print_order.iter().filter(|v| self.is_var(v) && view.any(&|x| matches!(x, Expr::Ident(n, _) if n == *v))).cloned().collect();
             if read.len() == es.len() {
-                let bullet = if self.vars.len() == 1 { "" } else { "/\\\\ " };
+                let bullet = "/\\\\ ";
                 let mut parts = vec![];
                 for (v, e) in read.iter().zip(es) {
                     let (c, t) = self.gen(e, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
