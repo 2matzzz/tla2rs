@@ -31,6 +31,8 @@ pub struct Output {
 #[derive(Default)]
 pub struct Startup {
     pub pcal: Vec<String>,
+    /// SANY's warnings, when it reported no errors
+    pub sany: Vec<String>,
     pub consts: Vec<String>,
     pub warnings: Vec<String>,
     /// TLC's warnings while it evaluates the invariants and properties of constant level
@@ -49,6 +51,7 @@ impl Startup {
     pub fn lines(&self) -> Vec<String> {
         // TLC prints the PlusCal warnings itself, not as the messages its note follows
         let mut v = self.pcal.clone();
+        v.extend(self.sany.iter().cloned());
         let mark = |w: &String| format!("{}{w}", crate::value::WARNING_MARK);
         let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
         // TLC prints a warning only when it has not printed the same text before, and the first
@@ -448,6 +451,11 @@ fn load_parsed(m: Module, dir: &std::path::Path, warnings: &mut Vec<String>, dep
     out.recursive.extend(m.recursive);
     out.constants.extend(m.constants);
     out.variables.extend(m.variables);
+    // A CONSTANT or VARIABLE declared again (SANY only warns) is one
+    for v in [&mut out.constants, &mut out.variables] {
+        let mut seen = HashSet::new();
+        v.retain(|x| seen.insert(x.clone()));
+    }
     out.defs.extend(m.defs);
     out.assumes.extend(m.assumes);
     out.local_defs.extend(m.local_defs);
@@ -1154,7 +1162,9 @@ fn compile_inner(
 ) -> R<Output> {
     let mut warnings = vec![];
     INTEGERS.with(|i| i.set(false));
+    crate::sany::take_warnings();
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
+    startup.sany = crate::sany::take_warnings();
     crate::value::NAT_DIV.with(|n| n.set(!INTEGERS.with(|i| i.get())));
     let cfg = parse_cfg(cfg_src)?;
     let const_substs = override_defs(&mut m, &cfg, &mut warnings)?;

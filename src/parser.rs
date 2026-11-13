@@ -94,6 +94,8 @@ fn sany_pos() -> bool {
 
 /// After a name in a tree from `parse_module_sany`: the position of the name follows
 pub const NAME_AT: char = '\u{5}';
+/// In a tree from `parse_module_sany`, the label around each argument of a call, with its position
+pub const ARG_AT: &str = "#argat ";
 
 /// The label around an operator applied, in a tree from `parse_module_sany`: `#opat `, the
 /// position of the operator's symbol or name, `\u{1}` and the position of the whole expression
@@ -601,7 +603,10 @@ impl Parser {
                         }
                         m.units.push(Unit::Decl(c.clone()));
                         m.unit_at.push((at, n));
-                        m.constants.push(c);
+                        // Declared twice: one constant (SANY warns, see sany.rs)
+                        if !m.constants.contains(&c) {
+                            m.constants.push(c);
+                        }
                     }
                 }
                 Tok::Ident(k) if k == "VARIABLE" || k == "VARIABLES" => {
@@ -609,7 +614,11 @@ impl Parser {
                     let vs = self.ident_list()?;
                     m.units.extend(vs.iter().map(|v| Unit::Decl(v.clone())));
                     m.unit_at.extend(std::mem::take(&mut self.names_at).into_iter().map(|at| (at, 0)));
-                    m.variables.extend(vs);
+                    for v in vs {
+                        if !m.variables.contains(&v) {
+                            m.variables.push(v);
+                        }
+                    }
                 }
                 // TLC checks ASSUME and ASSUMPTION, and skips THEOREM and AXIOM
                 Tok::Ident(k) if k == "ASSUME" || k == "ASSUMPTION" => {
@@ -1483,6 +1492,11 @@ impl Parser {
 
     /// Comma-separated items up to and including `close`.
     fn comma_list(&mut self, close: &str) -> R<Vec<Expr>> {
+        self.comma_list_at(close, &std::cell::RefCell::new(vec![]))
+    }
+
+    /// `comma_list`, noting the first and last token of each element in `at`
+    fn comma_list_at(&mut self, close: &str, at: &std::cell::RefCell<Vec<(usize, usize)>>) -> R<Vec<Expr>> {
         let mut v = vec![];
         if self.is(close) {
             self.pos += 1;
@@ -1493,6 +1507,7 @@ impl Parser {
             if let Some((_, _, name)) = infix(self.peek()) {
                 if matches!(self.peek2(), Tok::Sym(s) if s == "," || s == close) {
                     self.pos += 1;
+                    at.borrow_mut().push((self.pos - 1, self.pos - 1));
                     v.push(Expr::Ident(name.to_string(), NOPOS));
                     if self.is(",") {
                         self.pos += 1;
@@ -1502,7 +1517,9 @@ impl Parser {
                     return Ok(v);
                 }
             }
+            let start = self.pos;
             v.push(self.expr(0)?);
+            at.borrow_mut().push((start, self.pos - 1));
             if self.is(",") {
                 self.pos += 1;
             } else {
@@ -1591,7 +1608,16 @@ impl Parser {
                 loop {
                     if self.is("(") {
                         self.pos += 1;
-                        args.extend(self.nested(|p| p.comma_list(")"))?);
+                        let from = args.len();
+                        let starts = std::cell::RefCell::new(vec![]);
+                        args.extend(self.nested(|p| p.comma_list_at(")", &starts))?);
+                        if sany_pos() {
+                            // Each argument with its position, for SANY's errors about it (sany.rs)
+                            let ends = starts.borrow();
+                            for (a, &(b, e)) in args[from..].iter_mut().zip(ends.iter()) {
+                                *a = Expr::Label(format!("{ARG_AT}{}", self.span_text(b, e)), vec![], std::mem::replace(a, Expr::Bool(true)).b());
+                            }
+                        }
                         call = true;
                     }
                     // An operator of an instance: `N!Op`, `N(a)!Op(b)` (the arguments are joined)

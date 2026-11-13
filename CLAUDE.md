@@ -363,7 +363,24 @@ a level error or semantic errors is reproduced word for word, see "Messages and 
   `(SUBSET 1)..2` (TLC then fails to evaluate it). Unary minus as the operand of an infix operator whose range
   starts above 12 is refused (`a * -b`, `a ^ -b`); `~` never conflicts
 - Positional subexpression names (`Op!3`, `Op!(1, 2)`, `Op!lab`) that name nothing, in every definition and ASSUME
-  (`Expander::check_subexprs`), also in definitions nothing uses
+  (`Expander::check_subexprs`), also in definitions nothing uses. One whose operator is not a definition (a
+  CONSTANT, VARIABLE, parameter or bound variable: `Cannot take subexpression of `x'.`), or is named without the
+  arguments it takes (`Op!1`, `Lab!lab`: `The operator Op requires 1 arguments.`, placed from the name to the last
+  selector) is refused (`tests/tlc/RejSanySubOp`)
+- What an operator is passed must fit the parameter (`Walker::args`, from the number of arguments each parameter
+  takes: `Sym::params`; `tests/tlc/RejSanyOpArg*`): where the parameter takes none, an operator's name that takes
+  some (`The operator Len requires 1 arguments.`) or a LAMBDA (`LAMBDA expression used where an expression is
+  required.`); where it takes some, a name of another arity (`Expected arity 1 but found operator of arity 0.`, also a
+  CONSTANT or VARIABLE), a LAMBDA of another arity (placed at the operator's name) or any other expression (`An
+  expression appears as argument number 1 ...`, whose own names SANY does not look at), each followed, after the
+  other arguments' errors, by `Argument number 1 to operator 'B' should be a 1-parameter operator.` placed from the
+  name to the closing parenthesis. This covers the operators of the module, LET, the standard modules (SelectSeq,
+  SortSeq and BagOfAll take operators) and of a named INSTANCE without parameters (`I!Op`, also named alone). The
+  parser gives each argument its position in an ARG_AT label (`parser::ARG_AT`) when it parses again for SANY's report
+- A CONSTANT or VARIABLE declared again as the same kind (`VARIABLE x, x`, also one of an extended module) is a
+  warning (`Multiple declarations or definitions for symbol x.`), and the two are one; as another kind it is an
+  error (`tests/tlc/SanyDupDecl`, `RejSanyDupKind`). SANY prints the warnings of a module without errors and goes on
+  (`sany::take_warnings`, printed first by `compile::Startup`)
 - String escapes other than `\\ \" \n \t \r \f`
 
 LOCAL definitions of a module read for EXTENDS or INSTANCE are renamed (`compile::hide_locals`), since they are not
@@ -371,9 +388,9 @@ in scope in the module that reads it, which may define the same name (`tests/tlc
 
 Not repeated: names inside `\E x : P`, `\A x : P` and `CHOOSE x : P` without a set, and inside `\EE` and `\AA`
 (their bodies are not kept); the WITH substitutions of an INSTANCE inside LET; positional names whose operator is
-a LET definition; and SANY's checks of other kinds (an operator passed where a parameter takes none, `Op!1` of an operator that takes arguments, levels outside temporal formulas, the warning for
-two definitions of one name in two extended modules). Two declarations of one name (`VARIABLE x, x`) are refused,
-where SANY only warns.
+a LET definition (other than one named without its arguments); what is passed to an operator of an INSTANCE with
+parameters; and SANY's checks of other kinds
+(levels outside temporal formulas, the warning for two definitions of one name in two extended modules).
 
 ### Quantifiers and CHOOSE without a set
 
