@@ -2857,18 +2857,18 @@ impl<'a> Gen<'a> {
                 }
                 ("PrintT", [x]) if self.lazy_fun_shown(x, env).is_some() => {
                     let s = self.lazy_fun_shown(x, env).unwrap();
-                    (format!("{{ tlc_print(ppr({s:?})); true }}"), Ty::Bool)
+                    (format!("{{ tlc_print(printed(&[{s:?}])); true }}"), Ty::Bool)
                 }
                 ("Print", [x, v]) if self.lazy_fun_shown(x, env).is_some() => {
                     let s = self.lazy_fun_shown(x, env).unwrap();
                     let (vc, vt) = self.gen(v, env, want)?;
                     let vid = self.ty_id(&vt)?;
-                    (format!("{{ let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr({s:?}), ppr(&fmt_{vid}(&__v)))); __v }}"), vt)
+                    (format!("{{ let __v = {vc}; tlc_print(printed(&[{s:?}, &fmt_{vid}(&__v)])); __v }}"), vt)
                 }
                 ("PrintT", [x]) => {
                     let (c, t) = self.gen(x, env, None)?;
                     let shown = self.fmt_shaped(x, "__x", &t, env)?;
-                    (format!("{{ let __x = {c}; tlc_print(ppr(&{shown})); true }}"), Ty::Bool)
+                    (format!("{{ let __x = {c}; tlc_print(printed(&[&{shown}])); true }}"), Ty::Bool)
                 }
                 // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
@@ -2876,7 +2876,7 @@ impl<'a> Gen<'a> {
                     let shown = self.fmt_shaped(x, "__x", &t, env)?;
                     let (vc, vt) = self.gen(v, env, want)?;
                     let vshown = self.fmt_shaped(v, "__v", &vt, env)?;
-                    (format!("{{ let __x = {c}; let __v = {vc}; tlc_print(format!(\"{{}}  {{}}\", ppr(&{shown}), ppr(&{vshown}))); __v }}"), vt)
+                    (format!("{{ let __x = {c}; let __v = {vc}; tlc_print(printed(&[&{shown}, &{vshown}])); __v }}"), vt)
                 }
                 ("^", [a, b]) => {
                     let (ac, (alo, ahi)) = self.gen_int_of("Expt", false, false, a, env)?;

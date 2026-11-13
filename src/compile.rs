@@ -44,6 +44,23 @@ pub struct Startup {
     pub made: Vec<String>,
 }
 
+/// What starts a line that the spec printed (with Print or PrintT), which TLC's `-userFile` sends
+/// to its file. The values printed on it follow, as TLC writes them there, each after USER_SEP
+/// but the first; TLC prints each pretty-printed on the standard output (`user_text`)
+pub const USER_MARK: char = '\u{3}';
+pub const USER_SEP: char = '\u{4}';
+
+/// A line the spec printed (marked with USER_MARK) as TLC writes it to its `-userFile` (`raw`) or
+/// to the standard output, the values separated by two spaces
+pub fn user_text(line: &str, raw: bool) -> String {
+    let vals = line.split(USER_SEP);
+    if raw {
+        vals.collect::<Vec<_>>().join("  ")
+    } else {
+        vals.map(crate::ppr::ppr).collect::<Vec<_>>().join("  ")
+    }
+}
+
 /// TLC's note after the first warning it prints
 pub const NOWARNING: &str = "(Use the -nowarning option to disable this warning.)";
 
@@ -1213,8 +1230,8 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
                 continue;
             }
         }
-        // TLC pretty-prints each value printed (80 columns)
-        out.push(l.iter().map(|v| crate::ppr::ppr(v)).collect::<Vec<_>>().join("  "));
+        // TLC pretty-prints each value printed (80 columns) on the standard output (`user_text`)
+        out.push(format!("{USER_MARK}{}", l.join(&USER_SEP.to_string())));
     }
     r
 }

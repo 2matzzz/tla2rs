@@ -11,6 +11,9 @@
 //!   The canonical text is the sorted set of states and of labelled edges between their texts,
 //!   which depends on neither node ids nor the order of the file (stuttering edges left out, as in
 //!   `graph.rs`)
+//! - `-dump dot,colorize FILE` gives each edge the color of its action, and the file a legend that
+//!   lists the actions with their colors. The canonical text keeps the edges' colors, says that
+//!   the file names the color scheme, and lists the legend in the order of the file (TLC's order)
 //!
 //! `tla2rs --dump FILE` prints `dump N <sha256>` (N lines); `--dump-text FILE` prints the text.
 //!
@@ -61,8 +64,19 @@ fn dot(text: &str) -> Result<Vec<String>, String> {
     let mut label: HashMap<&str, String> = HashMap::new();
     let mut edges: Vec<(&str, &str, &str)> = vec![];
     let mut out = BTreeSet::new();
+    let mut legend = 0;
     for line in text.lines() {
+        if line == "edge [colorscheme=\"paired12\"]" {
+            out.insert("colorscheme paired12".to_string());
+            continue;
+        }
         let Some((id, rest)) = line.split_once(' ') else { continue };
+        // An entry of the legend: `Name [label="Name",fillcolor=N]`
+        if let Some((name, color)) = rest.strip_prefix("[label=\"").and_then(|r| r.strip_suffix(']')).and_then(|r| r.split_once("\",fillcolor=")) {
+            legend += 1;
+            out.insert(format!("legend {legend:05} {id} {name} {color}"));
+            continue;
+        }
         if let Some(r) = rest.strip_prefix("-> ") {
             if r.contains("style=\"dashed\"") {
                 continue;
