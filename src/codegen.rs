@@ -5068,6 +5068,11 @@ impl<'a> Gen<'a> {
             return Ok(if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) });
         }
         let (sc, st) = self.gen_val(s, env)?;
+        // An element of a set with no elements, such as the bound variable of `{c \\in {} : x \\in c}`:
+        // the test is never evaluated
+        if st == Ty::Enum(vec![]) {
+            return Ok(format!("{{ let _ = {sc}; false }}"));
+        }
         if !matches!(st, Ty::Set(_)) {
             return Err(format!("\\in a non-set: {s:?}"));
         }
