@@ -1388,6 +1388,9 @@ struct LiveChunk {
     /// that are new
     pend: Vec<usize>,
     newk: Vec<usize>,
+    /// (state, number of its edges before it) of each self-loop a successor makes, kept apart for
+    /// TLC's order of successors (see `tlc_lasso`)
+    selfs: Vec<(u32, u32)>,
 }
 
 struct Chunk {
@@ -1472,6 +1475,9 @@ fn expand_one_succ(
         let tfp = state_fp(&t, &w);
         if dumping() {
             dump_edge(&mut c.dump, sfp_dump, &tfp, l);
+        }
+        if LIVENESS && tfp == sfp {
+            c.live.selfs.push((head as u32, (c.live.edges.len() - first_edge) as u32));
         }
         if LIVENESS && tfp != sfp {
             // Its atoms are evaluated with fairness, after the successors (as TLC does)
@@ -1844,6 +1850,7 @@ fn main() {
         f.store(args.iter().any(|x| x == a), std::sync::atomic::Ordering::Relaxed);
     }
     DUMP_LABELS.store(args.iter().any(|x| x == "-dumplabels"), std::sync::atomic::Ordering::Relaxed);
+    OTHER_FP.store(args.iter().any(|x| x == "-tlcfp"), std::sync::atomic::Ordering::Relaxed);
     DUMP_ATTRS.store(args.iter().any(|x| x == "-dumplabels" || x == "-dumpattrs"), std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = args.iter().position(|a| a == "-dumpgraph").and_then(|i| args.get(i + 1)) {
         dump_open(std::path::Path::new(p), false);
@@ -3624,6 +3631,7 @@ fn run_liveness(opt: &Opt) {
             base.push(g.states.len());
             live.edges.extend(c.live.edges);
             live.en.extend(c.live.en);
+            live.selfs.extend(c.live.selfs);
             g.sbits.extend(c.sbits);
             g.states.extend(c.states);
             g.parent.extend(c.parent);
@@ -4068,6 +4076,7 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
         st.stut[s as usize] = stut;
         st.sbits[s as usize] |= cbits;
     }
+    let selfs = std::mem::take(&mut live.selfs);
     drop(live);
     let inits: Vec<u32> = (0..n as u32).filter(|&i| g.parent[i as usize].0 == u32::MAX).collect();
     let edges = st.dst.len();
@@ -4168,6 +4177,11 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
             let cycle: Vec<(u32, u32)> = cyc.iter().map(|&(p, l, _)| (pr.state(p), l)).collect();
             println!("Error: Temporal properties were violated.");
             println!("Error: The following behavior constitutes a counter-example:");
+            match tlc_lasso(g, &st, &inits, &selfs) {
+                Ok(true) => return false,
+                Ok(false) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
+                Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
+            }
             print_lasso(g, &prefix, &cycle);
             return false;
         }
@@ -4183,6 +4197,675 @@ fn liveness(g: &Graph, mut live: LiveChunk) -> bool {
 /// The graph keeps, for each fingerprint, the first state reached. With a VIEW or a SYMMETRY that
 /// state need not be a successor of the one before it on the lasso, so the lasso is replayed on
 /// actual states, as TLC rebuilds a behavior from fingerprints (`lasso_states`).
+// ---------------------------------------------------------------- TLC's liveness counterexample
+//
+// TLC's search for a counterexample (tlc2.tool.liveness: LiveCheck, LiveWorker, DiskGraph), followed
+// on the state graph so that the checker prints the lasso TLC prints, for the possible error
+// models `TLC_LIVE` lists (see `tlc_live` in tla2rs's live.rs). Its order depends on TLC's
+// fingerprints of the states, which `tlc_fp` computes as TLC does with `-fp 0`.
+
+/// A predicate over a state (`S`, `FE`) or a step from it (`A`, `FS`): state atom, action atom,
+/// fairness condition i's <<A>>_v enabled, a step of it
+#[allow(dead_code)]
+enum LP {
+    B(bool),
+    S(u32),
+    A(u32),
+    FE(u32),
+    FS(u32),
+    Not(&'static LP),
+    And(&'static [LP]),
+    Or(&'static [LP]),
+}
+
+impl LP {
+    fn eval(&self, sb: u64, fen: FMask, ab: u64, fb: FMask) -> bool {
+        match self {
+            LP::B(b) => *b,
+            LP::S(i) => sb >> i & 1 == 1,
+            LP::A(i) => ab >> i & 1 == 1,
+            LP::FE(i) => fen >> i & 1 == 1,
+            LP::FS(i) => fb >> i & 1 == 1,
+            LP::Not(x) => !x.eval(sb, fen, ab, fb),
+            LP::And(xs) => xs.iter().all(|x| x.eval(sb, fen, ab, fb)),
+            LP::Or(xs) => xs.iter().any(|x| x.eval(sb, fen, ab, fb)),
+        }
+    }
+}
+
+/// A possible error model: indices into check_state / check_action
+#[allow(dead_code)]
+struct TPem {
+    ae_state: &'static [usize],
+    ae_action: &'static [usize],
+    ea_action: &'static [usize],
+}
+
+#[allow(dead_code)]
+struct TLive {
+    check_state: &'static [LP],
+    check_action: &'static [LP],
+    pems: &'static [TPem],
+}
+
+/// TLC's fingerprint polynomial for `-fp 0` (tlc2.util.FP64.Polys[0])
+const FP64_POLY: u64 = 0x911498AE0E66BAD6;
+
+/// TLC's `-fp` chose another polynomial
+static OTHER_FP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn fp64_table() -> &'static [u64; 256] {
+    static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut pow = [0u64; 72];
+        let mut t: u64 = 1 << 63;
+        for p in pow.iter_mut() {
+            *p = t;
+            t = (t >> 1) ^ if t & 1 != 0 { FP64_POLY } else { 0 };
+        }
+        let mut tab = [0u64; 256];
+        for (j, v) in tab.iter_mut().enumerate() {
+            for k in 0..8 {
+                if j & (1 << k) != 0 {
+                    *v ^= pow[127 - 56 - k];
+                }
+            }
+        }
+        tab
+    })
+}
+
+fn fp_byte(fp: u64, b: u8) -> u64 {
+    (fp >> 8) ^ fp64_table()[((b as u64 ^ fp) & 0xFF) as usize]
+}
+
+fn fp_int(mut fp: u64, x: i32) -> u64 {
+    for b in x.to_le_bytes() {
+        fp = fp_byte(fp, b);
+    }
+    fp
+}
+
+/// A value as TLC fingerprints it: functions, tuples and records alike as a list of pairs
+enum TV {
+    B(bool),
+    I(i64),
+    S(String),
+    Set(Vec<TV>),
+    Fcn(Vec<(TV, TV)>),
+}
+
+impl TV {
+    fn fp(&self, fp: u64) -> u64 {
+        match self {
+            TV::B(b) => fp_byte(fp_byte(fp, 0), if *b { b't' } else { b'f' }),
+            TV::I(i) => fp_int(fp_byte(fp, 1), *i as i32),
+            TV::S(s) => {
+                let u: Vec<u16> = s.encode_utf16().collect();
+                let mut fp = fp_int(fp_byte(fp, 3), u.len() as i32);
+                for c in u {
+                    fp = fp_byte(fp, c as u8);
+                }
+                fp
+            }
+            TV::Set(xs) => xs.iter().fold(fp_int(fp_byte(fp, 5), xs.len() as i32), |fp, x| x.fp(fp)),
+            TV::Fcn(xs) => xs.iter().fold(fp_int(fp_byte(fp, 9), xs.len() as i32), |fp, (k, v)| v.fp(k.fp(fp))),
+        }
+    }
+}
+
+/// Reads a value as the checker prints it on one line. None for what TLC fingerprints by its own
+/// numbering (a model value) or a form not read here.
+struct TvParse<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl TvParse<'_> {
+    fn ws(&mut self) {
+        while self.i < self.b.len() && (self.b[self.i] as char).is_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, t: &str) -> bool {
+        self.ws();
+        if self.b[self.i..].starts_with(t.as_bytes()) {
+            self.i += t.len();
+            true
+        } else {
+            false
+        }
+    }
+    fn int(&mut self) -> Option<i64> {
+        self.ws();
+        let st = self.i;
+        if self.i < self.b.len() && self.b[self.i] == b'-' {
+            self.i += 1;
+        }
+        while self.i < self.b.len() && self.b[self.i].is_ascii_digit() {
+            self.i += 1;
+        }
+        std::str::from_utf8(&self.b[st..self.i]).ok()?.parse().ok()
+    }
+    fn list(&mut self, end: &str) -> Option<Vec<TV>> {
+        let mut v = vec![];
+        if self.eat(end) {
+            return Some(v);
+        }
+        loop {
+            v.push(self.val()?);
+            if self.eat(end) {
+                return Some(v);
+            }
+            if !self.eat(",") {
+                return None;
+            }
+        }
+    }
+    fn val(&mut self) -> Option<TV> {
+        self.ws();
+        let c = *self.b.get(self.i)?;
+        if self.eat("TRUE") {
+            return Some(TV::B(true));
+        }
+        if self.eat("FALSE") {
+            return Some(TV::B(false));
+        }
+        if c == b'-' || c.is_ascii_digit() {
+            let lo = self.int()?;
+            if self.eat("..") {
+                let hi = self.int()?;
+                return Some(TV::Set((lo..=hi).map(TV::I).collect()));
+            }
+            return Some(TV::I(lo));
+        }
+        if c == b'"' {
+            self.i += 1;
+            let mut s = String::new();
+            loop {
+                let ch = std::str::from_utf8(&self.b[self.i..]).ok()?.chars().next()?;
+                self.i += ch.len_utf8();
+                match ch {
+                    '"' => break,
+                    '\\' => {
+                        let e = *self.b.get(self.i)? as char;
+                        self.i += 1;
+                        s.push(match e {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            'f' => '\u{c}',
+                            e => e,
+                        });
+                    }
+                    ch => s.push(ch),
+                }
+            }
+            return Some(TV::S(s));
+        }
+        if self.eat("<<") {
+            let xs = self.list(">>")?;
+            return Some(TV::Fcn(xs.into_iter().enumerate().map(|(i, x)| (TV::I(i as i64 + 1), x)).collect()));
+        }
+        if self.eat("{") {
+            return Some(TV::Set(self.list("}")?));
+        }
+        if self.eat("[") {
+            let mut v = vec![];
+            loop {
+                self.ws();
+                let st = self.i;
+                while self.i < self.b.len() && (self.b[self.i].is_ascii_alphanumeric() || self.b[self.i] == b'_') {
+                    self.i += 1;
+                }
+                let name = std::str::from_utf8(&self.b[st..self.i]).ok()?.to_string();
+                if name.is_empty() || !self.eat("|->") {
+                    return None;
+                }
+                v.push((TV::S(name), self.val()?));
+                if self.eat("]") {
+                    return Some(TV::Fcn(v));
+                }
+                if !self.eat(",") {
+                    return None;
+                }
+            }
+        }
+        if self.eat("(") {
+            let mut v = vec![];
+            loop {
+                let k = self.val()?;
+                if !self.eat(":>") {
+                    return None;
+                }
+                v.push((k, self.val()?));
+                if self.eat(")") {
+                    return Some(TV::Fcn(v));
+                }
+                if !self.eat("@@") {
+                    return None;
+                }
+            }
+        }
+        None
+    }
+}
+
+/// TLC's fingerprint of a state (TLCStateMut.fingerPrint without VIEW or SYMMETRY)
+fn tlc_fp(s: &State) -> Option<u64> {
+    let mut fp = FP64_POLY;
+    for v in tlc_vals(s) {
+        let mut p = TvParse { b: v.as_bytes(), i: 0 };
+        let tv = p.val()?;
+        p.ws();
+        if p.i != p.b.len() {
+            return None;
+        }
+        fp = tv.fp(fp);
+    }
+    Some(fp)
+}
+
+/// TLC's stack of longs and ints (tlc2.util.MemIntStack), its size counted in ints
+struct TStack {
+    v: Vec<i64>,
+    ints: usize,
+}
+
+impl TStack {
+    fn pl(&mut self, x: i64) {
+        self.v.push(x);
+        self.ints += 2;
+    }
+    fn pi(&mut self, x: i64) {
+        self.v.push(x);
+        self.ints += 1;
+    }
+    fn ol(&mut self) -> i64 {
+        self.ints -= 2;
+        self.v.pop().unwrap()
+    }
+    fn oi(&mut self) -> i64 {
+        self.ints -= 1;
+        self.v.pop().unwrap()
+    }
+}
+
+/// TLC's counterexample, printed if TLC's search finds one: Ok(true). The graph's nodes are the
+/// states (no VIEW or SYMMETRY). Each node's transitions come in the order TLC's liveness graph
+/// keeps them: its distinct successors and itself (the stuttering step) out of a hash table keyed
+/// by TLC's fingerprint (tlc2.util.SetOfStates, whose starting size grows over the search). For
+/// each possible error model in turn, TLC's depth-first search for components
+/// (LiveWorker.checkSccs) from the initial states, skipping a step that breaks a <>[]A part;
+/// then for the first component that has every []<> part, the path to it (DiskGraph.getPath:
+/// breadth first from the initial states), and the cycle (LiveWorker.dfsPostFix: greedily to the
+/// steps and states that fulfil the []<> parts, then bfsPostFix: back to the start).
+fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)]) -> Result<bool, &'static str> {
+    let tl = match &TLC_LIVE {
+        Ok(t) => t,
+        Err(m) => return Err(m),
+    };
+    if HAS_VIEW || !PERMS.is_empty() {
+        return Err("VIEW or SYMMETRY");
+    }
+    if flag(&OTHER_FP) {
+        return Err("a fingerprint polynomial other than that of -fp 0");
+    }
+    let n = g.states.len();
+    let mut tfp = Vec::with_capacity(n);
+    for w in &g.states {
+        match tlc_fp(&unpack(w)) {
+            Some(f) => tfp.push(f),
+            None => return Err("a model value, whose fingerprint depends on TLC's numbering of names"),
+        }
+    }
+    let cs: Vec<u64> = (0..n)
+        .map(|s| tl.check_state.iter().enumerate().fold(0u64, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], 0, 0) as u64) << j))
+        .collect();
+    let cact = |s: usize, ab: u64, fb: FMask| -> u64 {
+        tl.check_action.iter().enumerate().fold(0u64, |b, (j, p)| b | (p.eval(st.sbits[s], st.fen[s], ab, fb) as u64) << j)
+    };
+    let mut self_at: Vec<Vec<u32>> = vec![vec![]; n];
+    for &(s, k) in selfs {
+        self_at[s as usize].push(k);
+    }
+    // The transitions of each node, in TLC's order: (target, check_action bits)
+    let mut gs: Vec<Vec<(u32, u64)>> = Vec::with_capacity(n);
+    let mut mult = 1usize;
+    for s in 0..n {
+        // The successors as TLC puts them into the set: in the order generated, then itself
+        let mut puts: Vec<(u32, u64, FMask)> = vec![];
+        let r = st.off[s]..st.off[s + 1];
+        let mut k = 0u32;
+        let mut sa = self_at[s].iter().peekable();
+        for e in r.clone() {
+            while sa.peek().is_some_and(|&&x| x == k) {
+                puts.push((s as u32, st.stut[s], 0));
+                sa.next();
+            }
+            puts.push((st.dst[e], st.abits[e], st.fbits[e]));
+            k += 1;
+        }
+        for _ in sa {
+            puts.push((s as u32, st.stut[s], 0));
+        }
+        puts.push((s as u32, st.stut[s], 0));
+        let mut len = mult * 16;
+        let mut tab: Vec<Option<usize>> = vec![None; len];
+        let mut count = 0usize;
+        let slot = |fp: u64, len: usize| ((fp as u32 & 0x7FFF_FFFF) as usize) % len;
+        for (i, &(t, _, _)) in puts.iter().enumerate() {
+            if count >= len / 2 {
+                let old = std::mem::take(&mut tab);
+                len = 2 * len + 1;
+                tab = vec![None; len];
+                for o in old.into_iter().flatten() {
+                    let mut l = slot(tfp[puts[o].0 as usize], len);
+                    while tab[l].is_some() {
+                        l = (l + 1) % len;
+                    }
+                    tab[l] = Some(o);
+                }
+            }
+            let mut l = slot(tfp[t as usize], len);
+            loop {
+                match tab[l] {
+                    None => {
+                        tab[l] = Some(i);
+                        count += 1;
+                        break;
+                    }
+                    Some(o) if puts[o].0 == t => break,
+                    Some(_) => l = (l + 1) % len,
+                }
+            }
+        }
+        if len > mult * 16 {
+            mult += 1;
+        }
+        gs.push(tab.into_iter().flatten().map(|o| (puts[o].0, cact(s, puts[o].1, puts[o].2))).collect());
+    }
+    const MAX_PTR: i64 = 0x4000_0000_0000_0000;
+    const MAX_LINK: i64 = i64::MAX;
+    const MARK: i64 = -42;
+    for pem in tl.pems {
+        let ea = |b: u64| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
+        let mut link = vec![0i64; n];
+        let mut queue: std::collections::VecDeque<(u32, i64)> = inits.iter().map(|&s| (s, 0)).collect();
+        let mut com: Vec<u32> = vec![];
+        let mut found = None;
+        'search: while let Some((s0, loc0)) = queue.pop_front() {
+            let mut dfs = TStack { v: vec![], ints: 0 };
+            dfs.pl(s0 as i64);
+            dfs.pi(-1);
+            dfs.pl(loc0);
+            dfs.pl(MAX_PTR);
+            let mut new_link = MAX_PTR;
+            while dfs.ints >= 7 {
+                let low = dfs.ol();
+                let loc = dfs.ol();
+                dfs.oi();
+                let cur = dfs.ol() as usize;
+                if loc == MARK {
+                    if link[cur] == low {
+                        // LiveWorker.checkComponent
+                        let top = com.pop().unwrap() as usize;
+                        let stutters = || gs[top].iter().find(|x| x.0 as usize == top).is_some_and(|x| ea(x.1));
+                        if top == cur && !stutters() {
+                            link[cur] = MAX_LINK;
+                        } else {
+                            let mut c = vec![top as u32];
+                            link[top] = MAX_LINK;
+                            let mut y = top;
+                            while y != cur {
+                                y = com.pop().unwrap() as usize;
+                                link[y] = MAX_LINK;
+                                c.push(y as u32);
+                            }
+                            let mut inc = vec![false; n];
+                            c.iter().for_each(|&y| inc[y as usize] = true);
+                            let aes = pem.ae_state.iter().all(|&j| c.iter().any(|&y| cs[y as usize] >> j & 1 == 1));
+                            let aea = pem.ae_action.iter().all(|&j| {
+                                c.iter().any(|&y| gs[y as usize].iter().any(|&(t, b)| inc[t as usize] && ea(b) && b >> j & 1 == 1))
+                            });
+                            if aes && aea {
+                                found = Some((cur as u32, inc));
+                                break 'search;
+                            }
+                        }
+                    }
+                    let plow = dfs.ol();
+                    dfs.pl(plow.min(low));
+                } else if link[cur] < MAX_PTR {
+                    link[cur] = new_link;
+                    dfs.pl(low);
+                    dfs.pl(cur as i64);
+                    dfs.pi(-1);
+                    dfs.pl(MARK);
+                    com.push(cur as u32);
+                    let mut next_low = new_link;
+                    new_link += 1;
+                    for &(t, b) in &gs[cur] {
+                        let nl = link[t as usize];
+                        if ea(b) {
+                            if nl < MAX_PTR {
+                                dfs.pl(t as i64);
+                                dfs.pi(-1);
+                                dfs.pl(nl);
+                            } else {
+                                next_low = next_low.min(nl);
+                            }
+                        } else if nl < MAX_PTR {
+                            queue.push_back((t, nl));
+                        }
+                    }
+                    dfs.pl(next_low);
+                } else {
+                    dfs.pl(low.min(link[cur]));
+                }
+            }
+        }
+        let Some((start, inc)) = found else { continue };
+        let start = start as usize;
+        // The path from an initial state (DiskGraph.getPath)
+        let mut prefix: Vec<u32> = vec![];
+        if inits.contains(&(start as u32)) {
+            prefix.push(start as u32);
+        } else {
+            let mut par = vec![u32::MAX; n];
+            let mut vis = vec![false; n];
+            let mut q: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+            for &s in inits {
+                vis[s as usize] = true;
+                q.push_back(s);
+            }
+            'bfs: while let Some(c) = q.pop_front() {
+                for &(t, _) in &gs[c as usize] {
+                    if t as usize == start {
+                        let mut y = c;
+                        prefix.push(t);
+                        loop {
+                            prefix.push(y);
+                            if par[y as usize] == u32::MAX {
+                                break;
+                            }
+                            y = par[y as usize];
+                        }
+                        break 'bfs;
+                    }
+                    if !vis[t as usize] {
+                        vis[t as usize] = true;
+                        par[t as usize] = c;
+                        q.push_back(t);
+                    }
+                }
+            }
+            if prefix.is_empty() {
+                return Err("no path to the component");
+            }
+            prefix.reverse();
+        }
+        // LiveWorker.dfsPostFix
+        let mut seen = vec![false; n];
+        let mut cnt = pem.ae_state.len() + pem.ae_action.len();
+        let mut aes = vec![false; pem.ae_state.len()];
+        let mut aea = vec![false; pem.ae_action.len()];
+        let mut stack: Vec<usize> = vec![];
+        let mut cur = start;
+        seen[cur] = true;
+        while cnt > 0 {
+            let cnt0 = cnt;
+            loop {
+                for (i, &j) in pem.ae_state.iter().enumerate() {
+                    if !aes[i] && cs[cur] >> j & 1 == 1 {
+                        aes[i] = true;
+                        cnt -= 1;
+                    }
+                }
+                if cnt == 0 {
+                    break;
+                }
+                let (mut next1, mut next2) = (None, None);
+                let mut unvisited = false;
+                let cnt1 = cnt;
+                let mut took = None;
+                for &(t, b) in &gs[cur] {
+                    let t = t as usize;
+                    if inc[t] {
+                        if !ea(b) {
+                            continue;
+                        }
+                        next1 = Some(t);
+                        for (i, &j) in pem.ae_action.iter().enumerate() {
+                            if !aea[i] && b >> j & 1 == 1 {
+                                aea[i] = true;
+                                cnt -= 1;
+                            }
+                        }
+                    }
+                    if cnt < cnt1 {
+                        took = Some(t);
+                        break;
+                    }
+                    if inc[t] && !seen[t] {
+                        unvisited = true;
+                        next2 = Some(t);
+                    }
+                }
+                if let Some(t) = took {
+                    stack.push(cur);
+                    cur = t;
+                    seen.iter_mut().for_each(|x| *x = false);
+                    break;
+                }
+                if cnt < cnt0 {
+                    stack.push(cur);
+                    cur = next1.ok_or("no step in the component")?;
+                    seen.iter_mut().for_each(|x| *x = false);
+                    break;
+                }
+                while !unvisited {
+                    cur = stack.pop().ok_or("the search for the cycle ran out of states")?;
+                    if let Some(&(t, _)) = gs[cur].iter().find(|&&(t, _)| inc[t as usize] && !seen[t as usize]) {
+                        unvisited = true;
+                        next2 = Some(t as usize);
+                    }
+                }
+                stack.push(cur);
+                cur = next2.unwrap();
+                seen[cur] = true;
+            }
+        }
+        seen.iter_mut().for_each(|x| *x = false);
+        // LiveWorker.bfsPostFix
+        let end = cur;
+        let mut postfix: Vec<usize> = vec![];
+        if end != start {
+            let mut par: Vec<Option<usize>> = vec![None; n];
+            let mut q: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
+            let (mut c, mut pl) = (end, None);
+            seen[end] = true;
+            'b: loop {
+                for &(t, b) in &gs[c] {
+                    let t = t as usize;
+                    if t == c || !ea(b) {
+                        continue;
+                    }
+                    if t == start {
+                        let (mut y, mut p) = (c, pl);
+                        while y != end {
+                            postfix.push(y);
+                            let pn: usize = p.ok_or("no way back")?;
+                            y = pn;
+                            p = par[pn];
+                        }
+                        postfix.push(end);
+                        break 'b;
+                    }
+                    if inc[t] && !seen[t] {
+                        seen[t] = true;
+                        q.push_back((t, c));
+                    }
+                }
+                par[c] = pl;
+                let (y, p) = q.pop_front().ok_or("no way back to the start of the cycle")?;
+                c = y;
+                pl = Some(p);
+            }
+        }
+        postfix.extend(stack.iter().rev().copied());
+        // Print: the prefix, then the cycle, each state rebuilt from its predecessor by the first
+        // action that yields it (Tool.getState)
+        let _quiet = Capturing::start();
+        let mut buf: Vec<(State, u32)> = vec![];
+        let mut next = |cur: &State, to: usize| -> Option<(State, u32)> {
+            let _ = successors(cur, &mut buf, true);
+            buf.iter().find(|x| pack(&x.0).is_some_and(|w| w == g.states[to])).copied()
+        };
+        let mut out: Vec<(State, u32)> = vec![(unpack(&g.states[prefix[0] as usize]), u32::MAX)];
+        let mut at = prefix[0] as usize;
+        for &y in &prefix[1..] {
+            if y as usize != at {
+                let t = next(&out[out.len() - 1].0, y as usize).ok_or("a step TLC cannot rebuild")?;
+                out.push(t);
+                at = y as usize;
+            }
+        }
+        let cycle_no = out.len();
+        for &y in postfix.iter().rev() {
+            if y != at {
+                let t = next(&out[out.len() - 1].0, y).ok_or("a step TLC cannot rebuild")?;
+                out.push(t);
+                at = y;
+            }
+        }
+        let back = if at == start {
+            None
+        } else {
+            Some(next(&out[out.len() - 1].0, start).ok_or("a step TLC cannot rebuild")?.1)
+        };
+        drop(_quiet);
+        let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
+        let mut texts = vec![];
+        for (i, (s, l)) in out.iter().enumerate() {
+            print_step(&format!("State {}: <{}>", i + 1, name(*l)), s, (i > 0).then(|| &out[i - 1].0));
+            texts.push(show(s));
+        }
+        match back {
+            None => {
+                println!("State {}: Stuttering", cycle_no + 1);
+                write_lasso_check(&texts, None);
+            }
+            Some(l) => {
+                println!("Back to state {cycle_no}: <{}>", name(l));
+                write_lasso_check(&texts, Some((cycle_no, None)));
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     let mut shown: Vec<(u32, u32)> = vec![];

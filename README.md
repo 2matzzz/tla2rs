@@ -243,7 +243,7 @@ memory.
   while it rebuilds a counterexample (see CLAUDE.md, "Messages and printed lines"). Such specs are searched without
   `-batched`
 - Not supported: `RandomElement` of more than one element, `JavaTime`, `TLCGet` / `TLCSet` (each is rejected with a
-  reason), sets that may hold both strings and integers (a set of strings compared with a set of integers is
+  reason; what TLC 2.19 defines of them is listed in CLAUDE.md, "TLCGet and TLCSet"), sets that may hold both strings and integers (a set of strings compared with a set of integers is
   supported: unequal when the sizes differ, an evaluation error otherwise, as in TLC), `Name <- [Module] Def` for a
   CONSTANT (TLC rejects it too), and `Op!@`
 - Specs that SANY refuses stop with exit 150, as in TLC, for these reasons: operators of overlapping precedence next
@@ -294,9 +294,11 @@ memory.
   was built: assigned to a variable, in a field of a record or tuple, and DOMAIN of a tuple or sequence. Taken from a
   set, as a function's value, or inside a set of sets, it prints as `{1, 2, 3}` (see CLAUDE.md, "State graphs"), so
   the comparison with TLC reads an interval as the set it denotes
-- A liveness counterexample is a valid lasso, but not always the one TLC prints. TLC's own differs from run to run (it
-  depends on a fingerprint polynomial TLC picks at random), so cross-checks do not compare it with TLC's; TLC checks
-  it instead (`-lassocheck`). Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a
+- A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
+  it otherwise picks at random) when the properties need no tableau in TLC (`[]<>`, `<>[]` and fairness, after
+  negation), the states hold no model value (TLC fingerprints a model value by its own numbering of names) and there
+  is no `VIEW` or `SYMMETRY`. Otherwise it is a valid lasso of tla2rs's own, which TLC checks (`-lassocheck`); the
+  checker says why on stderr. Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a
   behavior; when a value the view leaves out only grows, the lasso returns to its first state of the cycle under the
   view only, and the check folds states by the same view
 - With `VIEW` and `SYMMETRY` together, a state is reduced as TLC reduces it: the smallest of its permutations (values
@@ -312,9 +314,9 @@ and the set of transitions between them, from TLC's `-dump dot` and tla2rs's `-d
 hash (each state with its variables in the order TLC prints them, which the checker follows: the order of SANY's
 hash table of the root module's names, replayed by tla2rs). A safety counterexample is
 compared step by step: each state and the action that led to it, as TLC names it (with one worker TLC's is the same
-on every run). A liveness counterexample depends on TLC's random fingerprint polynomial, so instead TLC is run on the
-spec `-lassocheck` writes, and must confirm that tla2rs's lasso is a fair behavior of the spec that violates the
-properties. The messages are TLC's error and warning lines and what the spec prints with Print and PrintT, in order,
+on every run). So is a liveness counterexample, as TLC runs with `-fp 0`; where the checker prints a lasso of its own
+instead (see above) and it differs from TLC's, TLC is run on the spec `-lassocheck` writes, and must confirm that
+tla2rs's lasso is a fair behavior of the spec that violates the properties. The messages are TLC's error and warning lines and what the spec prints with Print and PrintT, in order,
 without the progress lines and with the parts that are TLC's internals left out (the stack of nested expressions
 TLC was evaluating, Java class names); where tla2rs cannot print all of TLC's text, the cfg can say why, and then
 only the error lines are compared (no configuration needs this now). Where the graph
@@ -342,7 +344,7 @@ expected file. Comparing against `tests/expected/` does not need the jar. `all.s
 (`JOBS=N` to change). TLC's result for each configuration is committed in `tests/expected/`: the verdict, the
 state counts, the length and a hash of the counterexample, the exit code, the hashes of the state graph and of the
 messages, with a hash of the jar, the cfg, the arguments, the modules the spec reads, `src/graph.rs`, `src/trace.rs`
-and `src/messages.rs`. Times, the fingerprint seed and the shape of a liveness counterexample vary between TLC runs and are not
+and `src/messages.rs`. Times and the random seed vary between TLC runs and are not
 recorded, so the files are the same for every TLC run. `crosscheck.sh` and `all.sh` only compare against these
 files and never run TLC on the configurations themselves (only on a lasso check whose confirmation is not yet cached in `target/crosscheck/lasso`); a missing or stale file fails
 the check. `scripts/expected.sh [cfg ...]` is what

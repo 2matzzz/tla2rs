@@ -31,7 +31,8 @@ pub fn steps(out: &str) -> Vec<Step> {
     for l in out.lines() {
         if is_header(l) {
             steps.push(Step { header: l.to_string(), state: String::new() });
-            in_state = true;
+            // A lasso ends with Stuttering or Back to state, which have no state after them
+            in_state = !(l.starts_with("Back to state ") || l.ends_with(": Stuttering"));
         } else if l.is_empty() {
             in_state = false;
         } else if in_state {

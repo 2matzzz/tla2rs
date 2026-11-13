@@ -695,6 +695,119 @@ fn tlc_plan(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> Result<u64,
     Ok(tableau)
 }
 
+/// Fairness atoms in TLC's form for `tlc_live`: whether fairness condition i's <<A>>_v is enabled
+/// (a state atom) and whether a step is one (an action atom), numbered past every other atom
+const FAIR_EN: usize = 1 << 40;
+const FAIR_STEP: usize = 1 << 41;
+
+/// A predicate of level 0 to 2 as the runtime's `LP`
+fn lp_src(e: &TExpr) -> String {
+    match e {
+        TExpr::Bool(b) => format!("LP::B({b})"),
+        TExpr::State(i) if *i >= FAIR_EN => format!("LP::FE({})", i - FAIR_EN),
+        TExpr::State(i) => format!("LP::S({i})"),
+        TExpr::Action(i) if *i >= FAIR_STEP => format!("LP::FS({})", i - FAIR_STEP),
+        TExpr::Action(i) => format!("LP::A({})", i - ACTION_BASE),
+        TExpr::Neg(b) => format!("LP::Not(&{})", lp_src(b)),
+        TExpr::Conj(xs) => format!("LP::And(&[{}])", xs.iter().map(lp_src).collect::<Vec<_>>().join(", ")),
+        TExpr::Disj(xs) => format!("LP::Or(&[{}])", xs.iter().map(lp_src).collect::<Vec<_>>().join(", ")),
+        TExpr::All(_) | TExpr::Even(_) => unreachable!("a temporal predicate"),
+    }
+}
+
+/// TLC's plan for finding a counterexample (tlc2.tool.liveness.Liveness.processLiveness), as the
+/// runtime's `TLC_LIVE`, which follows TLC's search on the state graph to print the counterexample
+/// TLC prints: the normal form of fairness /\ ~(the properties), each disjunct a possible error
+/// model of <>[]A (EAAction), []<>S (AEState) and []<>A (AEAction) parts, with the predicates
+/// numbered in TLC's order. A disjunct with another part needs TLC's tableau, which the runtime
+/// does not follow; it then gets the reason.
+fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
+    let none = |why: &str| format!("static TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
+    if props.is_empty() {
+        return none("no properties");
+    }
+    let mut conj = vec![];
+    for (i, f) in fair.iter().enumerate() {
+        let en = TExpr::Neg(TExpr::State(FAIR_EN + i).into());
+        let act = TExpr::Action(FAIR_STEP + i);
+        let t = if f.weak {
+            TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
+        } else {
+            TExpr::Disj(vec![TExpr::Even(TExpr::All(en.into()).into()), TExpr::All(TExpr::Even(act.into()).into())])
+        };
+        TExpr::add(&mut conj, t, true);
+    }
+    for a in assumed {
+        TExpr::add(&mut conj, a.clone(), true);
+    }
+    let neg = if props.len() == 1 {
+        TExpr::Neg(props[0].clone().into())
+    } else {
+        TExpr::junction(props.iter().map(|p| TExpr::Neg(p.clone().into())), false)
+    };
+    let e = if conj.is_empty() {
+        neg
+    } else {
+        TExpr::add(&mut conj, neg, true);
+        TExpr::Conj(conj)
+    };
+    let dnf = match e.push_neg(false).simplify().to_dnf() {
+        TExpr::Bool(false) => return none("no possible error"),
+        TExpr::Disj(d) => d,
+        e => vec![e],
+    };
+    // The predicates, numbered as TLC's checkState and checkAction (equal ones once)
+    let mut sbin: Vec<(String, TExpr)> = vec![];
+    let mut abin: Vec<(String, TExpr)> = vec![];
+    let bin = |b: &mut Vec<(String, TExpr)>, x: &TExpr| -> usize {
+        let k = format!("{x:?}");
+        match b.iter().position(|(y, _)| *y == k) {
+            Some(i) => i,
+            None => {
+                b.push((k, x.clone()));
+                b.len() - 1
+            }
+        }
+    };
+    let mut pems = vec![];
+    for d in dnf {
+        let items = match d.flatten() {
+            TExpr::Conj(xs) => xs,
+            e => vec![e],
+        };
+        let (mut ea, mut aes, mut aea) = (vec![], vec![], vec![]);
+        for ln in items {
+            match &ln {
+                TExpr::Even(b) if matches!(b.as_ref(), TExpr::All(c) if c.level() < 3) => {
+                    let TExpr::All(c) = b.as_ref() else { unreachable!() };
+                    ea.push(c.as_ref().clone());
+                }
+                TExpr::All(b) if matches!(b.as_ref(), TExpr::Even(c) if c.level() <= 2) => {
+                    let TExpr::Even(c) = b.as_ref() else { unreachable!() };
+                    if c.level() <= 1 { aes.push(c.as_ref().clone()) } else { aea.push(c.as_ref().clone()) }
+                }
+                _ => return none("a property TLC checks with its tableau"),
+            }
+        }
+        // PossibleErrorModel(AEAction, AEState, EAAction): the bins are filled in that order
+        let aea: Vec<usize> = aea.iter().map(|x| bin(&mut abin, x)).collect();
+        let aes: Vec<usize> = aes.iter().map(|x| bin(&mut sbin, x)).collect();
+        let ea: Vec<usize> = ea.iter().map(|x| bin(&mut abin, x)).collect();
+        pems.push(format!("TPem {{ ae_state: &{aes:?}, ae_action: &{aea:?}, ea_action: &{ea:?} }}"));
+    }
+    if sbin.len() > 64 || abin.len() > 64 {
+        return none("more than 64 predicates");
+    }
+    let cs: Vec<String> = sbin.iter().map(|(_, x)| lp_src(x)).collect();
+    let ca: Vec<String> = abin.iter().map(|(_, x)| lp_src(x)).collect();
+    format!(
+        "static TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ check_state: &[{}], check_action: &[{}], pems: &[{}] }});\n",
+        cs.join(", "),
+        ca.join(", "),
+        pems.join(", ")
+    )
+}
+
 /// Generated code for the liveness checks: the atoms, the fairness conditions, and an automaton per
 /// property part. `assumed` are the spec's temporal conjuncts other than fairness (with their
 /// constant bindings), under which each part is checked; `parts` are (name, formula, constant
@@ -735,6 +848,7 @@ pub fn compile(
         Ok(t) => t,
         Err(r) => return Ok(Err(r)),
     };
+    src += &tlc_live(fair, &atexprs, &texprs);
     for ((name, _, _), t) in parts.iter().zip(&texprs) {
         let f = t.to_ltl();
         let neg = if atexprs.is_empty() {

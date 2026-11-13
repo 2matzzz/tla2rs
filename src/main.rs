@@ -187,7 +187,12 @@ fn main() {
             "-cleanup" | "-gzip" | "-modelcheck" => {}
             "-metadir" | "-checkpoint" | "-fp" | "-fpbits" | "-fpmem" | "-lncheck" => {
                 i += 1;
-                args.get(i).unwrap_or_else(|| usage());
+                let v = args.get(i).unwrap_or_else(|| usage());
+                // The checker prints TLC's liveness counterexample only for TLC's first polynomial
+                if args[i - 1] == "-fp" && v != "0" {
+                    pass.push("-tlcfp".into());
+                    pass.push(v.clone());
+                }
             }
             "-simulate" | "-seed" | "-aril" | "-depth" | "-dfid" | "-generateSpecTE" | "-tool" | "-debug" | "-recover"
             | "-coverage" | "-terse" | "-userFile" | "-maxSetSize" => {
