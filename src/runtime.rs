@@ -440,14 +440,15 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
             self.len -= 1;
         }
     }
-    fn union(self, o: Self) -> Self {
+    // The other operand by reference: a set held as an array can be kilobytes
+    fn union(self, o: &Self) -> Self {
         let mut r = self;
         for x in o.iter() {
             r.insert(x);
         }
         r
     }
-    fn inter(self, o: Self) -> Self {
+    fn inter(self, o: &Self) -> Self {
         let mut r = Self::new();
         for x in self.iter() {
             if o.contains(&x) {
@@ -456,7 +457,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
         }
         r
     }
-    fn minus(self, o: Self) -> Self {
+    fn minus(self, o: &Self) -> Self {
         let mut r = self;
         for x in o.iter() {
             r.remove(x);

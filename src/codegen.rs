@@ -1924,9 +1924,9 @@ impl<'a> Gen<'a> {
     fn s_bin(&mut self, op: BOp, a: &str, b: &str, st: &Ty) -> String {
         if is_sparse(st) {
             match op {
-                BOp::Cup => format!("({a}).union({b})"),
-                BOp::Cap => format!("({a}).inter({b})"),
-                _ => format!("({a}).minus({b})"),
+                BOp::Cup => format!("({a}).union(&{b})"),
+                BOp::Cap => format!("({a}).inter(&{b})"),
+                _ => format!("({a}).minus(&{b})"),
             }
         } else {
             match op {
