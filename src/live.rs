@@ -42,6 +42,14 @@ pub fn collect_fair(e: &Expr, env: &HashMap<String, Value>, g: &Gen, out: &mut V
             })?;
             err
         }
+        // `c => F` with c constant, as in `\A x, y \in S : x # y => WF_v(A(x, y))`: TLC evaluates c
+        // to TRUE or FALSE, so the conjunct is F or nothing. Kept out of the property's automaton,
+        // which grows exponentially with the fairness conditions in it
+        Expr::Bin(BOp::Implies, c, f) => match g.ce.eval(c, env)? {
+            Value::Bool(true) => collect_fair(f, env, g, out),
+            Value::Bool(false) => Ok(()),
+            _ => Err(format!("unsupported fairness formula: {}", short(e))),
+        },
         Expr::Fair(weak, sub, a) => {
             out.push(FairDef { weak: *weak, action: a.as_ref().clone(), sub: sub.as_ref().clone(), env: env.clone() });
             Ok(())
