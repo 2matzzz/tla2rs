@@ -4,11 +4,16 @@
 #   check <module> <model> [rules=...]     selected; tla2rs must match TLC
 #   gap   <module> <model> [rules=...] [norun] # reason   selected; a known difference, with its measured
 #                                          reason (norun: too costly to run until it is fixed)
+#   large <module> <model> [rules=...] # times   not selected, as TLC takes longer; `scripts/corpus.sh
+#                                          -large` checks these, and tla2rs must match TLC
 #   skip  <module> <model> # reason        not selected, and why
 # Selected are the exhaustive searches that TLC 2.19 finishes, with tla2tools.jar and the modules of the
 # CommunityModules release that scripts/crosscheck.sh pins, in 60 s or less
 # with one worker (with -dump dot, as expected.sh runs it). `rules=` names narrowing rules of
 # crosscheck.sh (distinct-only, exact, ignore-exit, error-lines), as `\* crosscheck:` lines do in a cfg.
+# For a `large` model the state graph is not compared (see "Large models" in CLAUDE.md). Its times were
+# measured on a Linux machine with 32 cores: TLC 2.19 with one worker and without -dump, and tla2rs with
+# one worker, generation and builds included, with its peak memory.
 url https://github.com/tlaplus/Examples
 commit 334c3983a2f44ac78fce89d1d20aa79ceb3e6987
 
@@ -16,16 +21,16 @@ skip specifications/Bakery-Boulangerie/MCBakery.tla specifications/Bakery-Boulan
 skip specifications/Bakery-Boulangerie/MCBoulanger.tla specifications/Bakery-Boulangerie/MCBoulanger.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg
 check specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg
-skip specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg # TLC 2.19 did not finish in 150 s with one worker
+skip specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla specifications/CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg # TLC 2.19 did not finish in 2 h with one worker
 check specifications/Chameneos/Chameneos.tla specifications/Chameneos/Chameneos.cfg
-skip specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordination.cfg # TLC 2.19 did not finish in 150 s with one worker
+large specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordination.cfg rules=distinct-only # TLC 2.19 took 204 s; tla2rs 9 s, peak 343 MB
 check specifications/CheckpointCoordination/MCCheckpointCoordination.tla specifications/CheckpointCoordination/MCCheckpointCoordinationFailure.cfg rules=distinct-only
 skip specifications/CigaretteSmokers/APCigaretteSmokers.tla specifications/CigaretteSmokers/APCigaretteSmokers.cfg # symbolic mode: checked with Apalache
 check specifications/CigaretteSmokers/CigaretteSmokers.tla specifications/CigaretteSmokers/CigaretteSmokers.cfg
 skip specifications/CoffeeCan/APCoffeeCan.tla specifications/CoffeeCan/APCoffeeCan.cfg # symbolic mode: checked with Apalache
-skip specifications/CoffeeCan/CoffeeCan.tla specifications/CoffeeCan/CoffeeCan1000Beans.cfg # TLC 2.19 took 69 s with one worker
+large specifications/CoffeeCan/CoffeeCan.tla specifications/CoffeeCan/CoffeeCan1000Beans.cfg # TLC 2.19 took 38 s (69 s with -dump dot); tla2rs 13 s, peak 1281 MB
 check specifications/CoffeeCan/CoffeeCan.tla specifications/CoffeeCan/CoffeeCan100Beans.cfg
-skip specifications/CoffeeCan/CoffeeCan.tla specifications/CoffeeCan/CoffeeCan3000Beans.cfg # manifest runtime 00:02:30: beyond the 60 s budget
+large specifications/CoffeeCan/CoffeeCan.tla specifications/CoffeeCan/CoffeeCan3000Beans.cfg # TLC 2.19 took 526 s; tla2rs 56 s, peak 6259 MB
 skip specifications/DieHard/APDieHarder.tla specifications/DieHard/APDieHarder.cfg # symbolic mode: checked with Apalache
 check specifications/DieHard/DieHard.tla specifications/DieHard/DieHard.cfg
 check specifications/DieHard/MCDieHarder.tla specifications/DieHard/MCDieHarder.cfg
@@ -57,13 +62,13 @@ check specifications/GermanProtocol/MCGermanCMPWithMutex.tla specifications/Germ
 check specifications/GermanProtocol/MCGermanControl.tla specifications/GermanProtocol/MCGermanControl.cfg
 check specifications/GermanProtocol/MCGermanData.tla specifications/GermanProtocol/MCGermanData.cfg
 skip specifications/Huang/Huang.tla specifications/Huang/Huang.cfg # TLC 2.19 refuses the cfg: it reads the ALIAS section as a constraint ("The constraint ALIAS ... is not defined")
-skip specifications/KeyValueStore/MCKVS.tla specifications/KeyValueStore/MCKVSSafetyLarge.cfg # manifest runtime 07:16:00: beyond the 60 s budget
-skip specifications/KeyValueStore/MCKVS.tla specifications/KeyValueStore/MCKVSSafetyMedium.cfg # manifest runtime 00:04:30: beyond the 60 s budget
-skip specifications/KeyValueStore/MCKVS.tla specifications/KeyValueStore/MCKVSSafetySmall.cfg # TLC 2.19 did not finish in 150 s with one worker
+large specifications/KeyValueStore/MCKVS.tla specifications/KeyValueStore/MCKVSSafetyLarge.cfg # TLC 2.19 did not finish in 2 h with one worker, and took 5582 s with 32 workers (expected file from that run: with no violation, the verdict and counts do not depend on the workers); tla2rs 4579 s, peak 18621 MB
+large specifications/KeyValueStore/MCKVS.tla specifications/KeyValueStore/MCKVSSafetyMedium.cfg # TLC 2.19 took 997 s; tla2rs 33 s, peak 697 MB
+large specifications/KeyValueStore/MCKVS.tla specifications/KeyValueStore/MCKVSSafetySmall.cfg # TLC 2.19 took 140 s; tla2rs 6 s, peak 326 MB
 check specifications/KeyValueStore/MCKVsnap.tla specifications/KeyValueStore/MCKVsnap.cfg
 skip specifications/KnuthYao/SimKnuthYao.tla specifications/KnuthYao/SimKnuthYao.cfg # generate mode: random behaviors, not an exhaustive search
 skip specifications/LearnProofs/MCFindHighest.tla specifications/LearnProofs/MCFindHighest.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
-skip specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
+large specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg # TLC 2.19 took 283 s; tla2rs 6 s, peak 517 MB
 check specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla specifications/LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg
 skip specifications/LoopInvariance/MCBinarySearch.tla specifications/LoopInvariance/MCBinarySearch.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/LoopInvariance/MCQuicksort.tla specifications/LoopInvariance/MCQuicksort.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
@@ -72,23 +77,23 @@ skip specifications/MisraReachability/APParReach.tla specifications/MisraReachab
 check specifications/MisraReachability/MCParReach.tla specifications/MisraReachability/MCParReach.cfg
 skip specifications/MisraReachability/MCReachabilityTest.tla specifications/MisraReachability/MCReachabilityTestAllGraphs.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/MisraReachability/MCReachabilityTest.tla specifications/MisraReachability/MCReachabilityTestRandomGraphs.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
-skip specifications/MisraReachability/MCReachable.tla specifications/MisraReachability/MCReachable.cfg # TLC 2.19 took 81 s with one worker
+large specifications/MisraReachability/MCReachable.tla specifications/MisraReachability/MCReachable.cfg # TLC 2.19 took 77 s; tla2rs 10 s, peak 350 MB
 skip specifications/MissionariesAndCannibals/APMissionariesAndCannibals.tla specifications/MissionariesAndCannibals/APMissionariesAndCannibals.cfg # symbolic mode: checked with Apalache
 check specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg
 skip specifications/Moving_Cat_Puzzle/APCat.tla specifications/Moving_Cat_Puzzle/APCat.cfg # symbolic mode: checked with Apalache
 check specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatEvenBoxes.cfg
 check specifications/Moving_Cat_Puzzle/Cat.tla specifications/Moving_Cat_Puzzle/CatOddBoxes.cfg
-skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessLarge.cfg # manifest runtime 00:11:00: beyond the 60 s budget
+large specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessLarge.cfg # TLC 2.19 took 1973 s; tla2rs 6 s, peak 370 MB
 check specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorLivenessMedium.cfg
-skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetyLarge.cfg # manifest runtime 00:10:00: beyond the 60 s budget
-skip specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetyMedium.cfg # manifest runtime 00:03:00: beyond the 60 s budget
+large specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetyLarge.cfg # TLC 2.19 took 2266 s; tla2rs 135 s, peak 2308 MB
+large specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetyMedium.cfg rules=distinct-only # TLC 2.19 took 688 s; tla2rs 43 s, peak 620 MB
 check specifications/MultiCarElevator/Elevator.tla specifications/MultiCarElevator/ElevatorSafetySmall.cfg
-skip specifications/MultiPaxos-SMR/MultiPaxos_MC.tla specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg # manifest runtime 00:07:53: beyond the 60 s budget
-skip specifications/MultiPaxos-SMR/MultiPaxos_MC.tla specifications/MultiPaxos-SMR/MultiPaxos_MC_small.cfg # TLC 2.19 took 119 s with one worker
+skip specifications/MultiPaxos-SMR/MultiPaxos_MC.tla specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg # TLC 2.19 took 4200 s with one worker
+large specifications/MultiPaxos-SMR/MultiPaxos_MC.tla specifications/MultiPaxos-SMR/MultiPaxos_MC_small.cfg rules=error-lines # TLC 2.19 took 23 s (119 s with -dump dot); tla2rs 23 s, peak 410 MB. Error lines only: tla2rs does not check the PlusCal checksum of an algorithm with a macro or procedure, and TLC warns that the algorithm changed
 check specifications/N-Queens/Queens.toolbox/FourQueens/MC.tla specifications/N-Queens/Queens.toolbox/FourQueens/MC.cfg
 check specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.tla specifications/N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg
-skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoLarge.cfg # manifest runtime 00:20:00: beyond the 60 s budget
-skip specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoMedium.cfg # TLC 2.19 took 79 s with one worker
+large specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoLarge.cfg # TLC 2.19 took 4524 s; tla2rs 877 s, peak 5254 MB
+large specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoMedium.cfg # TLC 2.19 took 19 s (79 s with -dump dot); tla2rs 8 s, peak 405 MB
 check specifications/NanoBlockchain/MCNano.tla specifications/NanoBlockchain/MCNanoSmall.cfg
 skip specifications/Paxos/MCConsensus.tla specifications/Paxos/MCConsensus.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/Paxos/MCPaxos.tla specifications/Paxos/MCPaxos.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
@@ -106,24 +111,24 @@ skip specifications/ReadersWriters/APReadersWriters.tla specifications/ReadersWr
 check specifications/ReadersWriters/MC.tla specifications/ReadersWriters/MC.cfg
 check specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_New_Solution_Spec/MC.cfg
 check specifications/SDP_Verification/SDP_Attack_Spec/MC.tla specifications/SDP_Verification/SDP_Attack_Spec/MC.cfg
-skip specifications/SimplifiedFastPaxos/FastPaxos.tla specifications/SimplifiedFastPaxos/FastPaxos.cfg # TLC 2.19 took 134 s with one worker
+large specifications/SimplifiedFastPaxos/FastPaxos.tla specifications/SimplifiedFastPaxos/FastPaxos.cfg # TLC 2.19 took 37 s (134 s with -dump dot); tla2rs 34 s, peak 424 MB
 check specifications/SimplifiedFastPaxos/Paxos.tla specifications/SimplifiedFastPaxos/Paxos.cfg
 check specifications/SingleLaneBridge/MC.tla specifications/SingleLaneBridge/MC.cfg
 check specifications/SlidingPuzzles/SlidingPuzzles.tla specifications/SlidingPuzzles/SlidingPuzzles.cfg
 skip specifications/SlidingPuzzles/SlidingPuzzles_anim.tla specifications/SlidingPuzzles/SlidingPuzzles_anim.cfg # TLC 2.19 refuses the cfg: it reads the ALIAS section as an invariant ("The invariant ALIAS ... is not defined")
-skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushLarge.cfg # manifest runtime 00:50:00: beyond the 60 s budget
-skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushMedium.cfg # TLC 2.19 did not finish in 150 s with one worker
+skip specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushLarge.cfg # TLC 2.19 did not finish in 2 h with one worker
+large specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushMedium.cfg # TLC 2.19 took 242 s; tla2rs 20 s, peak 361 MB
 check specifications/SlushProtocol/Slush.tla specifications/SlushProtocol/SlushSmall.cfg
 skip specifications/SpanningTree/APSpanTree.tla specifications/SpanningTree/APSpanTree.cfg # symbolic mode: checked with Apalache
 check specifications/SpanningTree/SpanTree.tla specifications/SpanningTree/SpanTree.cfg
 skip specifications/SpanningTree/SpanTreeRandom.tla specifications/SpanningTree/SpanTreeRandom.cfg # TLC picks values at random (RandomElement, Randomization): two runs of TLC 2.19 gave different results
 skip specifications/SpanningTree/SpanTreeTest.tla specifications/SpanningTree/SpanTreeTest4Nodes.cfg # TLC picks values at random (RandomElement, Randomization): two runs of TLC 2.19 gave different results
-skip specifications/SpanningTree/SpanTreeTest.tla specifications/SpanningTree/SpanTreeTest5Nodes.cfg # TLC 2.19 did not finish in 150 s with one worker
+skip specifications/SpanningTree/SpanTreeTest.tla specifications/SpanningTree/SpanTreeTest5Nodes.cfg # TLC 2.19 took 600 s with one worker (and the spec extends Randomization, which tla2rs refuses)
 check specifications/SpecificationRefinement/abstract.tla specifications/SpecificationRefinement/abstract.cfg
 check specifications/SpecificationRefinement/bad.tla specifications/SpecificationRefinement/bad.cfg
 check specifications/SpecificationRefinement/good.tla specifications/SpecificationRefinement/good.cfg
 check specifications/SpecifyingSystems/AdvancedExamples/MCInnerSequential.tla specifications/SpecifyingSystems/AdvancedExamples/MCInnerSequential.cfg
-skip specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg # TLC 2.19 did not finish in 150 s with one worker
+large specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg # TLC 2.19 took 459 s; tla2rs 24 s, peak 513 MB
 skip specifications/SpecifyingSystems/AsynchronousInterface/APAsynchInterface.tla specifications/SpecifyingSystems/AsynchronousInterface/APAsynchInterface.cfg # symbolic mode: checked with Apalache
 skip specifications/SpecifyingSystems/AsynchronousInterface/APChannel.tla specifications/SpecifyingSystems/AsynchronousInterface/APChannel.cfg # symbolic mode: checked with Apalache
 check specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg
@@ -165,7 +170,7 @@ skip specifications/TwoPhase/MCTwoPhase.tla specifications/TwoPhase/MCTwoPhase.c
 check specifications/YoYo/MCYoYoNoPruning.tla specifications/YoYo/MCYoYoNoPruning.cfg
 check specifications/YoYo/MCYoYoPruning.tla specifications/YoYo/MCYoYoPruning.cfg
 skip specifications/YoYo/YoYoAllGraphs.tla specifications/YoYo/YoYoAllGraphs.cfg # TLC 2.19 stops in UndirectedGraphs' IsStronglyConnected, which quantifies over Seq(S) without the module's Java override
-skip specifications/aba-asyn-byz/aba_asyn_byz.tla specifications/aba-asyn-byz/aba_asyn_byz.cfg # manifest runtime 00:10:00: beyond the 60 s budget
+large specifications/aba-asyn-byz/aba_asyn_byz.tla specifications/aba-asyn-byz/aba_asyn_byz.cfg # TLC 2.19 took 1238 s; tla2rs 42 s, peak 3584 MB
 check specifications/acp/ACP_NB_TLC.tla specifications/acp/ACP_NB_TLC.cfg
 check specifications/acp/ACP_NB_WRONG_TLC.tla specifications/acp/ACP_NB_WRONG_TLC.cfg
 check specifications/acp/ACP_SB_TLC.tla specifications/acp/ACP_SB_TLC.cfg
@@ -180,9 +185,9 @@ skip specifications/barriers/Barriers.tla specifications/barriers/Barriers.cfg #
 skip specifications/bcastByz/bcastByz.tla specifications/bcastByz/bcastByz.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/bcastByz/bcastByz.tla specifications/bcastByz/bcastByzNoBcast.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/bcastFolklore/APbcastFolklore.tla specifications/bcastFolklore/APbcastFolklore.cfg # symbolic mode: checked with Apalache
-skip specifications/bcastFolklore/bcastFolklore.tla specifications/bcastFolklore/bcastFolklore.cfg # manifest runtime 00:30:00: beyond the 60 s budget
+large specifications/bcastFolklore/bcastFolklore.tla specifications/bcastFolklore/bcastFolklore.cfg # TLC 2.19 took 3476 s; tla2rs 141 s, peak 1678 MB
 skip specifications/bosco/APbosco.tla specifications/bosco/APbosco.cfg # symbolic mode: checked with Apalache
-skip specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # manifest runtime 00:03:00: beyond the 60 s budget
+large specifications/bosco/bosco.tla specifications/bosco/bosco.cfg # TLC 2.19 took 576 s; tla2rs 6 s, peak 327 MB
 skip specifications/braf/BufferedRandomAccessFile.tla specifications/braf/BufferedRandomAccessFile.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 check specifications/btree/MCbtree.tla specifications/btree/MCbtree.cfg
 check specifications/btree/kvstore.tla specifications/btree/kvstore.cfg
@@ -196,17 +201,17 @@ skip specifications/byzpaxos/Consensus.tla specifications/byzpaxos/Consensus.cfg
 skip specifications/byzpaxos/PConProof.tla specifications/byzpaxos/PConProof.cfg # needs module TLAPS (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/byzpaxos/VoteProof.tla specifications/byzpaxos/VoteProof.cfg # needs module NaturalsInduction (the proof system's library), not in tla2tools.jar nor in the CommunityModules
 skip specifications/c1cs/APc1cs.tla specifications/c1cs/APc1cs.cfg # symbolic mode: checked with Apalache
-skip specifications/c1cs/c1cs.tla specifications/c1cs/c1cs.cfg # TLC 2.19 took 114 s with one worker
-skip specifications/cf1s-folklore/cf1s_folklore.tla specifications/cf1s-folklore/cf1s_folklore.cfg # TLC 2.19 took 113 s with one worker
+skip specifications/c1cs/c1cs.tla specifications/c1cs/c1cs.cfg # TLC 2.19 did not finish in 2 h with one worker
+large specifications/cf1s-folklore/cf1s_folklore.tla specifications/cf1s-folklore/cf1s_folklore.cfg # TLC 2.19 took 185 s; tla2rs 5 s, peak 980 MB
 skip specifications/chang_roberts/APChangRoberts.tla specifications/chang_roberts/APChangRoberts.cfg # symbolic mode: checked with Apalache
 check specifications/chang_roberts/MCChangRoberts.tla specifications/chang_roberts/MCChangRoberts.cfg
 check specifications/dag-consensus/BlockDagTest.tla specifications/dag-consensus/BlockDagTest.cfg
 check specifications/dag-consensus/TLCSailfish1.tla specifications/dag-consensus/TLCSailfish1.cfg rules=distinct-only
-skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 150 s with one worker
-skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # manifest runtime 02:00:00: beyond the 60 s budget
+skip specifications/dag-consensus/TLCSailfish2.tla specifications/dag-consensus/TLCSailfish2.cfg # TLC 2.19 did not finish in 2 h with one worker
+skip specifications/detector_chan96/EnvironmentController.tla specifications/detector_chan96/EnvironmentController.cfg # TLC 2.19 did not finish in 2 h with one worker
 check specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg
-skip specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg # TLC 2.19 took 62 s with one worker
-skip specifications/diskpaxos/MC_HDiskSynod.tla specifications/diskpaxos/MC_HDiskSynod.cfg # TLC 2.19 took 60 s with one worker
+large specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla specifications/dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg # TLC 2.19 took 418 s; tla2rs 19 s, peak 1183 MB
+skip specifications/diskpaxos/MC_HDiskSynod.tla specifications/diskpaxos/MC_HDiskSynod.cfg # TLC 2.19 did not finish in 2 h with one worker
 check specifications/echo/MCEcho.tla specifications/echo/MCEcho.cfg
 skip specifications/ewd426/APTokenRing.tla specifications/ewd426/APTokenRing.cfg # symbolic mode: checked with Apalache
 skip specifications/ewd426/SimTokenRing.tla specifications/ewd426/SimTokenRing.cfg # generate mode: random behaviors, not an exhaustive search
@@ -252,6 +257,6 @@ check specifications/tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla specifications/
 skip specifications/tower_of_hanoi/Hanoi_anim.tla specifications/tower_of_hanoi/Hanoi_anim.cfg # TLC 2.19 refuses the cfg: it does not read the ALIAS section ("expecting a keyword")
 check specifications/transaction_commit/2PCwithBTM.tla specifications/transaction_commit/2PCwithBTM.cfg rules=distinct-only
 skip specifications/transaction_commit/APTCommit.tla specifications/transaction_commit/APTCommit.cfg # symbolic mode: checked with Apalache
-skip specifications/transaction_commit/PaxosCommit.tla specifications/transaction_commit/PaxosCommit.cfg # TLC 2.19 did not finish in 150 s with one worker
+large specifications/transaction_commit/PaxosCommit.tla specifications/transaction_commit/PaxosCommit.cfg rules=distinct-only # TLC 2.19 took 148 s; tla2rs 132 s, peak 371 MB
 check specifications/transaction_commit/TCommit.tla specifications/transaction_commit/TCommit.cfg
 check specifications/transaction_commit/TwoPhase.tla specifications/transaction_commit/TwoPhase.cfg

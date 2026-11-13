@@ -52,7 +52,9 @@ It has no crate dependencies.
 - `scripts/corpus.sh` cross-checks the models selected from a public corpus, the tlaplus/Examples repository
   at the commit pinned in `tests/corpus.txt`, against TLC's results in `tests/expected/corpus/` (see "The
   corpus"). It is separate from `all.sh`, which it does not slow down. `scripts/expected.sh -corpus` writes
-  those results; `JOBS` defaults to 2 for both
+  those results; `JOBS` defaults to 2 for both. `-large` (`corpus.sh -large`, `expected.sh -corpus -large`) takes
+  the models listed as `large` instead, one at a time unless `JOBS` says otherwise (see "Large models"), and
+  `corpus.sh -only RE` only the models whose cfg path matches RE
 - `scripts/bench.sh` measures speed against TLC on every configuration in `examples/` and `tests/tlc/`
   (`-corpus`: the corpus's selected models, `-norun` adds those marked norun): TLC with one worker, and tla2rs
   split into generation, a build from scratch (no build cache) and the checker alone with one worker, each with
@@ -964,7 +966,8 @@ finishes with `tla2tools.jar` and the CommunityModules' modules, in 60 s or less
 (measured; the manifest's runtimes are for several workers). Skipped, with the reason on each line: 46 symbolic
 (Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 37 that need a module
 neither in `tla2tools.jar` nor in the CommunityModules (the proof system's library: TLAPS, NaturalsInduction,
-FiniteSetTheorems; TLCExt), 31 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
+FiniteSetTheorems; TLCExt), 31 that take longer (from the manifest's runtime, or measured; 23 of them are listed as
+`large` and checked apart, see "Large models"), 7 whose cfg TLC 2.19
 refuses (an `ALIAS` section), 2 where TLC picks values at random (two TLC runs differed), 5 where TLC 2.19 stops in a
 CommunityModules definition that needs its Java override (IOUtils, and quantifiers over `Seq(S)` in Graphs and
 UndirectedGraphs), and 1 that reads `TLCGet("config")`, which TLC 2.19 does not define. That leaves 106 selected.
@@ -1006,13 +1009,35 @@ translation (`PcalSum`), a parameter of an instantiated module named like a defi
 under a constant guard (`\A i, j \in P : i # j => WF_v(A(i, j))`, `FairPairs`), and a pair of a record-or-model value
 and a record against pairs of records (`PairSource`).
 
-Of the models skipped for TLC's run time, measured on a Linux machine with one worker (TLC, then tla2rs with its
-generation and builds), these give the same verdict and state counts as TLC: `MCCheckpointCoordination` 204 s / 9 s,
-`MCKVSSafetySmall` 140 / 6, `MCKVSSafetyMedium` 997 / 33, `MCReachable` 77 / 10, `ElevatorSafetyMedium` 688 / 43,
-`ElevatorSafetyLarge` 2266 / 135, `ElevatorLivenessLarge` 1973 / 6, `MCNanoMedium` 19 / 8, `FastPaxos` 37 / 32,
-`SlushMedium` 242 / 20, `MCInnerSerial` 459 / 23, `aba_asyn_byz` 1238 / 42, `bcastFolklore` 3476 / 141, `bosco` 576 /
-6, `cf1s_folklore` 185 / 5, `DijkstraMutex` `Safety-4-processors` 418 / 19 and `PaxosCommit` 148 / 132. They stay
-skipped, since TLC's run time is what keeps them out of `corpus.sh`.
+### Large models
+
+23 of the models left out for TLC's run time match TLC, and are listed as `large` in `tests/corpus.txt`, each with TLC's
+time with one worker (from 19 s to 4524 s, and more than 2 h for `MCKVSSafetyLarge`) and tla2rs's time and peak
+memory. `scripts/corpus.sh -large` checks them against their files in `tests/expected/corpus/` and fails on one that
+differs, as on a `check`; `rules=` work as for the selected models. Their state graphs (up to 595 million states) are
+too big for TLC's `-dump dot` and for comparing, so their files keep only what is compared cheaply and does not vary
+from run to run: TLC's verdict, its counts, the length and hash of its counterexample, its exit code and the hashes of
+its messages, without the `states` and `edges` lines. For them `crosscheck.sh` runs TLC without `-dump` and tla2rs
+without `-dumpgraph`, and their key leaves out `-dump` and `src/graph.rs`. A TLC run longer than 30 minutes writes a
+checkpoint every 30 minutes (`Checkpointing of run <dir>`, `Checkpointing completed at (<time>)`); `crosscheck.sh`
+drops those lines from a large model's output before hashing its messages (`src/messages.rs` keeps them, so that the
+keys of the other files stay the same).
+
+`scripts/expected.sh -corpus -large` writes their files by running TLC, which takes hours and up to tens of GB: it is
+meant for a big machine. The files committed were written instead from TLC runs made before, with
+`scripts/crosscheck.sh --expected-from TLC.OUT RC <tla> <cfg>` (the output and exit code of a run of the same jar on
+the same model). Those runs used one worker but not `-fp 0`; none of the 23 violates a property, so the fingerprints
+change nothing in the file. `MCKVSSafetyLarge` did not finish in 2 h with one worker, and its file comes from a run
+with 32 workers (5582 s): without a violation the verdict and the counts do not depend on the number of workers, and
+tla2rs with one worker gives the same 13385471536 generated and 594616815 distinct states. The other 8 models left
+out for time stay `skip`, with what was measured on their lines.
+
+Four use a rule. `MCCheckpointCoordination`, `ElevatorSafetyMedium` and `PaxosCommit` use `distinct-only`: only the
+generated count differs, as in "TLC counts generated states per `\/` branch". `MultiPaxos_MC_small` uses `error-lines`:
+its algorithm has a macro or a procedure, so tla2rs does not check its PlusCal checksum (see "PlusCal checksums"),
+and TLC's warning that the algorithm changed is the one message tla2rs does not print. Measured on a Linux machine
+with 32 cores, `scripts/corpus.sh -large` with JOBS=8 on the 20 models other than `MCKVSSafetyLarge`, `MCNanoLarge`
+and `ElevatorSafetyLarge` (`-only`) took 165 s, and all 20 match.
 
 ### CommunityModules
 

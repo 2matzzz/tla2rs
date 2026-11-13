@@ -171,6 +171,14 @@ ok    tests/tlc/AssumeFalse.cfg  (graph not compared: TLC stopped before ending 
 
 上の構成は、誰かが思いついた書き方しか確かめられない。そこで `scripts/corpus.sh` は、tlaplus/Examples リポジトリ（https://github.com/tlaplus/Examples）のモデルとも同じやり方で突き合わせる。使うのは `tests/corpus.txt` に固定したコミットで、仕様集は `target/corpus/<コミット>/` に取ってきて TLC と tla2rs に読ませるだけにする。このリポジトリには仕様集の中身を一切写さず、TLC の結果（`tests/expected/corpus/`、書くのは `scripts/expected.sh -corpus`）だけを置く。`tests/corpus.txt` には仕様集のマニフェストにあるモデルをすべて並べ、選んだもの（TLC 2.19 が `tla2tools.jar` と CommunityModules のモジュールで、ワーカー 1 つで 60 秒以内に終える全探索）と、選ばなかったものそれぞれの理由を書いてある。選んだのにまだ tla2rs が一致しないモデルは、測って確かめた理由を添えて差分として載せる。`all.sh` とは別に回すので、`all.sh` の手間は変わらない。選んだ 106 モデルはすべて TLC と一致する（うち 7 つは生成した状態の数だけが違う。TLC は同じ後続状態を `\/` の枝ごとに数えるため）。その理由は `tests/corpus.txt` と CLAUDE.md に書いてある。
 
+このほかに、TLC だと選ぶ基準の 60 秒を超え、長いものでは何時間もかかる 23 モデルを `large` として載せている。`scripts/corpus.sh -large` で、同じように残しておいた TLC の結果と突き合わせる。ただし状態グラフは大きすぎるので比べない（CLAUDE.md の "Large models" を参照）。`scripts/corpus.sh -only RE` とすると、cfg のパスが RE に合うモデルだけを回す。
+
+```sh
+scripts/corpus.sh                       # 選んだ 106 モデル
+scripts/corpus.sh -large                # large の 23 モデル（tla2rs でも重いものは 77 分、19 GB かかる）
+scripts/corpus.sh -large -only bosco    # cfg のパスが bosco に合うものだけ
+```
+
 | 例 | 中身 |
 |---|---|
 | `DieHard` | 水差しのパズル。`NotSolved` の反例が答え |

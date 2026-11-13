@@ -384,6 +384,15 @@ selected (the exhaustive searches that TLC 2.19 finishes, with `tla2tools.jar` a
 not match yet is listed as a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost.
 Of the 106 selected models, all 106 match TLC (7 of them on everything but the generated count, which TLC counts once
 per `\/` branch).
+23 more models, on which TLC takes longer than the selection allows (up to hours), are listed as `large`: `scripts/corpus.sh -large` checks
+them against TLC's results kept the same way, except for the state graph, which is too big to compare (see "Large
+models" in CLAUDE.md). `scripts/corpus.sh -only RE` checks only the models whose cfg path matches RE.
+
+```sh
+scripts/corpus.sh                       # the 106 selected models
+scripts/corpus.sh -large                # the 23 large ones (tla2rs: up to 77 minutes and 19 GB on one)
+scripts/corpus.sh -large -only bosco    # only those whose cfg path matches bosco
+```
 
 | Example | What it is |
 |---|---|
