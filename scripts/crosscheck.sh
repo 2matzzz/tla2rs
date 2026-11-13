@@ -67,6 +67,11 @@ if [[ -n "${CROSSCHECK_RSARGS:-}" ]]; then
   read -r -a more <<< "$CROSSCHECK_RSARGS"
   rsonly+=("${more[@]}")
 fi
+# TLC runs with `-fp 0` (the first fingerprint polynomial) unless the cfg's args choose one, so that
+# a liveness counterexample, which depends on TLC's fingerprints, is the same on every run (see
+# "Counterexamples" in CLAUDE.md); the checker computes TLC's fingerprints with that polynomial
+fp0=(-fp 0)
+for x in ${extra[@]+"${extra[@]}"}; do [[ "$x" != -fp ]] || fp0=(); done
 jar="${TLA_TOOLS:-$HOME/.tla/tla2tools.jar}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$root/target/release/tla2rs"
@@ -116,9 +121,8 @@ summarize() {
   if [[ -z "$res" ]] && grep -qE '^Error:' "$f"; then
     res="Evaluation error"
   fi
-  local temporal=0
   if grep -qE 'Temporal propert(y .* is|ies were) violated' "$f"; then
-    res="Temporal property violated"; temporal=1
+    res="Temporal property violated"
   fi
   # The states left on queue are those of TLC's queue when it stops (0 when the search ends); with
   # one worker they are deterministic (see "Messages and printed lines" in CLAUDE.md)
@@ -127,9 +131,6 @@ summarize() {
   local trace mode=--trace
   [[ $view == 0 ]] || mode=--trace-view
   trace=$("$bin" $mode "$f" || echo "trace unreadable")
-  # A liveness counterexample (lasso) depends on TLC's random fingerprint polynomial, so it is not
-  # compared with TLC's; check_lasso checks tla2rs's instead
-  [[ $temporal == 1 ]] && trace="trace lasso"
   printf '%s\n%s\n%s\n' "$res" "$counts" "$trace"
 }
 
@@ -140,11 +141,12 @@ summarize() {
 # is kept in tests/expected/ with a hash of those inputs and of src/graph.rs, src/trace.rs and
 # src/messages.rs, which reduce the graph, the counterexample and the messages to their hashes (the
 # key). The parts of TLC's output that vary from run to run (times, the fingerprint seed, temporary
-# paths, the shape of a liveness counterexample) are not part of the summary, so the file is the
-# same for every TLC run.
+# paths) are not part of the summary, so the file is the same for every TLC run. TLC runs with
+# `-fp 0`, so that its liveness counterexample, which depends on its fingerprints, is the same on
+# every run too (see "Counterexamples" in CLAUDE.md).
 # CROSSCHECK_NO_CACHE=1 builds the checker from scratch instead of reusing target/crosscheck/build.
 tlc_key() {
-  { echo "v5 -workers 1 -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
+  { echo "v6 -workers 1 ${fp0[*]-} -dump dot ${extra[*]-}"; shasum -a 256 "$jar" "$root/src/graph.rs" "$root/src/trace.rs" "$root/src/messages.rs" | cut -d' ' -f1; cat "$cfg_abs"
     [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
     [[ -z "$user_dump" && $view == 0 ]] || shasum -a 256 "$root/src/options.rs" | cut -d' ' -f1
     for m in $(printf '%s\n' "${modules[@]}" | sort); do echo "== $m"; cat "$spec_dir/$m.tla"; done; } | shasum -a 256 | cut -d' ' -f1
@@ -188,7 +190,7 @@ run_tlc() {
   mkdir -p "$work/jtmp"
   local dump=(-dump dot tlc.dot)
   [[ -z "$user_dump" ]] || dump=()
-  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 ${dump[@]+"${dump[@]}"} -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
+  java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 ${fp0[@]+"${fp0[@]}"} ${dump[@]+"${dump[@]}"} -config "$c" ${extra[@]+"${extra[@]}"} "$t" > tlc.out 2>&1 || rc_tlc=$?
   [[ -z "$user_dump" ]] || mv "$user_dump" tlc.userdump 2> /dev/null || true
   a="$(summarize tlc.out)
 $(graphs tlc)
@@ -333,12 +335,21 @@ fi
 if [[ $distinct_only == 1 ]]; then
   a=$(echo "$a" | sed 's/^[0-9]* states generated //'); b=$(echo "$b" | sed 's/^[0-9]* states generated //')
 fi
-# A liveness counterexample (lasso) is not compared with TLC's, which depends on TLC's random
-# fingerprint polynomial. TLC checks tla2rs's instead: the checker writes a spec whose only behavior
-# is the lasso (-lassocheck, see src/lasso.rs), and TLC must report that it violates the properties,
-# with one distinct state per state of the lasso. That holds only if the lasso starts in an initial
-# state, each step is a step of the spec, it satisfies the spec's fairness and violates a property
+# A liveness counterexample is compared with TLC's like any other. Where the checker cannot follow
+# TLC's search (it says why on stderr: TLC's tableau, a model value, VIEW or SYMMETRY) and prints a
+# lasso of its own that differs from TLC's, TLC checks that lasso instead: the checker writes a spec
+# whose only behavior is the lasso (-lassocheck, see src/lasso.rs), and TLC must report that it
+# violates the properties, with one distinct state per state of the lasso. That holds only if the
+# lasso starts in an initial state, each step is a step of the spec, it satisfies the spec's fairness
+# and violates a property
 lasso_note=""
+if grep -q '^Temporal property violated' <<< "$a" && [[ "$(grep '^trace ' <<< "$a")" != "$(grep '^trace ' <<< "$b")" ]]; then
+  lasso_why=$(grep -m1 -oE "the counterexample is tla2rs's own, not TLC's \(.*\)|TLC's search found no counterexample" rs.err | sed -E "s/.*not TLC's \((.*)\)$/\1/" || true)
+  if [[ -n $lasso_why ]]; then
+    a=$(sed 's/^trace .*/trace lasso/' <<< "$a"); b=$(sed 's/^trace .*/trace lasso/' <<< "$b")
+    graph_note="$graph_note; lasso confirmed instead: $lasso_why"
+  fi
+fi
 if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
   if [[ ! -f Tla2rsLasso.tla ]]; then
     echo "  LASSO NOT CHECKED: $(grep -m1 'lasso check is not written' rs.out || echo 'the checker wrote no lasso check')"

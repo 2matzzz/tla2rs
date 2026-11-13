@@ -1826,6 +1826,10 @@ fn compile_inner(
         .unwrap();
     }
     show += "o }\n";
+    // The values of the variables in TLC's order, as printed on one line (for TLC's fingerprint of
+    // a state, see `tlc_fp` in the runtime)
+    let vals: Vec<String> = shown.iter().map(|(v, t)| Ok(format!("fmt_{}(&s.v_{v})", g.ty_id_pub(t)?))).collect::<R<_>>()?;
+    writeln!(show, "#[allow(dead_code)]\nfn tlc_vals(s: &State) -> Vec<String> {{ vec![{}] }}", vals.join(", ")).unwrap();
     writeln!(show, "const ACTIONS: usize = {actions};").unwrap();
     src += &show;
     writeln!(src, "const CHECK_DEADLOCK: bool = {};", cfg.check_deadlock.unwrap_or(true)).unwrap();
