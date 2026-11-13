@@ -147,7 +147,7 @@ not finish.
 When only invariants are checked, states themselves are not kept. The checker holds just
 
 - the visited fingerprints, each paired with the fingerprint of the state it was first reached from (16 bytes per
-  state, 8 with `-notrace`)
+  slot of a hash table kept between 3/8 and 3/4 full, so 21 to 43 bytes per state; half that with `-notrace`)
 - the queues for the current and next level (anything beyond `-memlimit` spills to a temp file and is read back in
   chunks)
 
