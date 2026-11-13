@@ -745,10 +745,10 @@ finishes with `tla2tools.jar` and the CommunityModules' modules, in 60 s or less
 (measured; the manifest's runtimes are for several workers). Skipped, with the reason on each line: 46 symbolic
 (Apalache), 6 random generation or simulation, 2 that need a TLC flag for action composition, 33 that need a module
 neither in `tla2tools.jar` nor in the CommunityModules (the proof system's library: TLAPS, NaturalsInduction,
-FiniteSetTheorems; TLCExt), 36 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
+FiniteSetTheorems; TLCExt), 35 that take longer (from the manifest's runtime, or measured), 7 whose cfg TLC 2.19
 refuses (an `ALIAS` section), 2 where TLC picks values at random (two TLC runs differed), 5 where TLC 2.19 stops in a
 CommunityModules definition that needs its Java override (IOUtils, and quantifiers over `Seq(S)` in Graphs and
-UndirectedGraphs), and 1 that reads `TLCGet("config")`, which TLC 2.19 does not define. That leaves 105 selected.
+UndirectedGraphs), and 1 that reads `TLCGet("config")`, which TLC 2.19 does not define. That leaves 106 selected.
 
 The cfgs of the corpus are not edited, so a line of the list gives what a `\* crosscheck:` line would: `rules=`
 (narrowing rules, passed as `CROSSCHECK_RULES`) and `rsargs=` (arguments for tla2rs only, `CROSSCHECK_RSARGS`; no

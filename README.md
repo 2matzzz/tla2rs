@@ -315,7 +315,7 @@ written by `scripts/expected.sh -corpus`). `tests/corpus.txt` lists every model 
 selected (the exhaustive searches that TLC 2.19 finishes, with `tla2tools.jar` and the CommunityModules' modules, in
 60 seconds or less with one worker) and, for each of the others, why it is skipped. A selected model that tla2rs does
 not match yet is listed as a gap, with the reason measured. The run is separate from `all.sh`, which keeps its cost.
-Of the 105 selected models, 104 match TLC (6 of them on everything but the generated count, which TLC counts once per
+Of the 106 selected models, 104 match TLC (6 of them on everything but the generated count, which TLC counts once per
 `\/` branch). The 2 gaps are not run each time, as they cost too much (one of them matches but takes 32 minutes);
 their reasons are in `tests/corpus.txt` and CLAUDE.md.
 
