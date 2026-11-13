@@ -511,6 +511,33 @@ impl<'a> Gen<'a> {
         Ok(None)
     }
 
+    /// Whether the order of the strings the checker makes while exploring (numbered from
+    /// `track_from`) can show: some set, bag or function domain in the code holds such strings,
+    /// so they are enumerated, chosen from or printed in their order. Strings that are only
+    /// compared for equality, printed alone and kept in variables show no order
+    pub fn made_order_shows(&self) -> bool {
+        let from = self.track_from;
+        fn made(t: &Ty, from: u32) -> bool {
+            match t {
+                Ty::Enum(ids) | Ty::IntAtom(_, _, ids) => ids.iter().any(|&a| a >= from),
+                Ty::Rec(fs) => fs.iter().any(|(_, f)| made(f, from)),
+                Ty::Set(e) | Ty::Seq(e) | Ty::Bag(e) | Ty::Opt(e) => made(e, from),
+                Ty::Fun(d, c) | Ty::PFun(d, c) => made(d, from) || made(c, from),
+                _ => false,
+            }
+        }
+        fn orders(t: &Ty, from: u32) -> bool {
+            match t {
+                Ty::Set(e) | Ty::Bag(e) => made(e, from),
+                Ty::Fun(d, c) | Ty::PFun(d, c) => made(d, from) || orders(c, from),
+                Ty::Rec(fs) => fs.iter().any(|(_, f)| orders(f, from)),
+                Ty::Seq(e) | Ty::Opt(e) => orders(e, from),
+                _ => false,
+            }
+        }
+        self.ty_ids.keys().chain(self.vars.iter().map(|(_, t)| t)).any(|t| orders(t, from))
+    }
+
     pub fn ty_id_pub(&mut self, t: &Ty) -> R<usize> {
         self.ty_id(t)
     }

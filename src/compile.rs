@@ -1883,10 +1883,12 @@ fn compile_inner(
     writeln!(src, "static REG_INIT: &[(i64, i64)] = &[{}];", regs.join(", ")).unwrap();
     // The strings the checker may make while exploring, and which of them TLC created when it
     // parsed the spec (a name or number of a module), whose place is known
-    writeln!(src, "const STR_ORDER: bool = {};", g.str_notes).unwrap();
+    // Strings that are only compared for equality, printed and kept need no order
+    let str_order = g.str_notes && g.made_order_shows();
+    writeln!(src, "const STR_ORDER: bool = {str_order};").unwrap();
     writeln!(src, "const TRACK_FROM: usize = {track_from};").unwrap();
     let ranked: Vec<String> = (track_from..atoms.len()).map(|a| ranks.contains_key(&atoms.name(a as u32)).to_string()).collect();
-    writeln!(src, "static RANKED_LATE: &[bool] = &[{}];", if g.str_notes { ranked.join(", ") } else { String::new() }).unwrap();
+    writeln!(src, "static RANKED_LATE: &[bool] = &[{}];", if str_order { ranked.join(", ") } else { String::new() }).unwrap();
     let labels: Vec<String> = g.labels.iter().map(|l| format!("{l:?}")).collect();
     writeln!(src, "static LABELS: &[&str] = &[{}];", labels.join(", ")).unwrap();
     // As TLC prints a state: each value through its pretty printer, and the variables as a
