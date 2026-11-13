@@ -135,7 +135,9 @@ not finish.
    predicates hold and which fair actions are enabled, and each edge which action predicates and fair actions it
    satisfies. Afterwards the checker looks for a strongly connected component of the product of the state graph and
    the automaton that is accepting and fair (WF: a step of the action or a state where it is disabled; SF: a step, or
-   no state where it is enabled, narrowing the component otherwise). Counterexamples are lassos printed as TLC does
+   no state where it is enabled, narrowing the component otherwise). When the automaton would be too large (many
+   `[]<>` conjuncts in the spec, say), each disjunct of the negation's normal form is checked on its own, as TLC
+   does, with its `[]<>` and `<>[]` parts as conditions on the component. Counterexamples are lassos printed as TLC does
 
 ### Memory
 
@@ -300,8 +302,8 @@ memory.
   the comparison with TLC reads an interval as the set it denotes
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
   it otherwise picks at random) when the properties need no tableau in TLC (`[]<>`, `<>[]` and fairness, after
-  negation), the states hold no model value (TLC fingerprints a model value by its own numbering of names) and there
-  is no `VIEW` or `SYMMETRY`. Otherwise it is a valid lasso of tla2rs's own, which TLC checks (`-lassocheck`); the
+  negation) and there is no `VIEW` (a model value is fingerprinted by the number TLC gives its name, and under
+  `SYMMETRY` a state by its smallest permutation, as TLC does). Otherwise it is a valid lasso of tla2rs's own, which TLC checks (`-lassocheck`); the
   checker says why on stderr. Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a
   behavior; when a value the view leaves out only grows, the lasso returns to its first state of the cycle under the
   view only, and the check folds states by the same view
