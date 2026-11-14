@@ -1996,6 +1996,10 @@ fn compile_inner(
     if live_sim {
         rt = live_sim_runtime(&rt);
     }
+    let cons_print = cons_prints && print_order;
+    if cons_print {
+        rt = cons_print_runtime(&rt);
+    }
     if g.shaped.is_empty() {
         src += &rt;
     } else {
@@ -2013,6 +2017,9 @@ fn compile_inner(
     src += crate::runtime::LIVENESS_RT;
     if live_sim {
         src += crate::runtime::LIVE_SIM_RT;
+    }
+    if cons_print {
+        src += crate::runtime::CONS_PRINT_RT;
     }
     let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
     Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap), atoms: names })
@@ -2035,6 +2042,21 @@ fn live_sim_runtime(rt: &str) -> String {
         (
             "    if LIVENESS {\n        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
             "    if LIVENESS {\n        held.flush(u32::MAX);\n        if let Err(m) = live_sim_expand(&s, buf) {\n            return Some(Found::Live(m));\n        }\n        let _quiet = Capturing::start();\n        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
+        ),
+    ])
+}
+
+/// `rt` with the hooks of `CONS_PRINT_RT`: what the constraints print on a successor, and the
+/// invariants on one outside them, held in TLC's place among what the actions print
+fn cons_print_runtime(rt: &str) -> String {
+    hook(rt, &[
+        (
+            "        if !in_model(s, t) {\n            if let Some(f) = out_of_model(s, sfp, t, l) {\n                return Some(f);\n            }\n            continue;\n        }\n",
+            "        if let Some(f) = held_at(&mut ws.held, i as u32, || (!in_model(s, t)).then(|| out_of_model(s, sfp, t, l))) {\n            if f.is_some() {\n                return f;\n            }\n            continue;\n        }\n",
+        ),
+        (
+            "        if !in_model(&s, &t) {\n            if let Some(msg) = check_out_of_model(&t)",
+            "        held.flush(k as u32 + 1);\n        if !in_model(&s, &t) {\n            if let Some(msg) = check_out_of_model(&t)",
         ),
     ])
 }

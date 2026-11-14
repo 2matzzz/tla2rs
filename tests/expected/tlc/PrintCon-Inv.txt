@@ -1,0 +1,10 @@
+key fc5c6d9f203c4955e75e6be92bd8d60d13291e9212b369408bd96e778733af43
+tlc Version 2.19
+rc 12
+Invariant Inv is violated
+8 states generated 4 distinct states found 1 states left on queue
+trace 2 f5258b87689d31a3607f9aec769c1494f21f048cdab32cf087fee5e37d16e627
+states 4 9e506eaa3488586e3c80e0547dd4dbf8a4e88c2eaa36dab7f0e77cb257d5e182
+edges 4 36790d1a88459bee12fc0e7afedfe2d0b9cf25303c684777a157bbec505719d9
+messages 36 83028da6fb86a15eeb80c62aef2d2054cf63e9bd2181bb8612dd6a64fc6d8e9c
+errors 2 8e4c7a9a5b1dd129e16f52a145c65057978959b112b412a9804dc535a9c300f8

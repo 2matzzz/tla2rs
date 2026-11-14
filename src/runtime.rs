@@ -6915,6 +6915,29 @@ fn write_lasso_check(states: &[String], back: Option<(usize, Option<String>)>) {
 }
 "##;
 
+/// For a spec whose CONSTRAINT or ACTION_CONSTRAINT prints (pasted, and hooked into `RUNTIME` by
+/// `compile::cons_print_runtime`, only then): TLC evaluates them on each successor as soon as an
+/// action yields it, then the invariants of a successor outside them, so what they print comes
+/// after what the actions printed before that successor.
+pub const CONS_PRINT_RT: &str = r##"
+/// `f()` for the successor with index `i` among those `held` was captured for: what it prints is
+/// held after the lines printed before that successor was pushed, also when it fails
+fn held_at<R>(held: &mut Held, i: u32, f: impl FnOnce() -> R) -> R {
+    if TLCGET {
+        return f();
+    }
+    let cap = Capturing::start();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let c = cap.finish().cap;
+    let acts = held.cap.push_acts.get(i as usize).copied().unwrap_or(held.cap.acts);
+    let at = held.cap.lines.partition_point(|x| x.0 <= i);
+    held.cap.lines.splice(at..at, c.lines.into_iter().map(|(_, _, l)| (i, acts, l)));
+    let at = held.cap.made.partition_point(|x| x.0 <= i);
+    held.cap.made.splice(at..at, c.made.into_iter().map(|(_, a)| (i, a)));
+    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+}
+"##;
+
 /// TLC's evaluations while it builds its liveness graph, followed for what they print (pasted, and
 /// hooked into `RUNTIME` by `compile::live_sim_runtime`, only when they print). With one worker TLC
 /// evaluates, for each order of solution in turn (tlc2.tool.liveness.LiveCheck), after a state's
