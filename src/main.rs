@@ -53,6 +53,8 @@ const CAP_EXIT_SEQ: i32 = 71;
 const ORDER_EXIT: i32 = 72;
 /// How many times the checker is built again for the order of the strings it makes
 const ORDER_RUNS: usize = 8;
+/// The exit code of a checker that met an EXCEPT warning while exploring (WARN_EXIT in runtime.rs)
+const WARN_EXIT: i32 = 74;
 
 /// Key of a built checker: every file cargo reads in the generated crate, and the compiler version.
 /// Two SipHash passes with different prefixes give 128 bits.
@@ -256,10 +258,12 @@ fn main() {
     // How many strings ToString may list for a type with more values than strings can be added,
     // by type (see TOSTR_CAP in codegen.rs), and how many times each has grown
     let mut tostr: std::collections::HashMap<String, (usize, u32)> = Default::default();
+    // Whether the checker prints in TLC's order for the EXCEPT warnings it meets (see `compile`)
+    let mut warn_order = false;
     let mut first = true;
     loop {
         let t0 = Instant::now();
-        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect(), fp128, metal, &made);
+        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect(), fp128, metal, &made, warn_order);
         if first {
             for w in &output.warnings {
                 eprintln!("warning: {w}");
@@ -300,7 +304,7 @@ fn main() {
         let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0) else { return };
         // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs)
         let (scap, qcap) = output.caps;
-        let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).chain(['t']).collect();
+        let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).chain(['t', 'w']).collect();
         let mut cmd = Command::new(bin);
         cmd.args(&pass).env("TLA2RS_GROW", grow).env("TLA2RS_NEED", &need_file);
         let _ = std::fs::remove_file(&need_file);
@@ -317,6 +321,12 @@ fn main() {
                 eprintln!("tla2rs: the strings made while exploring were made in another order each time; the last run may order them differently from TLC");
             }
             println!("tla2rs: strings were made in another order than they were numbered in; checking again from the start with them in that order");
+            first = false;
+            continue;
+        }
+        if code == WARN_EXIT {
+            warn_order = true;
+            println!("tla2rs: an EXCEPT warned while exploring; checking again from the start with the lines printed in TLC's order");
             first = false;
             continue;
         }
@@ -358,12 +368,12 @@ fn main() {
 /// stack: evaluating a recursive operator at compile time nests deeply (up to value::REC_LIMIT
 /// calls)
 #[allow(clippy::too_many_arguments)]
-fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String]) -> compile::Output {
+fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> compile::Output {
     let (src, cfg_src, made) = (src.to_string(), cfg_src.to_string(), made.to_vec());
     let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
     let result = std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &tostr, fp128, metal, &made))
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &tostr, fp128, metal, &made, warn_order))
         .expect("start the compiler thread")
         .join()
         .unwrap_or_else(|_| Err("internal error in the compiler".into()));

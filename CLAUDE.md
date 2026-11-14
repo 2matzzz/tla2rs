@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1063 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1067 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -831,8 +831,15 @@ when it starts. The warnings:
   next-state relation through is evaluated once, when TLC reads the spec, so its warnings come
   when TLC starts, after the constant invariants and before the ASSUMEs (`Gen::split_warns`,
   `tests/tlc/ExceptSplit*`).
+  TLC prints a warning of Init, an action or an invariant where it evaluates it, as it computes and
+  checks each state, so a warning of a later `\E` or `\/` branch comes after the error on an earlier
+  successor, while TLC rebuilds the behavior (`tests/tlc/ExceptWarnEx*`). The checker follows it
+  with PRINT_ORDER, like the printed lines below; to keep the faster search (and `-batched`) for a
+  spec that can warn but never does, a checker whose code can warn without PRINT_ORDER
+  (`WARN_RERUN`) exits at its first warning when tla2rs runs it (`WARN_EXIT`, `w` in TLA2RS_GROW),
+  and tla2rs builds it again with PRINT_ORDER (`compile`'s `warn_order`) and checks from the start.
   Not followed: other places where the compiler evaluates a constant without the warnings it notes
-  (`Gen::try_const`)
+  (`Gen::try_const`), and the order of a warning that only the liveness checks raise
 
 TLC warns that SYMMETRY and constraints are dangerous when it checks temporal properties. It prints
 these warnings after the Print and PrintT of the constant definitions and before those of the
@@ -881,7 +888,8 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   state` (`lasso_prefix_prints`; `tests/tlc/PrintLasso*`)
 
 When Init, Next, an invariant, an action property or what TLC evaluates for its liveness graph prints
-(`PRINT_ORDER` in the generated checker, set by `compile.rs`), the checker marks each state `init` or `next` pushes and the start of each action
+(`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of Init, Next or an
+invariant warned, see above), the checker marks each state `init` or `next` pushes and the start of each action
 (`mark_push`, `mark_action`, generated only then), holds what Print and PrintT print while it
 computes states, and prints those lines as it handles the states (`Capturing`, `Held` in
 `runtime.rs`); `print_states_tlc` shows a behavior as above. Such specs are searched without
