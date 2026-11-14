@@ -454,6 +454,41 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// `t = f` for a tuple t and a function f over keys that are not all integers (a model value,
+    /// a string), as TLC compares them either way round (`FcnRcdValue.equals`): unequal when the
+    /// sizes differ; otherwise f's keys are walked in TLC's order, and the first that is not an
+    /// integer stops it with an error, one that is not the next index or whose value differs makes
+    /// them unequal. None when the types are not such a pair
+    fn tuple_fun_eq(&mut self, tc: &str, tt: &Ty, fc: &str, ft: &Ty) -> R<Option<String>> {
+        let Some(elems) = tuple_elems(tt).map(|v| v.into_iter().cloned().collect::<Vec<_>>()) else { return Ok(None) };
+        let Ty::PFun(kt, vt) = ft else { return Ok(None) };
+        if elems.is_empty() || matches!(kt.as_ref(), Ty::Int(..)) {
+            return Ok(None);
+        }
+        let kid = self.ty_id(kt)?;
+        let it = self.fun_iter("__f", ft, true)?;
+        let fail = format!("{{ let __b: bool = eval_error(format!(\"Attempted to compare an integer with non-integer:\\n{{}}.\", ppr(&fmt_{kid}(&__k)))); __b }}");
+        let walk = if matches!(kt.as_ref(), Ty::IntAtom(..)) {
+            let mut arms = vec![];
+            for (i, et) in elems.iter().enumerate() {
+                let j = join(vt, et)?;
+                let v = self.coerce("__v".into(), vt, &j)?;
+                let e = self.coerce(format!("__t{}", rec_field(elems.len(), i)), et, &j)?;
+                arms.push(format!("{i} => {v} == {e},"));
+            }
+            format!(
+                "{{ let mut __ok = true; for (__i, &(__k, __v)) in __ks.iter().enumerate() {{ if __k < i64::MIN + 65536 {{ {fail}; }} if __k != __i as i64 + 1 || !(match __i {{ {} _ => unreachable!() }}) {{ __ok = false; break; }} }} __ok }}",
+                arms.join(" ")
+            )
+        } else {
+            format!("{{ let (__k, _) = __ks[0]; {fail} }}")
+        };
+        Ok(Some(format!(
+            "{{ let __t = {tc}; let __f = {fc}; let __ks: Vec<_> = {it}.collect(); __ks.len() == {} && {walk} }}",
+            elems.len()
+        )))
+    }
+
     /// `a = b` when one side is a tuple (or sequence) and the other may be a string. TLC asks the
     /// value on the left: a tuple compares itself with the characters of a string, element by
     /// element; a string asked about a tuple stops with an error. A model value is unequal to both,
@@ -2381,6 +2416,20 @@ impl<'a> Gen<'a> {
                 }
                 Ok(s + "__o }")
             }
+            // A record as the function over its field names (see types::rec_keys)
+            (Ty::Rec(fs), Ty::PFun(..)) if crate::types::rec_keys(fs).is_some() => {
+                let (tk, tv) = fun_kv(to);
+                let r = self.fresh("r");
+                let mut s = format!("{{ let {r} = {code}; let mut __o = {}; ", Self::default_code(to));
+                for (i, (n, ft)) in fs.iter().enumerate() {
+                    let a = crate::value::string_atom(n).ok_or("a field name the compiler did not number")?;
+                    let kc = self.coerce(format!("{a}u16"), &Ty::Enum(vec![a]), &tk)?;
+                    let vc = self.coerce(format!("{r}{}", rec_field(fs.len(), i)), ft, &tv)?;
+                    s += &self.fun_put("__o", &kc, &vc, to)?;
+                    s += " ";
+                }
+                Ok(s + "__o }")
+            }
             // A tuple as a function over part of a type (1..n in it)
             (Ty::Rec(fs), Ty::PFun(d, c)) if is_tuple_fields(fs) && !is_sparse_fun(to) => {
                 let did = self.ty_id(d)?;
@@ -3871,6 +3920,11 @@ impl<'a> Gen<'a> {
                 if rt == Ty::Enum(vec![]) {
                     return Ok((format!("{{ let _ = {rc}; type_error(\"a record\", \"with a field {k}\") }}"), Ty::Enum(vec![])));
                 }
+                // A function over field names (a record joined with one, see types::rec_keys):
+                // r.a is r["a"]
+                if matches!(&rt, Ty::PFun(d, _) | Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Enum(_))) {
+                    return self.gen(&Expr::App(r.clone(), Expr::Str(k.clone()).b()), env, want);
+                }
                 let Ty::Rec(fs) = rt else { return Err(format!("field .{k} of a non-record")) };
                 let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
                 let fp = rec_field(fs.len(), i);
@@ -4178,6 +4232,18 @@ impl<'a> Gen<'a> {
                     Cmp::Normal => {}
                     Cmp::Unequal => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", op == Neq), Ty::Bool)),
                     Cmp::Fails(m) => {
+                        let walk = match self.tuple_fun_eq(&ac, &at, &bc, &bt)? {
+                            Some(c) => Some(c),
+                            None => self.tuple_fun_eq(&bc, &bt, &ac, &at)?,
+                        };
+                        if let Some(mut c) = walk {
+                            // A tuple TLC builds here (not a constant one) on the left reports an
+                            // error in its comparison as a fingerprint error too (measured)
+                            if tuple_elems(&at).is_some() && self.built(a, env) && !self.is_const(a, env) {
+                                c = format!("{{ let __fp = FpSource::enter(); {c} }}");
+                            }
+                            return Ok((if op == Eq { c } else { format!("!{c}") }, Ty::Bool));
+                        }
                         // As TLC reports it, with both values, for a tuple and an integer
                         let f = match (tuple_elems(&at).is_some(), &bt, &at, tuple_elems(&bt).is_some()) {
                             (true, Ty::Int(..), _, _) => Some("Attempted to check equality of the function {} with the value:\n{}"),

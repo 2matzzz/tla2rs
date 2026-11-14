@@ -783,9 +783,14 @@ impl Drop for FpSource {
     }
 }
 
+/// Whether e was raised inside an `FpSource`
+fn fp_err(e: &EvalErr) -> bool {
+    FP_ERR.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(e.msg())
+}
+
 /// TLC's second error after an error raised inside an `FpSource` (see above)
 fn fp_note(e: &EvalErr) {
-    if FP_ERR.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(e.msg()) {
+    if fp_err(e) {
         println!("Error: TLC was unable to fingerprint.\nReason:\n{}", e.msg());
     }
 }
@@ -3048,6 +3053,9 @@ impl Iterator for Batches {
     }
 }
 
+/// The number of initial states Init computed (without TLCGET, which handles each as it is computed)
+static INITS_COMPUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Computes the initial states and checks each one the way TLC does while generating them: every
 /// state counts as generated, one that satisfies the CONSTRAINT is kept if it is new, and the
 /// invariants are checked on the new ones and on those outside the CONSTRAINT. Returns the kept
@@ -3057,6 +3065,10 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // An error that is not one of its own evaluation errors, raised while checking an initial
     // state (CONSTRAINT, invariant, property), comes with that state.
     fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize) -> ! {
+        // TLC stops generating at once only on its own exceptions; after a fingerprint error while
+        // checking a state it still generates (and counts, without keeping) the remaining initial
+        // states (`ModelChecker.DoInitFunctor`)
+        let generated = if state.is_some() && fp_err(&e) { generated.max(INITS_COMPUTED.load(std::sync::atomic::Ordering::Relaxed)) } else { generated };
         report_eval_as(&e, false);
         if let Some(s) = state.filter(|_| !tlc_eval_exception(&e) && !matches!(e, EvalErr::Type(_))) {
             println!("While working on the initial state:\n{}\n", show(s));
@@ -3078,6 +3090,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         let cap = Capturing::start();
         failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err();
         held = cap.finish();
+        INITS_COMPUTED.store(inits.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
