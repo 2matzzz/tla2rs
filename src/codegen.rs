@@ -3309,7 +3309,7 @@ impl<'a> Gen<'a> {
                             return Ok(format!("{{ if {id}.get().is_none() && !{id}a.get() {{ let _ = {id}.get_or_init(&{id}f); }} {mask} }}"));
                         }
                     }
-                    if !shows(f) {
+                    if !prints(f) {
                         return Ok(mask);
                     }
                     let (fc, _) = g.gen_val(f, env)?;
@@ -3675,7 +3675,7 @@ impl<'a> Gen<'a> {
             }
             // A function over Nat, Int, STRING, ...: its body, at the argument. So too a function
             // whose body prints: TLC evaluates `[y \in S |-> e][x]` as e at x only
-            App(f, x) if self.lazy_fun_domain(f, env).is_some() || matches!(f.strip(), FunCons(_, _, b) if shows(b)) => {
+            App(f, x) if self.lazy_fun_domain(f, env).is_some() || matches!(f.strip(), FunCons(_, _, b) if prints(b)) => {
                 let (xc, xt) = self.gen(x, env, None)?;
                 let k = self.fresh("k");
                 let (c, t) = self.lazy_apply(f, &k, &xt, env, want)?;
@@ -5098,7 +5098,7 @@ impl<'a> Gen<'a> {
             let mut comparable = false;
             // TLC builds the set before it looks for x in it: when an element prints, every
             // element is evaluated first, in order
-            let eager = xs.iter().any(shows);
+            let eager = xs.iter().any(prints);
             let mut first = String::new();
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
@@ -6390,7 +6390,7 @@ impl<'a> Gen<'a> {
             // keeping that value for the uses after; but once applied, DOMAIN computes nothing,
             // and printing it computes it without keeping it (measured on TLC 2.19,
             // `tests/tlc/PrintFun`). `{id}a` tells whether it was applied
-            if matches!(x.strip(), Expr::FunCons(_, d, b) if shows(b) && !self.lazy_domain(d, &env2)) && !(env.init && !all_assigned && self.mentions_state(&x)) {
+            if matches!(x.strip(), Expr::FunCons(_, d, b) if prints(b) && !self.lazy_domain(d, &env2)) && !(env.init && !all_assigned && self.mentions_state(&x)) {
                 if let Ok((c, t)) = self.gen(&x, &env2, None) {
                     let id = self.fresh("b");
                     let r = t.repr();
@@ -7723,6 +7723,11 @@ fn mask(k: u32) -> u64 {
 /// The value of a shape that is a number, not code
 fn lit_bits(c: &str) -> Option<u64> {
     c.strip_suffix("u64").unwrap_or(c).parse().ok()
+}
+
+/// Whether e prints (Print, PrintT)
+fn prints(e: &Expr) -> bool {
+    e.any(&|y| matches!(y, Expr::Call(n, _) if n == "Print" || n == "PrintT"))
 }
 
 /// Whether evaluating e again prints or changes what TLC shows
