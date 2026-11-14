@@ -77,6 +77,10 @@ pub struct Gen<'a> {
     /// The spec reads or writes TLC's search state (TLCGet, TLCSet): each state is handled as it
     /// is computed (see TLCGET in the runtime)
     pub tlcget: bool,
+    /// The spec may build an empty tuple that TLC holds as one and prints `<<>>` (see
+    /// `compile::makes_empty_tuples`), so the checker cannot tell an empty function over part of a
+    /// type from it; without one, ToString of such a function makes `<< >>` (`Gen::shows_empty_fun`)
+    pub empty_tuples: bool,
     /// How deep recursive operators are being unrolled in an action
     unroll: u32,
     pub atoms: &'a Atoms,
@@ -201,6 +205,7 @@ impl<'a> Gen<'a> {
             case_at: None,
             zero_defs: HashSet::new(),
             tlcget: false,
+            empty_tuples: true,
             unroll: 0,
             atoms,
             ce: ConstEval { atoms, constants },
@@ -3050,9 +3055,9 @@ impl<'a> Gen<'a> {
                         .collect();
                     // A set of integers TLC holds as an interval prints as one (see `shape_of`)
                     let sh = if self.shape_slots(&t) > 0 { self.shape_of(x, &t, env) } else { "0".into() };
-                    if sh != "0" {
+                    if sh != "0" || self.shows_empty_fun(&t) {
                         for v in &vals {
-                            for s in self.shown_forms(v, &t).into_iter().skip(1) {
+                            for s in self.shown_forms(v, &t) {
                                 let id = self.atoms.intern(false, &s);
                                 table.push((s, id));
                             }
@@ -8193,8 +8198,12 @@ impl Gen<'_> {
     /// The texts TLC may print for v of type t: as enumerated sets first, then with some sets of
     /// integers held as intervals (at most 64 forms; beyond, the first only)
     pub fn shown_forms(&self, v: &Value, t: &Ty) -> Vec<String> {
+        // The checker prints an empty function over part of a type as `<< >>`, never `<<>>`
+        if matches!((t, v), (Ty::PFun(..), Value::Tuple(xs)) if xs.is_empty()) && self.shows_empty_fun(t) {
+            return vec!["<< >>".into()];
+        }
         let plain = crate::compile::show_value(self.atoms, v);
-        let has = self.shape_slots(t) > 0;
+        let has = self.shape_slots(t) > 0 || self.shows_empty_fun(t);
         let mut out = match (t, v) {
             (Ty::Set(e), _) if matches!(**e, Ty::Int(..)) => interval_text(v).into_iter().collect(),
             (Ty::Set(e), Value::Set(xs)) if has => {
@@ -8202,7 +8211,7 @@ impl Gen<'_> {
                 product(&parts).into_iter().map(|p| format!("{{{}}}", p.join(", "))).collect()
             }
             (Ty::Seq(_), Value::Tuple(xs)) if xs.is_empty() => vec!["<< >>".into()],
-            (Ty::Seq(e) | Ty::Fun(_, e), Value::Tuple(xs)) if self.shape_slots(t) > 1 || matches!(t, Ty::Fun(..)) && has => {
+            (Ty::Seq(e) | Ty::Fun(_, e), Value::Tuple(xs)) if self.shape_slots(t) > 1 || self.shows_empty_fun(e) || matches!(t, Ty::Fun(..)) && has => {
                 let parts: Vec<Vec<String>> = xs.iter().map(|x| self.shown_forms(x, e)).collect();
                 product(&parts).into_iter().map(|p| format!("<<{}>>", p.join(", "))).collect()
             }
@@ -8251,6 +8260,18 @@ impl Gen<'_> {
         out.insert(0, plain);
         out.dedup();
         out
+    }
+
+    /// Whether a value of type t may hold an empty function over part of a type that TLC holds as
+    /// a function, which it prints `<< >>` as the checker does (see `empty_tuples`)
+    fn shows_empty_fun(&self, t: &Ty) -> bool {
+        !self.empty_tuples
+            && match t {
+                Ty::PFun(..) => true,
+                Ty::Set(e) | Ty::Seq(e) | Ty::Fun(_, e) => self.shows_empty_fun(e),
+                Ty::Rec(fs) => fs.iter().any(|(_, f)| self.shows_empty_fun(f)),
+                _ => false,
+            }
     }
 
     /// The bits of shape a value of type t has: one for a set of integers; one per interval its
