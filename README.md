@@ -266,10 +266,16 @@ bounds the size of a model with temporal properties (one property per thread, so
   part of a type; nested modules can be instantiated; user-defined postfix operators (`^+`, `^*`, `^#`) and the
   infix operators `--`, `|-`, `??`, `!!` and `\bigcirc` are accepted; `Print` and `PrintT` write to stdout as TLC
   does, those in definitions of constant level without arguments and in ASSUMEs once, when the checker starts
-- Print and PrintT in the initial predicate, an action or an invariant print in TLC's order with one worker: each
-  state's lines before its checks, nothing past the state that stops the search, and the lines TLC prints again
-  while it rebuilds a counterexample (see CLAUDE.md, "Messages and printed lines"). Such specs are searched without
-  `-batched`
+- Print and PrintT in the initial predicate, an action, an invariant or an action property print in TLC's order
+  with one worker, as many times as TLC prints them: each state's lines before its checks, nothing past the state
+  that stops the search, the lines TLC prints again while it rebuilds a counterexample (a liveness one too) and
+  while it evaluates again after an invariant fails to evaluate, and in a function `[x \in S |-> e]` only where
+  TLC evaluates e (at the argument where it is applied, at every element where it is used as a value). Such specs
+  are searched without `-batched`. Not followed: an EXCEPT of such a function, and what TLC evaluates again while
+  it checks liveness (the steps of fair actions, the successors of a state its tableau adds a node to, the state
+  predicates of a property); see CLAUDE.md, "Messages and printed lines"
+- As SANY does, the level of `Print(out, val)` is that of val, and `PrintT(out)` is of constant level, so in a
+  temporal formula a part that reads a variable only in what it prints stops TLC with exit 151, as in TLC
 - `TLCGet` / `TLCSet` with one worker, with the values TLC 2.19 gives, also where it evaluates again to rebuild a
   counterexample: the registers `TLCGet(i)` / `TLCSet(i, v)` holding integers, `TLCGet("level")`, `("diameter")`,
   `("distinct")`, `("queue")` and `TLCSet("exit", TRUE)` (see CLAUDE.md, "TLCGet and TLCSet"). With them, several
