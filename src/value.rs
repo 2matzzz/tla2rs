@@ -1570,6 +1570,20 @@ impl ConstEval<'_> {
                 }
                 Value::Rec(m)
             }
+            // A record is a function from its field names: !["a"] is !.a
+            (Path::Idx(i), Value::Rec(mut m)) => {
+                let n = match self.eval(i, env)? {
+                    Value::Atom(a) if !self.atoms.is_model(a) => self.atoms.name(a),
+                    k => return Err(format!("EXCEPT path does not match the value: index {k:?} of a record")),
+                };
+                match m.remove(&n) {
+                    Some(old) => {
+                        m.insert(n, self.except_at(old, rest, val, at, env, warn)?);
+                    }
+                    None => missing(),
+                }
+                Value::Rec(m)
+            }
             // A function over strings: !.a is !["a"]
             (Path::Field(n), Value::Fun(mut m)) => {
                 match self.atoms.get(false, n).map(Value::Atom).and_then(|k| m.remove(&k).map(|old| (k, old))) {
