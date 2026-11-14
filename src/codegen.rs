@@ -61,6 +61,9 @@ pub struct Env {
     /// Computing whether an action is enabled: the label of the block that the first successor
     /// leaves with `true`, since TLC stops at the first successor it finds
     pub en_exit: Option<String>,
+    /// Names bound to a function `[y \in S |-> e]` whose body prints, where TLC evaluates the name
+    /// once (see `gen_bind`): name -> (the cell of its value, the function)
+    lazy_cells: HashMap<String, (String, Expr)>,
 }
 
 pub struct Gen<'a> {
@@ -1276,6 +1279,8 @@ impl<'a> Gen<'a> {
             Expr::Call(n, _) if n == "PrintT" || n == "Print" => false,
             // They read and write the search's state, each time they are evaluated
             Expr::Call(n, _) if n == "TLCGet" || n == "TLCSet" => false,
+            // A recursive operator or function whose body prints: at each call (`tests/tlc/PrintFun`)
+            Expr::RecCall(i, _) if crate::expand::rec_def(*i).body.any(&|y| matches!(y, Expr::Call(n, _) if n == "Print" || n == "PrintT")) => false,
             Expr::Label(n, a, b) if a.is_empty() && self.zero_defs.contains(n) => self.is_const_quiet(b, env),
             Expr::Label(n, a, b) if is_bind(n) => {
                 self.bind_const(a, env);
@@ -2886,13 +2891,14 @@ impl<'a> Gen<'a> {
                     (format!("{{ let __v = {vc}; tlc_print(printed(&[{s:?}, &fmt_{vid}(&__v)])); __v }}"), vt)
                 }
                 ("PrintT", [x]) => {
+                    let env = &Self::shown_once(env);
                     let (c, t) = self.gen(x, env, None)?;
                     let shown = self.fmt_shaped(x, "__x", &t, env)?;
                     (format!("{{ let __x = {c}; tlc_print(printed(&[&{shown}])); true }}"), Ty::Bool)
                 }
                 // TLC prints both arguments, two spaces apart
                 ("Print", [x, v]) => {
-                    let (c, t) = self.gen(x, env, None)?;
+                    let (c, t) = self.gen(x, &Self::shown_once(env), None)?;
                     let shown = self.fmt_shaped(x, "__x", &t, env)?;
                     let (vc, vt) = self.gen(v, env, want)?;
                     let vshown = self.fmt_shaped(v, "__v", &vt, env)?;
@@ -3294,20 +3300,35 @@ impl<'a> Gen<'a> {
                     self.ty_id(&st)?;
                     return Ok((format!("{{ let __n = ({fc}).len as u32; if __n >= 128 {{ u128::MAX }} else {{ (1u128 << __n) - 1 }} }}"), st));
                 }
+                // The domain follows from the type, but TLC computes the function (all of it,
+                // `[x \in S |-> e]` too), so what that prints is printed
+                let value = |g: &mut Self, mask: String| -> R<String> {
+                    // A name bound to such a function (see `gen_bind`): computed unless it was applied
+                    if let Ident(n, _) = f.strip() {
+                        if let Some((id, _)) = env.lazy_cells.get(n).filter(|(id, _)| env.locals.get(n).is_some_and(|l| l.0.contains(id.as_str()))) {
+                            return Ok(format!("{{ if {id}.get().is_none() && !{id}a.get() {{ let _ = {id}.get_or_init(&{id}f); }} {mask} }}"));
+                        }
+                    }
+                    if !shows(f) {
+                        return Ok(mask);
+                    }
+                    let (fc, _) = g.gen_val(f, env)?;
+                    Ok(format!("{{ let _ = {fc}; {mask} }}"))
+                };
                 if let Some(el) = tuple_elems(&ft) {
                     // A tuple of n elements is a function over 1..n
                     let n = el.len();
                     let st = Ty::Set(Ty::Int(1, n as i64).into());
                     self.ty_id(&st)?;
                     let mask: u128 = if n >= 128 { u128::MAX } else { (1u128 << n) - 1 };
-                    return Ok((format!("{mask}u128"), st));
+                    return Ok((value(self, format!("{mask}u128"))?, st));
                 }
                 let Ty::Fun(d, _) = ft else { return Err("DOMAIN of a non-function".into()) };
                 let st = Ty::Set(d.clone());
                 self.ty_id(&st)?;
                 let n = d.size().unwrap();
                 let mask: u128 = if n >= 128 { u128::MAX } else { (1u128 << n) - 1 };
-                (format!("{mask}u128"), st)
+                (value(self, format!("{mask}u128"))?, st)
             }
             // UNCHANGED e for an expression that is not a tuple of variables is e' = e
             Un(UOp::Unchanged, x) if Self::unchanged_vars(x, &mut vec![]).is_err() => {
@@ -3634,8 +3655,27 @@ impl<'a> Gen<'a> {
                 }
                 (rec_build(&parts), Ty::Rec(tys))
             }
-            // A function over Nat, Int, STRING, ...: its body, at the argument
-            App(f, x) if self.lazy_fun_domain(f, env).is_some() => {
+            // A name bound to a function whose body prints (see `gen_bind`): its value once
+            // computed, else its body at the argument
+            App(f, x) if matches!(f.strip(), Ident(n, _) if env.lazy_cells.contains_key(n) && env.locals.get(n).is_some_and(|l| l.0.contains(&env.lazy_cells[n].0))) => {
+                let Ident(n, _) = f.strip() else { unreachable!() };
+                let (id, fx) = env.lazy_cells[n].clone();
+                let (xc, xt) = self.gen(x, env, None)?;
+                let k = self.fresh("k");
+                let (lc, lt) = self.lazy_apply(&fx, &k, &xt, env, want)?;
+                let ft = env.locals[n].1.clone();
+                let v = self.fresh("v");
+                let mut env3 = env.clone();
+                env3.bind("#lv", format!("(*{v})"), ft);
+                env3.bind("#lk", k.clone(), xt.clone());
+                let (vc, vt) = self.gen(&App(Ident("#lv".into(), NOPOS).b(), Ident("#lk".into(), NOPOS).b()), &env3, want)?;
+                let t = Self::layout(want, join(&vt, &lt)?);
+                let (vc, lc) = (self.coerce(vc, &vt, &t)?, self.coerce(lc, &lt, &t)?);
+                (format!("{{ let {k} = {xc}; match {id}.get() {{ Some({v}) => {vc}, None => {{ {id}a.set(true); {lc} }} }} }}"), t)
+            }
+            // A function over Nat, Int, STRING, ...: its body, at the argument. So too a function
+            // whose body prints: TLC evaluates `[y \in S |-> e][x]` as e at x only
+            App(f, x) if self.lazy_fun_domain(f, env).is_some() || matches!(f.strip(), FunCons(_, _, b) if shows(b)) => {
                 let (xc, xt) = self.gen(x, env, None)?;
                 let k = self.fresh("k");
                 let (c, t) = self.lazy_apply(f, &k, &xt, env, want)?;
@@ -5056,8 +5096,19 @@ impl<'a> Gen<'a> {
             let mut parts = vec![];
             let mut clash = None;
             let mut comparable = false;
+            // TLC builds the set before it looks for x in it: when an element prints, every
+            // element is evaluated first, in order
+            let eager = xs.iter().any(shows);
+            let mut first = String::new();
             for e in xs {
                 let (c, t) = self.gen(e, env, Some(xt))?;
+                let c = if eager {
+                    let v = self.fresh("el");
+                    first += &format!("let {v} = {c}; ");
+                    v
+                } else {
+                    c
+                };
                 if self.str_meets_int(xt, &t) {
                     let j = join(xt, &t)?;
                     let xc = self.coerce(x.to_string(), xt, &j)?;
@@ -5092,9 +5143,11 @@ impl<'a> Gen<'a> {
                 if comparable {
                     return Err(format!("{m}: {}", short(s)));
                 }
-                return Ok(format!("({} || {})", parts.join(" || "), eval_error_bool(&m)));
+                let test = format!("({} || {})", parts.join(" || "), eval_error_bool(&m));
+                return Ok(if eager { format!("{{ {first}{test} }}") } else { test });
             }
-            return Ok(if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) });
+            let test = if parts.is_empty() { "false".into() } else { format!("({})", parts.join(" || ")) };
+            return Ok(if eager { format!("{{ {first}{test} }}") } else { test });
         }
         let (sc, st) = self.gen_val(s, env)?;
         // An element of a set with no elements, such as the bound variable of `{c \\in {} : x \\in c}`:
@@ -6332,6 +6385,21 @@ impl<'a> Gen<'a> {
         for k in 0..pairs.len() {
             let (n, x) = pairs[k].clone();
             let all_assigned = env.primed.len() == self.vars.len();
+            // A function whose body prints: TLC keeps it unevaluated, evaluates e at the argument
+            // where it is applied, and computes all of it the first time it is used as a value,
+            // keeping that value for the uses after; but once applied, DOMAIN computes nothing,
+            // and printing it computes it without keeping it (measured on TLC 2.19,
+            // `tests/tlc/PrintFun`). `{id}a` tells whether it was applied
+            if matches!(x.strip(), Expr::FunCons(_, d, b) if shows(b) && !self.lazy_domain(d, &env2)) && !(env.init && !all_assigned && self.mentions_state(&x)) {
+                if let Ok((c, t)) = self.gen(&x, &env2, None) {
+                    let id = self.fresh("b");
+                    let r = t.repr();
+                    write!(lets, "let {id}: std::cell::OnceCell<{r}> = std::cell::OnceCell::new(); let {id}f = || -> {r} {{ {c} }}; let {id}a = std::cell::Cell::new(false); ").unwrap();
+                    env2.bind(&n, format!("(*{id}.get_or_init(&{id}f))"), t);
+                    env2.lazy_cells.insert(n.clone(), (id, x.clone()));
+                    continue;
+                }
+            }
             // A constant whose computation TLC warns about (an EXCEPT) is computed where first used
             // too, so that it warns once for the evaluation, as TLC does (`tests/tlc/ExceptFold-Arg`)
             let warns = || !self.try_const_made(&x, &env2).1.warns.is_empty();
@@ -6357,6 +6425,18 @@ impl<'a> Gen<'a> {
             body = crate::expand::subst_ident(&body, &n, &x);
         }
         Ok((lets, env2, body))
+    }
+
+    /// `env` where a function bound in `lazy_cells` that was applied and is not computed yet is
+    /// computed without keeping its value, as TLC prints it (see `gen_bind`)
+    fn shown_once(env: &Env) -> Env {
+        let mut env = env.clone();
+        for (n, (id, _)) in env.lazy_cells.clone() {
+            if let Some(l) = env.locals.get_mut(&n).filter(|l| l.0.contains(&id)) {
+                l.0 = format!("(match {id}.get() {{ Some(__c) => *__c, None if {id}a.get() => {id}f(), None => *{id}.get_or_init(&{id}f) }})");
+            }
+        }
+        env
     }
 
     /// Whether every element is a variable, primed or not, whose value `env` has

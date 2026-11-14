@@ -260,6 +260,10 @@ thread_local! {
     /// strings made while computing each (noted again where the value is used again, see
     /// `eval_bound`)
     static BOUND_VALUES: std::cell::RefCell<HashMap<(String, Vec<Option<Value>>), (Value, Vec<u32>)>> = std::cell::RefCell::new(HashMap::new());
+    /// The values of bound names whose computation printed, kept only while the BIND label that
+    /// binds them is evaluated: TLC evaluates such a name once each time it evaluates the LET or
+    /// the call, where first used (`eval_bound`)
+    static PRINTED_VALUES: std::cell::RefCell<HashMap<(String, Vec<Option<Value>>), Value>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Forgets the bound names and their values (the names are fresh for each expansion; the values
@@ -269,6 +273,7 @@ pub fn clear_bound() {
     BOUND_RECS.with(|b| b.borrow_mut().clear());
     BOUND_FREE.with(|b| b.borrow_mut().clear());
     BOUND_VALUES.with(|b| b.borrow_mut().clear());
+    PRINTED_VALUES.with(|b| b.borrow_mut().clear());
 }
 
 /// Notes the names the BIND labels in e bind (also in the recursive definitions e calls), before
@@ -646,7 +651,8 @@ impl ConstEval<'_> {
 
     /// The value of the bound name n, whose expression is x: evaluated where n is first used, as
     /// the expression written out there would be, and kept for the values of the names it depends
-    /// on. A value whose computation printed is not kept, so it prints again at each use, as before.
+    /// on. A value whose computation printed is kept only while the BIND label is evaluated (see
+    /// PRINTED_VALUES), so it prints again where the LET or the call is evaluated again.
     /// The strings made computing it are noted again at each use: code generation notes the
     /// strings a constant part makes where it folds the part (`Gen::note_folded`)
     fn eval_bound(&self, n: &str, x: &Expr, env: &HashMap<String, Value>) -> R<Value> {
@@ -655,6 +661,9 @@ impl ConstEval<'_> {
             for a in made {
                 self.atoms.made(a);
             }
+            return Ok(v);
+        }
+        if let Some(v) = PRINTED_VALUES.with(|b| b.borrow().get(&key).cloned()) {
             return Ok(v);
         }
         let prints = PRINTS.with(|p| p.get());
@@ -668,6 +677,8 @@ impl ConstEval<'_> {
         let v = v?;
         if PRINTS.with(|p| p.get()) == prints {
             BOUND_VALUES.with(|b| b.borrow_mut().insert(key, (v.clone(), made)));
+        } else {
+            PRINTED_VALUES.with(|b| b.borrow_mut().insert(key, v.clone()));
         }
         Ok(v)
     }
@@ -720,6 +731,23 @@ impl ConstEval<'_> {
                 } else {
                     return Err(format!("`{n}` is not a constant"));
                 }
+            }
+            // The values of its names that printed are kept while it is evaluated, and computed
+            // again the next time (see PRINTED_VALUES)
+            Label(n, pairs, b) if is_bind(n) => {
+                let names: Vec<&str> = pairs.chunks(2).filter_map(|p| if let Ident(m, _) = &p[0] { Some(m.as_str()) } else { None }).collect();
+                let take = |names: &[&str]| -> Vec<((String, Vec<Option<Value>>), Value)> {
+                    PRINTED_VALUES.with(|v| {
+                        let mut v = v.borrow_mut();
+                        let keys: Vec<_> = v.keys().filter(|k| names.contains(&k.0.as_str())).cloned().collect();
+                        keys.into_iter().map(|k| { let x = v.remove(&k).unwrap(); (k, x) }).collect()
+                    })
+                };
+                let outer = take(&names);
+                let r = self.eval(b, env);
+                take(&names);
+                PRINTED_VALUES.with(|v| v.borrow_mut().extend(outer));
+                r?
             }
             // TLC gives the position of a CASE or CHOOSE that fails (see ast::AT)
             Label(n, _, b) => match (crate::ast::err_pos_of(n), self.eval(b, env)) {
@@ -1703,7 +1731,17 @@ impl ConstEval<'_> {
 
     /// Whether `e` evaluates to a string
     fn is_str(&self, e: &Expr, env: &HashMap<String, Value>) -> bool {
-        matches!(self.eval(e, env), Ok(Value::Atom(a)) if !self.atoms.is_model(a))
+        // The operator evaluates e again: what it prints is printed then, once
+        let saved = PRINTED.with(|p| p.replace(None));
+        let prints = PRINTS.with(|p| p.get());
+        let kept = PRINTED_VALUES.with(|v| v.borrow().clone());
+        let r = matches!(self.eval(e, env), Ok(Value::Atom(a)) if !self.atoms.is_model(a));
+        PRINTED.with(|p| *p.borrow_mut() = saved);
+        if PRINTS.with(|p| p.get()) != prints {
+            PRINTS.with(|p| p.set(prints));
+            PRINTED_VALUES.with(|v| *v.borrow_mut() = kept);
+        }
+        r
     }
 
     /// The text of a string-valued expression

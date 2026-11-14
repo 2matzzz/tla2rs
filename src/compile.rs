@@ -1419,6 +1419,13 @@ fn compile_inner(
             if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) || bound_reads_state(&n, &m) {
                 continue;
             }
+            // A recursive function `f[x \in S] == e` is not evaluated then: TLC evaluates it
+            // where it is applied, at the argument only (and again at each application), and all
+            // of it where it is used as a value (`tests/tlc/PrintFun`)
+            let app = format!("{n}#app");
+            if m.defs.iter().any(|d| d.name == app) && has_prints(&ex.expand_def_bound(&n).unwrap_or(Expr::Bool(true))) {
+                continue;
+            }
             let Ok(e) = ex.expand_def_bound(&n) else { continue };
             if has_prints(&e) || has_except(&e) {
                 // TLC ignores a definition it fails to evaluate here (and may warn about an
@@ -1554,7 +1561,9 @@ fn compile_inner(
     let mut g = Gen::new(&atoms, &constants);
     g.track_from = track_from as u32;
     g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
-    g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
+    // Not a recursive function that prints: TLC does not evaluate it when it starts (see above)
+    let printing_rec = |n: &str| m.defs.iter().any(|d| d.name == format!("{n}#app") && has_prints(&d.body));
+    g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty() && !printing_rec(&d.name)).map(|d| d.name.clone()).collect();
     g.def_pos = m.defs.iter().filter_map(|d| match &d.body {
         Expr::Label(n, _, _) => pos_of(n).map(|p| (d.name.clone(), p.to_string())),
         _ => None,
