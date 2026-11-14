@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1063 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1078 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -977,14 +977,25 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   comparison fails (`<<"a">> \in {"ab"}`, `<<1, 2>> # s`) (`tests/tlc/FpErr*`). Code generation
   wraps such an operation in an `FpSource` when it can fail (`Gen::fp_source`). Such an error while
   checking an initial state does not stop TLC from generating the remaining initial states, which it
-  counts as generated without keeping them (`tests/tlc/TupleFunFail`: 3 generated, 1 distinct; TLC's
-  own exceptions stop it at once)
+  counts as generated without keeping or checking them, with what Init prints for them
+  (`tests/tlc/TupleFunFail`: 3 generated, 1 distinct; `TupleFunPrint`; TLC's own exceptions stop it
+  at once). In a spec that reads TLCGet, where each initial state is checked as Init computes it
+  (`TLCGET`), Init goes on after
+  the error and the states it still computes are only counted (`initial_states`, `TupleFunGet`)
 - A tuple compared with a function over keys that are not all integers (`<<1, x>> = (1 :> 1 @@ m :>
   x)`, `<<x>> = ("a" :> x)`), with either on the left: unequal when the sizes differ, otherwise TLC
   walks the function's keys in its order, and the first that is not an integer stops it with
   `Attempted to compare an integer with non-integer:` and the key followed by `.`, while an integer
-  key that is not the next index, or whose value differs, makes them unequal. A tuple built there on
-  the left adds `TLC was unable to fingerprint.` (`tests/tlc/TupleFunFail*`, `Gen::tuple_fun_eq`)
+  key that is not the next index, or whose value differs, makes them unequal. A value built there on
+  the left adds `TLC was unable to fingerprint.` (`tests/tlc/TupleFunFail*`, `Gen::tuple_fun_eq`).
+  Such a pair inside tuples of one length, records of the same fields or sets of one size is reached
+  part by part in order (sets in TLC's order of their elements), and the first part that differs
+  makes them unequal (`tests/tlc/TupleFunNest*`, `Gen::walk_eq`). In a set written out, TLC asks each
+  element in turn whether it equals the value, with the same error and a fingerprint error from the
+  set (`tests/tlc/TupleFunIn*`). Not followed: a tuple in a sorted set of such functions (from a
+  definition or the state), which TLC searches with its order instead, `Attempted to compare integer
+  with non-integer:` and the key (measured; following it needs TLC's binary search and its order
+  between a tuple and a function); tla2rs reports its own message there
 - A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
   tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
