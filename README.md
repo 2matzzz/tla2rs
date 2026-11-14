@@ -243,8 +243,11 @@ bounds the size of a model with temporal properties (one property per thread, so
   `("a-b" :> 1 @@ ...)` otherwise, as in TLC. A record and the function over its field names built with `:>`, `@@`,
   `[x \in S |-> e]` or EXCEPT are one value (`[f EXCEPT !.a = e]` updates such a function too), also as elements of a set the compiler evaluates, and a variable may hold both
   (one that holds records of different fields and such a function is refused). ToString of a value from the state interns the string of every value
-  of its type at compile time, so the type must have at most as many values as the 16-bit string ids leave room for
-  (65536 strings and model values in all). ToString of a record whose fields the spec writes in another order than
+  of its type at compile time, as the 16-bit string ids leave room for 65536 strings and model values in all. A type
+  with more values (integers whose range the type inference leaves unbounded) gets the strings of the values whose
+  integers are nearest 0, at most 256 at first; when the checker meets another, tla2rs prints `tla2rs: ToString met a
+  value whose string is not among the N listed for its type; checking again from the start with room for M`, builds
+  it with more for that type and checks again from the start, as for capacities. ToString of a record whose fields the spec writes in another order than
   TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends
   on when that happens
 - A function over part of a type (and a bag) is an array over the whole type when the type has at most 65536 values.

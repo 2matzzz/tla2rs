@@ -819,13 +819,52 @@ pub fn elem_ty_of_domain(s: &BTreeSet<Value>) -> R<Ty> {
     Ok(t)
 }
 
+/// The type `t` with each range of integers of more than `w` values cut to the `w` of them
+/// nearest 0 (the domains of functions left as they are)
+pub fn int_window(t: &Ty, w: u64) -> Ty {
+    let cut = |lo: i64, hi: i64| -> (i64, i64) {
+        if int_count(lo, hi).is_some_and(|n| n <= w) {
+            return (lo, hi);
+        }
+        let w = w.min(BIG as u64) as i64;
+        let a = if lo >= 0 {
+            lo
+        } else if hi <= 0 {
+            hi - w + 1
+        } else {
+            (-(w / 2)).max(lo).min(hi - w + 1)
+        };
+        (a, a + w - 1)
+    };
+    let b = |t: &Ty| Box::new(int_window(t, w));
+    match t {
+        Ty::Int(lo, hi) => {
+            let (lo, hi) = cut(*lo, *hi);
+            Ty::Int(lo, hi)
+        }
+        Ty::IntAtom(lo, hi, a) => {
+            let (lo, hi) = cut(*lo, *hi);
+            Ty::IntAtom(lo, hi, a.clone())
+        }
+        Ty::Rec(fs) => Ty::Rec(fs.iter().map(|(k, t)| (k.clone(), int_window(t, w))).collect()),
+        Ty::Opt(t) => Ty::Opt(b(t)),
+        Ty::Set(e) => Ty::Set(b(e)),
+        Ty::Seq(e) => Ty::Seq(b(e)),
+        Ty::Fun(d, c) => Ty::Fun(d.clone(), b(c)),
+        Ty::PFun(d, c) => Ty::PFun(d.clone(), b(c)),
+        Ty::Bool | Ty::Enum(_) | Ty::Bag(_) => t.clone(),
+    }
+}
+
 /// Every value of type `t`, for types whose values can be listed: sets of at most `scap`
 /// elements (when held as arrays), sequences of at most `qcap` elements. None when there are more
-/// than `limit` values or the type is unbounded.
-pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<Value>> {
+/// than `limit` values or the type is unbounded. With `window`, only the values whose integers
+/// lie in `int_window` of it are listed.
+pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, scap: usize, limit: usize) -> Option<Vec<Value>> {
     use crate::value::fun_value;
     let out: Vec<Value> = match t {
         _ if t.size().is_some() && !matches!(t, Ty::Rec(_)) => {
+            let t = &window.map_or_else(|| t.clone(), |w| int_window(t, w));
             if t.size()? > limit as u64 {
                 return None;
             }
@@ -836,8 +875,8 @@ pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<
             let mut rows: Vec<Vec<Option<Value>>> = vec![vec![]];
             for (_, ft) in fs {
                 let (vals, opt) = match ft {
-                    Ty::Opt(i) => (all_values(i, qcap, scap, limit)?, true),
-                    ft => (all_values(ft, qcap, scap, limit)?, false),
+                    Ty::Opt(i) => (all_values(i, window, qcap, scap, limit)?, true),
+                    ft => (all_values(ft, window, qcap, scap, limit)?, false),
                 };
                 let mut next = vec![];
                 for r in &rows {
@@ -864,7 +903,7 @@ pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<
                 .collect()
         }
         Ty::Set(e) => {
-            let elems = all_values(e, qcap, scap, limit)?;
+            let elems = all_values(e, window, qcap, scap, limit)?;
             let cap = if is_sparse(t) { scap.min(elems.len()) } else { elems.len() };
             let mut out: Vec<BTreeSet<Value>> = vec![BTreeSet::new()];
             for x in &elems {
@@ -888,7 +927,7 @@ pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<
                 return None;
             }
             let keys = d.enumerate();
-            let vals = all_values(c, qcap, scap, limit)?;
+            let vals = all_values(c, window, qcap, scap, limit)?;
             let partial = matches!(t, Ty::PFun(..));
             let mut maps: Vec<std::collections::BTreeMap<Value, Value>> = vec![Default::default()];
             for k in &keys {
@@ -911,7 +950,7 @@ pub fn all_values(t: &Ty, qcap: usize, scap: usize, limit: usize) -> Option<Vec<
             maps.into_iter().map(fun_value).collect()
         }
         Ty::Seq(e) => {
-            let elems = all_values(e, qcap, scap, limit)?;
+            let elems = all_values(e, window, qcap, scap, limit)?;
             let mut out = vec![Value::Tuple(vec![])];
             let mut last = vec![vec![]];
             for _ in 0..qcap {
