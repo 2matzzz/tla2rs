@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1063 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1068 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -861,7 +861,10 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   again makes it exit with 255. With `-continue` it reports the exception it did not expect before
   that pass, and one that fails to evaluate again there as a failed invariant with its behavior,
   then as the error itself with the behavior again (`again_failed`; `tests/tlc/AgainTwice`,
-  `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After an error while computing or checking
+  `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After the CONSTRAINT, the ACTION_CONSTRAINT
+  or the VIEW fails to evaluate on a successor, it reports the error and then generates the
+  successors once more in the same way, up to the error (`tests/tlc/AgainCon*`, also with liveness
+  checking). After an error while computing or checking
   the initial states (in Init, the CONSTRAINT, an invariant or a property), it reports the error
   and then computes and checks them again from the start, printing again up to the error
   (`init_again_prints`; `tests/tlc/PrintAgain*`)
@@ -945,8 +948,6 @@ Not followed:
 - What TLC evaluates for its liveness graph under a VIEW or a SYMMETRY (not measured with printing;
   the checker evaluates on the successors as generated), and with several orders of solution, which
   TLC takes in an order that changes from run to run
-- After a CONSTRAINT fails to evaluate on a successor, TLC generates the successors of the state it
-  was expanding once more, printing again up to the error; the checker does not
 - For a spec that prints nowhere, an invariant that fails to evaluate again in the pass after the
   behavior with `-continue` is still reported once (its code is kept as it was)
 

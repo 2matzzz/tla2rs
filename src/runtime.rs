@@ -2149,8 +2149,11 @@ enum Found {
     Succ(u32, State, u32, SMsg, bool),
     /// An evaluation error while expanding the parent state.
     Eval(u32, EvalErr),
-    /// An error for which TLC shows no behavior (SMsg::Untraced or SMsg::Live).
+    /// An error for which TLC shows no behavior (SMsg::Live).
     Live(SMsg),
+    /// An error in the CONSTRAINT, the ACTION_CONSTRAINT or the VIEW on a successor of the parent
+    /// state (SMsg::Untraced).
+    Untraced(u32, EvalErr),
     Deadlock(u32),
 }
 
@@ -2421,7 +2424,7 @@ fn expand(g: &Graph, lo: usize, hi: usize, seen: &Shards, stop: &std::sync::atom
             Ok(f) => f,
             Err(p) => Some(match classify(p) {
                 (e, true) => Found::Eval(head as u32, e),
-                (e, false) => Found::Live(SMsg::Untraced(e)),
+                (e, false) => Found::Untraced(head as u32, e),
             }),
         };
         // Checking liveness, TLC writes a state to `-dump FILE` again after its new successors,
@@ -2692,8 +2695,9 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
     }
 }
 
-/// After an error in evaluating an invariant on a new state, TLC evaluates the state it was
-/// expanding again to report where the error is (`ModelChecker`, with `CallStackTool`): it
+/// After an error in evaluating an invariant on a new state, or the CONSTRAINT, the
+/// ACTION_CONSTRAINT or the VIEW on a successor, TLC evaluates the state it was expanding again to
+/// report where the error is (`ModelChecker`, with `CallStackTool`): it
 /// generates all the successors of the state once more, printing what the actions print, writes
 /// an edge for each in the model to the graph, adds the ones it has not seen (the failing one was
 /// added the first time, so it is passed over now) and queues them, checks the invariants of new
@@ -3984,14 +3988,16 @@ fn merge_chunk(c: SChunk, generated: &mut u64, distinct: &mut u64, nxt: &mut Lev
 
 /// Reports a detected error and exits. Never returns.
 fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distinct: u64, left: usize) -> ! {
-    // The state whose new successor failed to evaluate an invariant: the one before it on the
-    // trace, which TLC evaluates again after showing the behavior (`eval_replay`)
-    let again = if f.extra.is_none() && matches!(f.msg, SMsg::InvEval(..)) {
-        let parent = seen.pred_of(f.fp).and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c));
-        parent.as_ref().and_then(|t| t.last()).map(|&(s, _)| s)
-    } else {
-        None
+    // The state TLC evaluates again after the error (`eval_replay`): the one before a new
+    // successor that failed to evaluate an invariant (after showing the behavior), or the one whose
+    // successor failed to evaluate the CONSTRAINT, the ACTION_CONSTRAINT or the VIEW
+    let again_at = match f.msg {
+        SMsg::InvEval(..) if f.extra.is_none() => seen.pred_of(f.fp),
+        SMsg::Untraced(_) => Some(f.fp),
+        _ => None,
     };
+    let again_trace = again_at.and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c));
+    let again = again_trace.as_ref().and_then(|t| t.last()).map(|&(s, _)| s);
     let mut left = left;
     let code = report_msg(&f.msg, f.in_model);
     // As in TLC, a successor that left its type counts as one state, and so does a new successor
@@ -4020,7 +4026,7 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
         left += added as usize - failed.is_some() as usize;
         if let Some(a) = failed {
             code = 255;
-            if let Some(trace) = seen.pred_of(f.fp).and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c)) {
+            if let Some(trace) = &again_trace {
                 again_failed(&a, &|t, l| {
                     if PRINT_ORDER {
                         print_states_tlc(&trace, trace.len(), Some((*t, l)));
@@ -4862,6 +4868,14 @@ fn run_liveness(opt: &Opt) {
                     }
                     // TLC shows no behavior for these
                     Found::Live(m) => report_msg(&m, true),
+                    Found::Untraced(p, e) => {
+                        let code = report_msg(&SMsg::Untraced(e), true);
+                        let s = g.state(p as usize);
+                        let (added, _) = eval_replay(&s, state_fp(&s, &g.states.get(p as usize)), &|fp| seen.contains(fp));
+                        distinct += added as usize;
+                        queued = added as usize;
+                        code
+                    }
                     Found::Eval(p, e) => {
                         let pseudo = matches!(e, EvalErr::Type(_));
                         let unassigned = matches!(e, EvalErr::Incomplete(_));

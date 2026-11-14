@@ -272,12 +272,12 @@ bounds the size of a model with temporal properties (one property per thread, so
 - Print and PrintT in the initial predicate, an action, an invariant, a constraint or an action property print in
   TLC's order with one worker, as many times as TLC prints them: each state's lines before its checks, nothing
   past the state that stops the search, the lines TLC prints again while it rebuilds a counterexample (a liveness
-  one too) and while it evaluates again after an invariant fails to evaluate, and in a function `[x \in S |-> e]`
-  only where TLC evaluates e (at the argument where it is applied, at every element where it is used as a value,
-  also through EXCEPT), and in what TLC evaluates while it builds its liveness graph (the steps of fair actions,
-  the predicates of the properties, the particles of its tableau, the successors of a state its tableau adds a
-  node to). Such specs are searched without `-batched`. Not followed: this under a VIEW or a SYMMETRY, and a few
-  uses of EXCEPT; see CLAUDE.md, "Messages and printed lines"
+  one too) and while it evaluates again after an invariant, a constraint or the VIEW fails to evaluate, and in a
+  function `[x \in S |-> e]` only where TLC evaluates e (at the argument where it is applied, at every element where
+  it is used as a value, also through EXCEPT), and in what TLC evaluates while it builds its liveness graph (the
+  steps of fair actions, the predicates of the properties, the particles of its tableau, the successors of a state
+  its tableau adds a node to). Such specs are searched without `-batched`. Not followed: this under a VIEW or a
+  SYMMETRY, and a few uses of EXCEPT; see CLAUDE.md, "Messages and printed lines"
 - As SANY does, the level of `Print(out, val)` is that of val, and `PrintT(out)` is of constant level, so in a
   temporal formula a part that reads a variable only in what it prints stops TLC with exit 151, as in TLC
 - `TLCGet` / `TLCSet` with one worker, with the values TLC 2.19 gives, also where it evaluates again to rebuild a
