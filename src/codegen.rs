@@ -525,6 +525,56 @@ impl<'a> Gen<'a> {
         )))
     }
 
+    /// `x \in S` for a tuple x and a sorted set S (from a definition or the state) of functions
+    /// over keys that are not all integers. TLC searches S by halves with its order
+    /// (`ValueVec.search`), comparing x with each element it visits (`TupleValue.compareTo`,
+    /// `FcnRcdValue.compareToInterval`): by size, then key by key in TLC's order, where a key that
+    /// is not an integer stops it with an error, and an integer key against the index, then the
+    /// values. None when the types are not such a pair
+    fn tuple_fun_search(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<Option<String>> {
+        let et = Self::elem_of(st);
+        if !tuple_fun_pair(xt, &et) {
+            return Ok(None);
+        }
+        let ft = match &et {
+            Ty::Fun(d, r) => Ty::PFun(d.clone(), r.clone()),
+            t => t.clone(),
+        };
+        let Ty::PFun(kt, vt) = &ft else { return Ok(None) };
+        let elems: Vec<Ty> = tuple_elems(xt).unwrap().into_iter().cloned().collect();
+        let mut arms = vec![];
+        for (i, t) in elems.iter().enumerate() {
+            let Ok(j) = join(vt, t) else { return Ok(None) };
+            let v = self.coerce("__v".into(), vt, &j)?;
+            let e = self.coerce(format!("__t{}", rec_field(elems.len(), i)), t, &j)?;
+            let cmp = self.tlc_cmp(&j, "(&__a)", "(&__b)")?;
+            arms.push(format!("{i} => {{ let (__a, __b) = ({e}, {v}); ({cmp}) as i64 }},"));
+        }
+        let kid = self.ty_id(kt)?;
+        let fail = format!("{{ let __b: i64 = eval_error(format!(\"Attempted to compare integer with non-integer:\\n{{}}.\", ppr(&fmt_{kid}(&__k)))); __b }}");
+        let key = if matches!(kt.as_ref(), Ty::IntAtom(..)) {
+            format!("if __k < i64::MIN + 65536 {{ {fail}; }} let __o = __i as i64 + 1 - __k;")
+        } else {
+            format!("{fail}; let __o = 0i64;")
+        };
+        let f = self.coerce("__xs[__mid]".into(), &et, &ft)?;
+        let it = self.fun_iter("__f", &ft, true)?;
+        let order = self.tlc_cmp(&et, "x", "y")?;
+        let sit = self.s_iter("__s", st)?;
+        let n = elems.len();
+        Ok(Some(format!(
+            "{{ let __t = {x}; let __s = {c}; let mut __xs: Vec<{}> = {sit}.collect(); __xs.sort_by(|x, y| {order}); \
+             let (mut __lo, mut __hi, mut __found) = (0usize, __xs.len(), false); \
+             while __lo < __hi {{ let __mid = (__lo + __hi) >> 1; let __f = {f}; let __ks: Vec<_> = {it}.collect(); \
+             let mut __c = {n} - __ks.len() as i64; \
+             if __c == 0 {{ for (__i, &(__k, __v)) in __ks.iter().enumerate() {{ {key} \
+             let __o = if __o != 0 {{ __o }} else {{ match __i {{ {} _ => unreachable!() }} }}; if __o != 0 {{ __c = __o; break; }} }} }} \
+             if __c == 0 {{ __found = true; break; }} if __c < 0 {{ __hi = __mid; }} else {{ __lo = __mid + 1; }} }} __found }}",
+            et.repr(),
+            arms.join(" ")
+        )))
+    }
+
     /// Whether TLC compares values of types `a` and `b` part by part down to the pairs where
     /// `tuple_cmp` fails, and each of those is a tuple against a function over keys that are not
     /// all integers (see `walk_eq`)
@@ -2236,6 +2286,9 @@ impl<'a> Gen<'a> {
             // TLC compares only against the elements present, so an empty set is no error. The set
             // is sorted: TLC searches it, comparing x first with the element in the middle
             Cmp::Fails(m) => {
+                if let Some(code) = self.tuple_fun_search(c, st, x, xt)? {
+                    return Ok(code);
+                }
                 let empty = if is_sparse(st) { format!("(({c}).len == 0)") } else { format!("({c} == 0)") };
                 if let Some(f) = self.compare_fails_msg(xt) {
                     let it = self.s_iter(c, st)?;
@@ -5510,6 +5563,12 @@ impl<'a> Gen<'a> {
                 }
             }
             if let Some(m) = clash {
+                if !written {
+                    let (sc, st) = self.gen(s, env, None)?;
+                    if let Some(code) = self.tuple_fun_search(&sc, &st, x, xt)? {
+                        return Ok(code);
+                    }
+                }
                 // TLC stops comparing x with an element it cannot compare it with. If other
                 // elements might match first, whether it stops depends on its order: reject
                 if !fits.is_empty() {
