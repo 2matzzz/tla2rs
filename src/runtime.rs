@@ -2699,16 +2699,17 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
 /// added the first time, so it is passed over now) and queues them, checks the invariants of new
 /// successors and of those outside the model, and the action properties of all, and stops at the
 /// first that fails. `visited` tells whether a fingerprint was visited by the search. Returns the
-/// states added, and whether an invariant failed to evaluate again (TLC then reports where, and
-/// exits with 255): the last one added is not queued then
-fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, bool) {
+/// states added, and the successor (and its action) whose invariant failed to evaluate again, with
+/// the invariant and the error (TLC then exits with 255; see `again_failed`): the last one added
+/// is not queued then
+fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option<Again>) {
     let mut buf = vec![];
     let cap = Capturing::start();
     let _ = tg_quiet(|| successors(s, &mut buf, true));
     let mut held = cap.finish();
     let mut out = String::new();
     let mut added = std::collections::HashSet::new();
-    let mut failed = false;
+    let mut failed = None;
     let mut stopped = true;
     for (i, (t, l)) in buf.into_iter().enumerate() {
         held.flush(i as u32 + 1);
@@ -2730,8 +2731,8 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, bool) 
         }
         if unseen {
             match check_out_of_model(&t) {
-                Some(SMsg::InvEval(..)) => {
-                    failed = true;
+                Some(SMsg::InvEval(inv, e)) => {
+                    failed = Some((t, l, inv, e));
                     break;
                 }
                 Some(_) => break,
@@ -2750,6 +2751,21 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, bool) 
         dump_write(&mut out);
     }
     (added.len() as u64, failed)
+}
+
+type Again = (State, u32, &'static str, EvalErr);
+
+/// With -continue, an invariant that failed to evaluate again in `eval_replay`: TLC reports it as
+/// a failed invariant with its behavior, then as the error itself with the behavior again
+/// (`tests/tlc/AgainTwice`, `PrintAgain-TwiceContinue`). `show` prints the behavior to the successor
+fn again_failed((t, l, inv, e): &Again, show: &dyn Fn(&State, u32)) {
+    if !flag(&CONTINUE) {
+        return;
+    }
+    report_msg(&SMsg::InvEval(inv, e.clone()), true);
+    show(t, *l);
+    report_eval_as(e, false);
+    show(t, *l);
 }
 
 /// Where the checker spills when `-tmpdir` is not given: the system's temp dir, unless it is a tmpfs
@@ -4001,9 +4017,18 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if let Some(s) = again {
         let (added, failed) = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
         distinct += added;
-        left += added as usize - failed as usize;
-        if failed {
+        left += added as usize - failed.is_some() as usize;
+        if let Some(a) = failed {
             code = 255;
+            if let Some(trace) = seen.pred_of(f.fp).and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c)) {
+                again_failed(&a, &|t, l| {
+                    if PRINT_ORDER {
+                        print_states_tlc(&trace, trace.len(), Some((*t, l)));
+                    } else {
+                        print_states(&trace, Some((*t, l)));
+                    }
+                });
+            }
         }
     }
     if let SMsg::Eval(e) | SMsg::InvEval(_, e) | SMsg::ActionEval(_, e) = &f.msg {
@@ -4729,7 +4754,8 @@ fn run_liveness(opt: &Opt) {
     let mut g = Graph { states: Col::new(), parent: Col::new(), sbits: Col::new() };
     let seen = Shards::new(false);
     let (inits, mut generated) = initial_states();
-    // TLC evaluates the tableau's state atoms on the initial states once they are all computed
+    // TLC evaluates the tableau's state atoms on each initial state as it computes it, before the
+    // state's invariants; the checker evaluates them once all are computed and checked
     let mut ibits = vec![];
     for (s, _, _) in &inits {
         match state_bits(s, SATOMS_TABLEAU) {
@@ -4811,9 +4837,10 @@ fn run_liveness(opt: &Opt) {
                             let s = g.state(p);
                             let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
                             distinct += added as usize;
-                            queued = added as usize - failed as usize;
-                            if failed {
+                            queued = added as usize - failed.is_some() as usize;
+                            if let Some(a) = failed {
                                 code = 255;
+                                again_failed(&a, &|t, l| g.print_trace(p as u32, Some((t, l)), false));
                             }
                             fp_note(e);
                         }
@@ -7145,25 +7172,5 @@ fn live_sim_expand(s: &State, succ: &[(State, u32)]) -> Result<(), SMsg> {
     let sim = g.get_or_insert_with(LiveSim::new);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.expand(s, succ)))
         .map_err(|p| SMsg::Live("a temporal property".into(), describe_panic(p)))
-}
-"##;
-
-/// With -continue, an invariant that fails to evaluate again in the pass TLC makes after showing
-/// the behavior (`eval_replay`): TLC reports it as a failed invariant with its behavior, then as
-/// the error itself with the behavior again (measured, `tests/tlc/PrintAgain-TwiceContinue`).
-/// Pasted, and hooked into `RUNTIME` by `compile::again_runtime`, for a spec that prints
-pub const AGAIN_RT: &str = r##"
-// ---------------------------------------------------------------- a second failure after an invariant failed (-continue)
-
-/// The successor (and its action) whose invariant failed to evaluate again, the invariant and the error
-static AGAIN: std::sync::Mutex<Option<(State, u32, &'static str, EvalErr)>> = std::sync::Mutex::new(None);
-
-/// Reports what `AGAIN` holds, `show` printing the behavior to the successor
-fn again_failed(show: &dyn Fn(&State, u32)) {
-    let Some((t, l, inv, e)) = AGAIN.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-    report_msg(&SMsg::InvEval(inv, e.clone()), true);
-    show(&t, l);
-    report_eval_as(&e, false);
-    show(&t, l);
 }
 "##;

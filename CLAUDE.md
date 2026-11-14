@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1045 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1047 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -88,7 +88,7 @@ It has no crate dependencies.
 | `src/pcal.rs` | TLC's check of the checksums a PlusCal translator wrote: the warnings for the root module and the modules it extends, and the algorithm's syntax tree as TLC's translator prints it (see "PlusCal checksums") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/ppr.rs` | TLC's pretty printer for values (`ppr`, ported from `tlc2.pprint` and checked against TLC's on 25,000 random values): used by the compiler for what Print and PrintT print when TLC starts, and pasted into every generated checker, which prints states and printed values with it |
-| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). Also the `-dumpgraph` output. `LIVE_SIM_RT` and `AGAIN_RT` are pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
+| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). Also the `-dumpgraph` output. `LIVE_SIM_RT` is pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
 
 ### Memory use (`runtime.rs`)
 
@@ -848,10 +848,11 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   queue) and its invariants are checked, up to the first that fails; one that fails to evaluate
   again makes it exit with 255. With `-continue` it reports the exception it did not expect before
   that pass, and one that fails to evaluate again there as a failed invariant with its behavior,
-  then as the error itself with the behavior again (`AGAIN_RT`; `tests/tlc/PrintAgain-TwiceContinue`,
-  `PrintAgain-LiveTwice`). After an error while computing or checking the initial states (in Init, the
-  CONSTRAINT, an invariant or a property), it reports the error and then computes and checks them
-  again from the start, printing again up to the error (`init_again_prints`; `tests/tlc/PrintAgain*`)
+  then as the error itself with the behavior again (`again_failed`; `tests/tlc/AgainTwice`,
+  `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After an error while computing or checking
+  the initial states (in Init, the CONSTRAINT, an invariant or a property), it reports the error
+  and then computes and checks them again from the start, printing again up to the error
+  (`init_again_prints`; `tests/tlc/PrintAgain*`)
 - The action properties are checked on the step to a successor after the successor is added (if
   new) and its invariants are checked: what they print comes then, before the next action is
   evaluated, and with `-continue` before their violation is reported (`Held::after`; the liveness
@@ -915,8 +916,8 @@ How many times a line is printed, measured on TLC 2.19 with one worker (each wit
   way (`LIVE_SIM_RT`, hooked into the runtime by `compile::live_sim_runtime`) and its own
   evaluations of the same predicates quietly
 
-The code pasted for these (`LIVE_SIM_RT`, `AGAIN_RT`) is generated only for a spec that prints, so
-the code of other specs is the same as before.
+The code pasted for this (`LIVE_SIM_RT`) is generated only for a spec that prints, so the code of
+other specs is the same as before.
 
 Not followed:
 
