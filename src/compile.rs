@@ -1988,10 +1988,10 @@ fn compile_inner(
         let rt = crate::runtime::RUNTIME
             .replacen(
                 "fn fingerprint(w: &[u64]) -> Fp {\n",
-                "fn fingerprint(w: &[u64]) -> Fp {\n    let w = if !HAS_VIEW && w.len() == WORDS { &w[..WORDS - 1] } else { w };\n",
+                "fn fingerprint(w: &[u64]) -> Fp {\n    let w = if !HAS_VIEW && w.len() == WORDS { &w[..WORDS - SHW] } else { w };\n",
                 1,
             )
-            .replace("WORDS * 64 > FP_BITS", "(WORDS - 1) * 64 > FP_BITS");
+            .replace("WORDS * 64 > FP_BITS", "(WORDS - SHW) * 64 > FP_BITS");
         src += &rt;
     }
     src += crate::runtime::PPR;
