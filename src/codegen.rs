@@ -495,11 +495,17 @@ impl<'a> Gen<'a> {
     /// integer stops it with an error, one that is not the next index or whose value differs makes
     /// them unequal. None when the types are not such a pair
     fn tuple_fun_eq(&mut self, tc: &str, tt: &Ty, fc: &str, ft: &Ty) -> R<Option<String>> {
-        let Some(elems) = tuple_elems(tt).map(|v| v.into_iter().cloned().collect::<Vec<_>>()) else { return Ok(None) };
-        let Ty::PFun(kt, vt) = ft else { return Ok(None) };
-        if elems.is_empty() || matches!(kt.as_ref(), Ty::Int(..)) {
+        if !tuple_fun_pair(tt, ft) {
             return Ok(None);
         }
+        // A function over the whole of its domain type (a constant one) as one over part of it
+        if let Ty::Fun(d, c) = ft {
+            let pt = Ty::PFun(d.clone(), c.clone());
+            let fc = self.coerce(fc.to_string(), ft, &pt)?;
+            return self.tuple_fun_eq(tc, tt, &fc, &pt);
+        }
+        let elems: Vec<Ty> = tuple_elems(tt).unwrap().into_iter().cloned().collect();
+        let Ty::PFun(kt, vt) = ft else { unreachable!() };
         let kid = self.ty_id(kt)?;
         let it = self.fun_iter("__f", ft, true)?;
         let fail = format!("{{ let __b: bool = eval_error(format!(\"Attempted to compare an integer with non-integer:\\n{{}}.\", ppr(&fmt_{kid}(&__k)))); __b }}");
@@ -522,6 +528,74 @@ impl<'a> Gen<'a> {
             "{{ let __t = {tc}; let __f = {fc}; let __ks: Vec<_> = {it}.collect(); __ks.len() == {} && {walk} }}",
             elems.len()
         )))
+    }
+
+    /// Whether TLC compares values of types `a` and `b` part by part down to the pairs where
+    /// `tuple_cmp` fails, and each of those is a tuple against a function over keys that are not
+    /// all integers (see `walk_eq`)
+    fn walkable(&self, a: &Ty, b: &Ty) -> bool {
+        if tuple_fun_pair(a, b) || tuple_fun_pair(b, a) {
+            return true;
+        }
+        let parts = |xs: Vec<(&Ty, &Ty)>| xs.iter().all(|&(x, y)| matches!(self.tuple_cmp(x, y), Ok(Cmp::Normal | Cmp::Unequal)) || self.walkable(x, y));
+        match (a, b) {
+            (Ty::Set(x), Ty::Set(y)) => self.walkable(x, y),
+            (Ty::Rec(x), Ty::Rec(y)) => match (tuple_elems(a), tuple_elems(b)) {
+                (Some(x), Some(y)) => x.len() == y.len() && parts(x.into_iter().zip(y).collect()),
+                (None, None) => {
+                    crate::types::rec_keys(x).is_some()
+                        && crate::types::rec_keys(y).is_some()
+                        && x.len() == y.len()
+                        && x.iter().zip(y).all(|((n, _), (m, _))| n == m)
+                        && parts(x.iter().zip(y).map(|((_, s), (_, t))| (s, t)).collect())
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// `a = b` where `walkable`: tuples of one length and records of the same fields compare their
+    /// parts in order, sets of one size their elements in TLC's order, each pair as `a = b` does,
+    /// and the first pair that differs makes them unequal (`TupleValue.equals`,
+    /// `RecordValue.equals`, `SetEnumValue.equals`). None when the types are not walkable
+    fn walk_eq(&mut self, ac: &str, at: &Ty, bc: &str, bt: &Ty, env: &Env) -> R<Option<String>> {
+        if let Some(c) = self.tuple_fun_eq(ac, at, bc, bt)? {
+            return Ok(Some(c));
+        }
+        if let Some(c) = self.tuple_fun_eq(bc, bt, ac, at)? {
+            return Ok(Some(c));
+        }
+        if !self.walkable(at, bt) {
+            return Ok(None);
+        }
+        let (x, y) = (self.fresh("x"), self.fresh("y"));
+        let pair_eq = |g: &mut Self, p: String, s: &Ty, q: String, t: &Ty| -> R<String> {
+            let mut env2 = env.clone();
+            env2.bind("#wa", p, s.clone());
+            env2.bind("#wb", q, t.clone());
+            let eq = Expr::Bin(BOp::Eq, Expr::Ident("#wa".into(), NOPOS).b(), Expr::Ident("#wb".into(), NOPOS).b());
+            g.gen_as(&eq, &env2, &Ty::Bool)
+        };
+        let body = match (at, bt) {
+            (Ty::Set(ea), Ty::Set(eb)) => {
+                let (p, q) = (self.fresh("p"), self.fresh("q"));
+                let eq = pair_eq(self, p.clone(), ea, q.clone(), eb)?;
+                let (nx, ny) = (self.s_card(&x, at), self.s_card(&y, bt));
+                let (ix, iy) = (self.s_iter(&x, at)?, self.s_iter(&y, bt)?);
+                format!("{nx} == {ny} && {{ let __all = {ix}.zip({iy}).all(|({p}, {q})| {eq}); __all }}")
+            }
+            (Ty::Rec(fa), Ty::Rec(fb)) => {
+                let mut parts = vec![];
+                for (i, ((_, ta), (_, tb))) in fa.iter().zip(fb).enumerate() {
+                    let f = rec_field(fa.len(), i);
+                    parts.push(format!("({})", pair_eq(self, format!("{x}{f}"), ta, format!("{y}{f}"), tb)?));
+                }
+                parts.join(" && ")
+            }
+            _ => unreachable!(),
+        };
+        Ok(Some(format!("{{ let ({x}, {y}) = ({ac}, {bc}); {body} }}")))
     }
 
     /// `a = b` when one side is a tuple (or sequence) and the other may be a string. TLC asks the
@@ -4535,14 +4609,10 @@ impl<'a> Gen<'a> {
                     Cmp::Normal => {}
                     Cmp::Unequal => return Ok((format!("{{ let _ = {ac}; let _ = {bc}; {} }}", op == Neq), Ty::Bool)),
                     Cmp::Fails(m) => {
-                        let walk = match self.tuple_fun_eq(&ac, &at, &bc, &bt)? {
-                            Some(c) => Some(c),
-                            None => self.tuple_fun_eq(&bc, &bt, &ac, &at)?,
-                        };
-                        if let Some(mut c) = walk {
-                            // A tuple TLC builds here (not a constant one) on the left reports an
+                        if let Some(mut c) = self.walk_eq(&ac, &at, &bc, &bt, env)? {
+                            // A value TLC builds here (not a constant one) on the left reports an
                             // error in its comparison as a fingerprint error too (measured)
-                            if tuple_elems(&at).is_some() && self.built(a, env) && !self.is_const(a, env) {
+                            if self.built(a, env) && !self.is_const(a, env) {
                                 c = format!("{{ let __fp = FpSource::enter(); {c} }}");
                             }
                             return Ok((if op == Eq { c } else { format!("!{c}") }, Ty::Bool));
@@ -5187,7 +5257,16 @@ impl<'a> Gen<'a> {
                         env2.bind("#elem", c.clone(), t.clone());
                         env2.bind("#x", x.to_string(), xt.clone());
                         let eq = Bin(BOp::Eq, Ident("#elem".into(), NOPOS).b(), Ident("#x".into(), NOPOS).b());
-                        parts.push(self.gen_as(&eq, &env2, &Ty::Bool)?);
+                        let code = self.gen_as(&eq, &env2, &Ty::Bool)?;
+                        // A tuple against a function over keys that are not all integers (see
+                        // walk_eq): the error comes from the set TLC built here, a fingerprint
+                        // error too (measured)
+                        if matches!(self.tuple_cmp(t, xt)?, Cmp::Fails(_)) && self.walkable(t, xt) {
+                            special = true;
+                            parts.push(format!("{{ let __fp = FpSource::enter(); {code} }}"));
+                        } else {
+                            parts.push(code);
+                        }
                     }
                 }
             }
@@ -7719,6 +7798,12 @@ impl<'a> Gen<'a> {
             strs.join(", ")
         )
     }
+}
+
+/// Whether `tt` is a tuple and `ft` a function over keys that are not all integers (a model value,
+/// a string), which TLC compares key by key (see `Gen::tuple_fun_eq`)
+fn tuple_fun_pair(tt: &Ty, ft: &Ty) -> bool {
+    matches!(ft, Ty::PFun(kt, _) | Ty::Fun(kt, _) if !matches!(kt.as_ref(), Ty::Int(..))) && tuple_elems(tt).is_some_and(|e| !e.is_empty())
 }
 
 /// How a comparison involving tuples turns out in TLC (see `Gen::tuple_cmp`)

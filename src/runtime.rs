@@ -3073,9 +3073,6 @@ impl Iterator for Batches {
     }
 }
 
-/// The number of initial states Init computed (without TLCGET, which handles each as it is computed)
-static INITS_COMPUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Computes the initial states and checks each one the way TLC does while generating them: every
 /// state counts as generated, one that satisfies the CONSTRAINT is kept if it is new, and the
 /// invariants are checked on the new ones and on those outside the CONSTRAINT. Returns the kept
@@ -3084,18 +3081,20 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // TLC shows no behavior for an evaluation error in the initial states, only the counts so far.
     // An error that is not one of its own evaluation errors, raised while checking an initial
     // state (CONSTRAINT, invariant, property), comes with that state.
-    fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize) -> ! {
-        // TLC stops generating at once only on its own exceptions; after a fingerprint error while
-        // checking a state it still generates (and counts, without keeping) the remaining initial
-        // states (`ModelChecker.DoInitFunctor`)
-        let generated = if state.is_some() && fp_err(&e) { generated.max(INITS_COMPUTED.load(std::sync::atomic::Ordering::Relaxed)) } else { generated };
-        report_eval_as(&e, false);
-        if let Some(s) = state.filter(|_| !tlc_eval_exception(&e) && !matches!(e, EvalErr::Type(_))) {
+    fn report(e: &EvalErr, state: Option<&State>) {
+        report_eval_as(e, false);
+        if let Some(s) = state.filter(|_| !tlc_eval_exception(e) && !matches!(e, EvalErr::Type(_))) {
             println!("While working on the initial state:\n{}\n", show(s));
         }
         if !matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
             init_again_prints();
         }
+    }
+    fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize) -> ! {
+        report(&e, state);
+        finish(e, while_, generated, distinct)
+    }
+    fn finish(e: EvalErr, while_: &str, generated: u64, distinct: usize) -> ! {
         fp_note(&e);
         eprintln!("  (while {while_})");
         println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
@@ -3110,7 +3109,6 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         let cap = Capturing::start();
         failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err();
         held = cap.finish();
-        INITS_COMPUTED.store(inits.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
@@ -3118,9 +3116,27 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // The first call writes the initial states to the graph; later ones rebuild traces
     let dump = dumping() && !DUMPED_INITS.swap(true, std::sync::atomic::Ordering::Relaxed);
     let mut buf = String::new();
+    // TLC stops generating at once only on its own exceptions; after a fingerprint error while
+    // checking a state it still generates (and counts, without keeping or checking) the remaining
+    // initial states (`ModelChecker.DoInitFunctor`)
+    let mut pending: Option<(EvalErr, String, usize)> = None;
+    macro_rules! halt {
+        ($e:expr, $while_:expr, $s:expr) => {{
+            let e = $e;
+            if fp_err(&e) {
+                report(&e, Some($s));
+                pending = Some((e, $while_.to_string(), out.len()));
+                return;
+            }
+            stop(e, &$while_, Some($s), generated, out.len())
+        }};
+    }
     let mut handle = |s: State| {
         generated += 1;
         held.flush(generated as u32);
+        if pending.is_some() {
+            return;
+        }
         let step = std::panic::catch_unwind(|| {
             let in_model = constraint(&s);
             let w = pack(&s);
@@ -3129,7 +3145,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         });
         let (in_model, w, fp) = match step {
             Ok(v) => v,
-            Err(p) => stop(describe_panic(p), "checking an initial state", Some(&s), generated, out.len()),
+            Err(p) => halt!(describe_panic(p), "checking an initial state", &s),
         };
         if let (Some(w), Some(fp)) = (w, fp) {
             if !seen.insert(fp) {
@@ -3178,7 +3194,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                             match std::panic::catch_unwind(|| f(&s)) {
                                 Ok(true) => {}
                                 Ok(false) => println!("Error: Invariant {name} is violated by the initial state:\n{}\n", init_text(&s)),
-                                Err(p) => stop(describe_panic(p), &format!("evaluating invariant {name} on an initial state"), Some(&s), generated, out.len()),
+                                Err(p) => halt!(describe_panic(p), format!("evaluating invariant {name} on an initial state"), &s),
                             }
                         }
                     }
@@ -3187,9 +3203,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                     exit(12);
                 }
             }
-            Err((inv, e)) => {
-                stop(e, &format!("evaluating invariant {inv} on an initial state"), Some(&s), generated, out.len())
-            }
+            Err((inv, e)) => halt!(e, format!("evaluating invariant {inv} on an initial state"), &s),
         }
         // A PROPERTY that is a state predicate holds if it holds in every initial state
         for (name, f) in INIT_PROPS {
@@ -3199,7 +3213,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                     println!("Error: Property {name} is violated by the initial state:\n{}", init_text(&s));
                     exit(13);
                 }
-                Err(p) => stop(describe_panic(p), &format!("evaluating property {name} on an initial state"), Some(&s), generated, out.len()),
+                Err(p) => halt!(describe_panic(p), format!("evaluating property {name} on an initial state"), &s),
             }
         }
         if w.is_none() && (in_model || TYPE_INV_SUBSUMED) {
@@ -3220,6 +3234,9 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         }
     }
     held.flush(u32::MAX);
+    if let Some((e, while_, distinct)) = pending {
+        finish(e, &while_, generated, distinct);
+    }
     INITS_REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = failed {
         let e = describe_panic(p);

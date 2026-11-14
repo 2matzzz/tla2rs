@@ -21,10 +21,12 @@ Some rules of `src/sany.rs` (`var_order`: the names SANY's context of a module h
 prints variables in), `src/runtime.rs` (`fresh_fp`: the state whose VIEW TLC fingerprints under SYMMETRY;
 `initial_states`: the initial states TLC still generates after a fingerprint error) and `src/codegen.rs`
 (`member_unsorted`: how TLC unites sets; `lazy_fun_string`: how it prints a function it cannot enumerate;
-`tuple_fun_eq`: how it compares a tuple with a function over keys that are not all integers) follow TLC 2.19's
+`tuple_fun_eq`: how it compares a tuple with a function over keys that are not all integers; `walk_eq` and
+`gen_member_of`: how it reaches such a pair inside other values and in a set written out) follow TLC 2.19's
 behaviour as measured and as read from its classes in tla2tools.jar (`ModuleNode.getVariableDecls`, `Context`,
 `TLCStateMut.fingerPrint`, `SetEnumValue.cup`, `FcnLambdaValue.toString`, `FcnRcdValue.equals`, `TupleValue.equals`,
-`ModelChecker.DoInitFunctor`). They are written for tla2rs; no code of TLC is copied.
+`ModelChecker.DoInitFunctor`, `SetEnumValue.member`, `ValueVec.search`, `TupleValue.compareTo`,
+`FcnRcdValue.compareTo`). They are written for tla2rs; no code of TLC is copied.
 
 `src/runtime.rs` (`tlc_lasso`, `tableau_graph`, `tlc_search`, `tlc_fp`) and `src/live.rs` (`tlc_live`, `tableau`)
 follow TLC 2.19's search for a liveness counterexample, its tableau and its fingerprints, as read from its classes
