@@ -3249,28 +3249,40 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
 /// After an error while computing or checking the initial states, TLC computes and checks them
 /// again from the start to report where the error is (`ModelChecker.doInit`, with `CallStackTool`),
 /// printing again what Init, the CONSTRAINT, the invariants and the properties print, up to the
-/// error
+/// error. With TLCGET it checks each state as Init computes it, as the first time; the registers go
+/// on changing and the counts stay
 fn init_again_prints() {
-    if !PRINT_ORDER || TLCGET {
+    if !PRINT_ORDER {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    // Whether the pass goes on after s
+    let mut check = |s: &State| {
+        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else { return false };
+        if let Some(w) = pack(s).filter(|_| in_model) {
+            if !seen.insert(state_fp(s, &w)) {
+                return true;
+            }
+        }
+        INVARIANTS.iter().chain(INIT_PROPS).all(|(_, f)| matches!(std::panic::catch_unwind(|| f(s)), Ok(true)))
+    };
+    if TLCGET {
+        let mut hook = |s: &State, _: u32| {
+            if !check(s) {
+                std::panic::panic_any(EagerStop);
+            }
+        };
+        let _ = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut vec![]))));
         return;
     }
     let cap = Capturing::start();
     let mut inits = vec![];
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).is_err();
     let mut held = cap.finish();
-    let mut seen = std::collections::HashSet::new();
     for (k, s) in inits.iter().enumerate() {
         held.flush(k as u32 + 1);
-        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else { return };
-        if let Some(w) = pack(s).filter(|_| in_model) {
-            if !seen.insert(state_fp(s, &w)) {
-                continue;
-            }
-        }
-        for (_, f) in INVARIANTS.iter().chain(INIT_PROPS) {
-            if !matches!(std::panic::catch_unwind(|| f(s)), Ok(true)) {
-                return;
-            }
+        if !check(s) {
+            return;
         }
     }
     if failed {

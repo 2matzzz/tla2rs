@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1078 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1081 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -864,7 +864,9 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After an error while computing or checking
   the initial states (in Init, the CONSTRAINT, an invariant or a property), it reports the error
   and then computes and checks them again from the start, printing again up to the error
-  (`init_again_prints`; `tests/tlc/PrintAgain*`)
+  (`init_again_prints`; `tests/tlc/PrintAgain*`). In a spec that reads TLCGet it checks each state as
+  Init computes it there too; the registers go on changing and the counts stay where they were
+  (`tests/tlc/TlcGetAgain*`)
 - TLC evaluates the CONSTRAINT, then the ACTION_CONSTRAINT, on each successor as soon as an action
   yields it (also one already seen), and the invariants of a successor outside them right after:
   what they print comes after what the action printed before the successor. When a constraint
@@ -981,7 +983,8 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   (`tests/tlc/TupleFunFail`: 3 generated, 1 distinct; `TupleFunPrint`; TLC's own exceptions stop it
   at once). In a spec that reads TLCGet, where each initial state is checked as Init computes it
   (`TLCGET`), Init goes on after
-  the error and the states it still computes are only counted (`initial_states`, `TupleFunGet`)
+  the error and the states it still computes are only counted (`initial_states`, `TupleFunGet`),
+  after the pass that computes and checks them again up to the error (`TlcGetAgain-Fp`)
 - A tuple compared with a function over keys that are not all integers (`<<1, x>> = (1 :> 1 @@ m :>
   x)`, `<<x>> = ("a" :> x)`), with either on the left: unequal when the sizes differ, otherwise TLC
   walks the function's keys in its order, and the first that is not an integer stops it with
@@ -1077,10 +1080,10 @@ Refused at run time: several workers (TLC's counts and registers are then those 
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
 `-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
 
-Not followed: with TLCGet, the passes TLC makes again after an evaluation error in an invariant (see "Messages and
-printed lines"), which read and set the registers again (the `UnsetInv` probe in `TlcGetReg` was dropped for
-this). None of the corpus's models becomes checkable: the skipped ones that read them use TLCGet("config") or a
-simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
+Not followed: with TLCGet, the pass TLC makes again after a successor fails to evaluate an invariant (see
+"Messages and printed lines"), which reads and sets the registers again (the `UnsetInv` probe in `TlcGetReg` was
+dropped for this). None of the corpus's models becomes checkable: the skipped ones that read them use
+TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
 
 ### Arguments written out at each use
 
