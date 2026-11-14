@@ -1492,6 +1492,11 @@ impl<'a> Gen<'a> {
                     Some(Value::Atom(a)) if fs.iter().any(|(n, _)| *n == self.atoms.name(a)) => Path::Field(self.atoms.name(a)),
                     _ => p.clone(),
                 },
+                // A function over strings: !.a is !["a"] (a name that is no string of the spec stays
+                // a field, outside the domain)
+                (Path::Field(k), Some(Ty::Fun(d, _) | Ty::PFun(d, _))) if !k.starts_with('@') && matches!(d.as_ref(), Ty::Enum(_)) && self.atoms.get(false, k).is_some() => {
+                    Path::Idx(Expr::Str(k.clone()))
+                }
                 _ => p.clone(),
             };
             cur = match &cur {
@@ -1538,6 +1543,7 @@ impl<'a> Gen<'a> {
             cur = match (p, &cur) {
                 (Path::Field(k), _) if k.starts_with('@') => continue,
                 (Path::Idx(_), Ty::Fun(_, c) | Ty::PFun(_, c)) => c.as_ref().clone(),
+                (Path::Field(_), Ty::Fun(d, c) | Ty::PFun(d, c)) if matches!(d.as_ref(), Ty::Enum(_)) => c.as_ref().clone(),
                 (Path::Idx(_), Ty::Seq(e)) => e.as_ref().clone(),
                 (Path::Field(k), Ty::Rec(fs)) => match &fs.iter().find(|(n, _)| n == k)?.1 {
                     Ty::Opt(i) => i.as_ref().clone(),
@@ -4130,6 +4136,7 @@ impl<'a> Gen<'a> {
                     let mut cur = ft.clone();
                     let mut conds = vec![];
                     let mut at_name = None;
+                    let mut outside = false;
                     for p in path {
                         match (p, &cur) {
                             // Name of this EXCEPT's @, attached during expansion
@@ -4198,8 +4205,19 @@ impl<'a> Gen<'a> {
                                     }
                                 }
                             }
+                            // A name that is no string of the spec, outside the domain (see resolve_path)
+                            (Path::Field(_), Ty::Fun(d, _) | Ty::PFun(d, _)) if matches!(d.as_ref(), Ty::Enum(_)) => {
+                                outside = true;
+                                break;
+                            }
                             _ => return Err("EXCEPT path does not match the value's type".into()),
                         }
+                    }
+                    if outside {
+                        if let Some(at) = except_pos(f) {
+                            write!(s, "except_warning({at:?}); ").unwrap();
+                        }
+                        continue;
                     }
                     let at = self.fresh("at");
                     let mut env2 = env.clone();
@@ -6342,6 +6360,7 @@ impl<'a> Gen<'a> {
             let mut cur = ft.clone();
             let mut conds = vec![];
             let mut at_name = None;
+            let mut outside = false;
             for step in path {
                 match (step, &cur) {
                     // Name of this EXCEPT's @, attached during expansion
@@ -6406,8 +6425,19 @@ impl<'a> Gen<'a> {
                             }
                         }
                     }
+                    // A name that is no string of the spec, outside the domain (see resolve_path)
+                    (Path::Field(_), Ty::Fun(d, _) | Ty::PFun(d, _)) if matches!(d.as_ref(), Ty::Enum(_)) => {
+                        outside = true;
+                        break;
+                    }
                     _ => return Err("EXCEPT path does not match the value's type".into()),
                 }
+            }
+            if outside {
+                if let Some(at) = &warn_at {
+                    writeln!(out, "except_warning({at:?});").unwrap();
+                }
+                continue;
             }
             let at = self.fresh("at");
             let mut env2 = env.clone();
@@ -8356,7 +8386,16 @@ impl Gen<'_> {
     /// record of variants)
     fn part_at(&mut self, t: &Ty, p: &Path, env: &Env) -> Option<(String, u32, Ty)> {
         let Ty::Rec(fs) = t else {
-            let Path::Idx(i) = p else { return None };
+            let field;
+            let i = match p {
+                Path::Idx(i) => i,
+                // A function over strings: .a is ["a"]
+                Path::Field(k) if matches!(t, Ty::Fun(d, _) | Ty::PFun(d, _) if matches!(d.as_ref(), Ty::Enum(_))) => {
+                    field = Expr::Str(k.clone());
+                    &field
+                }
+                _ => return None,
+            };
             if self.reshows(i) {
                 return None;
             }
