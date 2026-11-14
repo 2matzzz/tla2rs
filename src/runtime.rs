@@ -1121,10 +1121,20 @@ fn put_line(l: &str) {
     }
 }
 
+/// The exit code that tells tla2rs to build the checker again with the lines printed in TLC's order
+const WARN_EXIT: i32 = 74;
+
 /// TLC's warning for an EXCEPT that names an argument or field the value at `at` does not have
-/// (the EXCEPT then changes nothing there)
+/// (the EXCEPT then changes nothing there). TLC prints it as it computes and checks each state,
+/// which a checker without PRINT_ORDER does not follow: when tla2rs runs it (`w` in TLA2RS_GROW),
+/// it exits at once with WARN_EXIT, and tla2rs builds it again with PRINT_ORDER
 #[cold]
 fn except_warning(at: &str) {
+    if WARN_RERUN && !flag(&NOWARN) && std::env::var("TLA2RS_GROW").is_ok_and(|g| g.contains('w')) {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(WARN_EXIT);
+    }
     tlc_print(format!("{WARNING_MARK}Warning: The EXCEPT was applied to non-existing fields of the value at\n{at}"));
 }
 
