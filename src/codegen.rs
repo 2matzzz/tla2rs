@@ -81,6 +81,9 @@ pub struct Gen<'a> {
     /// `compile::makes_empty_tuples`), so the checker cannot tell an empty function over part of a
     /// type from it; without one, ToString of such a function makes `<< >>` (`Gen::shows_empty_fun`)
     pub empty_tuples: bool,
+    /// The spec may build an empty function the checker holds as a value of a type with no fields,
+    /// as it holds the empty tuple (see `compile::makes_empty_funs`; `Gen::empty_text`)
+    pub empty_funs: bool,
     /// How deep recursive operators are being unrolled in an action
     unroll: u32,
     pub atoms: &'a Atoms,
@@ -206,6 +209,7 @@ impl<'a> Gen<'a> {
             zero_defs: HashSet::new(),
             tlcget: false,
             empty_tuples: true,
+            empty_funs: true,
             unroll: 0,
             atoms,
             ce: ConstEval { atoms, constants },
@@ -3213,7 +3217,7 @@ impl<'a> Gen<'a> {
                             short(x)
                         )
                     };
-                    if scalar_or_tuple(&t) && t.size().is_some_and(|n| n <= room as u64) {
+                    if scalar_or_tuple(&t) && t.size().is_some_and(|n| n <= room as u64) && (!has_empty_tuple(&t) || self.empty_text() == Some("<<>>")) {
                         let n = t.size().unwrap();
                         let ids: Vec<u32> = t.enumerate().iter().map(|v| self.atoms.intern(false, &crate::compile::show_value(self.atoms, v))).collect();
                         let table: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
@@ -7319,8 +7323,8 @@ impl<'a> Gen<'a> {
                 Ty::Int(..) => "v.to_string()".into(),
                 Ty::Enum(_) => "ATOMS[*v as usize].to_string()".into(),
                 Ty::IntAtom(..) => "if *v < i64::MIN + 65536 { ATOMS[(*v - i64::MIN) as usize].to_string() } else { v.to_string() }".into(),
-                // The empty tuple (as TLC prints it)
-                Ty::Rec(fs) if fs.is_empty() => "\"<< >>\".to_string()".into(),
+                // The empty tuple or an empty function (see `empty_text`)
+                Ty::Rec(fs) if fs.is_empty() => format!("{:?}.to_string()", self.empty_text().unwrap_or("<< >>")),
                 Ty::Rec(fs) if fs.iter().all(|(n, _)| n.starts_with('#')) => {
                     // Tuple
                     let mut parts = vec![];
@@ -8409,8 +8413,10 @@ impl Gen<'_> {
     /// The texts TLC may print for v of type t: as enumerated sets first, then with some sets of
     /// integers held as intervals (at most 64 forms; beyond, the first only)
     pub fn shown_forms(&self, v: &Value, t: &Ty) -> Vec<String> {
-        // The checker prints an empty function over part of a type as `<< >>`, never `<<>>`
-        if matches!((t, v), (Ty::PFun(..), Value::Tuple(xs)) if xs.is_empty()) && self.shows_empty_fun(t) {
+        // The checker prints an empty function over part of a type as `<< >>`, never `<<>>`, and
+        // a value of a type with no fields as `empty_text`
+        let empty_fun = matches!(t, Ty::PFun(..)) || matches!(t, Ty::Rec(fs) if fs.is_empty());
+        if empty_fun && matches!(v, Value::Tuple(xs) if xs.is_empty()) && self.shows_empty_fun(t) {
             return vec!["<< >>".into()];
         }
         let plain = crate::compile::show_value(self.atoms, v);
@@ -8460,10 +8466,19 @@ impl Gen<'_> {
                 let parts: Vec<Vec<String>> = fs.iter().zip(xs).map(|((_, ft), x)| self.shown_forms(x, ft)).collect();
                 product(&parts).into_iter().map(|p| format!("<<{}>>", p.join(", "))).collect()
             }
-            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) && fs.len() == m.len() && has => {
-                let parts: Option<Vec<Vec<String>>> =
-                    fs.iter().map(|(f, ft)| m.get(f).map(|x| self.shown_forms(x, ft).into_iter().map(|y| format!("{f} |-> {y}")).collect())).collect();
-                parts.map_or(vec![], |ps| product(&ps).into_iter().map(|p| format!("[{}]", p.join(", "))).collect())
+            // An optional field the record lacks is not printed
+            (Ty::Rec(fs), Value::Rec(m)) if !is_tuple_fields(fs) && has => {
+                let parts: Option<Vec<Vec<String>>> = fs
+                    .iter()
+                    .filter_map(|(f, ft)| match (m.get(f), ft) {
+                        (None, Ty::Opt(_)) => None,
+                        (x, ft) => {
+                            let ft = if let Ty::Opt(i) = ft { i.as_ref() } else { ft };
+                            Some(x.map(|x| self.shown_forms(x, ft).into_iter().map(|y| format!("{f} |-> {y}")).collect()))
+                        }
+                    })
+                    .collect();
+                parts.filter(|ps| ps.len() == m.len()).map_or(vec![], |ps| product(&ps).into_iter().map(|p| format!("[{}]", p.join(", "))).collect())
             }
             _ => vec![],
         };
@@ -8473,14 +8488,26 @@ impl Gen<'_> {
         out
     }
 
-    /// Whether a value of type t may hold an empty function over part of a type that TLC holds as
-    /// a function, which it prints `<< >>` as the checker does (see `empty_tuples`)
+    /// What TLC prints for a value of a type with no fields, which the checker holds alike for the
+    /// empty tuple and an empty function: `<< >>` when the spec builds no empty tuple, `<<>>` when
+    /// it builds no such empty function, and None when it may build both
+    fn empty_text(&self) -> Option<&'static str> {
+        match (self.empty_tuples, self.empty_funs) {
+            (false, _) => Some("<< >>"),
+            (true, false) => Some("<<>>"),
+            (true, true) => None,
+        }
+    }
+
+    /// Whether a value of type t may hold an empty function over part of a type or a value of a
+    /// type with no fields that TLC holds as a function, which it prints `<< >>` as the checker
+    /// does (see `empty_tuples`)
     fn shows_empty_fun(&self, t: &Ty) -> bool {
         !self.empty_tuples
             && match t {
                 Ty::PFun(..) => true,
-                Ty::Set(e) | Ty::Seq(e) | Ty::Fun(_, e) => self.shows_empty_fun(e),
-                Ty::Rec(fs) => fs.iter().any(|(_, f)| self.shows_empty_fun(f)),
+                Ty::Set(e) | Ty::Seq(e) | Ty::Fun(_, e) | Ty::Opt(e) => self.shows_empty_fun(e),
+                Ty::Rec(fs) => fs.is_empty() || fs.iter().any(|(_, f)| self.shows_empty_fun(f)),
                 _ => false,
             }
     }

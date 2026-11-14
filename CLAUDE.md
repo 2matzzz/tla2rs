@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1072 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1076 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -158,6 +158,14 @@ as a function, so ToString lists that text for it (`Gen::shows_empty_fun`; `test
 prints `<<>>` for one it holds as a tuple, which the checker cannot tell apart, so a spec that may build an empty
 tuple (`<<>>`, Tail, SubSeq, `\o`, SelectSeq or SortSeq in any definition, or a constant holding one:
 `compile::makes_empty_tuples`) lists no text for it, and ToString of it stops the checker with an evaluation error.
+The empty tuple and the empty function over a constant empty set (`[x \in {} |-> e]`) share one type with no
+fields, so the checker prints a value of it by what the spec may build (`Gen::empty_text`): `<< >>` in a spec that
+builds no empty tuple, `<<>>` in one that builds no such empty function (`[x \in S |-> e]`, `[S -> T]` or
+Permutations(S) over an S not written to have an element, or `@@` of two values that may both be empty:
+`compile::makes_empty_funs`), and `<< >>` with no text listed for ToString, which stops there, in a spec that may
+build both. This holds alone and inside sets, records, tuples, functions and optional fields of records, in
+states, Print, PrintT and ToString (`tests/tlc/EmptyTupleShow*`, `EmptyFunShow*`). ToString of a bag from the state
+is refused when compiling: its counts are unbounded, and the window of values nearest 0 does not cut them.
 
 Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
 
