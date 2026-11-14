@@ -1454,8 +1454,26 @@ impl<'a> Gen<'a> {
         let mut cur = Some(t.clone());
         for (j, p) in path.iter().enumerate() {
             if let (Path::Idx(i), Some(Ty::Rec(fs))) = (p, &cur) {
-                let inside = matches!(self.try_const(i, env), Some(Value::Int(k)) if k >= 1 && k as u64 <= fs.len() as u64);
-                if is_tuple_fields(fs) && !inside {
+                let ic = self.try_const(i, env);
+                let inside = matches!(ic, Some(Value::Int(k)) if k >= 1 && k as u64 <= fs.len() as u64);
+                // A record at a key of strings that is not constant: one arm per field the key may
+                // name, as for a tuple
+                let rec_keys = match (is_tuple_fields(fs), &ic) {
+                    (false, None) => match self.gen(i, env, None) {
+                        Ok((_, Ty::Enum(ks))) if !ks.iter().any(|&a| self.atoms.is_model(a)) => {
+                            let names: Vec<String> = ks.iter().map(|&a| self.atoms.name(a)).collect();
+                            Some(fs.iter().filter(|(n, _)| names.contains(n)).map(|(n, _)| Expr::Str(n.clone())).collect::<Vec<_>>())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let keys = match rec_keys {
+                    Some(ks) => Some(ks),
+                    None if is_tuple_fields(fs) && !inside => Some((1..=fs.len()).map(|k| Expr::Num(k as i64)).collect()),
+                    None => None,
+                };
+                if let Some(keys) = keys {
                     self.tmp += 1;
                     let at = format!("@dyn{}", self.tmp);
                     let base = Expr::Ident(at.clone(), NOPOS);
@@ -1463,15 +1481,16 @@ impl<'a> Gen<'a> {
                         Some(w) => except_at(w, base.clone()),
                         None => base.clone(),
                     };
-                    let arms = (1..=fs.len())
+                    let arms = keys
+                        .into_iter()
                         .map(|k| {
-                            let mut inner: Vec<Path> = vec![Path::Idx(Expr::Num(k as i64))];
+                            let mut inner: Vec<Path> = vec![Path::Idx(k.clone())];
                             inner.extend(path[j + 1..].iter().cloned());
                             // Within the arm the index is k, which lets constant tests on it pick
                             // the branch meant for this element's type
-                            let v = replace_expr(val, i, &Expr::Num(k as i64));
+                            let v = replace_expr(val, i, &k);
                             let arm = Expr::Except(arm_base.clone().b(), vec![(inner, v)]);
-                            (Expr::Bin(BOp::Eq, i.clone().b(), Expr::Num(k as i64).b()), Expr::Label("#per-element".into(), vec![], arm.b()))
+                            (Expr::Bin(BOp::Eq, i.clone().b(), k.b()), Expr::Label("#per-element".into(), vec![], arm.b()))
                         })
                         .collect();
                     let mut outer: Vec<Path> = path[..j].to_vec();
@@ -1493,6 +1512,51 @@ impl<'a> Gen<'a> {
             };
         }
         (path.to_vec(), val.clone())
+    }
+
+    /// `r[k]` for a record r and a key of strings that is not constant or names no field: the field
+    /// the key names at run time, and TLC's error for one it does not. None for a key that may be
+    /// something other than a string
+    fn rec_apply(&mut self, rc: &str, fs: &[(String, Ty)], rt: &Ty, x: &Expr, env: &Env) -> R<Option<(String, Ty)>> {
+        let (xc, xt) = self.gen(x, env, None)?;
+        let Ty::Enum(ks) = &xt else { return Ok(None) };
+        if ks.iter().any(|&a| self.atoms.is_model(a)) {
+            return Ok(None);
+        }
+        let keys: Vec<(u32, String, Option<usize>)> = ks
+            .iter()
+            .map(|&a| {
+                let n = self.atoms.name(a);
+                let i = fs.iter().position(|(f, _)| *f == n);
+                (a, n, i)
+            })
+            .collect();
+        let mut t = Ty::Enum(vec![]);
+        for i in keys.iter().filter_map(|k| k.2) {
+            let ft = match &fs[i].1 {
+                Ty::Opt(ft) => ft.as_ref(),
+                ft => ft,
+            };
+            t = join(&t, ft).map_err(|e| format!("applying a record to a key that is not constant needs fields of one type: {e}"))?;
+        }
+        let tid = self.ty_id(rt)?;
+        let (r, o) = (self.fresh("r"), self.fresh("o"));
+        let mut arms = String::new();
+        for (a, name, i) in keys {
+            let miss = format!("eval_error(format!(\"Attempted to apply the record\\n{{}}\\nto nonexistent record field {{}}.\", fmt_{tid}(&{r}), {name:?}))");
+            let arm = match i {
+                None => miss,
+                Some(i) => {
+                    let fp = rec_field(fs.len(), i);
+                    match &fs[i].1 {
+                        Ty::Opt(ft) => self.coerce(format!("{{ let {o} = {r}{fp}; if !{o}.0 {{ {miss} }} {o}.1 }}"), ft, &t)?,
+                        ft => self.coerce(format!("{r}{fp}"), ft, &t)?,
+                    }
+                }
+            };
+            write!(arms, "{a}u16 => {arm}, ").unwrap();
+        }
+        Ok(Some((format!("{{ let {r} = {rc}; match {xc} {{ {arms}_ => unreachable!() }} }}"), t)))
     }
 
     /// Rewrites the steps of an EXCEPT path that index into a tuple (`![k][1]`) as steps into the
@@ -4113,6 +4177,9 @@ impl<'a> Gen<'a> {
                         if fs.iter().any(|(n, _)| *n == k) {
                             return self.gen(&Expr::Field(f.clone(), k), env, want);
                         }
+                    }
+                    if let Some(r) = self.rec_apply(&fc, fs, &ft, x, env)? {
+                        return Ok(r);
                     }
                 }
                 let Ty::Fun(d, c) = ft else { return Err(format!("applying a non-function: {f:?}")) };
