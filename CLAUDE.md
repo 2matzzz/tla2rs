@@ -1009,10 +1009,13 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   part by part in order (sets in TLC's order of their elements), and the first part that differs
   makes them unequal (`tests/tlc/TupleFunNest*`, `Gen::walk_eq`). In a set written out, TLC asks each
   element in turn whether it equals the value, with the same error and a fingerprint error from the
-  set (`tests/tlc/TupleFunIn*`). Not followed: a tuple in a sorted set of such functions (from a
-  definition or the state), which TLC searches with its order instead, `Attempted to compare integer
-  with non-integer:` and the key (measured; following it needs TLC's binary search and its order
-  between a tuple and a function); tla2rs reports its own message there
+  set (`tests/tlc/TupleFunIn*`). A sorted set of such functions (from a definition or the state) is
+  searched by halves in TLC's order instead, starting at index n/2: the tuple compares with each
+  element it visits by size, then key by key in TLC's order (model values before integers), where a
+  key that is not an integer stops it with `Attempted to compare integer with non-integer:` (no
+  "an") and the key followed by `.`, without a fingerprint error, and an integer key against the
+  index, then the values, decide which half it goes on in (`tests/tlc/TupleFunSorted*`,
+  `Gen::tuple_fun_search`). So the search may pass every element without an error
 - A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
   tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
