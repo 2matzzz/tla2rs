@@ -3983,7 +3983,8 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if pseudo && shown > 0 {
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
     }
-    let mut code = code;
+    // With -continue, TLC reports the exception before it evaluates again
+    let mut code = continued_inv_eval(&f.msg, f.in_model).unwrap_or(code);
     if let Some(s) = again {
         let (added, failed) = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
         distinct += added;
@@ -3995,7 +3996,6 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if let SMsg::Eval(e) | SMsg::InvEval(_, e) | SMsg::ActionEval(_, e) = &f.msg {
         fp_note(e);
     }
-    let code = continued_inv_eval(&f.msg, f.in_model).unwrap_or(code);
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
     }
@@ -4790,8 +4790,9 @@ fn run_liveness(opt: &Opt) {
                 let mut queued = 0;
                 let code = match f {
                     Found::New(w, idx, msg) => {
-                        let mut code = report_msg(&msg, true);
+                        let code = report_msg(&msg, true);
                         g.print_trace((base[w] + idx) as u32, None, true);
+                        let mut code = continued_inv_eval(&msg, true).unwrap_or(code);
                         if let SMsg::InvEval(_, e) = &msg {
                             let p = g.parent.get(base[w] + idx).0 as usize;
                             let s = g.state(p);
@@ -4803,7 +4804,7 @@ fn run_liveness(opt: &Opt) {
                             }
                             fp_note(e);
                         }
-                        continued_inv_eval(&msg, true).unwrap_or(code)
+                        code
                     }
                     Found::Deadlock(id) => {
                         println!("Error: Deadlock reached.");
