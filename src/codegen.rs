@@ -117,8 +117,9 @@ pub struct Gen<'a> {
     pub shaped: std::collections::BTreeMap<String, (u32, u32, u32)>,
     /// The bits of a word of shape: 64, or 128 when a variable needs more (see `plan_shapes`)
     pub sh_bits: u32,
-    /// IFs whose condition prints inside a value assigned to a variable with a shape, by address:
-    /// the checker keeps the outcome of each under its number, read for the shape (`sh_if`)
+    /// IFs whose condition prints inside the value being assigned to a variable with a shape, by
+    /// address: the checker keeps the outcome of each under its number, read for the shape right
+    /// after (`sh_if`). Cleared once the shape is generated, while the expression is alive
     if_sites: HashMap<usize, u32>,
     /// While generating shape code, which evaluates parts of a value again after it
     if_replay: bool,
@@ -5699,6 +5700,7 @@ impl<'a> Gen<'a> {
                             return self.gen_action(rest, &env2, out);
                         }
                     }
+                    self.if_sites.clear();
                     if self.infer.is_none() && self.shaped.contains_key(&v) {
                         self.note_if_sites(rhs);
                     }
@@ -5715,6 +5717,7 @@ impl<'a> Gen<'a> {
                         },
                     }
                     self.shape_set(&v, &w, Some(rhs), env, out);
+                    self.if_sites.clear();
                     env2.primed.insert(v, (place, t));
                     return self.gen_action(rest, &env2, out);
                 }
@@ -7195,7 +7198,7 @@ impl<'a> Gen<'a> {
         for (v, t) in self.vars.clone() {
             write!(un, "v_{v}: {}, ", self.unpack_value(&t, &mut at)?).unwrap();
         }
-        // The shape, in a word of its own after the state, which fingerprints leave out
+        // The shape, in words of its own after the state, which fingerprints leave out
         if !self.shaped.is_empty() {
             let n = self.sh_words();
             words += n;
@@ -7862,15 +7865,14 @@ pub fn short(e: &Expr) -> String {
 // beside each state, a shape: bits laid out by `shape_slots`, set where TLC holds a set of
 // integers as an interval or a sequence as a function, also inside the records, tuples,
 // sequences, functions and sets the variables hold. It is not part of the fingerprint, and the
-// queue keeps it in a word of its own after the state (`gen_pack`).
+// queue keeps it in words of its own after the state (`gen_pack`).
 
 /// The shape's helpers in a checker, over words of SHB bits (`Shw`): a part of a shape and a part
-/// replaced (nothing past its SHB bits); where the element at index i starts (k bits each, after `base`); the shape of a
-/// sequence of la elements followed by those of another; where the element in slot j starts (k
-/// bits each); the outcome of IF number i kept and read (`Gen::if_sites`); and the bit of the
-/// set of integers x
-/// held as a bitmask, when it is an interval: the interval of offsets i..j is bit j*(j+1)/2 + i
-/// (SHB when x is no interval)
+/// replaced (nothing past its SHB bits); where the element at index i starts (k bits each, after
+/// `base`); where the element in slot j starts (k bits each); the shape of a sequence of la
+/// elements followed by those of another; the outcome of IF number i kept and read
+/// (`Gen::if_sites`); and the bit of the set of integers x held as a bitmask, when it is an
+/// interval: the interval of offsets i..j is bit j*(j+1)/2 + i (SHB when x is no interval)
 const SHAPE_HELPERS: &str = "\
 #[inline] fn sh_get(b: Shw, at: u64, m: Shw) -> Shw { if at >= SHB { 0 } else { (b >> at) & m } }
 #[inline] fn sh_put(b: Shw, at: u64, m: Shw, v: Shw) -> Shw { if at >= SHB { b } else { (b & !(m << at)) | ((v & m) << at) } }
@@ -7993,7 +7995,7 @@ impl Gen<'_> {
 
     /// The bits of shape a value of type t has: one for a set of integers; one per interval its
     /// elements may be for a set of such sets, over at most 10 integers; for another set, those of
-    /// the element in each slot (`set_slot`); for a sequence, one for whether TLC holds it as a
+    /// the element in each slot (`set_find`); for a sequence, one for whether TLC holds it as a
     /// function, then those of each element up to QCAP when they fit; those of each value of a
     /// function over integers, model values or strings, also over part of them; those of the
     /// fields of a record or tuple
@@ -8061,7 +8063,7 @@ impl Gen<'_> {
         }
     }
 
-    /// Whether a set of type t keeps the shape of each element by slot (`set_slot`): its elements
+    /// Whether a set of type t keeps the shape of each element by slot (`set_find`): its elements
     /// have bits of shape and are not sets of integers, whose intervals `iv_count` numbers
     fn pos_set(&self, t: &Ty) -> bool {
         matches!(t, Ty::Set(e) if Self::iv_count(e) == 0 && self.shape_slots(e) > 0) && self.shape_slots(t) > 0
