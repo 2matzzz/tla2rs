@@ -1233,6 +1233,66 @@ fn makes_empty_tuples(m: &Module, cfg: &Cfg, constants: &HashMap<String, Value>)
     m.defs.iter().any(|d| makes(&d.body)) || cfg.constants.iter().any(|(_, e)| makes(e)) || constants.values().any(holds)
 }
 
+/// Whether the spec may build an empty function the checker holds as it holds the empty tuple (a
+/// value of a type with no fields), which TLC prints `<< >>`: `[x \in S |-> e]`, `[S -> T]` or
+/// Permutations(S) over an S not written to have an element, or `@@` of two values that may both
+/// be empty. Read from every definition, used or not
+fn makes_empty_funs(m: &Module, constants: &HashMap<String, Value>) -> bool {
+    type Defs<'a> = HashMap<&'a str, &'a Expr>;
+    fn int(e: &Expr, defs: &Defs, constants: &HashMap<String, Value>, depth: u32) -> Option<i64> {
+        let f = |x: &Expr| int(x, defs, constants, depth);
+        match e.strip() {
+            Expr::Num(n) => Some(*n),
+            Expr::Un(UOp::Neg, a) => f(a)?.checked_neg(),
+            Expr::Bin(BOp::Add, a, b) => f(a)?.checked_add(f(b)?),
+            Expr::Bin(BOp::Sub, a, b) => f(a)?.checked_sub(f(b)?),
+            Expr::Bin(BOp::Mul, a, b) => f(a)?.checked_mul(f(b)?),
+            Expr::Ident(n, _) => match constants.get(n) {
+                Some(Value::Int(i)) => Some(*i),
+                Some(_) => None,
+                None => int(defs.get(n.as_str())?, defs, constants, depth.checked_sub(1)?),
+            },
+            _ => None,
+        }
+    }
+    fn has_elems(e: &Expr, defs: &Defs, constants: &HashMap<String, Value>, depth: u32) -> bool {
+        let f = |x: &Expr| has_elems(x, defs, constants, depth);
+        match e.strip() {
+            Expr::SetLit(xs) => !xs.is_empty(),
+            Expr::Bin(BOp::Cup, a, b) => f(a) || f(b),
+            Expr::Bin(BOp::Range, a, b) => {
+                matches!((int(a, defs, constants, depth), int(b, defs, constants, depth)), (Some(x), Some(y)) if x <= y)
+            }
+            Expr::Un(UOp::Subset, _) => true,
+            Expr::Ident(n, _) => match constants.get(n) {
+                Some(v) => matches!(v, Value::Set(xs) if !xs.is_empty()),
+                None => {
+                    ["Nat", "Int", "STRING", "BOOLEAN"].contains(&n.as_str())
+                        || depth > 0 && defs.get(n.as_str()).is_some_and(|b| has_elems(b, defs, constants, depth - 1))
+                }
+            },
+            _ => false,
+        }
+    }
+    let defs: Defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| (d.name.as_str(), &d.body)).collect();
+    let elems = |s: &Expr| has_elems(s, &defs, constants, 8);
+    let non_empty_fun = |x: &Expr| match x.strip() {
+        Expr::Call(n, _) => n == ":>",
+        Expr::RecLit(fs) => !fs.is_empty(),
+        Expr::Tuple(xs) => !xs.is_empty(),
+        Expr::FunCons(_, s, _) => elems(s),
+        _ => false,
+    };
+    m.defs.iter().any(|d| {
+        d.body.any(&|x| match x {
+            Expr::FunCons(_, s, _) | Expr::FunSet(s, _) => !elems(s),
+            Expr::Call(n, xs) if n == "Permutations" => !xs.first().is_some_and(elems),
+            Expr::Call(n, xs) if n == "@@" => !xs.iter().any(non_empty_fun),
+            _ => false,
+        })
+    })
+}
+
 fn has_except(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Except(..)))
 }
@@ -1584,6 +1644,7 @@ fn compile_inner(
 
     let mut g = Gen::new(&atoms, &constants);
     g.empty_tuples = makes_empty_tuples(&m, &cfg, &constants);
+    g.empty_funs = makes_empty_funs(&m, &constants);
     g.track_from = track_from as u32;
     g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
     // Not a recursive function that prints: TLC does not evaluate it when it starts (see above)
@@ -1686,7 +1747,7 @@ fn compile_inner(
     // Variables whose type TypeOK leaves open are inferred from the assignments in Init and Next
     let undeclared: Vec<String> = m.variables.iter().filter(|v| !decl.contains_key(*v)).cloned().collect();
     if !undeclared.is_empty() {
-        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap, g.qcap, g.empty_tuples)?;
+        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap, g.qcap, (g.empty_tuples, g.empty_funs))?;
         decl.extend(inferred);
     }
     for v in &m.variables {
@@ -2576,7 +2637,7 @@ fn infer_types(
     next: &Expr,
     scap: usize,
     qcap: usize,
-    empty_tuples: bool,
+    (empty_tuples, empty_funs): (bool, bool),
 ) -> R<HashMap<String, Ty>> {
     let bottom = Ty::Enum(vec![]);
     let mut cur: HashMap<String, Ty> = undeclared.iter().map(|v| (v.clone(), bottom.clone())).collect();
@@ -2589,6 +2650,7 @@ fn infer_types(
         g.scap = scap;
         g.qcap = qcap;
         g.empty_tuples = empty_tuples;
+        g.empty_funs = empty_funs;
         for v in vars {
             g.vars.push((v.clone(), decl.get(v).or(cur.get(v)).unwrap().clone()));
         }

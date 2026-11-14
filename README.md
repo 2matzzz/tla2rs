@@ -251,7 +251,10 @@ bounds the size of a model with temporal properties (one property per thread, so
   TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends
   on when that happens. ToString of an empty function over part of a type makes `<< >>`, as TLC does for one built as
   a function; in a spec that may also build an empty tuple (`<<>>`, Tail, SubSeq, `\o`, SelectSeq, SortSeq, or a
-  constant holding one), which TLC prints `<<>>`, it stops with an evaluation error
+  constant holding one), which TLC prints `<<>>`, it stops with an evaluation error. The empty tuple and the empty
+  function over a constant empty set share one type in a checker, which prints `<< >>` for it in a spec that builds
+  no empty tuple and `<<>>` in one that builds no such function (in states, Print, PrintT and ToString); in a spec
+  that may build both, ToString of it stops with an evaluation error. ToString of a bag from the state is refused
 - A function over part of a type (and a bag) is an array over the whole type when the type has at most 65536 values.
   Over a larger or unbounded type (Nat, a large integer range, sets, records of those) it is the sorted list of its
   (key, value) pairs, whose capacity grows as a set's does (`Cardinality(DOMAIN f) <= K` in `TypeOK` sets where it
