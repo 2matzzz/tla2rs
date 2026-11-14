@@ -128,7 +128,27 @@ fn action_level(e: &Expr) -> bool {
     match e {
         Expr::Prime(_) | Expr::Un(UOp::Unchanged, _) | Expr::BoxAction(..) => true,
         Expr::Un(UOp::Enabled, _) => false,
-        _ => e.children().into_iter().any(action_level),
+        _ => level_parts(e).into_iter().any(action_level),
+    }
+}
+
+/// The parts of e that SANY counts for its level: all but what Print and PrintT print (see
+/// `sany_level`)
+fn level_parts(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Call(n, a) if n == "Print" && a.len() == 2 => vec![&a[1]],
+        Expr::Call(n, a) if n == "PrintT" && a.len() == 1 => vec![],
+        _ => e.children(),
+    }
+}
+
+/// Whether e is of state or action level as SANY counts it (see `level_parts`): it reads a
+/// variable, primed or not, or ENABLED or UNCHANGED of something
+fn reads_state(g: &Gen, e: &Expr) -> bool {
+    match e {
+        Expr::Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
+        Expr::Prime(_) | Expr::Un(UOp::Enabled | UOp::Unchanged, _) => true,
+        _ => level_parts(e).into_iter().any(|c| reads_state(g, c)),
     }
 }
 
@@ -174,6 +194,14 @@ pub(crate) fn sany_level(e: &Expr) -> Result<u8, String> {
             r => r?,
         },
         Label(_, _, b) => sany_level(b)?,
+        // TLC.tla defines `Print(out, val) == val` and `PrintT(out) == TRUE`, and SANY takes the
+        // level of a call from the definition: that of the value printed is not counted
+        Call(n, a) if (n == "Print" && a.len() == 2) || (n == "PrintT" && a.len() == 1) => {
+            for c in a {
+                sany_level(c)?;
+            }
+            if n == "Print" { sany_level(&a[1])? } else { 0 }
+        }
         Un(UOp::Enabled, x) => {
             sany_level(x)?;
             1
@@ -560,22 +588,27 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
     let e0 = e;
     let e = e.strip();
     if !temporal(e) {
-        if let Some(m) = live_const_error(g, e0, env) {
-            let m = format!("TLC threw an unexpected exception.\nThis was probably caused by an error in the spec or model.\nSee the User Output or TLC Console for clues to what happened.\n{m}");
-            return Ok(Err(Rejected(m, 255)));
+        match live_const_error(g, e0, env) {
+            // A variable in a part of constant level (as SANY counts levels, Print(x, TRUE) is
+            // one): TLC reports it as it fails to evaluate it, and stops with exit 151
+            Some(m) if m.starts_with(UNDEFINED) => return Ok(Err(Rejected(m[UNDEFINED.len()..].to_string(), 151))),
+            Some(m) => {
+                let m = format!("TLC threw an unexpected exception.\nThis was probably caused by an error in the spec or model.\nSee the User Output or TLC Console for clues to what happened.\n{m}");
+                return Ok(Err(Rejected(m, 255)));
+            }
+            None => {}
         }
         if let Bool(b) = e {
             return Ok(Ok(TExpr::Bool(*b)));
         }
         // A predicate of constant level is a boolean constant to TLC, which evaluates it here
-        // (Liveness.astToLive); see TExpr::tableau_bools for what that changes
-        let reads_state = e.any(&|x| match x {
-            Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
-            Prime(_) | Un(UOp::Enabled | UOp::Unchanged, _) => true,
-            _ => false,
-        });
-        if !reads_state {
-            if let Ok(Value::Bool(b)) = g.ce.eval(e, env) {
+        // (Liveness.astToLive); see TExpr::tableau_bools for what that changes. What it printed
+        // then was noted by live_const_error
+        if !reads_state(g, e) {
+            let quiet = crate::value::PRINTED.with(|p| p.replace(None));
+            let v = g.ce.eval(e, env);
+            crate::value::PRINTED.with(|p| *p.borrow_mut() = quiet);
+            if let Ok(Value::Bool(b)) = v {
                 return Ok(Ok(TExpr::Bool(b)));
             }
         }
@@ -689,11 +722,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
 /// of an IF that the condition does not take (`tests/tlc/LiveConstErr`)
 fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<String> {
     use Expr::*;
-    let reads_state = e.any(&|x| match x {
-        Ident(n, _) => g.vars.iter().any(|(v, _)| v == n),
-        Prime(_) | Un(UOp::Enabled | UOp::Unchanged, _) => true,
-        _ => false,
-    });
+    let reads_state = reads_state(g, e);
     match e {
         // A call of a definition of constant level is evaluated whole, as TLC evaluates it: the
         // branch of an IF in it that the condition does not take is not (`tests/tlc/LiveConstErr-Call`)
@@ -726,11 +755,45 @@ fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<S
     if reads_state {
         return None;
     }
+    // What it prints, TLC prints when it starts (`take_live_prints`)
+    let outer = crate::value::PRINTED.with(|p| p.replace(Some(vec![])));
+    let r = g.ce.eval(e, env);
+    let lines = crate::value::PRINTED.with(|p| p.replace(outer)).unwrap_or_default();
+    LIVE_PRINTS.with(|p| p.borrow_mut().extend(lines));
     // Only TLC's own evaluation errors (the constant evaluator also fails on what it cannot do)
-    match g.ce.eval(e, env) {
+    match r {
         Err(m) if m.starts_with("Attempted to") || m.starts_with("0^0") || m.starts_with("The second argument of ^") => Some(m),
+        // A variable where TLC evaluates the part as a constant (a part that reads one only in
+        // what Print or PrintT prints): the first one evaluated, where it is written
+        Err(m) => {
+            let is_var = |v: &str| g.vars.iter().any(|(n, _)| n == v);
+            let v = match m.strip_prefix('`').and_then(|x| x.strip_suffix("` is not a constant")) {
+                Some(v) => v.to_string(),
+                // A primed variable
+                None if m == "not a constant expression" => first_var(e, &is_var)?,
+                None => return None,
+            };
+            let at = first_named(e, &v).filter(|_| is_var(&v))?;
+            Some(format!("{UNDEFINED}In evaluation, the identifier {v} is either undefined or not an operator.\n{}", at.text()))
+        }
         _ => None,
     }
+}
+
+/// Marks the error of a variable met where TLC evaluates a part of a temporal formula as a
+/// constant (see `live_const_error`)
+const UNDEFINED: &str = "\u{1}undefined:";
+
+thread_local! {
+    /// What Print and PrintT printed while the parts of constant level of the temporal formulas
+    /// were evaluated, as `value::PRINTED` records it
+    static LIVE_PRINTS: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// The lines printed while evaluating the parts of constant level of the temporal formulas, which
+/// TLC prints when it starts, after the constant invariants and properties and before the ASSUMEs
+pub fn take_live_prints() -> Vec<Vec<String>> {
+    LIVE_PRINTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 /// TLC's fairness conditions in its form; their atoms are only classified
 fn fair_texpr(f: &FairDef) -> TExpr {
@@ -1398,6 +1461,14 @@ pub fn compile(
 }
 
 /// The position of the first identifier named v written in e
+/// The first variable named in e, as written
+fn first_var(e: &Expr, is_var: &dyn Fn(&str) -> bool) -> Option<String> {
+    match e {
+        Expr::Ident(n, _) if is_var(n) => Some(n.clone()),
+        e => e.children().into_iter().find_map(|c| first_var(c, is_var)),
+    }
+}
+
 fn first_named(e: &Expr, v: &str) -> Option<Pos> {
     match e {
         Expr::Ident(n, at) if n == v && at.known() => Some(*at),

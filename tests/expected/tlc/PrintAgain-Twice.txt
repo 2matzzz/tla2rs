@@ -1,0 +1,10 @@
+key 44afeb510a18d97507bd2fd1bc364064e827d784446ac7ee37a68b0f315000c5
+tlc Version 2.19
+rc 255
+Evaluating invariant BadTwice failed
+13 states generated 11 distinct states found 6 states left on queue
+trace 2 e334756ef27b9ec49bef74204afba49a538d52d481e945ade73b3b65dce4c528
+states 11 fdc8491f4a54540760cc7b7c1fbb4413bc2eefd4cf486a5202b4025d37db728a
+edges 12 e1199ff17702125c0e25b522898a969372ce2cd8c41ef8a5a220f95eb2154936
+messages 44 5f7a665c5e3c76ff8c7d3f3938f2e6931b4c395fc00ca981b64655a278e4901c
+errors 2 0448cb4a43bdb68a7bb84cfa319abb06915da9ef36fa932220532f63662d08bf

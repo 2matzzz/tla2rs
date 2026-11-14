@@ -1173,7 +1173,7 @@ impl Capturing {
             return Held::default();
         }
         let cap = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
-        Held { cap, next: 0, next_made: 0 }
+        Held { cap, ..Default::default() }
     }
 }
 
@@ -1194,16 +1194,46 @@ struct Held {
     cap: Capture,
     next: usize,
     next_made: usize,
+    /// What the action properties printed on the step to each successor (by its index among the
+    /// states pushed, in order), which TLC evaluates after the successor is added and its
+    /// invariants are checked: printed after the lines before the next state was pushed
+    after: Vec<(u32, Held)>,
+    next_after: usize,
 }
 
 impl Held {
     /// Prints the lines printed before the `n`th state was pushed (all with u32::MAX), and notes
-    /// the strings made before it
+    /// the strings made before it; with what the action properties printed on the steps to the
+    /// states before the last of those
     #[inline]
     fn flush(&mut self, n: u32) {
         if !PRINT_ORDER && !STR_ORDER {
             return;
         }
+        while let Some(j) = self.after.get(self.next_after).map(|a| a.0).filter(|&j| j.saturating_add(1) < n) {
+            self.flush_plain(j + 1);
+            let mut h = std::mem::take(&mut self.after[self.next_after].1);
+            self.next_after += 1;
+            h.flush(u32::MAX);
+        }
+        self.flush_plain(n);
+    }
+
+    /// `flush(j + 1)`, then what the action properties printed on the step to state j (once its
+    /// invariants are checked)
+    fn flush_after(&mut self, j: u32) {
+        if !PRINT_ORDER && !STR_ORDER {
+            return;
+        }
+        self.flush(j + 1);
+        if self.after.get(self.next_after).is_some_and(|a| a.0 == j) {
+            let mut h = std::mem::take(&mut self.after[self.next_after].1);
+            self.next_after += 1;
+            h.flush(u32::MAX);
+        }
+    }
+
+    fn flush_plain(&mut self, n: u32) {
         while let Some((p, _, l)) = self.cap.lines.get(self.next) {
             if *p >= n {
                 break;
@@ -1916,7 +1946,8 @@ fn check_invariants(s: &State) -> Option<&'static str> {
 
 /// `check_invariants`, with an evaluation error returned along with the invariant that raised it.
 fn eval_invariants(s: &State) -> Result<Option<&'static str>, (&'static str, EvalErr)> {
-    match std::panic::catch_unwind(|| if TLCGET { Err(()) } else { Ok(check_invariants(s)) }) {
+    // An invariant that prints is evaluated once, as TLC does
+    match std::panic::catch_unwind(|| if TLCGET || INV_PRINTS { Err(()) } else { Ok(check_invariants(s)) }) {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(())) => {
             for (name, f) in INVARIANTS {
@@ -2211,7 +2242,6 @@ fn expand_one_succ(
             }
             continue;
         }
-        let act = check_action_props(&s, &t);
         let Some(w) = pack(&t) else {
             if dumping() {
                 dump_unpacked(&mut c.dump, sfp_dump, &t, l);
@@ -2254,7 +2284,9 @@ fn expand_one_succ(
                 c.live.newk.push(k);
             }
         }
-        if let Some(m) = act {
+        // As TLC does, after t is added (if new) and its invariants are checked
+        held.flush(k as u32 + 1);
+        if let Some(m) = check_action_props(&s, &t) {
             if flag(&CONTINUE) && matches!(m, SMsg::Action(_)) {
                 let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
                 report_msg(&m, true);
@@ -2656,18 +2688,26 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
 }
 
 /// After an error in evaluating an invariant on a new state, TLC evaluates the state it was
-/// expanding again to report where the error is (`ModelChecker`, with `CallStackTool`), and that
-/// pass writes to the graph too: it generates all the successors of the state once more, writes
-/// an edge for each in the model, adds the ones it has not seen (the failing one was added the
-/// first time, so it is passed over now), checks the invariants of new successors and of those
-/// outside the model, and the action properties of all, and stops at the first that fails.
-/// `visited` tells whether a fingerprint was visited by the search.
-fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
+/// expanding again to report where the error is (`ModelChecker`, with `CallStackTool`): it
+/// generates all the successors of the state once more, printing what the actions print, writes
+/// an edge for each in the model to the graph, adds the ones it has not seen (the failing one was
+/// added the first time, so it is passed over now) and queues them, checks the invariants of new
+/// successors and of those outside the model, and the action properties of all, and stops at the
+/// first that fails. `visited` tells whether a fingerprint was visited by the search. Returns the
+/// states added, and whether an invariant failed to evaluate again (TLC then reports where, and
+/// exits with 255): the last one added is not queued then
+fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, bool) {
     let mut buf = vec![];
+    let cap = Capturing::start();
     let _ = tg_quiet(|| successors(s, &mut buf, true));
+    let mut held = cap.finish();
     let mut out = String::new();
     let mut added = std::collections::HashSet::new();
-    for (t, l) in buf {
+    let mut failed = false;
+    let mut stopped = true;
+    for (i, (t, l)) in buf.into_iter().enumerate() {
+        held.flush(i as u32 + 1);
+        stopped = true;
         let Ok(inm) = std::panic::catch_unwind(|| in_model(s, &t)) else { break };
         let mut unseen = true;
         if inm {
@@ -2683,14 +2723,28 @@ fn dump_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) {
                 Err(_) => break,
             }
         }
-        if unseen && check_out_of_model(&t).is_some() {
-            break;
+        if unseen {
+            match check_out_of_model(&t) {
+                Some(SMsg::InvEval(..)) => {
+                    failed = true;
+                    break;
+                }
+                Some(_) => break,
+                None => {}
+            }
         }
         if check_action_props(s, &t).is_some() {
             break;
         }
+        stopped = false;
     }
-    dump_write(&mut out);
+    if !stopped {
+        held.flush(u32::MAX);
+    }
+    if dumping() {
+        dump_write(&mut out);
+    }
+    (added.len() as u64, failed)
 }
 
 /// Where the checker spills when `-tmpdir` is not given: the system's temp dir, unless it is a tmpfs
@@ -3007,6 +3061,9 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         if let Some(s) = state.filter(|_| !tlc_eval_exception(&e) && !matches!(e, EvalErr::Type(_))) {
             println!("While working on the initial state:\n{}\n", show(s));
         }
+        if !matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
+            init_again_prints();
+        }
         fp_note(&e);
         eprintln!("  (while {while_})");
         println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
@@ -3141,6 +3198,38 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         stop(e, "computing the initial states", None, generated, out.len());
     }
     (out, generated)
+}
+
+/// After an error while computing or checking the initial states, TLC computes and checks them
+/// again from the start to report where the error is (`ModelChecker.doInit`, with `CallStackTool`),
+/// printing again what Init, the CONSTRAINT, the invariants and the properties print, up to the
+/// error
+fn init_again_prints() {
+    if !PRINT_ORDER || TLCGET {
+        return;
+    }
+    let cap = Capturing::start();
+    let mut inits = vec![];
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).is_err();
+    let mut held = cap.finish();
+    let mut seen = std::collections::HashSet::new();
+    for (k, s) in inits.iter().enumerate() {
+        held.flush(k as u32 + 1);
+        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else { return };
+        if let Some(w) = pack(s).filter(|_| in_model) {
+            if !seen.insert(state_fp(s, &w)) {
+                continue;
+            }
+        }
+        for (_, f) in INVARIANTS.iter().chain(INIT_PROPS) {
+            if !matches!(std::panic::catch_unwind(|| f(s)), Ok(true)) {
+                return;
+            }
+        }
+    }
+    if failed {
+        held.flush(u32::MAX);
+    }
 }
 
 /// Whether the violations of the initial states have been reported (-continue)
@@ -3370,8 +3459,13 @@ fn expand_safety_one(
         return found;
     }
     c.generated = examined;
-    // What was printed up to the successor that stops the search, or all of it
-    ws.held.flush(if matches!(stopped, Ok(None)) { u32::MAX } else { (examined - base) as u32 });
+    // What was printed up to the successor that stops the search (and on the step to it, when an
+    // action property stops it), or all of it
+    match &stopped {
+        Ok(None) => ws.held.flush(u32::MAX),
+        Ok(Some(f)) if f.extra.is_some() && matches!(f.msg, SMsg::Action(_) | SMsg::ActionEval(..)) => ws.held.flush_after((examined - base - 1) as u32),
+        _ => ws.held.flush((examined - base) as u32),
+    }
     // A successor that violates an action property is added to the visited states, but TLC
     // stops before queueing it
     if let (Ok(Some(f)), Some(&(i, tfp, _))) = (&stopped, ws.cand.last()) {
@@ -3473,8 +3567,17 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
             ws.dpend.push((i, e));
         }
         // A violated action property is reported after t is added (if new) and its invariants are
-        // checked, as TLC does: t stays a candidate, and the search stops after it.
-        let act = match check_action_props(s, t) {
+        // checked, as TLC does: t stays a candidate, and the search stops after it. What it prints
+        // is held until then too
+        let act = if (PRINT_ORDER || str_on()) && !TLCGET {
+            let cap = Capturing::start();
+            let act = check_action_props(s, t);
+            ws.held.after.push((i as u32, cap.finish()));
+            act
+        } else {
+            check_action_props(s, t)
+        };
+        let act = match act {
             // With -continue, reported in `insert_candidates` and the search goes on
             Some(SMsg::Action(name)) if flag(&CONTINUE) => {
                 ws.acts.push((i, name));
@@ -3518,8 +3621,9 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
 fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
     // With -continue, the violations of action properties, each after its successor is checked
     let mut acts = 0;
-    let report_acts = |upto: usize, acts: &mut usize, ws: &SWork| {
+    let report_acts = |upto: usize, acts: &mut usize, ws: &mut SWork| {
         while let Some(&(j, name)) = ws.acts.get(*acts).filter(|(j, _)| *j < upto) {
+            ws.held.flush_after(j as u32);
             report_continued(seen, &SFound::new(sfp, Some(ws.buf[j]), SMsg::Action(name)));
             *acts += 1;
         }
@@ -3531,7 +3635,7 @@ fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut
     r
 }
 
-fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork, acts: &mut dyn FnMut(usize, &SWork)) -> Option<SFound> {
+fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork, acts: &mut dyn FnMut(usize, &mut SWork)) -> Option<SFound> {
     for k in 0..ws.cand.len() {
         let (i, tfp, tw) = ws.cand[k];
         acts(i, ws);
@@ -3556,6 +3660,7 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
             Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
             Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
+        ws.held.flush_after(i as u32);
         c.next.push((tw, tfp));
         tg_queued(1);
         acts(i + 1, ws);
@@ -3850,14 +3955,15 @@ fn merge_chunk(c: SChunk, generated: &mut u64, distinct: &mut u64, nxt: &mut Lev
 
 /// Reports a detected error and exits. Never returns.
 fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distinct: u64, left: usize) -> ! {
-    if dumping() && f.extra.is_none() && matches!(f.msg, SMsg::InvEval(..)) {
-        // The state whose successor failed: the one before it on the trace
+    // The state whose new successor failed to evaluate an invariant: the one before it on the
+    // trace, which TLC evaluates again after showing the behavior (`eval_replay`)
+    let again = if f.extra.is_none() && matches!(f.msg, SMsg::InvEval(..)) {
         let parent = seen.pred_of(f.fp).and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c));
-        if let Some(&(s, _)) = parent.as_ref().and_then(|t| t.last()) {
-            let p = state_fp(&s, &pack(&s).unwrap());
-            dump_replay(&s, p, &|fp| seen.contains(fp));
-        }
-    }
+        parent.as_ref().and_then(|t| t.last()).map(|&(s, _)| s)
+    } else {
+        None
+    };
+    let mut left = left;
     let code = report_msg(&f.msg, f.in_model);
     // As in TLC, a successor that left its type counts as one state, and so does a new successor
     // that could not be packed (unless it is outside the CONSTRAINT).
@@ -3877,10 +3983,19 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if pseudo && shown > 0 {
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
     }
+    // With -continue, TLC reports the exception before it evaluates again
+    let mut code = continued_inv_eval(&f.msg, f.in_model).unwrap_or(code);
+    if let Some(s) = again {
+        let (added, failed) = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
+        distinct += added;
+        left += added as usize - failed as usize;
+        if failed {
+            code = 255;
+        }
+    }
     if let SMsg::Eval(e) | SMsg::InvEval(_, e) | SMsg::ActionEval(_, e) = &f.msg {
         fp_note(e);
     }
-    let code = continued_inv_eval(&f.msg, f.in_model).unwrap_or(code);
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
     }
@@ -4671,19 +4786,25 @@ fn run_liveness(opt: &Opt) {
             }
             if let Some((_, f)) = found {
                 let mut distinct = g.states.len();
+                // The states TLC queues as it evaluates again after an error (`eval_replay`)
+                let mut queued = 0;
                 let code = match f {
                     Found::New(w, idx, msg) => {
-                        if dumping() && matches!(msg, SMsg::InvEval(..)) {
-                            let p = g.parent.get(base[w] + idx).0 as usize;
-                            let s = g.state(p);
-                            dump_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
-                        }
                         let code = report_msg(&msg, true);
                         g.print_trace((base[w] + idx) as u32, None, true);
+                        let mut code = continued_inv_eval(&msg, true).unwrap_or(code);
                         if let SMsg::InvEval(_, e) = &msg {
+                            let p = g.parent.get(base[w] + idx).0 as usize;
+                            let s = g.state(p);
+                            let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
+                            distinct += added as usize;
+                            queued = added as usize - failed as usize;
+                            if failed {
+                                code = 255;
+                            }
                             fp_note(e);
                         }
-                        continued_inv_eval(&msg, true).unwrap_or(code)
+                        code
                     }
                     Found::Deadlock(id) => {
                         println!("Error: Deadlock reached.");
@@ -4726,7 +4847,7 @@ fn run_liveness(opt: &Opt) {
                 // As in `run_safety`
                 println!(
                     "{generated} states generated, {distinct} distinct states found, {} states left on queue.",
-                    (hi - lo - expanded) + (g.states.len() - hi) - unqueued as usize
+                    (hi - lo - expanded) + (g.states.len() - hi) - unqueued as usize + queued
                 );
                 exit(code);
             }
@@ -6543,7 +6664,11 @@ fn tlc_print_lasso(g: &Graph, tfp: &[u64], prefix: &[u32], postfix: &[u32]) -> R
     drop(_quiet);
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     let mut texts = vec![];
+    lasso_prefix_prints(&out, cycle_no);
     for (i, (s, l)) in out.iter().enumerate() {
+        if i >= cycle_no && PRINT_ORDER {
+            step_prints(&out[i - 1].0, s, i);
+        }
         print_step(&format!("State {}: <{}>", i + 1, name(*l)), s, (i > 0).then(|| &out[i - 1].0));
         texts.push(show(s));
     }
@@ -6553,6 +6678,9 @@ fn tlc_print_lasso(g: &Graph, tfp: &[u64], prefix: &[u32], postfix: &[u32]) -> R
             write_lasso_check(&texts, None);
         }
         Some((t, l)) => {
+            if PRINT_ORDER {
+                step_prints(&out[out.len() - 1].0, &t, out.len());
+            }
             println!("Back to state {cycle_no}: <{}>", name(l));
             // Under a SYMMETRY the step back can reach another member of the class, which
             // the lasso check folds into the state returned to
@@ -6561,6 +6689,23 @@ fn tlc_print_lasso(g: &Graph, tfp: &[u64], prefix: &[u32], postfix: &[u32]) -> R
         }
     }
     Ok(())
+}
+
+/// What TLC prints again as it rebuilds a lasso from fingerprints before showing it: Init (all of
+/// it) and each step to the states up to the start of the cycle (`upto`, from 1), the actions in
+/// order up to the one that yields the next state. It evaluates each step of the cycle, and the
+/// step back to its start, just before it shows the state (measured on TLC 2.19,
+/// `tests/tlc/PrintLasso`)
+fn lasso_prefix_prints(states: &[(State, u32)], upto: usize) {
+    if !PRINT_ORDER {
+        return;
+    }
+    let mut v = vec![];
+    tg_set_level(0);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
+    for i in 1..upto.min(states.len()) {
+        step_prints(&states[i - 1].0, &states[i].0, i);
+    }
 }
 
 fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
@@ -6592,7 +6737,12 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
     let (states, ret) = lasso_states(g, &path, entry_no, back_label);
     // The states shown, for -lassocheck
     let mut texts: Vec<String> = vec![];
+    let cycle_no = ret.as_ref().map_or(states.len(), |r| r.0);
+    lasso_prefix_prints(&states, cycle_no);
     for (i, &(s, l)) in states.iter().enumerate() {
+        if i >= cycle_no && PRINT_ORDER {
+            step_prints(&states[i - 1].0, &s, i);
+        }
         print_step(&format!("State {}: <{}>", i + 1, name(l)), &s, (i > 0).then(|| &states[i - 1].0));
         texts.push(show(&s));
     }
@@ -6602,6 +6752,10 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
             write_lasso_check(&texts, None);
         }
         Some((back, l, folded)) => {
+            if PRINT_ORDER {
+                let to = folded.unwrap_or(states[back - 1].0);
+                step_prints(&states[states.len() - 1].0, &to, states.len());
+            }
             println!("Back to state {back}: <{}>", name(l));
             write_lasso_check(&texts, Some((back, folded.map(|t| show(&t)))));
         }

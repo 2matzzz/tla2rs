@@ -37,6 +37,9 @@ pub struct Startup {
     pub warnings: Vec<String>,
     /// TLC's warnings while it evaluates the invariants and properties of constant level
     pub invs: Vec<String>,
+    /// What TLC prints while it evaluates the parts of constant level of the temporal formulas
+    /// (`live::take_live_prints`)
+    pub live: Vec<String>,
     pub assumes: Vec<String>,
     /// The strings that operations made while TLC evaluated the constants, the definitions of
     /// constant level, the constant invariants and properties and the ASSUMEs, in the order made
@@ -76,7 +79,7 @@ impl Startup {
         let mut v = self.pcal.clone();
         v.extend(self.sany.iter().cloned());
         let mark = |w: &String| format!("{}{w}", crate::value::WARNING_MARK);
-        let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
+        let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.live.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
         // TLC prints a warning only when it has not printed the same text before, and the first
         // warning of a run carries its note (so the same warning can come once more without it)
         let mut seen = HashSet::new();
@@ -1230,10 +1233,18 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
                 continue;
             }
         }
-        // TLC pretty-prints each value printed (80 columns) on the standard output (`user_text`)
-        out.push(format!("{USER_MARK}{}", l.join(&USER_SEP.to_string())));
+        out.push(user_line(&l));
     }
     r
+}
+
+/// A line recorded in `value::PRINTED`, marked as one the spec printed (TLC pretty-prints each
+/// value printed, 80 columns, on the standard output: `user_text`), or one of TLC's warnings
+fn user_line(l: &[String]) -> String {
+    match l {
+        [w] if w.starts_with(crate::value::WARNING_MARK) => w.clone(),
+        _ => format!("{USER_MARK}{}", l.join(&USER_SEP.to_string())),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1408,6 +1419,13 @@ fn compile_inner(
             if !ex.expand_def_code(&n, false).is_ok_and(|e| constant_level(&e, &m)) || bound_reads_state(&n, &m) {
                 continue;
             }
+            // A recursive function `f[x \in S] == e` is not evaluated then: TLC evaluates it
+            // where it is applied, at the argument only (and again at each application), and all
+            // of it where it is used as a value (`tests/tlc/PrintFun`)
+            let app = format!("{n}#app");
+            if m.defs.iter().any(|d| d.name == app) && has_prints(&ex.expand_def_bound(&n).unwrap_or(Expr::Bool(true))) {
+                continue;
+            }
             let Ok(e) = ex.expand_def_bound(&n) else { continue };
             if has_prints(&e) || has_except(&e) {
                 // TLC ignores a definition it fails to evaluate here (and may warn about an
@@ -1543,7 +1561,9 @@ fn compile_inner(
     let mut g = Gen::new(&atoms, &constants);
     g.track_from = track_from as u32;
     g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
-    g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty()).map(|d| d.name.clone()).collect();
+    // Not a recursive function that prints: TLC does not evaluate it when it starts (see above)
+    let printing_rec = |n: &str| m.defs.iter().any(|d| d.name == format!("{n}#app") && has_prints(&d.body));
+    g.zero_defs = m.defs.iter().filter(|d| d.params.is_empty() && !printing_rec(&d.name)).map(|d| d.name.clone()).collect();
     g.def_pos = m.defs.iter().filter_map(|d| match &d.body {
         Expr::Label(n, _, _) => pos_of(n).map(|p| (d.name.clone(), p.to_string())),
         _ => None,
@@ -1709,6 +1729,7 @@ fn compile_inner(
 
     // Temporal properties
     let mut live_parts: Vec<(String, Expr, HashMap<String, Value>)> = vec![];
+    let mut act_prints = false;
     let mut action_props: Vec<(String, String, String)> = vec![];
     let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
@@ -1750,6 +1771,8 @@ fn compile_inner(
                 continue;
             }
             if kind == 5 {
+                // What it prints comes in TLC's order with the rest (see PRINT_ORDER)
+                act_prints |= has_prints(&p) || q.as_ref().is_some_and(has_prints);
                 let env = g.env_step(env);
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 let qc = g.gen_as(&q.unwrap(), &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
@@ -1771,10 +1794,15 @@ fn compile_inner(
         }
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
-    let live_code = match crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts)? {
+    crate::live::take_live_prints();
+    let live_code = crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts);
+    startup.live = crate::live::take_live_prints().into_iter().map(|l| user_line(&l)).collect();
+    let live_code = match live_code? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0), atoms: vec![] })
+            // TLC converts the temporal formulas before it evaluates the ASSUMEs
+            startup.assumes.clear();
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0), atoms: vec![] });
         }
     };
     let mut prop_code = String::new();
@@ -1896,7 +1924,7 @@ fn compile_inner(
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
-    writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
+    writeln!(src, "const PRINT_ORDER: bool = {};", print_order || act_prints).unwrap();
     writeln!(src, "const TLCGET: bool = {};", g.tlcget).unwrap();
     // The registers the ASSUMEs set
     let regs: Vec<String> = reg_init.iter().map(|(i, v)| format!("({i}, {v})")).collect();

@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 949 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 987 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -496,8 +496,9 @@ What TLC 2.19 writes, measured (`tlc2.util.DotStateWriter`, called from `Worker`
   label are there). With one worker this point is deterministic, and every such configuration is compared
 - After an error in evaluating an invariant on a new state, TLC evaluates the state it was expanding again to show
   where the error is, and that pass writes too: an edge to every successor of that state, adding those not yet seen,
-  until a new successor fails an invariant or any fails an action property. `dump_replay` repeats this
-  (`tests/tlc/BagOps-Lit.cfg`, `FunMember-NotFun.cfg`, `StrSeqOps-StrLeft.cfg` need it)
+  until a new successor fails an invariant or any fails an action property. `eval_replay` repeats this
+  (`tests/tlc/BagOps-Lit.cfg`, `FunMember-NotFun.cfg`, `StrSeqOps-StrLeft.cfg` need it), and counts the states it
+  adds, which TLC queues (`AgainCount`; see "Messages and printed lines")
 - For liveness checking, TLC also writes a dashed stuttering edge from each state it expands to itself
 - The values are pretty-printed to 80 columns (`tlc2.pprint`, ported as `ppr` and checked against TLC's on 25,000
   random values). A spec with a single variable prints `x = 1`, without `/\`
@@ -826,16 +827,68 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   k > 1) and to the successor that stopped the search the same way, each before its state. No
   invariant is evaluated again. After an evaluation error in the actions it evaluates the failing
   step once more (to find where the error is), printing again up to the error
+- After a new successor fails to evaluate an invariant, it shows the behavior and then generates
+  every successor of the state it was expanding once more (`eval_replay`): the actions print again
+  in order, a successor not seen yet is added and queued (so it counts as distinct and left on
+  queue) and its invariants are checked, up to the first that fails; one that fails to evaluate
+  again makes it exit with 255. With `-continue` it reports the exception it did not expect before
+  that pass. After an error while computing or checking the initial states (in Init, the
+  CONSTRAINT, an invariant or a property), it reports the error and then computes and checks them
+  again from the start, printing again up to the error (`init_again_prints`; `tests/tlc/PrintAgain*`)
+- The action properties are checked on the step to a successor after the successor is added (if
+  new) and its invariants are checked: what they print comes then, before the next action is
+  evaluated, and with `-continue` before their violation is reported (`Held::after`; the liveness
+  search evaluates them after the invariants; `tests/tlc/PrintAct*`)
+- To show a liveness counterexample it rebuilds the lasso from fingerprints too: it first evaluates
+  Init and the steps up to the state the cycle starts at, then shows those states, then evaluates
+  each step of the cycle just before the state it leads to, and the step back before `Back to
+  state` (`lasso_prefix_prints`; `tests/tlc/PrintLasso*`)
 
-When Init, Next or an invariant prints (`PRINT_ORDER` in the generated checker, set by
+When Init, Next, an invariant or an action property prints (`PRINT_ORDER` in the generated checker, set by
 `compile.rs`), the checker marks each state `init` or `next` pushes and the start of each action
 (`mark_push`, `mark_action`, generated only then), holds what Print and PrintT print while it
 computes states, and prints those lines as it handles the states (`Capturing`, `Held` in
 `runtime.rs`); `print_states_tlc` shows a behavior as above. Such specs are searched without
 `-batched` (on the default path), and a spec that prints nowhere else generates the same code as
-before. A property `[]P` checked as an invariant is not covered: with `-batched` / `-metal`, when it
+before. An invariant that prints is evaluated once per state, not again to find which one failed. A property `[]P` checked as an invariant is not covered: with `-batched` / `-metal`, when it
 prints, phase 1 first skips a candidate already visited or collected in the level (`INV_PRINTS`),
 since TLC checks new states only.
+
+How many times a line is printed, measured on TLC 2.19 with one worker (each with a test in `tests/tlc/`):
+
+- `[y \in S |-> e]` is kept unevaluated (`PrintFun`): applied, TLC evaluates e at the argument only, at
+  each application; used as a value (compared, printed, ToString, DOMAIN, a variable's value) it
+  evaluates e at every element. Where it evaluates a LET definition or an argument once, it keeps the
+  function computed the first time it is used as a value; once applied, DOMAIN computes nothing and
+  printing computes it without keeping it. Code generation applies such a function as its body at
+  the argument (as for `lazy_apply`) and binds such a name to a cell with a flag for whether it was
+  applied (`Gen::gen_bind`, `lazy_cells`, `shown_once`). A function definition of constant level is
+  computed when TLC starts, but a recursive one is not: it is evaluated where it is applied, the
+  recursion too, at each application (`compile.rs`, and `Gen::is_const` for `RecCall`)
+- TLC evaluates what tla2rs decides without evaluating (`PrintFold`): the elements of a set written
+  out where membership is tested (it builds the set first), the tuple or function DOMAIN is taken
+  of, and, when it starts, the argument of Head (`value::is_str` evaluates it quietly)
+- SANY takes the level of `Print(out, val)` from val and that of `PrintT(out)` as constant (TLC.tla
+  defines them so), so a part of a temporal formula that reads a variable only in what it prints is
+  of constant level: TLC evaluates it when it converts the formula, before the ASSUMEs, printing
+  then, and stops with exit 151 on the variable (`live::level_parts`, `take_live_prints`;
+  `PrintLevel`)
+
+Not followed:
+
+- An EXCEPT of a function whose body prints: TLC computes `@` at the key when it evaluates the
+  EXCEPT and the body at another key when it applies the result; the checker computes the whole
+  function first
+- While checking liveness TLC evaluates the step of a fair action on the step to each successor
+  (twice: a state with k successors evaluated A 2k + 2 times in all with `WF_x(A)`, the checker k +
+  3) but not on the stuttering step, whose subscript it compares first (`LNAction.eval`); and it
+  evaluates a state's successors again, with the same checks, for each node its tableau adds to a
+  state it has expanded (`tests/tlc/PrintLasso` keeps to states with one successor and no such
+  node). It evaluates the state predicates of a property once per tableau node and particle (7 times
+  on 3 states for `<>P`, the checker 3), and a part of constant level once when it starts and then
+  again within the state predicate around it
+- With `-continue`, an invariant that fails to evaluate again in the pass after the behavior: TLC
+  reports it once more with its behaviors
 
 Other messages tla2rs words as TLC does, measured on TLC 2.19:
 
@@ -944,10 +997,10 @@ Refused at run time: several workers (TLC's counts and registers are then those 
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
 `-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
 
-Not followed: after an evaluation error in an invariant, TLC evaluates the step to the failing state once more
-(after an error on an initial state, Init), printing again; the checker does not, with or without TLCGet (the
-`UnsetInv` probe in `TlcGetReg` was dropped for this). None of the corpus's models becomes checkable: the skipped
-ones that read them use TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
+Not followed: with TLCGet, the passes TLC makes again after an evaluation error in an invariant (see "Messages and
+printed lines"), which read and set the registers again (the `UnsetInv` probe in `TlcGetReg` was dropped for
+this). None of the corpus's models becomes checkable: the skipped ones that read them use TLCGet("config") or a
+simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
 
 ### Arguments written out at each use
 
@@ -964,7 +1017,8 @@ and a LET definition without arguments (not a function `f[x \in S]`), is expande
 BIND label (`ast::BIND`); the body refers to the name. The evaluator reads the name's expression where the name is
 used: the value is computed there, as the copy written out there would be (so the strings it makes and its errors
 come in the same order), and kept for the values of the names it depends on (`value::eval_bound`, `bound_free`); one
-whose computation printed is not kept, so Print and PrintT print at each use as before. Where the evaluator reads
+whose computation printed is kept only while the BIND label is evaluated (`PRINTED_VALUES`), so it prints once
+each time TLC evaluates the LET or the call, as TLC does where it starts (`tests/tlc/PrintFold`). Where the evaluator reads
 how a set or function is written (`x \in Nat`, `[x \in S |-> e][k]`, `Seq(S)`, a lazy function printed), it reads
 the bound expression (`value::shape`). Fresh names while binding come from a counter of their own, and the
 recursive definitions expanded while binding are kept apart from those code generation uses. `tests/tlc/ArgShare` (an

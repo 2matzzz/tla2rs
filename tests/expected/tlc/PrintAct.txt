@@ -1,0 +1,10 @@
+key 540dbeeda4ef31ab3fe4bb22bed56c02bf75cd0d7918b32c12cc4dd08f955a28
+tlc Version 2.19
+rc 13
+Action property Act is violated
+6 states generated 4 distinct states found 1 states left on queue
+trace 2 6921ddcc4e8d2c0bfb29ff43e67f5380e21a9e6ef4496509dfea3eba4e286071
+states 4 38bdbef3b437e49f03f771855ce6cf438c58d5e4f14dba77fc9c097f8c29cd06
+edges 4 36790d1a88459bee12fc0e7afedfe2d0b9cf25303c684777a157bbec505719d9
+messages 14 4f52cd55f2855f401f9318d42415c16a3615b2ae26c303616f2957fc5a92deff
+errors 2 0073c5f3011a51c420ec291ed5973e566695f8a44c6d6f4a88dfb35f598bad6c
