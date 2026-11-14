@@ -682,7 +682,7 @@ fingerprint as TLC does, and no `-fp` other than 0 among TLC's options (`crossch
 `args` choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own,
 not TLC's", with the reason; under a VIEW or a SYMMETRY also "the liveness verdict under VIEW or SYMMETRY is tla2rs's
 own"). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
-after `MATCH` (`lasso confirmed instead: <reason>`). All 67 liveness violations of `examples/` and `tests/tlc/` print
+after `MATCH` (`lasso confirmed instead: <reason>`). All 69 liveness violations of `examples/` and `tests/tlc/` print
 TLC's lasso (most by following TLC's search, some by coincidence), 19 of them through a tableau (`LiveTab`,
 `LiveTabSym`, `LiveFold-ViewLoopEv`, `SymLoopEv`, `ViewSucc`, `Late`, `Live-Spec*-Starve`, `Live-SpillNext-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`,
 `LiveConst-Leads`, `LiveAssumed-Leads`).
