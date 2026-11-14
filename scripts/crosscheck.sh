@@ -317,14 +317,16 @@ rs_dump=(-dumpgraph rs.dot)
 [[ -z "$user_dump" ]] || mv "$user_dump" rs.userdump 2> /dev/null || true
 [[ -z "$user_file" ]] || mv "$user_file" rs.userfile 2> /dev/null || true
 s2=$(date +%s.%N)
-# When a set or sequence outgrew the capacity the checker was built with, or the checker made
-# strings in another order than they were numbered in, tla2rs built it again and checked from the
-# start, after a line saying so: only the last run counts
-restart='^tla2rs: .* checking again from the start with (room for [0-9]+|them in that order)$'
+# When a set or sequence outgrew the capacity the checker was built with, the checker made
+# strings in another order than they were numbered in, or an EXCEPT warned while exploring,
+# tla2rs built it again and checked from the start, after a line saying so: only the last run
+# counts
+restart='^tla2rs: .* checking again from the start with (room for [0-9]+|them in that order|the lines printed in TLC.s order)$'
 grown=$(grep -cE "$restart" rs.out || true)
 reordered=$(grep -cE '^tla2rs: .* with them in that order$' rs.out || true)
-grown=$((grown - reordered))
-if [[ $((grown + reordered)) -gt 0 ]]; then
+warned=$(grep -cE "^tla2rs: .* with the lines printed in TLC.s order$" rs.out || true)
+grown=$((grown - reordered - warned))
+if [[ $((grown + reordered + warned)) -gt 0 ]]; then
   last=$(grep -nE "$restart" rs.out | tail -1 | cut -d: -f1)
   tail -n +"$((last + 1))" rs.out > rs.last && mv rs.last rs.out
 fi
@@ -437,6 +439,7 @@ fi
 note=""; [[ $tlc_cached == 1 ]] && note=" cached"
 rebuilt=""; [[ $grown -gt 0 ]] && rebuilt="; rebuilt $grown more times with more room"
 [[ $reordered -gt 0 ]] && rebuilt="$rebuilt; rebuilt $reordered more times for the order of strings made"
+[[ $warned -gt 0 ]] && rebuilt="$rebuilt; rebuilt once for an EXCEPT warning"
 printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build%s)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)" "$rebuilt"
 if [[ "$a" == "$b" ]]; then
   if [[ $distinct_only == 1 ]]; then

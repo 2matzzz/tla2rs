@@ -127,6 +127,8 @@ thread_local! {
     /// The strings made by operations, in the order TLC makes them as far as it is known (see
     /// `compile`): those made when TLC starts, then those the checker made while exploring
     static MADE_ORDER: std::cell::RefCell<(Vec<String>, Vec<String>)> = const { std::cell::RefCell::new((vec![], vec![])) };
+    /// Set when a checker built earlier met an EXCEPT warning while exploring (see `compile`)
+    static WARN_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The bounded sequences `UNION {[1..n -> S] : n \in R}`: (R, S)
@@ -1029,10 +1031,15 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 /// numbered in that order after the strings TLC knows when it starts. Those, in turn, are
 /// numbered after the strings TLC creates when it parses the spec, in the order the evaluation of
 /// the constants, definitions and ASSUMEs makes them, which is known only once they are evaluated:
-/// when it differs from the order they were numbered in, the spec is compiled again with it
+/// when it differs from the order they were numbered in, the spec is compiled again with it.
+/// `warn_order` puts the lines printed in TLC's order (PRINT_ORDER) for the EXCEPT warnings of
+/// Init, the actions and the invariants; without it, the checker exits at the first of them it
+/// meets when tla2rs runs it (WARN_EXIT in runtime.rs), so a spec that never warns keeps its
+/// faster search
 #[allow(clippy::too_many_arguments)]
-pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, tostr: &HashMap<String, usize>, fp128: bool, metal: bool, made: &[String]) -> R<Output> {
+pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, tostr: &HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> R<Output> {
     crate::codegen::TOSTR_CAP.with(|c| *c.borrow_mut() = tostr.clone());
+    WARN_ORDER.with(|w| w.set(warn_order));
     let mut at_start: Vec<String> = vec![];
     // Each round numbers the strings made at the start in the order the round before made them;
     // that order changes only when the numbering changes the order of a set they are made from
@@ -1959,8 +1966,11 @@ fn compile_inner(
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
-    let print_order = print_order || act_prints || live_sim;
+    // An EXCEPT warning is a printed line, which TLC prints as it computes and checks each state
+    let warns = [&init_code, &next_code, &inv_code, &rec_fns].iter().any(|c| c.contains("except_warning("));
+    let print_order = print_order || act_prints || live_sim || warns && WARN_ORDER.with(|w| w.get());
     writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
+    writeln!(src, "const WARN_RERUN: bool = {};", warns && !print_order).unwrap();
     writeln!(src, "const TLCGET: bool = {};", g.tlcget).unwrap();
     // The registers the ASSUMEs set
     let regs: Vec<String> = reg_init.iter().map(|(i, v)| format!("({i}, {v})")).collect();

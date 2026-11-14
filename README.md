@@ -313,7 +313,12 @@ bounds the size of a model with temporal properties (one property per thread, so
 - TLC's warning that an EXCEPT names an argument or field the value does not have is printed as TLC prints it (each
   text once, the first with TLC's note about `-nowarning`; for an EXCEPT applied to @, at the pair @ belongs to), also for an EXCEPT of constant level inside Init, an
   action or an invariant, which the compiler evaluates once: the checker warns each time TLC would evaluate it, and
-  when it starts for the set of a `\E` that TLC splits the next-state relation through (TLC evaluates that set once)
+  when it starts for the set of a `\E` that TLC splits the next-state relation through (TLC evaluates that set once).
+  TLC prints it as it computes and checks each state, so a warning of a later successor comes after the error on an
+  earlier one: a checker that meets a warning of Init, an action or an invariant while exploring makes tla2rs print
+  `tla2rs: an EXCEPT warned while exploring; checking again from the start with the lines printed in TLC's order`,
+  build the checker again to print its lines as it does for `Print` and `PrintT`, and run it from the start (output
+  printed before the line is repeated); a spec that never warns keeps the faster search
 - Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
   body; 50,000 levels at compile time). TLC overflows its JVM stack much earlier (500 to 900 levels for small
   bodies), so a recursion between the two depths passes here where TLC reports a stack overflow
