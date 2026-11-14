@@ -78,6 +78,11 @@ pub fn bind_env(g: &mut Gen, env: &HashMap<String, Value>) -> R<Env> {
 struct Atoms {
     state: Vec<(String, String)>,
     action: Vec<(String, String)>,
+    /// Per action atom, the predicate as TLC evaluates it on a step (see `subscript_first`) and
+    /// the constant bindings
+    action_tlc: Vec<(Expr, HashMap<String, Value>)>,
+    /// Whether an atom prints
+    prints: bool,
 }
 
 const ACTION_BASE: usize = 64;
@@ -102,10 +107,12 @@ impl Atoms {
         let genv = bind_env(g, env)?;
         let c = g.gen_as(e, &genv, &Ty::Bool).map_err(|m| format!("{m}\n  in: {}", short(e)))?;
         self.state.push((k, format!("{{ {c} }}")));
+        self.prints |= crate::codegen::prints(e);
         Ok(self.state.len() - 1)
     }
 
-    fn action(&mut self, g: &mut Gen, e: &Expr, env: &HashMap<String, Value>) -> R<usize> {
+    /// `tlc` is e as TLC evaluates it on a step
+    fn action(&mut self, g: &mut Gen, e: &Expr, tlc: Expr, env: &HashMap<String, Value>) -> R<usize> {
         let k = key(e, env);
         if let Some(i) = self.action.iter().position(|(x, _)| *x == k) {
             return Ok(ACTION_BASE + i);
@@ -114,6 +121,8 @@ impl Atoms {
         let genv = g.env_step(genv);
         let c = g.gen_as(e, &genv, &Ty::Bool).map_err(|m| format!("{m}\n  in: {}", short(e)))?;
         self.action.push((k, format!("{{ {c} }}")));
+        self.action_tlc.push((tlc, env.clone()));
+        self.prints |= crate::codegen::prints(e);
         Ok(ACTION_BASE + self.action.len() - 1)
     }
 }
@@ -246,6 +255,20 @@ pub(crate) fn sany_level(e: &Expr) -> Result<u8, String> {
         }
         _ => e.children().into_iter().map(sany_level).collect::<Result<Vec<u8>, _>>()?.into_iter().max().unwrap_or(0),
     })
+}
+
+/// A step predicate as TLC evaluates it (LNAction.eval): for <<A>>_v or [A]_v written as the whole
+/// predicate, whether v changes comes first, and decides without A when it does not
+fn subscript_first(e: &Expr) -> Expr {
+    match e {
+        Expr::Label(n, _, b) if n == ANGLE => match b.as_ref() {
+            Expr::And(xs) if xs.len() == 2 => Expr::And(vec![xs[1].clone(), xs[0].clone()]),
+            _ => e.clone(),
+        },
+        Expr::Label(n, a, b) if !e.is_user_label() => Expr::Label(n.clone(), a.clone(), subscript_first(b).b()),
+        Expr::BoxAction(a, v) => Expr::Or(vec![Expr::Bin(BOp::Eq, Expr::Prime(v.clone()).b(), v.clone()), box_to_or(a)]),
+        _ => e.clone(),
+    }
 }
 
 /// e with each [A]_v written as A \/ v' = v
@@ -613,7 +636,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             }
         }
         return Ok(Ok(if action_level(e) {
-            TExpr::Action(atoms.action(g, &box_to_or(e), env)?, tag())
+            TExpr::Action(atoms.action(g, &box_to_or(e), box_to_or(&subscript_first(e)), env)?, tag())
         } else {
             TExpr::State(atoms.state(g, e, env)?, tag())
         }));
@@ -658,7 +681,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
                 _ => step.clone(),
             };
             let en = TExpr::Neg(TExpr::State(atoms.state(g, &Un(UOp::Enabled, en_step.b()), env)?, tag()).into());
-            let act = TExpr::Action(atoms.action(g, &step, env)?, tag());
+            let act = TExpr::Action(atoms.action(g, &step, And(vec![changed(v), a.as_ref().clone()]), env)?, tag());
             if *weak {
                 TExpr::All(TExpr::Even(TExpr::Disj(vec![en, act]).into()).into())
             } else {
@@ -742,6 +765,15 @@ fn live_const_error(g: &Gen, e: &Expr, env: &HashMap<String, Value>) -> Option<S
                 }
             }
             return live_const_error(g, &body, env);
+        }
+        // A call of a definition that reads the state is one predicate of the formula. TLC still
+        // evaluates its arguments and goes through its body, printing what its parts of constant
+        // level print, but an error there only makes it take the call whole (`tests/tlc/PrintLive`)
+        Label(n, args, b) if !n.starts_with('#') && !e.is_user_label() => {
+            if !args.iter().any(|a| crate::live::reads_state(g, a)) {
+                let _ = live_const_error(g, b, env);
+            }
+            return None;
         }
         Label(_, _, b) if matches!(b.as_ref(), Label(..) | And(_) | Or(_) | Un(UOp::Not, _) | Bin(BOp::Implies, ..) | If(..)) => {
             return live_const_error(g, b, env);
@@ -1159,7 +1191,8 @@ fn tableau_src(tf: &TExpr) -> Result<String, &'static str> {
 /// model of <>[]A (EAAction), []<>S (AEState) and []<>A (AEAction) parts, and the rest of it a
 /// formula for a tableau. The disjuncts with the same rest make an order of solution, in the order
 /// first met, with its tableau and the predicates of its models numbered in TLC's order.
-fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
+/// `tableau` tells whether an order of solution has a tableau.
+fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr], tableau: &mut bool) -> String {
     let none = |why: &str| format!("type TBits = u64;\nstatic TLC_LIVE: Result<TLive, &str> = Err({why:?});\n");
     if props.is_empty() {
         return none("no properties");
@@ -1271,6 +1304,7 @@ fn tlc_live(fair: &[FairDef], assumed: &[TExpr], props: &[TExpr]) -> String {
     }
     // The predicates of a state or step as a bit mask (wider only when needed)
     let bits = if wide { "u128" } else { "u64" };
+    *tableau = tfbin.iter().any(|x| x.0.is_some());
     format!("type TBits = {bits};\nstatic TLC_LIVE: Result<TLive, &str> = Ok(TLive {{ oos: &[{}] }});\n", oss.join(", "))
 }
 
@@ -1341,13 +1375,16 @@ fn split_disjuncts(neg: TExpr) -> Option<Vec<(Ltl, Vec<TExpr>, Vec<TExpr>, Vec<T
 /// Generated code for the liveness checks: the atoms, the fairness conditions, and an automaton per
 /// property part. `assumed` are the spec's temporal conjuncts other than fairness (with their
 /// constant bindings), under which each part is checked; `parts` are (name, formula, constant
-/// bindings). A formula TLC rejects comes back as Ok(Err(..)).
+/// bindings). A formula TLC rejects comes back as Ok(Err(..)). `next_prints` tells whether the
+/// next-state relation or the constraints print; with the code comes whether what TLC evaluates
+/// while it builds its liveness graph prints (see `LIVE_SIM_RT` in the runtime).
 pub fn compile(
     g: &mut Gen,
     fair: &[FairDef],
     assumed: &[(Expr, HashMap<String, Value>)],
     parts: &[(String, Expr, HashMap<String, Value>)],
-) -> R<Result<String, Rejected>> {
+    next_prints: bool,
+) -> R<Result<(String, bool), Rejected>> {
     // The spec's temporal conjuncts matter only when there are properties to check
     let assumed = if parts.is_empty() { &[][..] } else { assumed };
     let mut atoms = Atoms::default();
@@ -1378,7 +1415,8 @@ pub fn compile(
         Ok(t) => t,
         Err(r) => return Ok(Err(r)),
     };
-    src += &tlc_live(fair, &atexprs, &texprs);
+    let mut has_tableau = false;
+    src += &tlc_live(fair, &atexprs, &texprs, &mut has_tableau);
     for ((name, _, _), t) in parts.iter().zip(&texprs) {
         let neg = TExpr::junction(atexprs.iter().cloned().chain([TExpr::Neg(t.clone().into())]), true).push_neg(false).simplify();
         let lp_list = |xs: &[TExpr]| format!("&[{}]", xs.iter().map(lp_src).collect::<Vec<_>>().join(", "));
@@ -1457,7 +1495,29 @@ pub fn compile(
     // The state atoms TLC evaluates when a state is generated (those of the tableau); it evaluates
     // the others when the state is expanded
     writeln!(src, "const SATOMS_TABLEAU: u64 = {tableau};").unwrap();
-    Ok(Ok(src))
+    // What TLC evaluates while it builds its liveness graph prints: the steps as TLC evaluates
+    // them, for `LIVE_SIM_RT`. A node of the tableau new to a state already expanded makes TLC
+    // generate that state's successors again
+    let fair_prints = fair.iter().any(|f| crate::codegen::prints(&f.action) || crate::codegen::prints(&f.sub));
+    let sim = !parts.is_empty() && (atoms.prints || fair_prints || (has_tableau && next_prints));
+    if sim {
+        let mut tl = vec![];
+        for (i, (e, env)) in atoms.action_tlc.iter().enumerate() {
+            let genv = bind_env(g, env)?;
+            let genv = g.env_step(genv);
+            let c = g.gen_as(e, &genv, &Ty::Bool).map_err(|m| format!("{m}\n  in: {}", short(e)))?;
+            writeln!(src, "#[allow(unused_variables)]\nfn tlc_aa_{i}(s: &State, t: &State) -> bool {{ {c} }}").unwrap();
+            tl.push(format!("tlc_aa_{i} as fn(&State, &State) -> bool"));
+        }
+        let mut fs = vec![];
+        for i in 0..fairs.len() {
+            writeln!(src, "fn tlc_fs_{i}(s: &State, t: &State) -> bool {{ fchg_{i}(s, t) && fstep_{i}(s, t) }}").unwrap();
+            fs.push(format!("tlc_fs_{i} as fn(&State, &State) -> bool"));
+        }
+        writeln!(src, "static TLC_AATOMS: &[fn(&State, &State) -> bool] = &[{}];", tl.join(", ")).unwrap();
+        writeln!(src, "static TLC_FSTEPS: &[fn(&State, &State) -> bool] = &[{}];", fs.join(", ")).unwrap();
+    }
+    Ok(Ok((src, sim)))
 }
 
 /// The position of the first identifier named v written in e

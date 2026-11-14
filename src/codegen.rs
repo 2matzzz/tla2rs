@@ -64,6 +64,9 @@ pub struct Env {
     /// Names bound to a function `[y \in S |-> e]` whose body prints, where TLC evaluates the name
     /// once (see `gen_bind`): name -> (the cell of its value, the function)
     lazy_cells: HashMap<String, (String, Expr)>,
+    /// Of those names, the ones bound to an EXCEPT of such a function (see `print_except`): the
+    /// types of the arguments and values of its updates, kept in the cell `{id}u`
+    lazy_upd: HashMap<String, Vec<(Ty, Ty)>>,
 }
 
 pub struct Gen<'a> {
@@ -1767,6 +1770,113 @@ impl<'a> Gen<'a> {
             Expr::Except(b, _) => self.lazy_fun_domain(b, env),
             _ => None,
         }
+    }
+
+    /// `[F EXCEPT ![a] = v, ...]` (nested EXCEPTs too) of a function constructor F whose body
+    /// prints, each update naming one argument: F and the updates in order, each with the value
+    /// its EXCEPT changes (for TLC's warning)
+    #[allow(clippy::type_complexity)]
+    fn print_except<'e>(&self, f: &'e Expr, env: &Env) -> Option<(&'e Expr, Vec<(&'e Expr, &'e [Path], &'e Expr)>)> {
+        let mut levels = vec![];
+        let mut b = f;
+        loop {
+            match b.strip() {
+                Expr::Except(base, ups) => {
+                    levels.push((base.as_ref(), ups));
+                    b = base;
+                }
+                Expr::FunCons(_, d, body) if prints(body) && !self.lazy_domain(d, env) => break,
+                _ => return None,
+            }
+        }
+        if levels.is_empty() {
+            return None;
+        }
+        let mut out = vec![];
+        for (base, ups) in levels.into_iter().rev() {
+            for (path, val) in ups {
+                let mut steps = path.iter().filter(|p| !matches!(p, Path::Field(n) if n.starts_with('@')));
+                if !matches!((steps.next(), steps.next()), (Some(Path::Idx(_)), None)) {
+                    return None;
+                }
+                out.push((base, path.as_slice(), val));
+            }
+        }
+        Some((b, out))
+    }
+
+    /// The updates of a `print_except` where its value is applied, as TLC evaluates them (it keeps
+    /// F unevaluated): for each in order its argument, the value there (that of the last update of
+    /// the same argument, else F's body there, which prints; outside the domain none, with TLC's
+    /// warning, and the update is left out), and the new value from it. Code for the tuple (a1,
+    /// v1, a2, v2, ...), each vi an Option, and the types of each ai and vi
+    #[allow(clippy::type_complexity)]
+    fn print_except_updates(&mut self, base: &Expr, ups: &[(&Expr, &[Path], &Expr)], env: &Env, want: Option<&Ty>) -> R<(String, Vec<(Ty, Ty)>)> {
+        let Expr::FunCons(_, dom, _) = base.strip() else { unreachable!() };
+        let mut code = String::from("{ ");
+        let mut tys: Vec<(Ty, Ty)> = vec![];
+        let mut names: Vec<(String, String)> = vec![];
+        for (lvl, path, val) in ups {
+            let Some(Path::Idx(a)) = path.iter().find(|p| !matches!(p, Path::Field(n) if n.starts_with('@'))) else { unreachable!() };
+            let at_name = path.iter().find_map(|p| match p {
+                Path::Field(n) if n.starts_with('@') => Some(n.clone()),
+                _ => None,
+            });
+            let (ac, at) = self.gen(a, env, None)?;
+            let av = self.fresh("a");
+            let (bc, bt) = self.lazy_apply(base, &av, &at, env, want)?;
+            let mut cur = bt.clone();
+            for (_, vt) in &tys {
+                cur = join(&cur, vt)?;
+            }
+            let mem = self.gen_member(&av, &at, dom, env)?;
+            let warn = match except_pos(lvl) {
+                Some(p) => format!("except_warning({p:?}); "),
+                None => String::new(),
+            };
+            let mut sel = format!("if {mem} {{ Some({}) }} else {{ {warn}None }}", self.coerce(bc, &bt, &cur)?);
+            // TLC looks at the last update first
+            for ((an, vn), (kt, vt)) in names.iter().zip(&tys) {
+                let j = join(kt, &at)?;
+                let same = format!("{} == {}", self.coerce(an.clone(), kt, &j)?, self.coerce(av.clone(), &at, &j)?);
+                let v = self.coerce(format!("{vn}.unwrap()"), vt, &cur)?;
+                sel = format!("if {vn}.is_some() && {same} {{ Some({v}) }} else {{ {sel} }}");
+            }
+            let pv = self.fresh("p");
+            let mut env2 = env.clone();
+            env2.locals.insert("@".into(), (pv.clone(), cur.clone()));
+            if let Some(n) = at_name {
+                env2.locals.insert(n, (pv.clone(), cur.clone()));
+            }
+            let (vc, vt) = self.gen(val, &env2, want.or(Some(&cur)))?;
+            let vv = self.fresh("v");
+            write!(code, "let {av} = {ac}; let {vv}: Option<{}> = match {sel} {{ Some({pv}) => Some({vc}), None => None }}; ", vt.repr()).unwrap();
+            names.push((av, vv));
+            tys.push((at, vt));
+        }
+        let parts: Vec<String> = names.iter().flat_map(|(a, v)| [a.clone(), v.clone()]).collect();
+        write!(code, "({},) }}", parts.join(", ")).unwrap();
+        Ok((code, tys))
+    }
+
+    /// A `print_except` applied at `kc` (of type `kt`), its updates in the tuple `u` (see
+    /// `print_except_updates`): the value of the last update of that argument, else F's body there
+    #[allow(clippy::too_many_arguments)]
+    fn print_except_at(&mut self, base: &Expr, u: &str, tys: &[(Ty, Ty)], kc: &str, kt: &Ty, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
+        let (bc, bt) = self.lazy_apply(base, kc, kt, env, want)?;
+        let mut t = bt.clone();
+        for (_, vt) in tys {
+            t = join(&t, vt)?;
+        }
+        let t = Self::layout(want, t);
+        let mut code = self.coerce(bc, &bt, &t)?;
+        for (j, (at, vt)) in tys.iter().enumerate() {
+            let jt = join(kt, at)?;
+            let same = format!("{} == {}", self.coerce(kc.to_string(), kt, &jt)?, self.coerce(format!("{u}.{}", 2 * j), at, &jt)?);
+            let v = self.coerce(format!("{u}.{}.unwrap()", 2 * j + 1), vt, &t)?;
+            code = format!("if {u}.{}.is_some() && {same} {{ {v} }} else {{ {code} }}", 2 * j + 1);
+        }
+        Ok((code, t))
     }
 
     /// `f[k]` for a function `f` evaluated only where it is applied (`lazy_fun_domain`), with `k`
@@ -3815,7 +3925,16 @@ impl<'a> Gen<'a> {
                 let (id, fx) = env.lazy_cells[n].clone();
                 let (xc, xt) = self.gen(x, env, None)?;
                 let k = self.fresh("k");
-                let (lc, lt) = self.lazy_apply(&fx, &k, &xt, env, want)?;
+                let (lc, lt) = match env.lazy_upd.get(n).cloned() {
+                    // An EXCEPT: its updates computed at the first application
+                    Some(tys) => {
+                        let (base, _) = self.print_except(&fx, env).unwrap();
+                        let u = self.fresh("u");
+                        let (c, t) = self.print_except_at(base, &u, &tys, &k, &xt, env, want)?;
+                        (format!("{{ let {u} = {id}u.get_or_init(&{id}uf); {c} }}"), t)
+                    }
+                    None => self.lazy_apply(&fx, &k, &xt, env, want)?,
+                };
                 let ft = env.locals[n].1.clone();
                 let v = self.fresh("v");
                 let mut env3 = env.clone();
@@ -3825,6 +3944,17 @@ impl<'a> Gen<'a> {
                 let t = Self::layout(want, join(&vt, &lt)?);
                 let (vc, lc) = (self.coerce(vc, &vt, &t)?, self.coerce(lc, &lt, &t)?);
                 (format!("{{ let {k} = {xc}; match {id}.get() {{ Some({v}) => {vc}, None => {{ {id}a.set(true); {lc} }} }} }}"), t)
+            }
+            // An EXCEPT of a function whose body prints, applied: TLC keeps the function
+            // unevaluated, so it evaluates the body at each argument the EXCEPT updates, then at x
+            // unless x is one of them (`tests/tlc/PrintExcept`)
+            App(f, x) if self.print_except(f, env).is_some() => {
+                let (base, ups) = self.print_except(f, env).unwrap();
+                let (uc, tys) = self.print_except_updates(base, &ups, env, want)?;
+                let (xc, xt) = self.gen(x, env, None)?;
+                let (k, u) = (self.fresh("k"), self.fresh("u"));
+                let (c, t) = self.print_except_at(base, &u, &tys, &k, &xt, env, want)?;
+                (format!("{{ let {u} = &{uc}; let {k} = {xc}; {c} }}"), t)
             }
             // A function over Nat, Int, STRING, ...: its body, at the argument. So too a function
             // whose body prints: TLC evaluates `[y \in S |-> e][x]` as e at x only
@@ -6568,11 +6698,27 @@ impl<'a> Gen<'a> {
             // keeping that value for the uses after; but once applied, DOMAIN computes nothing,
             // and printing it computes it without keeping it (measured on TLC 2.19,
             // `tests/tlc/PrintFun`). `{id}a` tells whether it was applied
-            if matches!(x.strip(), Expr::FunCons(_, d, b) if prints(b) && !self.lazy_domain(d, &env2)) && !(env.init && !all_assigned && self.mentions_state(&x)) {
-                if let Ok((c, t)) = self.gen(&x, &env2, None) {
+            // So too an EXCEPT of such a function, whose updates TLC computes when it first
+            // evaluates the name, where it is applied: those are kept in `{id}u`
+            let fun = matches!(x.strip(), Expr::FunCons(_, d, b) if prints(b) && !self.lazy_domain(d, &env2));
+            let pex = !fun && self.print_except(&x, &env2).is_some();
+            if (fun || pex) && !(env.init && !all_assigned && self.mentions_state(&x)) {
+                let upd = if pex {
+                    let (base, ups) = self.print_except(&x, &env2).unwrap();
+                    self.print_except_updates(base, &ups, &env2, None).ok()
+                } else {
+                    None
+                };
+                if let (Ok((c, t)), true) = (self.gen(&x, &env2, None), fun || upd.is_some()) {
                     let id = self.fresh("b");
                     let r = t.repr();
                     write!(lets, "let {id}: std::cell::OnceCell<{r}> = std::cell::OnceCell::new(); let {id}f = || -> {r} {{ {c} }}; let {id}a = std::cell::Cell::new(false); ").unwrap();
+                    if let Some((uc, tys)) = upd {
+                        let ur: Vec<String> = tys.iter().flat_map(|(a, v)| [a.repr(), format!("Option<{}>", v.repr())]).collect();
+                        let ur = format!("({},)", ur.join(", "));
+                        write!(lets, "let {id}u: std::cell::OnceCell<{ur}> = std::cell::OnceCell::new(); let {id}uf = || -> {ur} {{ {uc} }}; ").unwrap();
+                        env2.lazy_upd.insert(n.clone(), tys);
+                    }
                     env2.bind(&n, format!("(*{id}.get_or_init(&{id}f))"), t);
                     env2.lazy_cells.insert(n.clone(), (id, x.clone()));
                     continue;
@@ -7920,7 +8066,7 @@ fn lit_bits(c: &str) -> Option<u128> {
 }
 
 /// Whether e prints (Print, PrintT)
-fn prints(e: &Expr) -> bool {
+pub fn prints(e: &Expr) -> bool {
     e.any(&|y| matches!(y, Expr::Call(n, _) if n == "Print" || n == "PrintT"))
 }
 

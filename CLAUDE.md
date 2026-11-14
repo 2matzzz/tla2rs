@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1020 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1045 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -88,7 +88,7 @@ It has no crate dependencies.
 | `src/pcal.rs` | TLC's check of the checksums a PlusCal translator wrote: the warnings for the root module and the modules it extends, and the algorithm's syntax tree as TLC's translator prints it (see "PlusCal checksums") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/ppr.rs` | TLC's pretty printer for values (`ppr`, ported from `tlc2.pprint` and checked against TLC's on 25,000 random values): used by the compiler for what Print and PrintT print when TLC starts, and pasted into every generated checker, which prints states and printed values with it |
-| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). Also the `-dumpgraph` output |
+| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). Also the `-dumpgraph` output. `LIVE_SIM_RT` and `AGAIN_RT` are pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
 
 ### Memory use (`runtime.rs`)
 
@@ -847,7 +847,9 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   in order, a successor not seen yet is added and queued (so it counts as distinct and left on
   queue) and its invariants are checked, up to the first that fails; one that fails to evaluate
   again makes it exit with 255. With `-continue` it reports the exception it did not expect before
-  that pass. After an error while computing or checking the initial states (in Init, the
+  that pass, and one that fails to evaluate again there as a failed invariant with its behavior,
+  then as the error itself with the behavior again (`AGAIN_RT`; `tests/tlc/PrintAgain-TwiceContinue`,
+  `PrintAgain-LiveTwice`). After an error while computing or checking the initial states (in Init, the
   CONSTRAINT, an invariant or a property), it reports the error and then computes and checks them
   again from the start, printing again up to the error (`init_again_prints`; `tests/tlc/PrintAgain*`)
 - The action properties are checked on the step to a successor after the successor is added (if
@@ -859,8 +861,8 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   each step of the cycle just before the state it leads to, and the step back before `Back to
   state` (`lasso_prefix_prints`; `tests/tlc/PrintLasso*`)
 
-When Init, Next, an invariant or an action property prints (`PRINT_ORDER` in the generated checker, set by
-`compile.rs`), the checker marks each state `init` or `next` pushes and the start of each action
+When Init, Next, an invariant, an action property or what TLC evaluates for its liveness graph prints
+(`PRINT_ORDER` in the generated checker, set by `compile.rs`), the checker marks each state `init` or `next` pushes and the start of each action
 (`mark_push`, `mark_action`, generated only then), holds what Print and PrintT print while it
 computes states, and prints those lines as it handles the states (`Capturing`, `Held` in
 `runtime.rs`); `print_states_tlc` shows a behavior as above. Such specs are searched without
@@ -887,23 +889,47 @@ How many times a line is printed, measured on TLC 2.19 with one worker (each wit
   defines them so), so a part of a temporal formula that reads a variable only in what it prints is
   of constant level: TLC evaluates it when it converts the formula, before the ASSUMEs, printing
   then, and stops with exit 151 on the variable (`live::level_parts`, `take_live_prints`;
-  `PrintLevel`)
+  `PrintLevel`). A call of a definition that reads the state is one predicate of the formula, but
+  TLC goes through its body when it starts, printing what its parts of constant level print and
+  ignoring an error there (`live_const_error`; `PrintLive-Def`); a part of constant level written in
+  the formula prints when TLC starts and again each time the predicate around it is evaluated
+  (`PrintLive-Inline`)
+- `[f EXCEPT ![a] = v]` of such a function (`PrintExcept`): where the result is applied, TLC keeps f
+  unevaluated, so evaluating the EXCEPT evaluates e at each argument it updates (the value `@` stands
+  for, also when v does not use it; an earlier update's value if it names the same argument, and
+  nothing, with the warning, outside the domain, where v is not evaluated either), then v; applying
+  the result evaluates e at the argument unless an update names it. Where the result is used as a
+  value, TLC computes f whole first, then the new values. A name bound to such an EXCEPT keeps the
+  updates from its first application (`Gen::print_except`, `print_except_updates`, `lazy_upd`)
+- While it builds its liveness graph (`tlc2.tool.liveness.LiveCheck`; `PrintLive*`), TLC evaluates,
+  for each order of solution in turn, after a state's successors: the step predicates of its
+  `check_action` on the step to each successor in TLC's set of them (the state itself put last; see
+  `tlc_lasso`), its `check_state` on the state, then each particle of the tableau on each
+  successor; and a node of the tableau new to a state already expanded makes it evaluate at once
+  that state's `check_state`, its stuttering step and its successors, generated again an action at
+  a time (what an action prints comes before its successors are taken, with the CONSTRAINT on each).
+  `WF_v(A)` is the step predicate `~ENABLED <<A>>_v \/ <<A>>_v`, so ENABLED is evaluated once per
+  step, and a step predicate `<<A>>_v` (also `[A]_v`) compares v first and does not evaluate A on a
+  step that leaves it unchanged. On each new initial state, before its invariants, it evaluates the
+  formula's particles. When any of this prints (`live::compile`), the checker evaluates it the same
+  way (`LIVE_SIM_RT`, hooked into the runtime by `compile::live_sim_runtime`) and its own
+  evaluations of the same predicates quietly
+
+The code pasted for these (`LIVE_SIM_RT`, `AGAIN_RT`) is generated only for a spec that prints, so
+the code of other specs is the same as before.
 
 Not followed:
 
-- An EXCEPT of a function whose body prints: TLC computes `@` at the key when it evaluates the
-  EXCEPT and the body at another key when it applies the result; the checker computes the whole
-  function first
-- While checking liveness TLC evaluates the step of a fair action on the step to each successor
-  (twice: a state with k successors evaluated A 2k + 2 times in all with `WF_x(A)`, the checker k +
-  3) but not on the stuttering step, whose subscript it compares first (`LNAction.eval`); and it
-  evaluates a state's successors again, with the same checks, for each node its tableau adds to a
-  state it has expanded (`tests/tlc/PrintLasso` keeps to states with one successor and no such
-  node). It evaluates the state predicates of a property once per tableau node and particle (7 times
-  on 3 states for `<>P`, the checker 3), and a part of constant level once when it starts and then
-  again within the state predicate around it
-- With `-continue`, an invariant that fails to evaluate again in the pass after the behavior: TLC
-  reports it once more with its behaviors
+- An EXCEPT whose function is a name already applied, used as a value (TLC keeps the name
+  unevaluated, evaluates e at the updated arguments, then everywhere); and a name bound to such an
+  EXCEPT, applied and later used as a value, evaluates its new values again (TLC keeps them)
+- What TLC evaluates for its liveness graph under a VIEW or a SYMMETRY (not measured with printing;
+  the checker evaluates on the successors as generated), and with several orders of solution, which
+  TLC takes in an order that changes from run to run
+- A CONSTRAINT that prints: TLC evaluates it on each successor as soon as the successor is
+  generated, after what the action printed before it; the checker prints it before those lines
+- For a spec that prints nowhere, an invariant that fails to evaluate again in the pass after the
+  behavior with `-continue` is still reported once (its code is kept as it was)
 
 Other messages tla2rs words as TLC does, measured on TLC 2.19:
 

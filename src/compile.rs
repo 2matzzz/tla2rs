@@ -1676,13 +1676,23 @@ fn compile_inner(
     // Init / Next. When they or an invariant print (Print, PrintT), the checker follows TLC's
     // order of the lines printed (see PRINT_ORDER in the runtime)
     let checked = cfg.invariants.iter().chain(&cfg.constraints).chain(&cfg.action_constraints);
+    // Whether a constraint prints, noted from the same expansions (each expansion numbers the bound
+    // variables anew, so more of them would rename those of other specs' code)
+    let mut cons_prints = false;
+    let is_cons = |n: &String| cfg.constraints.contains(n) || cfg.action_constraints.contains(n);
     g.tlcget = uses_tlc_state(&init)
         || uses_tlc_state(&next_pos)
-        || checked.clone().any(|n| ex.expand_def_code(n, false).is_ok_and(|e| uses_tlc_state(&e)));
+        || checked.clone().any(|n| {
+            ex.expand_def_code(n, false).is_ok_and(|e| {
+                cons_prints |= is_cons(n) && has_prints(&e);
+                uses_tlc_state(&e)
+            })
+        });
     let print_order = has_prints(&init)
         || has_prints(&next_pos)
         || cfg.invariants.iter().any(|n| ex.expand_def_code(n, false).is_ok_and(|e| has_prints(&e)))
         || g.tlcget;
+    let next_prints = has_prints(&next_pos) || cons_prints;
     g.plan_shapes(&init, &next_pos);
     let mut init_code = String::new();
     g.gen_action(&[init], &Gen::env_init(), &mut init_code).map_err(|e| format!("Init: {e}"))?;
@@ -1795,9 +1805,9 @@ fn compile_inner(
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
     crate::live::take_live_prints();
-    let live_code = crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts);
+    let live_code = crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts, next_prints);
     startup.live = crate::live::take_live_prints().into_iter().map(|l| user_line(&l)).collect();
-    let live_code = match live_code? {
+    let (live_code, live_sim) = match live_code? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
             // TLC converts the temporal formulas before it evaluates the ASSUMEs
@@ -1924,7 +1934,8 @@ fn compile_inner(
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
-    writeln!(src, "const PRINT_ORDER: bool = {};", print_order || act_prints).unwrap();
+    let print_order = print_order || act_prints || live_sim;
+    writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
     writeln!(src, "const TLCGET: bool = {};", g.tlcget).unwrap();
     // The registers the ASSUMEs set
     let regs: Vec<String> = reg_init.iter().map(|(i, v)| format!("({i}, {v})")).collect();
@@ -1981,11 +1992,18 @@ fn compile_inner(
     writeln!(src, "const FP_BITS: usize = {fp_bits};\ntype Fp = u{fp_bits};").unwrap();
     src += if metal { crate::metal::GLUE } else { crate::metal::NO_GPU };
     src += &crate::lasso::template(&m, &cfg, &written);
+    let mut rt = crate::runtime::RUNTIME.to_string();
+    if live_sim {
+        rt = live_sim_runtime(&rt);
+    }
+    if print_order {
+        rt = again_runtime(&rt);
+    }
     if g.shaped.is_empty() {
-        src += crate::runtime::RUNTIME;
+        src += &rt;
     } else {
         // The shape after the state is no part of its fingerprint (see `Gen::gen_pack`)
-        let rt = crate::runtime::RUNTIME
+        let rt = rt
             .replacen(
                 "fn fingerprint(w: &[u64]) -> Fp {\n",
                 "fn fingerprint(w: &[u64]) -> Fp {\n    let w = if !HAS_VIEW && w.len() == WORDS { &w[..WORDS - SHW] } else { w };\n",
@@ -1996,8 +2014,64 @@ fn compile_inner(
     }
     src += crate::runtime::PPR;
     src += crate::runtime::LIVENESS_RT;
+    if live_sim {
+        src += crate::runtime::LIVE_SIM_RT;
+    }
+    if print_order {
+        src += crate::runtime::AGAIN_RT;
+    }
     let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
     Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap), atoms: names })
+}
+
+/// `rt` with the hooks of `LIVE_SIM_RT`: TLC's evaluations for its liveness graph, on each new
+/// initial state before its invariants and after each state's successors, printing what they
+/// print, while the checker's own evaluations of the same predicates print nothing. The runtime of
+/// other specs stays as it is
+fn live_sim_runtime(rt: &str) -> String {
+    hook(rt, &[
+        (
+            "            out.push((s, w, fp));\n            tg_added();\n            tg_queued(1);\n",
+            "            out.push((s, w, fp));\n            tg_added();\n            tg_queued(1);\n            if let Err(SMsg::Live(_, e)) = live_sim_init(&s) {\n                stop(e, \"evaluating a temporal property on an initial state\", Some(&s), generated, out.len());\n            }\n",
+        ),
+        (
+            "        match state_bits(s, SATOMS_TABLEAU) {\n",
+            "        match {\n            let _quiet = Capturing::start();\n            state_bits(s, SATOMS_TABLEAU)\n        } {\n",
+        ),
+        (
+            "    if LIVENESS {\n        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
+            "    if LIVENESS {\n        held.flush(u32::MAX);\n        if let Err(m) = live_sim_expand(&s, buf) {\n            return Some(Found::Live(m));\n        }\n        let _quiet = Capturing::start();\n        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
+        ),
+    ])
+}
+
+/// `rt` with the hooks of `AGAIN_RT`, for a spec that prints. The runtime of other specs stays as
+/// it is
+fn again_runtime(rt: &str) -> String {
+    hook(rt, &[
+        (
+            "                Some(SMsg::InvEval(..)) => {\n                    failed = true;\n",
+            "                Some(SMsg::InvEval(inv, e)) => {\n                    failed = true;\n                    if flag(&CONTINUE) {\n                        *AGAIN.lock().unwrap_or_else(|e| e.into_inner()) = Some((t, l, inv, e));\n                    }\n",
+        ),
+        (
+            "        if failed {\n            code = 255;\n        }\n",
+            "        if failed {\n            code = 255;\n            if let Some(trace) = seen.pred_of(f.fp).and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c)) {\n                again_failed(&|t, l| {\n                    print_states_tlc(&trace, trace.len(), Some((*t, l)));\n                });\n            }\n        }\n",
+        ),
+        (
+            "                            if failed {\n                                code = 255;\n                            }\n",
+            "                            if failed {\n                                code = 255;\n                                again_failed(&|t, l| g.print_trace(p as u32, Some((t, l)), false));\n                            }\n",
+        ),
+    ])
+}
+
+/// `rt` with each (from, to) replaced; each `from` must occur once
+fn hook(rt: &str, hooks: &[(&str, &str)]) -> String {
+    let mut rt = rt.to_string();
+    for (from, to) in hooks {
+        assert_eq!(rt.matches(from).count(), 1, "the runtime has no single place for a hook: {from}");
+        rt = rt.replacen(from, to, 1);
+    }
+    rt
 }
 
 /// The group generated by `listed`: the listed permutations in their order, then the products
