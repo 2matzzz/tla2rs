@@ -1,0 +1,10 @@
+key de93415471f00d411634a501dc01a6c31daaa2240fb0ad240c082b95987b14b6
+tlc Version 2.19
+rc 12
+Invariant Short is violated
+6 states generated 6 distinct states found 3 states left on queue
+trace 3 c5a365ba6f634e22fd7b351f422f1f9dc1e4e958bc04f0ed63c40af9489c53b9
+states 6 27155b5d0a554d6f1e29ec67e4b47165c8f4eb0d566dc1194c85677bca0faf7b
+edges 5 b7686a78c4ca3946d6ff55a097148756a7ad6486afc4726ec0274bad4d77cc0c
+messages 101 cbcb626fadcd3ff7cc0eb51cc016bd65df97c779a11309db45864667c62b84a3
+errors 2 ca3c35b37da0a176b2ad1e53df22e2d89d3083f5624d6292e76a43106c37ed67
