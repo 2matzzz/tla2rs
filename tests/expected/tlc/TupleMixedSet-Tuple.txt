@@ -1,0 +1,10 @@
+key 937354cfa69352a5c75fa53e2bcbe488328926ca30dd1a8d36797a9052441c2c
+tlc Version 2.19
+rc 0
+No error has been found
+5 states generated 4 distinct states found 0 states left on queue
+trace 0
+states 4 ca8816ab22ecfeb8db81fd41f6bcaea4bf874d1733c392122416ec787bf16b80
+edges 4 21e9ce1b2f6c023fcd9cff03156abfd47c8af9f97534d0fed4374ae23f5f80d0
+messages 0
+errors 0

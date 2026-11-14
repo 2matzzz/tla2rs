@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 999 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1012 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -917,7 +917,16 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   after `x \in S` for S from the state or a constant definition, `x \in 5..6`, `\E y \in {5, 6} : y =
   x`, `t[i]` for t from the state, or `k \notin [{1} -> {1}]`, nor when a string's or a tuple's own
   comparison fails (`<<"a">> \in {"ab"}`, `<<1, 2>> # s`) (`tests/tlc/FpErr*`). Code generation
-  wraps such an operation in an `FpSource` when it can fail (`Gen::fp_source`)
+  wraps such an operation in an `FpSource` when it can fail (`Gen::fp_source`). Such an error while
+  checking an initial state does not stop TLC from generating the remaining initial states, which it
+  counts as generated without keeping them (`tests/tlc/TupleFunFail`: 3 generated, 1 distinct; TLC's
+  own exceptions stop it at once)
+- A tuple compared with a function over keys that are not all integers (`<<1, x>> = (1 :> 1 @@ m :>
+  x)`, `<<x>> = ("a" :> x)`), with either on the left: unequal when the sizes differ, otherwise TLC
+  walks the function's keys in its order, and the first that is not an integer stops it with
+  `Attempted to compare an integer with non-integer:` and the key followed by `.`, while an integer
+  key that is not the next index, or whose value differs, makes them unequal. A tuple built there on
+  the left adds `TLC was unable to fingerprint.` (`tests/tlc/TupleFunFail*`, `Gen::tuple_fun_eq`)
 - A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
   tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the

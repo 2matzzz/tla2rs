@@ -241,8 +241,8 @@ bounds the size of a model with temporal properties (one property per thread, so
 - Records are compared and printed with their fields in TLC's order (the order TLC first created the field names),
   and functions over strings print as records when every string of the domain is an identifier, and as
   `("a-b" :> 1 @@ ...)` otherwise, as in TLC. A record and the function over its field names built with `:>`, `@@`,
-  `[x \in S |-> e]` or EXCEPT are one value, also as elements of a set the compiler evaluates (a variable that may hold
-  both is refused). ToString of a value from the state interns the string of every value
+  `[x \in S |-> e]` or EXCEPT are one value, also as elements of a set the compiler evaluates, and a variable may hold both
+  (one that holds records of different fields and such a function is refused). ToString of a value from the state interns the string of every value
   of its type at compile time, so the type must have at most as many values as the 16-bit string ids leave room for
   (65536 strings and model values in all). ToString of a record whose fields the spec writes in another order than
   TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends

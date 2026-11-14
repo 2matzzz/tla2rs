@@ -133,6 +133,11 @@ impl Ord for Value {
     }
 }
 
+/// The atom of the string `name` in the registered Atoms, if the compiler numbered it
+pub fn string_atom(name: &str) -> Option<u32> {
+    STRING_IDS.with(|s| s.borrow().as_ref()?.borrow().get(&(false, name.to_string())).copied())
+}
+
 /// A record against a function, as the function over its field names. A record with a field
 /// name that is no string the compiler numbered differs from every function, and sorts after them
 fn rec_vs_fun(r: &BTreeMap<String, Value>, f: &BTreeMap<Value, Value>) -> std::cmp::Ordering {

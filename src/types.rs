@@ -688,6 +688,10 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
                 Ty::Seq(seq_elem_join(&[a, b])?.into())
             }
         }
+        // Over another domain, the two are functions over part of the joined domain type
+        (Ty::Fun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, c)) if is_tuple_fields(fs) && !fs.is_empty() => {
+            join(&Ty::PFun(d.clone(), c.clone()), &Ty::Rec(fs.clone()))?
+        }
         (Ty::Fun(d1, _), Ty::Fun(d2, _)) if seq_domain(d1).is_some() && seq_domain(d2).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         // Functions over different domains (other than 1..n): functions over part of the joined
         // domain type
@@ -699,6 +703,17 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
         (Ty::PFun(d1, c1), Ty::Fun(d2, c2)) | (Ty::Fun(d2, c2), Ty::PFun(d1, c1)) => Ty::PFun(join(d1, d2)?.into(), join(c1, c2)?.into()),
         (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if fs.is_empty() => Ty::PFun(d.clone(), c.clone()),
+        // A record is the function over its field names (`[a |-> 1] @@ [b |-> 2]` beside `[a |-> 0]`)
+        (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if rec_keys(fs).is_some() => {
+            let mut e = c.as_ref().clone();
+            for (_, t) in fs {
+                e = join(&e, t)?;
+            }
+            Ty::PFun(join(d, &Ty::Enum(rec_keys(fs).unwrap()))?.into(), e.into())
+        }
+        (Ty::Fun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, c)) if matches!(d.as_ref(), Ty::Enum(_)) && rec_keys(fs).is_some() => {
+            join(&Ty::PFun(d.clone(), c.clone()), &Ty::Rec(fs.clone()))?
+        }
         // A tuple is a function over 1..n (`tests/tlc/PFunTuple`)
         (Ty::PFun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::PFun(d, c)) if is_tuple_fields(fs) => {
             let mut e = c.as_ref().clone();
@@ -715,6 +730,17 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         }
         _ => return Err(format!("type mismatch: {a:?} vs {b:?}")),
     })
+}
+
+/// The atoms of the field names of a record of fixed fields (not a tuple, no optional field), as
+/// the keys of the function over them; None when some name is no string the compiler numbered
+pub fn rec_keys(fs: &[(String, Ty)]) -> Option<Vec<u32>> {
+    if fs.is_empty() || is_tuple_fields(fs) || has_atoms(fs) || has_val(fs) || fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_))) {
+        return None;
+    }
+    let mut ks = fs.iter().map(|(n, _)| crate::value::string_atom(n)).collect::<Option<Vec<u32>>>()?;
+    ks.sort();
+    Some(ks)
 }
 
 /// n when the type `d` of a function domain is 1..n (an empty 1..0 included)
