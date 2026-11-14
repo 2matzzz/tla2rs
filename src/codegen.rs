@@ -1487,9 +1487,10 @@ impl<'a> Gen<'a> {
         for p in path {
             let step = match (p, &cur) {
                 (Path::Idx(i), Some(Ty::Rec(fs))) if is_tuple_fields(fs) => Path::Field(tuple_field(self.tuple_index(i, env, fs.len())?)),
-                // A record is a function from its field names: !["a"] is !.a
+                // A record is a function from its field names: !["a"] is !.a (also for a string
+                // that is no field, outside the record)
                 (Path::Idx(i), Some(Ty::Rec(fs))) => match self.try_const(i, env) {
-                    Some(Value::Atom(a)) if fs.iter().any(|(n, _)| *n == self.atoms.name(a)) => Path::Field(self.atoms.name(a)),
+                    Some(Value::Atom(a)) if fs.iter().any(|(n, _)| *n == self.atoms.name(a)) || !self.atoms.is_model(a) => Path::Field(self.atoms.name(a)),
                     _ => p.clone(),
                 },
                 // A function over strings: !.a is !["a"] (a name that is no string of the spec stays
@@ -4190,7 +4191,11 @@ impl<'a> Gen<'a> {
                                 cur = c.as_ref().clone();
                             }
                             (Path::Field(k), Ty::Rec(fs)) => {
-                                let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
+                                // A field the record does not have
+                                let Some(i) = fs.iter().position(|(n, _)| n == k) else {
+                                    outside = true;
+                                    break;
+                                };
                                 match &fs[i].1 {
                                     // EXCEPT on an absent field is a no-op
                                     Ty::Opt(t) => {
@@ -6410,7 +6415,11 @@ impl<'a> Gen<'a> {
                         cur = c.as_ref().clone();
                     }
                     (Path::Field(k), Ty::Rec(fs)) => {
-                        let i = fs.iter().position(|(n, _)| n == k).ok_or(format!("no field {k}"))?;
+                        // A field the record does not have
+                        let Some(i) = fs.iter().position(|(n, _)| n == k) else {
+                            outside = true;
+                            break;
+                        };
                         match &fs[i].1 {
                             // EXCEPT on an absent field is a no-op
                             Ty::Opt(t) => {
