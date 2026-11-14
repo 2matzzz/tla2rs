@@ -11,12 +11,22 @@ use std::rc::Rc;
 #[derive(Default, Debug)]
 pub struct Atoms {
     list: std::cell::RefCell<Vec<(bool, String)>>, // (is model value, name)
-    map: std::cell::RefCell<HashMap<(bool, String), u32>>,
+    map: Rc<std::cell::RefCell<HashMap<(bool, String), u32>>>,
     /// While Some, the strings that operations (`\o`, ToString, ...) make, in order (see `made`)
     log: std::cell::RefCell<Option<Vec<u32>>>,
 }
 
+thread_local! {
+    /// The numbers of the strings of the Atoms that values are compared under (`Atoms::register`)
+    static STRING_IDS: std::cell::RefCell<Option<Rc<std::cell::RefCell<HashMap<(bool, String), u32>>>>> = const { std::cell::RefCell::new(None) };
+}
+
 impl Atoms {
+    /// Makes these the atoms values are compared under: a record equals the function over its
+    /// field names, whose keys are these atoms (see `Ord for Value`)
+    pub fn register(&self) {
+        STRING_IDS.with(|s| *s.borrow_mut() = Some(self.map.clone()));
+    }
     /// A string made by an operation (TLC creates its string then, which decides where it comes in
     /// TLC's order of strings), noted while a log is kept
     pub fn made(&self, a: u32) -> u32 {
@@ -72,7 +82,7 @@ impl Atoms {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Bool(bool),
     Int(i64),
@@ -114,7 +124,48 @@ impl Ord for Value {
             // field names
             (Rec(a), Rec(b)) => a.len().cmp(&b.len()).then_with(|| crate::types::rec_cmp(a, b)),
             (Tuple(a), Tuple(b)) => a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())),
+            // A record is the function over its field names: `[a |-> 1]` and `"a" :> 1` are one
+            // value (`tests/tlc/RecFunEq`)
+            (Rec(a), Fun(b)) => rec_vs_fun(a, b),
+            (Fun(a), Rec(b)) => rec_vs_fun(b, a).reverse(),
             _ => self.rank().cmp(&o.rank()),
+        }
+    }
+}
+
+/// A record against a function, as the function over its field names. A record with a field
+/// name that is no string the compiler numbered differs from every function, and sorts after them
+fn rec_vs_fun(r: &BTreeMap<String, Value>, f: &BTreeMap<Value, Value>) -> std::cmp::Ordering {
+    let keys: Option<BTreeMap<Value, &Value>> = STRING_IDS.with(|s| {
+        let s = s.borrow();
+        let ids = s.as_ref()?.borrow();
+        r.iter().map(|(k, v)| ids.get(&(false, k.clone())).map(|&a| (Value::Atom(a), v))).collect()
+    });
+    match keys {
+        Some(g) => g.len().cmp(&f.len()).then_with(|| g.iter().map(|(k, v)| (k, *v)).cmp(f.iter())),
+        None => std::cmp::Ordering::Greater,
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o).is_eq()
+    }
+}
+
+impl Eq for Value {}
+
+/// Consistent with `PartialEq`: a record and a function hash alike when their sizes are equal
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match self {
+            Value::Bool(b) => (0u8, b).hash(h),
+            Value::Int(i) => (1u8, i).hash(h),
+            Value::Atom(a) => (2u8, a).hash(h),
+            Value::Set(s) => (3u8, s).hash(h),
+            Value::Fun(m) => (4u8, m.len()).hash(h),
+            Value::Rec(m) => (4u8, m.len()).hash(h),
+            Value::Tuple(t) => (6u8, t).hash(h),
         }
     }
 }

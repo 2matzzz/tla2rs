@@ -1302,6 +1302,7 @@ fn compile_inner(
     // TLC orders a model value before any string (measured: {"zz", m1} prints as {m1, "zz"} and
     // CHOOSE picks m1), and atoms are ordered by their number
     let atoms = Atoms::default();
+    atoms.register();
     for a in 0..seen.len() as u32 {
         if seen.is_model(a) {
             atoms.intern(true, &seen.name(a));
