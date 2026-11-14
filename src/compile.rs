@@ -1720,6 +1720,7 @@ fn compile_inner(
 
     // Temporal properties
     let mut live_parts: Vec<(String, Expr, HashMap<String, Value>)> = vec![];
+    let mut act_prints = false;
     let mut action_props: Vec<(String, String, String)> = vec![];
     let mut init_props: Vec<(String, String)> = vec![];
     for name in &cfg.properties {
@@ -1761,6 +1762,8 @@ fn compile_inner(
                 continue;
             }
             if kind == 5 {
+                // What it prints comes in TLC's order with the rest (see PRINT_ORDER)
+                act_prints |= has_prints(&p) || q.as_ref().is_some_and(has_prints);
                 let env = g.env_step(env);
                 let pc = g.gen_as(&p, &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
                 let qc = g.gen_as(&q.unwrap(), &env, &Ty::Bool).map_err(|m| format!("property {name}: {m}"))?;
@@ -1912,7 +1915,7 @@ fn compile_inner(
     writeln!(src, "static INIT_PROPS: &[(&str, fn(&State) -> bool)] = &[{}];", iprop_list.join(", ")).unwrap();
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
-    writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
+    writeln!(src, "const PRINT_ORDER: bool = {};", print_order || act_prints).unwrap();
     writeln!(src, "const TLCGET: bool = {};", g.tlcget).unwrap();
     // The registers the ASSUMEs set
     let regs: Vec<String> = reg_init.iter().map(|(i, v)| format!("({i}, {v})")).collect();

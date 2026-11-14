@@ -1173,7 +1173,7 @@ impl Capturing {
             return Held::default();
         }
         let cap = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
-        Held { cap, next: 0, next_made: 0 }
+        Held { cap, ..Default::default() }
     }
 }
 
@@ -1194,16 +1194,46 @@ struct Held {
     cap: Capture,
     next: usize,
     next_made: usize,
+    /// What the action properties printed on the step to each successor (by its index among the
+    /// states pushed, in order), which TLC evaluates after the successor is added and its
+    /// invariants are checked: printed after the lines before the next state was pushed
+    after: Vec<(u32, Held)>,
+    next_after: usize,
 }
 
 impl Held {
     /// Prints the lines printed before the `n`th state was pushed (all with u32::MAX), and notes
-    /// the strings made before it
+    /// the strings made before it; with what the action properties printed on the steps to the
+    /// states before the last of those
     #[inline]
     fn flush(&mut self, n: u32) {
         if !PRINT_ORDER && !STR_ORDER {
             return;
         }
+        while let Some(j) = self.after.get(self.next_after).map(|a| a.0).filter(|&j| j.saturating_add(1) < n) {
+            self.flush_plain(j + 1);
+            let mut h = std::mem::take(&mut self.after[self.next_after].1);
+            self.next_after += 1;
+            h.flush(u32::MAX);
+        }
+        self.flush_plain(n);
+    }
+
+    /// `flush(j + 1)`, then what the action properties printed on the step to state j (once its
+    /// invariants are checked)
+    fn flush_after(&mut self, j: u32) {
+        if !PRINT_ORDER && !STR_ORDER {
+            return;
+        }
+        self.flush(j + 1);
+        if self.after.get(self.next_after).is_some_and(|a| a.0 == j) {
+            let mut h = std::mem::take(&mut self.after[self.next_after].1);
+            self.next_after += 1;
+            h.flush(u32::MAX);
+        }
+    }
+
+    fn flush_plain(&mut self, n: u32) {
         while let Some((p, _, l)) = self.cap.lines.get(self.next) {
             if *p >= n {
                 break;
@@ -2212,7 +2242,6 @@ fn expand_one_succ(
             }
             continue;
         }
-        let act = check_action_props(&s, &t);
         let Some(w) = pack(&t) else {
             if dumping() {
                 dump_unpacked(&mut c.dump, sfp_dump, &t, l);
@@ -2255,7 +2284,9 @@ fn expand_one_succ(
                 c.live.newk.push(k);
             }
         }
-        if let Some(m) = act {
+        // As TLC does, after t is added (if new) and its invariants are checked
+        held.flush(k as u32 + 1);
+        if let Some(m) = check_action_props(&s, &t) {
             if flag(&CONTINUE) && matches!(m, SMsg::Action(_)) {
                 let _g = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
                 report_msg(&m, true);
@@ -3428,8 +3459,13 @@ fn expand_safety_one(
         return found;
     }
     c.generated = examined;
-    // What was printed up to the successor that stops the search, or all of it
-    ws.held.flush(if matches!(stopped, Ok(None)) { u32::MAX } else { (examined - base) as u32 });
+    // What was printed up to the successor that stops the search (and on the step to it, when an
+    // action property stops it), or all of it
+    match &stopped {
+        Ok(None) => ws.held.flush(u32::MAX),
+        Ok(Some(f)) if f.extra.is_some() && matches!(f.msg, SMsg::Action(_) | SMsg::ActionEval(..)) => ws.held.flush_after((examined - base - 1) as u32),
+        _ => ws.held.flush((examined - base) as u32),
+    }
     // A successor that violates an action property is added to the visited states, but TLC
     // stops before queueing it
     if let (Ok(Some(f)), Some(&(i, tfp, _))) = (&stopped, ws.cand.last()) {
@@ -3531,8 +3567,17 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
             ws.dpend.push((i, e));
         }
         // A violated action property is reported after t is added (if new) and its invariants are
-        // checked, as TLC does: t stays a candidate, and the search stops after it.
-        let act = match check_action_props(s, t) {
+        // checked, as TLC does: t stays a candidate, and the search stops after it. What it prints
+        // is held until then too
+        let act = if (PRINT_ORDER || str_on()) && !TLCGET {
+            let cap = Capturing::start();
+            let act = check_action_props(s, t);
+            ws.held.after.push((i as u32, cap.finish()));
+            act
+        } else {
+            check_action_props(s, t)
+        };
+        let act = match act {
             // With -continue, reported in `insert_candidates` and the search goes on
             Some(SMsg::Action(name)) if flag(&CONTINUE) => {
                 ws.acts.push((i, name));
@@ -3576,8 +3621,9 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
 fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
     // With -continue, the violations of action properties, each after its successor is checked
     let mut acts = 0;
-    let report_acts = |upto: usize, acts: &mut usize, ws: &SWork| {
+    let report_acts = |upto: usize, acts: &mut usize, ws: &mut SWork| {
         while let Some(&(j, name)) = ws.acts.get(*acts).filter(|(j, _)| *j < upto) {
+            ws.held.flush_after(j as u32);
             report_continued(seen, &SFound::new(sfp, Some(ws.buf[j]), SMsg::Action(name)));
             *acts += 1;
         }
@@ -3589,7 +3635,7 @@ fn insert_candidates(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut
     r
 }
 
-fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork, acts: &mut dyn FnMut(usize, &SWork)) -> Option<SFound> {
+fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork, acts: &mut dyn FnMut(usize, &mut SWork)) -> Option<SFound> {
     for k in 0..ws.cand.len() {
         let (i, tfp, tw) = ws.cand[k];
         acts(i, ws);
@@ -3614,6 +3660,7 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
             Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
             Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
+        ws.held.flush_after(i as u32);
         c.next.push((tw, tfp));
         tg_queued(1);
         acts(i + 1, ws);
