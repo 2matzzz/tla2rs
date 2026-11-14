@@ -1570,6 +1570,16 @@ impl ConstEval<'_> {
                 }
                 Value::Rec(m)
             }
+            // A function over strings: !.a is !["a"]
+            (Path::Field(n), Value::Fun(mut m)) => {
+                match self.atoms.get(false, n).map(Value::Atom).and_then(|k| m.remove(&k).map(|old| (k, old))) {
+                    Some((k, old)) => {
+                        m.insert(k, self.except_at(old, rest, val, at, env, warn)?);
+                    }
+                    None => missing(),
+                }
+                Value::Fun(m)
+            }
             (_, v) => return Err(format!("EXCEPT path does not match the value {v:?}")),
         })
     }
