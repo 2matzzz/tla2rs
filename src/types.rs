@@ -692,6 +692,8 @@ pub fn join(a: &Ty, b: &Ty) -> R<Ty> {
         (Ty::Fun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, c)) if is_tuple_fields(fs) && !fs.is_empty() => {
             join(&Ty::PFun(d.clone(), c.clone()), &Ty::Rec(fs.clone()))?
         }
+        // The empty function and one over another domain: functions over part of that domain
+        (Ty::Fun(d, c), Ty::Rec(fs)) | (Ty::Rec(fs), Ty::Fun(d, c)) if fs.is_empty() => Ty::PFun(d.clone(), c.clone()),
         (Ty::Fun(d1, _), Ty::Fun(d2, _)) if seq_domain(d1).is_some() && seq_domain(d2).is_some() => Ty::Seq(seq_elem_join(&[a, b])?.into()),
         // Functions over different domains (other than 1..n): functions over part of the joined
         // domain type
