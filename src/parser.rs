@@ -452,6 +452,16 @@ fn fun_cons(bs: Vec<(String, Expr)>, body: Expr) -> Expr {
     Expr::FunCons(t, dom.b(), Expr::Let(defs, body.b()).b())
 }
 
+/// `e` with each EXCEPT applied to @ that is not yet in an EXCEPT_AT label put in one for `at`. The
+/// pairs of an EXCEPT nested in `e` were labeled when they were read, so what is left belongs to
+/// the pair whose value `e` is
+fn at_base(e: &Expr, at: &str) -> Expr {
+    match e {
+        Expr::Except(f, ups) if matches!(f.as_ref(), Expr::At) => Expr::Except(except_at(at, Expr::At).b(), ups.clone()),
+        _ => crate::codegen::map_children(e, &|c| at_base(c, at)),
+    }
+}
+
 impl Parser {
     /// The position of the tokens a..=b as TLC prints it: 1-based, the end column inclusive. SANY
     /// gives a parenthesized expression the position of what is inside the parentheses
@@ -1830,6 +1840,7 @@ impl Parser {
             self.pos += 1;
             let mut ups = vec![];
             loop {
+                let pair = self.pos;
                 self.expect("!")?;
                 let mut path = vec![];
                 loop {
@@ -1847,7 +1858,10 @@ impl Parser {
                     }
                 }
                 self.expect("=")?;
-                ups.push((path, self.expr(0)?));
+                let v = self.expr(0)?;
+                // TLC's warning for an EXCEPT applied to @ names the pair @ belongs to
+                let v = at_base(&v, &self.span_text(pair, self.pos - 1));
+                ups.push((path, v));
                 if self.is(",") {
                     self.pos += 1;
                 } else {
@@ -1857,7 +1871,7 @@ impl Parser {
             self.expect("]")?;
             // Where the value is written, which TLC's warning for a missing argument or field
             // names (an identifier keeps its own position)
-            let e = if matches!(e, Expr::Ident(..)) { e } else { except_at(&self.span_text(start, e_end - 1), e) };
+            let e = if matches!(e, Expr::Ident(..) | Expr::At) { e } else { except_at(&self.span_text(start, e_end - 1), e) };
             return Ok(Expr::Except(e.b(), ups));
         }
         if self.is("->") {

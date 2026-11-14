@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 987 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 999 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -784,7 +784,9 @@ when it starts. The warnings:
 - An EXCEPT that names an argument or field the value does not have (of a function, a function over
   a set TLC does not enumerate, a tuple or a record, also an inner index) changes nothing there, and
   TLC warns `The EXCEPT was applied to non-existing fields of the value at` with the position of
-  the value the EXCEPT changes, once per such argument (two in one evaluation print it twice). The
+  the value the EXCEPT changes, once per such argument (two in one evaluation print it twice). For
+  an EXCEPT applied to @ (`![1] = [@ EXCEPT ![5] = 0]`) the position is that of the pair @ belongs
+  to, `![1] = [...]` (`tests/tlc/ExceptWarnAt`). The
   parser keeps that position in an EXCEPT_AT label when the value is not an identifier, and
   expansion when a name is replaced by what it stands for (`ast::except_pos`); the checker warns
   with the printed lines (`except_warning`), the constant evaluator records it with them. TLC

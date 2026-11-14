@@ -447,6 +447,9 @@ impl<'a> Gen<'a> {
             Ty::Seq(_) => Cmp::Normal,
             Ty::Fun(d, _) if seq_domain(d).is_some() => Cmp::Normal,
             Ty::Fun(d, _) if matches!(d.as_ref(), Ty::Int(..)) => Cmp::Unequal,
+            // A function over integers built with :> and @@ equals the tuple when its domain is
+            // 1..n. Not over model values or strings, where TLC's comparison fails
+            Ty::PFun(d, _) if matches!(d.as_ref(), Ty::Int(..)) => Cmp::Normal,
             _ => Cmp::Fails(format!("Attempted to compare a tuple with a value of type {t:?}")),
         })
     }
@@ -1451,6 +1454,34 @@ impl<'a> Gen<'a> {
         Ok(out)
     }
 
+    /// `t` with the domain of each function on the EXCEPT path widened to the type of its index,
+    /// where the index cannot be converted to the domain's type (a set of elements the domain's
+    /// sets do not hold): such a key is outside the domain, so the function stays as it is (as in
+    /// TLC), and only the type grows. Integer keys convert to any integer domain
+    fn widen_keys(&mut self, t: &Ty, path: &[Path], env: &Env) -> Ty {
+        let Some((p, rest)) = path.split_first() else { return t.clone() };
+        match (p, t) {
+            (Path::Idx(i), Ty::Fun(d, c) | Ty::PFun(d, c)) => {
+                let c2 = self.widen_keys(c, rest, env);
+                let it = self.gen(i, env, Some(d)).ok().map(|(_, it)| it);
+                let wider = it.filter(|it| it != d.as_ref() && !(it.kind_eq(d) && Self::trivial(it, d))).and_then(|it| join(d, &it).ok()).filter(|j| j != d.as_ref());
+                match (wider, t) {
+                    (Some(j), _) => Ty::PFun(j.into(), c2.into()),
+                    (None, Ty::Fun(..)) => Ty::Fun(d.clone(), c2.into()),
+                    (None, _) => Ty::PFun(d.clone(), c2.into()),
+                }
+            }
+            (Path::Field(k), _) if k.starts_with('@') => self.widen_keys(t, rest, env),
+            _ => match Self::path_type(t, std::slice::from_ref(p)) {
+                Some(c) => {
+                    let c2 = self.widen_keys(&c, rest, env);
+                    if c2 == c { t.clone() } else { Self::set_path_type(t, std::slice::from_ref(p), &c2) }
+                }
+                None => t.clone(),
+            },
+        }
+    }
+
     /// Type at the end of an EXCEPT path
     fn path_type(t: &Ty, path: &[Path]) -> Option<Ty> {
         let mut cur = t.clone();
@@ -1511,6 +1542,57 @@ impl<'a> Gen<'a> {
     fn s_add(&mut self, acc: &str, x: &str, st: &Ty) -> R<String> {
         let eid = self.ty_id(&Self::elem_of(st))?;
         Ok(if is_sparse(st) { format!("{acc}.insert({x});") } else { format!("{acc} |= bit_{eid}({x});") })
+    }
+
+    /// `a @@ b` for two records, one of them among records of other fields (an optional field,
+    /// which `rec_as_fun` cannot hold): a record with the fields of both, each from `a` where `a`
+    /// has it, optional where neither side always has it, so that it joins with the records it
+    /// comes from. None otherwise, for `rec_as_fun`
+    fn rec_merge(&mut self, ac: &str, at: &Ty, bc: &str, bt: &Ty) -> R<Option<(String, Ty)>> {
+        let plain = |fs: &[(String, Ty)]| !fs.is_empty() && !is_tuple_fields(fs) && !has_atoms(fs) && !has_val(fs);
+        let opt = |fs: &[(String, Ty)]| fs.iter().any(|(_, t)| matches!(t, Ty::Opt(_)));
+        let (Ty::Rec(x), Ty::Rec(y)) = (at, bt) else { return Ok(None) };
+        if !plain(x) || !plain(y) || !(opt(x) || opt(y)) {
+            return Ok(None);
+        }
+        let mut names: Vec<&String> = x.iter().chain(y).map(|(n, _)| n).collect();
+        names.sort_by(|a, b| field_cmp(a, b));
+        names.dedup();
+        let (av, bv) = (self.fresh("a"), self.fresh("b"));
+        let field = |v: &str, fs: &[(String, Ty)], n: &str| fs.iter().position(|(m, _)| m == n).map(|i| (format!("{v}{}", rec_field(fs.len(), i)), fs[i].1.clone()));
+        let (mut parts, mut fs) = (vec![], vec![]);
+        for n in names {
+            let (part, t) = match (field(&av, x, n), field(&bv, y, n)) {
+                (Some((pa, ta)), None) => (pa, ta),
+                (None, Some((pb, tb))) => (pb, tb),
+                (Some((pa, ta)), Some(_)) if !matches!(ta, Ty::Opt(_)) => (pa, ta),
+                (Some((pa, Ty::Opt(ta))), Some((pb, tb))) => {
+                    let ib = match &tb {
+                        Ty::Opt(i) => i.as_ref().clone(),
+                        t => t.clone(),
+                    };
+                    let j = join(&ta, &ib)?;
+                    let va = self.coerce(format!("{pa}.1"), &ta, &j)?;
+                    match &tb {
+                        Ty::Opt(_) => {
+                            let vb = self.coerce(format!("{pb}.1"), &ib, &j)?;
+                            let t = Ty::Opt(j.into());
+                            (format!("if {pa}.0 {{ (true, {va}) }} else if {pb}.0 {{ (true, {vb}) }} else {{ {} }}", Self::default_code(&t)), t)
+                        }
+                        _ => {
+                            let vb = self.coerce(pb, &ib, &j)?;
+                            (format!("if {pa}.0 {{ {va} }} else {{ {vb} }}"), j)
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            };
+            parts.push(part);
+            fs.push((n.clone(), t));
+        }
+        let t = Ty::Rec(fs);
+        self.ty_id(&t)?;
+        Ok(Some((format!("{{ let {av} = {ac}; let {bv} = {bc}; {} }}", rec_build(&parts)), t)))
     }
 
     /// Statement setting the value at key `k` of `acc`, a function over part of a type or a bag of
@@ -2335,8 +2417,10 @@ impl<'a> Gen<'a> {
             (Ty::PFun(d1, c1), Ty::PFun(d2, c2)) => {
                 let (aid, bid) = (self.ty_id(d1)?, self.ty_id(d2)?);
                 let inner = self.coerce("__x".into(), c1, c2)?;
+                // Keys of another kind (model values among integers) take the target's layout
+                let key = self.coerce(format!("dec_{aid}(__i as u64)"), d1, d2)?;
                 Ok(format!(
-                    "{{ let __f = {code}; let mut __o = {}; for (__i, &(__p, __x)) in __f.iter().enumerate() {{ if __p {{ __o[idx_{bid}(dec_{aid}(__i as u64))] = (true, {inner}); }} }} __o }}",
+                    "{{ let __f = {code}; let mut __o = {}; for (__i, &(__p, __x)) in __f.iter().enumerate() {{ if __p {{ __o[idx_{bid}({key})] = (true, {inner}); }} }} __o }}",
                     Self::default_code(to)
                 ))
             }
@@ -2354,8 +2438,9 @@ impl<'a> Gen<'a> {
             (Ty::Bag(a), Ty::Bag(b)) => {
                 let (aid, bid) = (self.ty_id(a)?, self.ty_id(b)?);
                 let r = self.fresh("r");
+                let key = self.coerce(format!("dec_{aid}(__i as u64)"), a, b)?;
                 Ok(format!(
-                    "{{ let {r} = {code}; let mut __o = {}; for (__i, &__c) in {r}.iter().enumerate() {{ if __c > 0 {{ __o[idx_{bid}(dec_{aid}(__i as u64))] = __c; }} }} __o }}",
+                    "{{ let {r} = {code}; let mut __o = {}; for (__i, &__c) in {r}.iter().enumerate() {{ if __c > 0 {{ __o[idx_{bid}({key})] = __c; }} }} __o }}",
                     Self::default_code(to)
                 ))
             }
@@ -2845,9 +2930,12 @@ impl<'a> Gen<'a> {
                 // f @@ g: f where it is defined, g elsewhere
                 ("@@", [a, b]) => {
                     let (ac, at) = self.gen(a, env, None)?;
+                    let (bc0, bt0) = self.gen(b, env, None)?;
+                    if let Some(r) = self.rec_merge(&ac, &at, &bc0, &bt0)? {
+                        return Ok(r);
+                    }
                     let (ac, at) = self.rec_as_fun(ac, at, env)?;
-                    let (bc, bt) = self.gen(b, env, None)?;
-                    let (bc, bt) = self.rec_as_fun(bc, bt, env)?;
+                    let (bc, bt) = self.rec_as_fun(bc0, bt0, env)?;
                     let (ad, acod) = pfun_parts(&at).ok_or(format!("@@ of {at:?}, which is not a function"))?;
                     let (bd, bcod) = pfun_parts(&bt).ok_or(format!("@@ of {bt:?}, which is not a function"))?;
                     let ft = Ty::PFun(join(&ad, &bd)?.into(), join(&acod, &bcod)?.into());
@@ -3813,9 +3901,12 @@ impl<'a> Gen<'a> {
                     })
                     .collect::<R<_>>()?;
                 let ups = &ups;
+                let mut ft = ft0.clone();
+                for (path, _) in ups {
+                    ft = self.widen_keys(&ft, path, env);
+                }
                 // Widen to include the types of the written values (when writing a wider value into
                 // a narrower function; type inference relies on this too)
-                let mut ft = ft0.clone();
                 for (path, val) in ups {
                     let Some(cur) = Self::path_type(&ft, path) else { continue };
                     let mut env2 = env.clone();
@@ -5528,7 +5619,7 @@ impl<'a> Gen<'a> {
                         }
                     }
                     match rhs.strip() {
-                        Except(base, ups) if matches!(base.strip(), Ident(n, _) if *n == v) => {
+                        Except(base, ups) if matches!(base.strip(), Ident(n, _) if *n == v) && ups.iter().all(|(p, _)| self.widen_keys(&t, p, env) == t) => {
                             self.gen_except_into(&place, ups, &t, &env2, except_pos(base), out)?;
                         }
                         _ => match self.gen_set_update(&place, &v, rhs, &t, env) {
@@ -6634,7 +6725,7 @@ impl<'a> Gen<'a> {
                     let (kt, vt) = fun_kv(&t);
                     let (kid, vid) = (self.ty_id(&kt)?, self.ty_id(&vt)?);
                     let it = self.fun_iter("v", &t, true)?;
-                    let ints = matches!(kt, Ty::Int(..));
+                    let ints = matches!(kt, Ty::Int(..) | Ty::IntAtom(..));
                     format!(
                         "let ks: Vec<(String, String)> = {it}.map(|(k, x)| (fmt_{kid}(&k), fmt_{vid}(&x))).collect(); \
                          if ks.is_empty() {{ return \"<< >>\".into(); }} \
@@ -6647,7 +6738,7 @@ impl<'a> Gen<'a> {
                 // function), a tuple over 1..n
                 Ty::PFun(d, c) => {
                     let (did, cid) = (self.ty_id(d)?, self.ty_id(c)?);
-                    let ints = matches!(d.as_ref(), Ty::Int(..));
+                    let ints = matches!(d.as_ref(), Ty::Int(..) | Ty::IntAtom(..));
                     format!(
                         "let ks: Vec<(u64, String)> = v.iter().enumerate().filter(|(_, x)| x.0).map(|(i, x)| (i as u64, fmt_{cid}(&x.1))).collect(); \
                          if ks.is_empty() {{ return \"<< >>\".into(); }} \
@@ -6658,7 +6749,7 @@ impl<'a> Gen<'a> {
                 }
                 Ty::Bag(e) => {
                     let eid = self.ty_id(e)?;
-                    let ints = matches!(e.as_ref(), Ty::Int(..));
+                    let ints = matches!(e.as_ref(), Ty::Int(..) | Ty::IntAtom(..));
                     format!(
                         "let ks: Vec<(u64, i64)> = v.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, &c)| (i as u64, c)).collect(); \
                          if ks.is_empty() {{ return \"<< >>\".into(); }} \

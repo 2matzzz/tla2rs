@@ -305,7 +305,7 @@ bounds the size of a model with temporal properties (one property per thread, so
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning
 - TLC's warning that an EXCEPT names an argument or field the value does not have is printed as TLC prints it (each
-  text once, the first with TLC's note about `-nowarning`), also for an EXCEPT of constant level inside Init, an
+  text once, the first with TLC's note about `-nowarning`; for an EXCEPT applied to @, at the pair @ belongs to), also for an EXCEPT of constant level inside Init, an
   action or an invariant, which the compiler evaluates once: the checker warns each time TLC would evaluate it, and
   when it starts for the set of a `\E` that TLC splits the next-state relation through (TLC evaluates that set once)
 - Recursion stops with an evaluation error when it has used 1 MB of a worker's stack (about 9,000 levels for a small
