@@ -35,6 +35,14 @@ follow TLC 2.19's search for a liveness counterexample, its tableau and its fing
 with jdb). They are written for tla2rs; what is taken over is the
 polynomial `FP64.Polys[0]`, which TLC uses with `-fp 0`.
 
+`src/runtime.rs` (`LIVE_SIM_RT`, `AGAIN_RT`), `src/live.rs` (`live_const_error`, `subscript_first`) and
+`src/codegen.rs` (`print_except_updates`) follow what TLC 2.19 evaluates while it builds its liveness graph, how it
+converts a call of a definition in a temporal formula, and how it evaluates an EXCEPT of a function it keeps
+unevaluated, as measured and as read from its classes (`LiveCheck.addNextState`, `LiveCheck$TableauLiveChecker`,
+`OrderOfSolution.checkState`, `OrderOfSolution.checkAction`, `TBGraphNode.isConsistent`, `Liveness.astToLiveAppl`,
+`ModelChecker$DoInitFunctor`, `FcnLambdaValue.select`, `FcnLambdaValue.takeExcept`, `Value.select`,
+`tlc2.tool.impl.Tool`). They are written for tla2rs; no code of TLC is copied.
+
 ```
 MIT License
 
