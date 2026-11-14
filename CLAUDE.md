@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1059 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1063 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -142,6 +142,17 @@ checker reports an evaluation error as before. Output before the line is repeate
 stays within its capacities builds and runs exactly as before.
 A constant filter `{x \in S : P}` too large to compute when compiling is no such array where it is only iterated
 over (as in `v \in` it in Init): the checker computes it once into a vector (`tests/tlc/Staircase`).
+
+ToString of a value from the state needs the string of every value it can make numbered when the checker is built
+(`Gen::gen`, `("ToString", [x])`). A type with more values than strings can still be added (integers whose range the
+type inference leaves unbounded, as under `n < 3 /\ n' = n + 1`, which it does not read) gets the strings of the
+values whose integers lie in the widest window nearest 0 (`types::int_window`; sets held as arrays of at most SCAP
+elements) that gives at most 256 of them (`TOSTR_START`, per type by its Debug text: `Gen::tostr_window`). A value
+outside makes the checker write its type to the file `TLA2RS_NEED` names and exit with 73 (`tostring_miss`, emitted
+only where used); tla2rs prints `tla2rs: ToString met a value whose string is not among the N listed for its type;
+checking again from the start with room for M` and builds again with M for that type, growing as capacities do,
+until no wider window fits in the strings that can be added, where the miss is an evaluation error
+(`tests/tlc/ToStringWide*`: 3, 3, 2 and 0 rebuilds). A type with few enough values is listed whole, as before.
 
 Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
 

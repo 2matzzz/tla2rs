@@ -253,10 +253,13 @@ fn main() {
     // `capacity_exceeded` in runtime.rs), and how many times each kind has grown
     let need_file = dir.join("capacity-needed.txt");
     let mut grown = [0u32; 2];
+    // How many strings ToString may list for a type with more values than strings can be added,
+    // by type (see TOSTR_CAP in codegen.rs), and how many times each has grown
+    let mut tostr: std::collections::HashMap<String, (usize, u32)> = Default::default();
     let mut first = true;
     loop {
         let t0 = Instant::now();
-        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, fp128, metal, &made);
+        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect(), fp128, metal, &made);
         if first {
             for w in &output.warnings {
                 eprintln!("warning: {w}");
@@ -297,7 +300,7 @@ fn main() {
         let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0) else { return };
         // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs)
         let (scap, qcap) = output.caps;
-        let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).collect();
+        let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).chain(['t']).collect();
         let mut cmd = Command::new(bin);
         cmd.args(&pass).env("TLA2RS_GROW", grow).env("TLA2RS_NEED", &need_file);
         let _ = std::fs::remove_file(&need_file);
@@ -314,6 +317,17 @@ fn main() {
                 eprintln!("tla2rs: the strings made while exploring were made in another order each time; the last run may order them differently from TLC");
             }
             println!("tla2rs: strings were made in another order than they were numbered in; checking again from the start with them in that order");
+            first = false;
+            continue;
+        }
+        if code == codegen::TOSTR_EXIT {
+            // As capacities grow (below); the checker asks only while more can be listed
+            let Ok(key) = std::fs::read_to_string(&need_file) else { exit(code) };
+            let (cap, grown) = tostr.entry(key).or_insert((codegen::TOSTR_START, 0));
+            let old = *cap;
+            *grown += 1;
+            *cap = old.saturating_mul(1 << (*grown).min(12)).min(types::MAX_CAP);
+            println!("tla2rs: ToString met a value whose string is not among the {old} listed for its type; checking again from the start with room for {cap}");
             first = false;
             continue;
         }
@@ -344,12 +358,12 @@ fn main() {
 /// stack: evaluating a recursive operator at compile time nests deeply (up to value::REC_LIMIT
 /// calls)
 #[allow(clippy::too_many_arguments)]
-fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, fp128: bool, metal: bool, made: &[String]) -> compile::Output {
+fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String]) -> compile::Output {
     let (src, cfg_src, made) = (src.to_string(), cfg_src.to_string(), made.to_vec());
     let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
     let result = std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, fp128, metal, &made))
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &tostr, fp128, metal, &made))
         .expect("start the compiler thread")
         .join()
         .unwrap_or_else(|_| Err("internal error in the compiler".into()));

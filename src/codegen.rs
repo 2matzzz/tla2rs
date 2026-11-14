@@ -89,6 +89,8 @@ pub struct Gen<'a> {
     convs: BTreeSet<(usize, usize)>,
     /// Whether `subsets_tlc` is used
     need_subsets: bool,
+    /// Whether `tostring_miss` is used
+    need_tostr_miss: bool,
     pub labels: Vec<String>,
     /// The number of actions the next-state relation splits into (see `gen_split`)
     pub actions: usize,
@@ -175,6 +177,19 @@ fn phantom(n: &str) -> String {
     format!("'{n}")
 }
 
+/// How many strings ToString of a value from the state may list for a type (by its Debug text)
+/// with more values than strings can be added (integers the type inference leaves unbounded):
+/// those of the values whose integers lie in the widest window nearest 0 that fits
+/// (`Gen::tostr_window`). It starts at TOSTR_START; a checker that meets a value outside writes
+/// the type to the file TLA2RS_NEED names and exits with TOSTR_EXIT, and tla2rs builds it again
+/// with more for that type, as for capacities
+pub const TOSTR_START: usize = 256;
+pub const TOSTR_EXIT: i32 = 73;
+
+thread_local! {
+    pub static TOSTR_CAP: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
+}
+
 fn rid(n: &str) -> String {
     format!("l_{}", n.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_"))
 }
@@ -194,6 +209,7 @@ impl<'a> Gen<'a> {
             ty_ids: HashMap::new(),
             convs: BTreeSet::new(),
             need_subsets: false,
+            need_tostr_miss: false,
             labels: vec!["Init".into(), "Next".into()],
             actions: 0,
             int_module: "Naturals",
@@ -1740,6 +1756,33 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// The widest window w (see `types::int_window`) whose values of `t` number at most `cap`,
+    /// with those values
+    fn tostr_window(&self, t: &Ty, cap: usize) -> Option<(u64, Vec<Value>)> {
+        let fits = |w: u64| all_values(t, Some(w), self.qcap, self.scap, cap);
+        let mut best = (1, fits(1)?);
+        let mut over = None;
+        while best.0 < 1 << 63 {
+            let w = best.0 * 2;
+            match fits(w) {
+                Some(v) => best = (w, v),
+                None => {
+                    over = Some(w);
+                    break;
+                }
+            }
+        }
+        let Some(mut hi) = over else { return Some(best) };
+        while hi - best.0 > 1 {
+            let mid = best.0 + (hi - best.0) / 2;
+            match fits(mid) {
+                Some(v) => best = (mid, v),
+                None => hi = mid,
+            }
+        }
+        Some(best)
+    }
+
     /// How TLC prints a function over a set it cannot enumerate (see `lazy_fun_string`), when f is
     /// one whose domain TLC prints as tla2rs can: Nat, Int, STRING, `Seq(S)` and products of
     /// those and of finite sets, the finite ones printed as their values
@@ -2974,8 +3017,8 @@ impl<'a> Gen<'a> {
                             short(x)
                         )
                     };
-                    if scalar_or_tuple(&t) {
-                        let n = t.size().filter(|&n| n <= room as u64).ok_or_else(too_many)?;
+                    if scalar_or_tuple(&t) && t.size().is_some_and(|n| n <= room as u64) {
+                        let n = t.size().unwrap();
                         let ids: Vec<u32> = t.enumerate().iter().map(|v| self.atoms.intern(false, &crate::compile::show_value(self.atoms, v))).collect();
                         let table: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
                         let mut res = ids.clone();
@@ -2984,7 +3027,19 @@ impl<'a> Gen<'a> {
                         let code = format!("{{ const T: [u16; {n}] = [{}]; T[idx_{tid}({c})] }}", table.join(", "));
                         return Ok((self.note_made(code, &res), Ty::Enum(res)));
                     }
-                    let vals = crate::types::all_values(&t, self.qcap, self.scap, room).ok_or_else(too_many)?;
+                    // Too many values (integers the type inference leaves unbounded): only those whose
+                    // integers lie in the window nearest 0 that TOSTR_CAP strings allow, and the
+                    // checker built again with more when it meets one outside (`tostring_miss`)
+                    let (vals, window) = match crate::types::all_values(&t, None, self.qcap, self.scap, room) {
+                        Some(v) => (v, None),
+                        None => {
+                            let key = format!("{t:?}");
+                            let cap = TOSTR_CAP.with(|c| c.borrow().get(&key).copied()).unwrap_or(TOSTR_START).min(room);
+                            let (w, v) = self.tostr_window(&t, cap).ok_or_else(too_many)?;
+                            let grows = cap < room.min(MAX_CAP) && int_window(&t, w + 1) != int_window(&t, w);
+                            (v, Some((grows, key)))
+                        }
+                    };
                     let mut table: Vec<(String, u32)> = vals
                         .iter()
                         .map(|v| {
@@ -3009,9 +3064,16 @@ impl<'a> Gen<'a> {
                     res.sort();
                     res.dedup();
                     let rows: Vec<String> = table.iter().map(|(s, i)| format!("({s:?}, {i})")).collect();
+                    let miss = match window {
+                        None => "eval_error(format!(\"ToString of {__k}: TLC prints this value in a way that depends on how it was built (an empty function prints as << >> or <<>>)\"))".to_string(),
+                        Some((grows, key)) => {
+                            self.need_tostr_miss = true;
+                            format!("tostring_miss(&__k, {grows}, {}, {key:?})", rows.len())
+                        }
+                    };
                     let code = format!(
                         "{{ static T: [(&str, u16); {}] = [{}]; let __k = {}; match T.binary_search_by(|(s, _)| (*s).cmp(__k.as_str())) {{ \
-                         Ok(__i) => T[__i].1, Err(_) => eval_error(format!(\"ToString of {{__k}}: TLC prints this value in a way that depends on how it was built (an empty function prints as << >> or <<>>)\")) }} }}",
+                         Ok(__i) => T[__i].1, Err(_) => {miss} }} }}",
                         rows.len(),
                         rows.join(", "),
                         if sh != "0" {
@@ -6840,6 +6902,19 @@ impl<'a> Gen<'a> {
             s += "fn subsets_tlc(m: u128) -> Vec<u128> { if m.count_ones() > 20 { eval_error(format!(\"SUBSET of a set of {} elements is too large to enumerate\", m.count_ones())) } \
                   let mut v = vec![]; let mut sub = m; loop { v.push(sub); if sub == 0 { break; } sub = (sub - 1) & m; } \
                   v.sort_by(|a, b| a.count_ones().cmp(&b.count_ones()).then_with(|| { let d = a ^ b; if d == 0 { std::cmp::Ordering::Equal } else if a & d & d.wrapping_neg() != 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } })); v }\n";
+        }
+        if self.need_tostr_miss {
+            // ToString of a value whose string the checker was not built with (see TOSTR_CAP):
+            // when tla2rs runs it and more strings can be listed, it exits for a checker built
+            // with more
+            writeln!(
+                s,
+                "#[cold] fn tostring_miss(k: &str, grows: bool, n: usize, key: &str) -> u16 {{ \
+                 if grows && std::env::var(\"TLA2RS_GROW\").is_ok_and(|g| g.contains('t')) {{ \
+                 use std::io::Write; if let Some(f) = std::env::var_os(\"TLA2RS_NEED\") {{ let _ = std::fs::write(f, key); }} let _ = std::io::stdout().flush(); std::process::exit({TOSTR_EXIT}) }} \
+                 eval_error(format!(\"ToString of {{k}}: not among the {{n}} strings the checker lists for values of its type, those whose integers are nearest 0 (strings are 16-bit ids), nor printed as TLC prints it here\")) }}"
+            )
+            .unwrap();
         }
         // fmt is needed for every type reachable from the variables' types, so register those first
         for (_, t) in self.vars.clone() {

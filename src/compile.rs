@@ -1031,7 +1031,8 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 /// the constants, definitions and ASSUMEs makes them, which is known only once they are evaluated:
 /// when it differs from the order they were numbered in, the spec is compiled again with it
 #[allow(clippy::too_many_arguments)]
-pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, fp128: bool, metal: bool, made: &[String]) -> R<Output> {
+pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, tostr: &HashMap<String, usize>, fp128: bool, metal: bool, made: &[String]) -> R<Output> {
+    crate::codegen::TOSTR_CAP.with(|c| *c.borrow_mut() = tostr.clone());
     let mut at_start: Vec<String> = vec![];
     // Each round numbers the strings made at the start in the order the round before made them;
     // that order changes only when the numbering changes the order of a set they are made from
