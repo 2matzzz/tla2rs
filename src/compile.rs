@@ -37,6 +37,9 @@ pub struct Startup {
     pub warnings: Vec<String>,
     /// TLC's warnings while it evaluates the invariants and properties of constant level
     pub invs: Vec<String>,
+    /// What TLC prints while it evaluates the parts of constant level of the temporal formulas
+    /// (`live::take_live_prints`)
+    pub live: Vec<String>,
     pub assumes: Vec<String>,
     /// The strings that operations made while TLC evaluated the constants, the definitions of
     /// constant level, the constant invariants and properties and the ASSUMEs, in the order made
@@ -76,7 +79,7 @@ impl Startup {
         let mut v = self.pcal.clone();
         v.extend(self.sany.iter().cloned());
         let mark = |w: &String| format!("{}{w}", crate::value::WARNING_MARK);
-        let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
+        let lines = self.consts.iter().cloned().chain(self.invs.iter().cloned()).chain(self.live.iter().cloned()).chain(self.warnings.iter().map(mark)).chain(self.assumes.iter().cloned());
         // TLC prints a warning only when it has not printed the same text before, and the first
         // warning of a run carries its note (so the same warning can come once more without it)
         let mut seen = HashSet::new();
@@ -1230,10 +1233,18 @@ fn eval_printing(ce: &ConstEval, e: &Expr, out: &mut Vec<String>) -> R<Value> {
                 continue;
             }
         }
-        // TLC pretty-prints each value printed (80 columns) on the standard output (`user_text`)
-        out.push(format!("{USER_MARK}{}", l.join(&USER_SEP.to_string())));
+        out.push(user_line(&l));
     }
     r
+}
+
+/// A line recorded in `value::PRINTED`, marked as one the spec printed (TLC pretty-prints each
+/// value printed, 80 columns, on the standard output: `user_text`), or one of TLC's warnings
+fn user_line(l: &[String]) -> String {
+    match l {
+        [w] if w.starts_with(crate::value::WARNING_MARK) => w.clone(),
+        _ => format!("{USER_MARK}{}", l.join(&USER_SEP.to_string())),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1771,10 +1782,15 @@ fn compile_inner(
         }
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
-    let live_code = match crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts)? {
+    crate::live::take_live_prints();
+    let live_code = crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts);
+    startup.live = crate::live::take_live_prints().into_iter().map(|l| user_line(&l)).collect();
+    let live_code = match live_code? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0), atoms: vec![] })
+            // TLC converts the temporal formulas before it evaluates the ASSUMEs
+            startup.assumes.clear();
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0), atoms: vec![] });
         }
     };
     let mut prop_code = String::new();
