@@ -1996,9 +1996,6 @@ fn compile_inner(
     if live_sim {
         rt = live_sim_runtime(&rt);
     }
-    if print_order {
-        rt = again_runtime(&rt);
-    }
     if g.shaped.is_empty() {
         src += &rt;
     } else {
@@ -2016,9 +2013,6 @@ fn compile_inner(
     src += crate::runtime::LIVENESS_RT;
     if live_sim {
         src += crate::runtime::LIVE_SIM_RT;
-    }
-    if print_order {
-        src += crate::runtime::AGAIN_RT;
     }
     let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
     Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap), atoms: names })
@@ -2041,25 +2035,6 @@ fn live_sim_runtime(rt: &str) -> String {
         (
             "    if LIVENESS {\n        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
             "    if LIVENESS {\n        held.flush(u32::MAX);\n        if let Err(m) = live_sim_expand(&s, buf) {\n            return Some(Found::Live(m));\n        }\n        let _quiet = Capturing::start();\n        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
-        ),
-    ])
-}
-
-/// `rt` with the hooks of `AGAIN_RT`, for a spec that prints. The runtime of other specs stays as
-/// it is
-fn again_runtime(rt: &str) -> String {
-    hook(rt, &[
-        (
-            "                Some(SMsg::InvEval(..)) => {\n                    failed = true;\n",
-            "                Some(SMsg::InvEval(inv, e)) => {\n                    failed = true;\n                    if flag(&CONTINUE) {\n                        *AGAIN.lock().unwrap_or_else(|e| e.into_inner()) = Some((t, l, inv, e));\n                    }\n",
-        ),
-        (
-            "        if failed {\n            code = 255;\n        }\n",
-            "        if failed {\n            code = 255;\n            if let Some(trace) = seen.pred_of(f.fp).and_then(|p| fp_chain(seen, p)).and_then(|c| replay(&c)) {\n                again_failed(&|t, l| {\n                    print_states_tlc(&trace, trace.len(), Some((*t, l)));\n                });\n            }\n        }\n",
-        ),
-        (
-            "                            if failed {\n                                code = 255;\n                            }\n",
-            "                            if failed {\n                                code = 255;\n                                again_failed(&|t, l| g.print_trace(p as u32, Some((t, l)), false));\n                            }\n",
         ),
     ])
 }
