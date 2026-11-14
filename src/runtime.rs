@@ -6887,3 +6887,283 @@ fn write_lasso_check(states: &[String], back: Option<(usize, Option<String>)>) {
     }
 }
 "##;
+
+/// TLC's evaluations while it builds its liveness graph, followed for what they print (pasted, and
+/// hooked into `RUNTIME` by `compile::live_sim_runtime`, only when they print). With one worker TLC
+/// evaluates, for each order of solution in turn (tlc2.tool.liveness.LiveCheck), after a state's
+/// successors: the step predicates on the step to each successor in its set of them (the state
+/// itself last, see `tlc_lasso`), the state predicates, then each particle of the tableau on each
+/// successor, and a node new to a state already expanded gets its transitions at once (the state's
+/// predicates, its stuttering step, then its successors generated again an action at a time);
+/// and each initial state, when they are all computed, against the formula's particles.
+pub const LIVE_SIM_RT: &str = r##"
+// ---------------------------------------------------------------- liveness prints (TLC's order)
+
+#[derive(Default)]
+struct LiveSim {
+    /// TLC's fingerprint of each state met, by the checker's
+    tfp: std::collections::HashMap<Fp, Option<u64>>,
+    inits: std::collections::HashSet<Fp>,
+    /// The starting size of TLC's set of successors (see `tlc_lasso`)
+    mult: usize,
+    /// Per order of solution: the particles recorded for each state, in order, the transitions
+    /// made (state, particle, state, particle) and the states expanded
+    rows: Vec<std::collections::HashMap<Fp, Vec<u32>>>,
+    trans: Vec<std::collections::HashSet<(Fp, u32, Fp, u32)>>,
+    done: Vec<std::collections::HashSet<Fp>>,
+}
+
+static LIVE_SIM: std::sync::Mutex<Option<LiveSim>> = std::sync::Mutex::new(None);
+
+fn sim_fp(s: &State) -> Fp {
+    pack(s).map(|w| state_fp(s, &w)).unwrap_or_default()
+}
+
+/// A predicate of an order of solution on s, or on the step s -> t, as TLC evaluates it
+fn sim_lp(p: &LP, s: &State, t: Option<&State>) -> bool {
+    match p {
+        LP::B(b) => *b,
+        LP::S(i) => SATOMS[*i as usize](s),
+        LP::A(i) => TLC_AATOMS[*i as usize](s, t.unwrap_or(s)),
+        LP::FE(i) => (FAIRS[*i as usize].1)(s),
+        LP::FS(i) => TLC_FSTEPS[*i as usize](s, t.unwrap_or(s)),
+        LP::Not(x) => !sim_lp(x, s, t),
+        LP::And(xs) => xs.iter().all(|x| sim_lp(x, s, t)),
+        LP::Or(xs) => xs.iter().any(|x| sim_lp(x, s, t)),
+    }
+}
+
+/// TBGraphNode.isConsistent: its state predicates in order, up to the first that fails
+fn sim_cons(n: &TNode, s: &State) -> bool {
+    n.preds.iter().all(|&(a, p)| SATOMS[a as usize](s) == p)
+}
+
+impl LiveSim {
+    fn new() -> Self {
+        let k = TLC_LIVE.as_ref().map(|l| l.oos.len()).unwrap_or(0);
+        LiveSim {
+            mult: 1,
+            rows: (0..k).map(|_| Default::default()).collect(),
+            trans: (0..k).map(|_| Default::default()).collect(),
+            done: (0..k).map(|_| Default::default()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The states put into TLC's set of successors, in its order: each once (by fingerprint)
+    fn order(&mut self, puts: Vec<(Fp, State)>) -> Vec<(Fp, State)> {
+        let mut tfp = Vec::with_capacity(puts.len());
+        for (f, s) in &puts {
+            let t = *self.tfp.entry(*f).or_insert_with(|| tlc_fp(s));
+            match t {
+                Some(t) => tfp.push(t),
+                // Not fingerprinted as TLC does: in the order generated
+                None => {
+                    let mut seen = std::collections::HashSet::new();
+                    return puts.into_iter().filter(|(f, _)| seen.insert(*f)).collect();
+                }
+            }
+        }
+        let slot = |fp: u64, len: usize| ((fp as u32 & 0x7FFF_FFFF) as usize) % len;
+        let mut len = self.mult * 16;
+        let mut tab: Vec<Option<usize>> = vec![None; len];
+        let mut count = 0usize;
+        for i in 0..puts.len() {
+            if count >= len / 2 {
+                let old = std::mem::take(&mut tab);
+                len = 2 * len + 1;
+                tab = vec![None; len];
+                for o in old.into_iter().flatten() {
+                    let mut l = slot(tfp[o], len);
+                    while tab[l].is_some() {
+                        l = (l + 1) % len;
+                    }
+                    tab[l] = Some(o);
+                }
+            }
+            let mut l = slot(tfp[i], len);
+            loop {
+                match tab[l] {
+                    None => {
+                        tab[l] = Some(i);
+                        count += 1;
+                        break;
+                    }
+                    Some(o) if puts[o].0 == puts[i].0 => break,
+                    Some(_) => l = (l + 1) % len,
+                }
+            }
+        }
+        if len > self.mult * 16 {
+            self.mult += 1;
+        }
+        tab.into_iter().flatten().map(|o| puts[o]).collect()
+    }
+
+    /// A transition from particle ti0 of state f0 to particle ti1 of f1 unless it has one: whether
+    /// the node of f1 is new
+    fn link(&mut self, o: usize, f0: Fp, ti0: u32, f1: Fp, ti1: u32) -> Option<bool> {
+        let exists = self.rows[o].get(&f1).is_some_and(|r| r.contains(&ti1));
+        if exists && self.trans[o].contains(&(f0, ti0, f1, ti1)) {
+            return None;
+        }
+        self.trans[o].insert((f0, ti0, f1, ti1));
+        if !exists {
+            self.rows[o].entry(f1).or_default().push(ti1);
+        }
+        Some(!exists)
+    }
+
+    fn init(&mut self, s: &State) {
+        let f = sim_fp(s);
+        if !self.inits.insert(f) {
+            return;
+        }
+        let Ok(tl) = &TLC_LIVE else { return };
+        for (o, oos) in tl.oos.iter().enumerate() {
+            let Some(tab) = oos.tableau else { continue };
+            for ti in 0..oos.init_cnt {
+                if sim_cons(&tab[ti], s) && !self.rows[o].get(&f).is_some_and(|r| r.contains(&(ti as u32))) {
+                    self.rows[o].entry(f).or_default().push(ti as u32);
+                }
+            }
+        }
+    }
+
+    fn expand(&mut self, s: &State, succ: &[(State, u32)]) {
+        let Ok(tl) = &TLC_LIVE else { return };
+        let sf = sim_fp(s);
+        let mut puts: Vec<(Fp, State)> = vec![];
+        for (t, _) in succ {
+            let inm = {
+                let _quiet = Capturing::start();
+                in_model(s, t)
+            };
+            if inm {
+                puts.push((sim_fp(t), *t));
+            }
+        }
+        puts.push((sf, *s));
+        let order = self.order(puts);
+        for (o, oos) in tl.oos.iter().enumerate() {
+            for (_, t) in &order {
+                for p in oos.check_action {
+                    sim_lp(p, s, Some(t));
+                }
+            }
+            for p in oos.check_state {
+                sim_lp(p, s, None);
+            }
+            let Some(tab) = oos.tableau else { continue };
+            let n = order.len();
+            let mut cons = vec![false; tab.len() * n];
+            for (ti, node) in tab.iter().enumerate() {
+                for (j, (_, t)) in order.iter().enumerate() {
+                    cons[ti * n + j] = sim_cons(node, t);
+                }
+            }
+            self.done[o].insert(sf);
+            let mine = self.rows[o].get(&sf).cloned().unwrap_or_default();
+            for ti0 in mine {
+                for (j, &(tf, t)) in order.iter().enumerate() {
+                    let tdone = self.done[o].contains(&tf);
+                    for &ti1 in tab[ti0 as usize].nexts {
+                        if cons[ti1 as usize * n + j] && self.link(o, sf, ti0, tf, ti1) == Some(true) && tdone {
+                            self.late(o, &t, ti1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A node new to the expanded state a, with particle ti: its transitions at once
+    fn late(&mut self, o: usize, a: &State, ti: u32) {
+        let Ok(tl) = &TLC_LIVE else { return };
+        let oos = &tl.oos[o];
+        let tab = oos.tableau.unwrap();
+        let af = sim_fp(a);
+        for p in oos.check_state {
+            sim_lp(p, a, None);
+        }
+        let nexts = tab[ti as usize].nexts;
+        if !nexts.is_empty() {
+            for p in oos.check_action {
+                sim_lp(p, a, Some(a));
+            }
+        }
+        for &ti2 in nexts {
+            if sim_cons(&tab[ti2 as usize], a) && self.link(o, af, ti, af, ti2) == Some(true) {
+                self.late(o, a, ti2);
+            }
+        }
+        // The successors an action at a time: what an action prints comes before its successors
+        // are taken
+        let cap = Capturing::start();
+        let mut buf = vec![];
+        let _ = successors(a, &mut buf, true);
+        let held = cap.finish();
+        let mut li = 0;
+        let lines = &held.cap.lines;
+        for (j, (t, _)) in buf.iter().enumerate() {
+            let act = held.cap.push_acts.get(j).copied().unwrap_or(u32::MAX);
+            while li < lines.len() && lines[li].1 <= act {
+                put_line(&lines[li].2);
+                li += 1;
+            }
+            if !in_model(a, t) {
+                continue;
+            }
+            for p in oos.check_action {
+                sim_lp(p, a, Some(t));
+            }
+            let tf = sim_fp(t);
+            let tdone = self.done[o].contains(&tf);
+            for &ti2 in nexts {
+                if sim_cons(&tab[ti2 as usize], t) && self.link(o, af, ti, tf, ti2) == Some(true) && tdone {
+                    self.late(o, t, ti2);
+                }
+            }
+        }
+        for l in &lines[li..] {
+            put_line(&l.2);
+        }
+    }
+}
+
+/// The evaluations TLC makes on an initial state for its liveness graph, once they are all computed
+fn live_sim_init(s: &State) -> Result<(), SMsg> {
+    let mut g = LIVE_SIM.lock().unwrap_or_else(|e| e.into_inner());
+    let sim = g.get_or_insert_with(LiveSim::new);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.init(s)))
+        .map_err(|p| SMsg::Live("a temporal property".into(), describe_panic(p)))
+}
+
+/// The evaluations TLC makes for its liveness graph after the successors of s
+fn live_sim_expand(s: &State, succ: &[(State, u32)]) -> Result<(), SMsg> {
+    let mut g = LIVE_SIM.lock().unwrap_or_else(|e| e.into_inner());
+    let sim = g.get_or_insert_with(LiveSim::new);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.expand(s, succ)))
+        .map_err(|p| SMsg::Live("a temporal property".into(), describe_panic(p)))
+}
+"##;
+
+/// With -continue, an invariant that fails to evaluate again in the pass TLC makes after showing
+/// the behavior (`eval_replay`): TLC reports it as a failed invariant with its behavior, then as
+/// the error itself with the behavior again (measured, `tests/tlc/PrintAgain-TwiceContinue`).
+/// Pasted, and hooked into `RUNTIME` by `compile::again_runtime`, for a spec that prints
+pub const AGAIN_RT: &str = r##"
+// ---------------------------------------------------------------- a second failure after an invariant failed (-continue)
+
+/// The successor (and its action) whose invariant failed to evaluate again, the invariant and the error
+static AGAIN: std::sync::Mutex<Option<(State, u32, &'static str, EvalErr)>> = std::sync::Mutex::new(None);
+
+/// Reports what `AGAIN` holds, `show` printing the behavior to the successor
+fn again_failed(show: &dyn Fn(&State, u32)) {
+    let Some((t, l, inv, e)) = AGAIN.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    report_msg(&SMsg::InvEval(inv, e.clone()), true);
+    show(&t, l);
+    report_eval_as(&e, false);
+    show(&t, l);
+}
+"##;
