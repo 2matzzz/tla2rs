@@ -6664,7 +6664,11 @@ fn tlc_print_lasso(g: &Graph, tfp: &[u64], prefix: &[u32], postfix: &[u32]) -> R
     drop(_quiet);
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     let mut texts = vec![];
+    lasso_prefix_prints(&out, cycle_no);
     for (i, (s, l)) in out.iter().enumerate() {
+        if i >= cycle_no && PRINT_ORDER {
+            step_prints(&out[i - 1].0, s, i);
+        }
         print_step(&format!("State {}: <{}>", i + 1, name(*l)), s, (i > 0).then(|| &out[i - 1].0));
         texts.push(show(s));
     }
@@ -6674,6 +6678,9 @@ fn tlc_print_lasso(g: &Graph, tfp: &[u64], prefix: &[u32], postfix: &[u32]) -> R
             write_lasso_check(&texts, None);
         }
         Some((t, l)) => {
+            if PRINT_ORDER {
+                step_prints(&out[out.len() - 1].0, &t, out.len());
+            }
             println!("Back to state {cycle_no}: <{}>", name(l));
             // Under a SYMMETRY the step back can reach another member of the class, which
             // the lasso check folds into the state returned to
@@ -6682,6 +6689,23 @@ fn tlc_print_lasso(g: &Graph, tfp: &[u64], prefix: &[u32], postfix: &[u32]) -> R
         }
     }
     Ok(())
+}
+
+/// What TLC prints again as it rebuilds a lasso from fingerprints before showing it: Init (all of
+/// it) and each step to the states up to the start of the cycle (`upto`, from 1), the actions in
+/// order up to the one that yields the next state. It evaluates each step of the cycle, and the
+/// step back to its start, just before it shows the state (measured on TLC 2.19,
+/// `tests/tlc/PrintLasso`)
+fn lasso_prefix_prints(states: &[(State, u32)], upto: usize) {
+    if !PRINT_ORDER {
+        return;
+    }
+    let mut v = vec![];
+    tg_set_level(0);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
+    for i in 1..upto.min(states.len()) {
+        step_prints(&states[i - 1].0, &states[i].0, i);
+    }
 }
 
 fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
@@ -6713,7 +6737,12 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
     let (states, ret) = lasso_states(g, &path, entry_no, back_label);
     // The states shown, for -lassocheck
     let mut texts: Vec<String> = vec![];
+    let cycle_no = ret.as_ref().map_or(states.len(), |r| r.0);
+    lasso_prefix_prints(&states, cycle_no);
     for (i, &(s, l)) in states.iter().enumerate() {
+        if i >= cycle_no && PRINT_ORDER {
+            step_prints(&states[i - 1].0, &s, i);
+        }
         print_step(&format!("State {}: <{}>", i + 1, name(l)), &s, (i > 0).then(|| &states[i - 1].0));
         texts.push(show(&s));
     }
@@ -6723,6 +6752,10 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
             write_lasso_check(&texts, None);
         }
         Some((back, l, folded)) => {
+            if PRINT_ORDER {
+                let to = folded.unwrap_or(states[back - 1].0);
+                step_prints(&states[states.len() - 1].0, &to, states.len());
+            }
             println!("Back to state {back}: <{}>", name(l));
             write_lasso_check(&texts, Some((back, folded.map(|t| show(&t)))));
         }
