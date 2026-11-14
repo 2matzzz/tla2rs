@@ -332,11 +332,11 @@ bounds the size of a model with temporal properties (one property per thread, so
 - A set that TLC holds as an interval (`x = 1..3`) prints as `1..3`, and an empty function built by `[x \in S |->
   e]` as `<< >>` where an empty tuple prints `<<>>`, as in TLC, where tla2rs follows how the value was built: in what
   the compiler evaluates (ASSUMEs, constants, also inside tuples, records, functions and sets), and in the state: in
-  variables, in the fields of records and tuples, in the elements of sequences, of functions over integers or model
-  values and of sets of sets of integers, and in what is taken out of them or of a constant set. Elsewhere (a set of
-  records holding intervals, a sequence too long for the 64 bits a state keeps for these forms, the operators of the
-  CommunityModules) it prints as `{1, 2, 3}` and `<<>>` (see CLAUDE.md, "State graphs"). The comparison with TLC
-  reads intervals as printed
+  variables, in the fields of records and tuples, in the elements of sequences, sets and functions over integers,
+  model values or strings (also those built by `:>` and `@@`), and in what is taken out of them or of a constant set.
+  Elsewhere (a variable whose forms need more than the 128 bits a state keeps for one variable, a record of variants,
+  an IF that prints under a bound variable, the operators of the CommunityModules) it prints as `{1, 2, 3}` and
+  `<<>>` (see CLAUDE.md, "State graphs"). The comparison with TLC reads intervals as printed
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
   it otherwise picks at random), also for properties TLC checks with its tableau (such as `~>` and `<>P`) and under
   `VIEW` or `SYMMETRY` (a model value is fingerprinted by the number TLC gives its name, under `SYMMETRY` a state by

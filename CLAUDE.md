@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1012 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1020 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -536,24 +536,37 @@ not the graphs. Reducing to it:
   gives the form of the arm taken. The compiler follows these forms for the values it evaluates (`value::Form`):
   what TLC prints when it starts, ToString of a constant, and a constant printed while exploring. A checker follows
   them for the variables that some assignment may give such a value (`Gen::plan_shapes`): beside each state it keeps
-  a shape of at most 64 bits, laid out by `Gen::shape_slots`: one per set of integers (set while TLC holds it as an
-  interval); one per sequence (set while TLC holds it as a function), then those of its elements up to QCAP when
-  they fit; those of each value of a function over integers or model values; one per interval a set of sets of
-  integers may hold (when its elements range over at most 10 integers); and those of the fields of a record or
-  tuple. A variable gets its shape from the expression assigned, also from a constant (a constant function's value,
-  CHOOSE over a constant set) and, for `x' \in S`, CHOOSE from S and a name bound by `\E` over S, from the element
-  taken when S is constant, written as a set of elements or a set of sets of integers from the state
-  (`tests/tlc/IntervalElem`, `IntervalExists`). An IF whose condition prints is evaluated once for both the value
-  and its shape. The shape is no part of the fingerprint, so the first state reached keeps its form, as in TLC.
-  States, `Print`, `PrintT` and `ToString` use it, so `ToString(s)` makes `"1..2"` where TLC does, and an invariant
-  comparing that text holds in both (`tests/tlc/IntervalToString`); a tuple written out in `Print` or `PrintT` whose
-  parts have more bits than one shape holds prints part by part. Not followed, and printed as enumerated sets and
-  `<<>>`: the elements of a set held in the state that are not sets of integers (records, tuples, sequences) or that
-  range over more than 10 integers, the elements of a sequence or function whose bits do not fit in the shape with
-  those of the other variables, functions over strings and partial functions, SelectSeq of a sequence from the
-  state, an IF whose condition prints inside another value, and the operators of the CommunityModules tla2rs
-  provides (TLC computes many of them in Java, which builds values in forms of its own; `community::defines`). No
-  configuration has one of these
+  a shape, laid out by `Gen::shape_slots`: one bit per set of integers (set while TLC holds it as an interval); one
+  per sequence (set while TLC holds it as a function), then those of its elements up to QCAP when they fit; those
+  of each value of a function over integers, model values or strings, also over part of them (`:>`, `@@`); one per
+  interval a set of sets of integers may hold (when its elements range over at most 10 integers); for another set
+  whose elements have bits of shape, those of the element in each slot (its index in the array, or its number in
+  the element type for a bitmask: `Gen::set_find`), so records, tuples and sequences in a set keep their forms; and
+  those of the fields of a record or tuple. Each shaped variable takes its bits in one word, the first with room
+  (the shape is a word per group of variables, kept after the state in the queue); words are 64 bits, or 128 when
+  a variable needs more (`Gen::sh_bits`; `tests/tlc/IntervalWide`). A variable gets its shape from the expression
+  assigned, also from a constant (a constant function's value, CHOOSE over a constant set, a constant set of records)
+  and, for `x' \in S`, CHOOSE from S and a name bound by `\E` over S, from the element taken when S is constant,
+  written as a set of elements or a set from the state (`tests/tlc/IntervalElem`, `IntervalExists`,
+  `IntervalSetElem`). A function constructor gives each value the shape its body has there, and an index from the
+  state into a tuple whose elements are laid out alike finds its part. SelectSeq keeps the shapes of the elements it
+  keeps (`tests/tlc/IntervalSelect`). An IF whose condition prints is evaluated once for both the value and its
+  shape: assigned whole, by evaluating the condition first; inside a value (where it is evaluated at most once),
+  the checker keeps its outcome while computing the value and the shape reads it, also where the shape evaluates
+  parts of the value again (`Gen::if_sites`; `IntervalSelect`, `IntervalMerge`). The shape is no part of the
+  fingerprint, so the first state reached keeps its form, as in TLC. States, `Print`, `PrintT` and `ToString` use
+  it, so `ToString(s)` makes `"1..2"` where TLC does, and an invariant comparing that text holds in both
+  (`tests/tlc/IntervalToString`); a tuple written out in `Print` or `PrintT` whose parts have more bits than one
+  shape holds prints part by part. Not followed, and printed as enumerated sets and `<<>>`: a variable whose shape
+  needs more than 128 bits (a function over more than 128 values, a set of records holding intervals once its
+  capacity grows past 128 / the bits of an element, a bitmask set whose element type has more values than that); a
+  record of variants (optional fields) or a value mixed with model values; a function over a domain of other values
+  (booleans, tuples, records) or of more than 65536; the elements of a set built by `{e : x \in S}` when e's shape
+  depends on x; an index from the state into a tuple whose elements are laid out differently; an IF whose condition
+  prints under a bound variable (in a function constructor, a set map, a quantifier); a set of records holding
+  intervals inside a constant of another structure; and the operators of the CommunityModules tla2rs provides (TLC
+  computes many of them in Java, which builds values in forms of its own; `community::defines`). No configuration
+  has one of these
 
 Where the graph cannot be compared as a whole, `crosscheck.sh` compares less, and says so after `MATCH` (the counts
 are for the 483 configurations at the time of writing):
