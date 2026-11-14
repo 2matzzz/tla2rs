@@ -1210,6 +1210,29 @@ fn has_prints(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Call(n, _) if n == "PrintT" || n == "Print"))
 }
 
+/// Whether the spec may build an empty tuple TLC holds as a tuple: one written `<<>>`, a result of
+/// Tail, SubSeq, `\o`, SelectSeq or SortSeq, or a constant holding one (an empty function TLC
+/// holds as a function looks the same in a constant). Read from every definition, used or not
+fn makes_empty_tuples(m: &Module, cfg: &Cfg, constants: &HashMap<String, Value>) -> bool {
+    fn holds(v: &Value) -> bool {
+        match v {
+            Value::Tuple(xs) => xs.is_empty() || xs.iter().any(holds),
+            Value::Set(xs) => xs.iter().any(holds),
+            Value::Fun(m) => m.iter().any(|(k, x)| holds(k) || holds(x)),
+            Value::Rec(m) => m.values().any(holds),
+            _ => false,
+        }
+    }
+    let makes = |e: &Expr| {
+        e.any(&|x| match x {
+            Expr::Tuple(xs) => xs.is_empty(),
+            Expr::Call(n, _) => ["Tail", "SubSeq", "\\o", "SelectSeq", "SortSeq"].contains(&n.as_str()),
+            _ => false,
+        })
+    };
+    m.defs.iter().any(|d| makes(&d.body)) || cfg.constants.iter().any(|(_, e)| makes(e)) || constants.values().any(holds)
+}
+
 fn has_except(e: &Expr) -> bool {
     e.any(&|x| matches!(x, Expr::Except(..)))
 }
@@ -1560,6 +1583,7 @@ fn compile_inner(
     crate::value::register_bound(&next_pos);
 
     let mut g = Gen::new(&atoms, &constants);
+    g.empty_tuples = makes_empty_tuples(&m, &cfg, &constants);
     g.track_from = track_from as u32;
     g.int_module = if INTEGERS.with(|i| i.get()) { "Integers" } else { "Naturals" };
     // Not a recursive function that prints: TLC does not evaluate it when it starts (see above)
@@ -1662,7 +1686,7 @@ fn compile_inner(
     // Variables whose type TypeOK leaves open are inferred from the assignments in Init and Next
     let undeclared: Vec<String> = m.variables.iter().filter(|v| !decl.contains_key(*v)).cloned().collect();
     if !undeclared.is_empty() {
-        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap, g.qcap)?;
+        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap, g.qcap, g.empty_tuples)?;
         decl.extend(inferred);
     }
     for v in &m.variables {
@@ -2552,6 +2576,7 @@ fn infer_types(
     next: &Expr,
     scap: usize,
     qcap: usize,
+    empty_tuples: bool,
 ) -> R<HashMap<String, Ty>> {
     let bottom = Ty::Enum(vec![]);
     let mut cur: HashMap<String, Ty> = undeclared.iter().map(|v| (v.clone(), bottom.clone())).collect();
@@ -2563,6 +2588,7 @@ fn infer_types(
         let mut g = Gen::new(atoms, constants);
         g.scap = scap;
         g.qcap = qcap;
+        g.empty_tuples = empty_tuples;
         for v in vars {
             g.vars.push((v.clone(), decl.get(v).or(cur.get(v)).unwrap().clone()));
         }

@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1069 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1072 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -153,6 +153,11 @@ only where used); tla2rs prints `tla2rs: ToString met a value whose string is no
 checking again from the start with room for M` and builds again with M for that type, growing as capacities do,
 until no wider window fits in the strings that can be added, where the miss is an evaluation error
 (`tests/tlc/ToStringWide*`: 3, 3, 2 and 0 rebuilds). A type with few enough values is listed whole, as before.
+An empty function over part of a type (`PFun`) prints `<< >>` in a checker, which is TLC's text for one it holds
+as a function, so ToString lists that text for it (`Gen::shows_empty_fun`; `tests/tlc/EmptyFunToString*`). TLC
+prints `<<>>` for one it holds as a tuple, which the checker cannot tell apart, so a spec that may build an empty
+tuple (`<<>>`, Tail, SubSeq, `\o`, SelectSeq or SortSeq in any definition, or a constant holding one:
+`compile::makes_empty_tuples`) lists no text for it, and ToString of it stops the checker with an evaluation error.
 
 Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
 

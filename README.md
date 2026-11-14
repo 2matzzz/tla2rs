@@ -249,7 +249,9 @@ bounds the size of a model with temporal properties (one property per thread, so
   value whose string is not among the N listed for its type; checking again from the start with room for M`, builds
   it with more for that type and checks again from the start, as for capacities. ToString of a record whose fields the spec writes in another order than
   TLC's is refused: TLC prints such a record in the written order until it first compares it, so the string depends
-  on when that happens
+  on when that happens. ToString of an empty function over part of a type makes `<< >>`, as TLC does for one built as
+  a function; in a spec that may also build an empty tuple (`<<>>`, Tail, SubSeq, `\o`, SelectSeq, SortSeq, or a
+  constant holding one), which TLC prints `<<>>`, it stops with an evaluation error
 - A function over part of a type (and a bag) is an array over the whole type when the type has at most 65536 values.
   Over a larger or unbounded type (Nat, a large integer range, sets, records of those) it is the sorted list of its
   (key, value) pairs, whose capacity grows as a set's does (`Cardinality(DOMAIN f) <= K` in `TypeOK` sets where it
