@@ -6961,7 +6961,7 @@ impl<'a> Gen<'a> {
     /// state) into a bit string
     pub fn gen_key(&mut self, view: Option<&Expr>) -> R<String> {
         let Some(view) = view else {
-            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\nfn show_view(s: &State) -> String { show(s) }\n".into());
+            return Ok("const HAS_VIEW: bool = false;\ntype Key = Packed;\nfn key_of(s: &State) -> Option<Key> { pack(s) }\nfn show_view(s: &State) -> String { show(s) }\n#[allow(dead_code)]\nfn view_text(_: &State) -> String { String::new() }\n".into());
         };
         let (vc, vt) = self.gen(view, &Gen::env_next(), None).map_err(|e| format!("VIEW: {e}"))?;
         let mut body = String::new();
@@ -6999,7 +6999,11 @@ impl<'a> Gen<'a> {
         Ok(format!(
             "const HAS_VIEW: bool = true;\nconst VWORDS: usize = {words};\ntype Key = [u64; VWORDS];\n\
              fn key_of(s: &State) -> Option<Key> {{ let __v: &{} = &{{ {vc} }}; let mut w: Key = [0; VWORDS]; {vp}{body}Some(w) }}\n\
-             fn show_view(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; {show} }}\n",
+             fn show_view(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; {show} }}\n\
+             /// The view's value as TLC prints it, for TLC's fingerprint of the state\n\
+             #[allow(dead_code)]\n\
+             fn view_text(s: &State) -> String {{ let __v: &{} = &{{ {vc} }}; ppr(&fmt_{tid}(__v)) }}\n",
+            vt.repr(),
             vt.repr(),
             vt.repr()
         ))
