@@ -332,12 +332,18 @@ bounds the size of a model with temporal properties (one property per thread, so
   CommunityModules) it prints as `{1, 2, 3}` and `<<>>` (see CLAUDE.md, "State graphs"). The comparison with TLC
   reads intervals as printed
 - A liveness counterexample is the one TLC prints with `-fp 0` (TLC's depends on its fingerprints, whose polynomial
-  it otherwise picks at random), also for properties TLC checks with its tableau (such as `~>` and `<>P`), when
-  there is no `VIEW` (a model value is fingerprinted by the number TLC gives its name, and under
-  `SYMMETRY` a state by its smallest permutation, as TLC does). Otherwise it is a valid lasso of tla2rs's own, which TLC checks (`-lassocheck`); the
-  checker says why on stderr. Under `VIEW` or `SYMMETRY` the lasso is replayed on actual states, as TLC rebuilds a
-  behavior; when a value the view leaves out only grows, the lasso returns to its first state of the cycle under the
-  view only, and the check folds states by the same view
+  it otherwise picks at random), also for properties TLC checks with its tableau (such as `~>` and `<>P`) and under
+  `VIEW` or `SYMMETRY` (a model value is fingerprinted by the number TLC gives its name, under `SYMMETRY` a state by
+  its smallest permutation, and under `VIEW` by its view, as TLC does). Otherwise it is a valid lasso of tla2rs's
+  own, which TLC checks (`-lassocheck`); the checker says why on stderr. Such a lasso is replayed on actual states,
+  as TLC rebuilds a behavior; when a value the view leaves out only grows, the lasso returns to its first state of
+  the cycle under the view only, and the check folds states by the same view
+- Under `VIEW` or `SYMMETRY`, whether a temporal property holds is decided as TLC decides it: on TLC's liveness
+  graph, not on the graph folded by the view or the permutations. TLC keeps each successor as generated (a step that
+  changes only what the view leaves out is a step of its action, not stuttering), checks its tableau on the
+  successor itself, and keeps only the first step into a state it has already expanded, so its verdict can differ
+  from what the spec's behaviors give (`tests/tlc/LiveFold-Twice` has a fair behavior that violates the property,
+  and TLC reports no error). The checker builds that graph in memory beside the state graph
 - With `VIEW` and `SYMMETRY` together, a state is reduced as TLC reduces it: the smallest of its permutations (values
   compared as TLC compares them, variables in the order TLC prints them), and then the view of that state. This
   compares whole permuted states, which costs more than comparing views did
