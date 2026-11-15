@@ -474,8 +474,10 @@ pub const CHOOSE_NONE: &str = "Attempted to compute the value of an expression o
 
 /// The starts of the error messages for failures that TLC raises too when it evaluates the same
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
-const EVAL_FAILURES: [&str; 12] = [
+const EVAL_FAILURES: [&str; 14] = [
     "Attempted to check equality of string ",
+    "Attempted to compare integer with non-integer:",
+    "Attempted to compare an integer with non-integer:",
     TOO_MANY,
     "The first argument of BagOfAll should be an operator",
     "Attempted to check if ",
@@ -498,6 +500,24 @@ pub fn bag_of_all_literal(atoms: &Atoms, body: &Expr) -> Option<String> {
         _ => return None,
     };
     Some(format!("The first argument of BagOfAll should be an operator, but instead it is:\n{}", crate::compile::show_value(atoms, &v)))
+}
+
+/// The elements of a set written out where it is used (not a definition, whose value TLC keeps
+/// sorted)
+fn written_elems(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::Label(n, _, b) if n.starts_with('#') || crate::ast::pos_of(n).is_some() => written_elems(b),
+        Expr::SetLit(xs) => Some(xs),
+        _ => None,
+    }
+}
+
+/// The tuple t and the function f when a is t and b a function over keys that are not all integers
+fn tuple_fun_values<'a>(a: &'a Value, b: &'a Value) -> Option<(&'a [Value], &'a BTreeMap<Value, Value>)> {
+    match (a, b) {
+        (Value::Tuple(t), Value::Fun(f)) if !t.is_empty() && f.keys().any(|k| !matches!(k, Value::Int(_))) => Some((t, f)),
+        _ => None,
+    }
 }
 
 /// Whether an error from `ConstEval::eval` is an evaluation failure of the spec itself.
@@ -1191,6 +1211,28 @@ impl ConstEval<'_> {
             }
             // As in TLC, the consequent only when the antecedent holds
             Bin(BOp::Implies, a, b) => Value::Bool(!self.eval(a, env)?.as_bool()? || self.eval(b, env)?.as_bool()?),
+            // A tuple meeting a function over keys that are not all integers, which TLC compares
+            // key by key: each element of a set written out in turn, a sorted set by halves
+            Bin(op @ (BOp::In | BOp::NotIn), x, set) => {
+                let v = self.eval(x, env)?;
+                let inside = if let Some(xs) = written_elems(set) {
+                    let es: Vec<Value> = xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?;
+                    match self.tuple_fun_scan(&v, &es)? {
+                        Some(b) => b,
+                        None => return self.bin(*op, v, self.set_of(es)?),
+                    }
+                } else {
+                    let s = self.eval(set, env)?;
+                    match &s {
+                        Value::Set(ss) => match self.tuple_fun_search(&v, ss)? {
+                            Some(b) => b,
+                            None => return self.bin(*op, v, s),
+                        },
+                        _ => return self.bin(*op, v, s),
+                    }
+                };
+                Value::Bool(inside == matches!(op, BOp::In))
+            }
             Bin(op, a, b) => {
                 let a = self.eval(a, env)?;
                 let b = self.eval(b, env)?;
@@ -1276,11 +1318,7 @@ impl ConstEval<'_> {
             }
             SetLit(xs) => {
                 let vs: Vec<Value> = xs.iter().map(|x| self.eval(x, env)).collect::<R<_>>()?;
-                // TLC sorts a set's elements, and stops when that compares a string with an integer
-                if vs.iter().any(|a| vs.iter().any(|b| self.str_int(a, b))) {
-                    return Err("Attempted to compare a string with an integer in a set".into());
-                }
-                Value::Set(vs.into_iter().collect())
+                self.set_of(vs)?
             }
             // Over a set TLC enumerates without building it, element by element (see `BigSet`)
             SetFilter(x, s, p) if self.streams(s, env, false) => {
@@ -1596,6 +1634,88 @@ impl ConstEval<'_> {
             }
             (_, v) => return Err(format!("EXCEPT path does not match the value {v:?}")),
         })
+    }
+
+    /// The set of the values of a set written out. TLC sorts its elements, and stops when that
+    /// compares a string with an integer
+    fn set_of(&self, vs: Vec<Value>) -> R<Value> {
+        if vs.iter().any(|a| vs.iter().any(|b| self.str_int(a, b))) {
+            return Err("Attempted to compare a string with an integer in a set".into());
+        }
+        Ok(Value::Set(vs.into_iter().collect()))
+    }
+
+    /// `x \in {e1, ..., en}` when x is a tuple and some ei a function over keys that are not all
+    /// integers, or the other way round: TLC asks each element in turn whether it equals x
+    /// (`Gen::tuple_fun_eq`). None when no element makes such a pair with x
+    fn tuple_fun_scan(&self, x: &Value, es: &[Value]) -> R<Option<bool>> {
+        if !es.iter().any(|e| tuple_fun_values(x, e).is_some() || tuple_fun_values(e, x).is_some()) {
+            return Ok(None);
+        }
+        for e in es {
+            let eq = match tuple_fun_values(e, x).or_else(|| tuple_fun_values(x, e)) {
+                Some((t, f)) => {
+                    if t.len() != f.len() {
+                        continue;
+                    }
+                    let mut eq = true;
+                    for (i, (k, v)) in f.iter().enumerate() {
+                        let Value::Int(k) = k else {
+                            return Err(format!("Attempted to compare an integer with non-integer:\n{}.", self.show(k)));
+                        };
+                        if *k != i as i64 + 1 || !self.tlc_eq(v, &t[i])? {
+                            eq = false;
+                            break;
+                        }
+                    }
+                    eq
+                }
+                None => self.tlc_eq(e, x)?,
+            };
+            if eq {
+                return Ok(Some(true));
+            }
+        }
+        Ok(Some(false))
+    }
+
+    /// `x \in S` for a tuple x and a sorted set S that holds functions over keys that are not all
+    /// integers: TLC searches S by halves, comparing x with each element it visits by size, then
+    /// key by key, where a key that is not an integer stops it (`Gen::tuple_fun_search`). None when
+    /// S holds no such function, or values other than functions
+    fn tuple_fun_search(&self, x: &Value, s: &BTreeSet<Value>) -> R<Option<bool>> {
+        let Value::Tuple(t) = x else { return Ok(None) };
+        if !s.iter().any(|e| tuple_fun_values(x, e).is_some()) || !s.iter().all(|e| matches!(e, Value::Fun(_))) {
+            return Ok(None);
+        }
+        let xs: Vec<&BTreeMap<Value, Value>> = s.iter().filter_map(|e| if let Value::Fun(f) = e { Some(f) } else { None }).collect();
+        let (mut lo, mut hi) = (0, xs.len());
+        while lo < hi {
+            let mid = (lo + hi) >> 1;
+            let f = xs[mid];
+            let mut c = t.len().cmp(&f.len());
+            if c.is_eq() {
+                for (i, (k, v)) in f.iter().enumerate() {
+                    let Value::Int(k) = k else {
+                        return Err(format!("Attempted to compare integer with non-integer:\n{}.", self.show(k)));
+                    };
+                    c = (i as i64 + 1).cmp(k).then_with(|| t[i].cmp(v));
+                    if c.is_ne() {
+                        break;
+                    }
+                }
+            }
+            match c {
+                std::cmp::Ordering::Equal => return Ok(Some(true)),
+                std::cmp::Ordering::Less => hi = mid,
+                std::cmp::Ordering::Greater => lo = mid + 1,
+            }
+        }
+        Ok(Some(false))
+    }
+
+    fn show(&self, v: &Value) -> String {
+        crate::ppr::ppr(&crate::compile::show_value(self.atoms, v))
     }
 
     /// Whether a and b are a string and an integer, which TLC does not compare
