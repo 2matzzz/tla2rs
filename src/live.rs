@@ -1502,7 +1502,7 @@ pub fn compile(
     // them, for `LIVE_SIM_RT`. A node of the tableau new to a state already expanded makes TLC
     // generate that state's successors again
     let fair_prints = fair.iter().any(|f| crate::codegen::prints(&f.action) || crate::codegen::prints(&f.sub));
-    let warns = !parts.is_empty() && src.contains("except_warning(");
+    let warns = !parts.is_empty() && g.can_warn(&src);
     let sim = !parts.is_empty() && (atoms.prints || fair_prints || (has_tableau && next_prints) || warns && warn_order);
     if sim {
         let mut tl = vec![];

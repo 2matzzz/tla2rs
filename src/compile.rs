@@ -2028,8 +2028,9 @@ fn compile_inner(
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
     // An EXCEPT warning is a printed line, which TLC prints as it computes and checks each state
-    let warns = live_warns || [&init_code, &next_code, &inv_code, &rec_fns].iter().any(|c| c.contains("except_warning("));
-    let print_order = print_order || act_prints || live_sim || warns && WARN_ORDER.with(|w| w.get());
+    let warns = live_warns || [&init_code, &next_code, &inv_code, &prop_code, &key_code, &rec_fns].iter().any(|c| g.can_warn(c));
+    let warn_order = warns && WARN_ORDER.with(|w| w.get());
+    let print_order = print_order || act_prints || live_sim || warn_order;
     writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
     writeln!(src, "const WARN_RERUN: bool = {};", warns && !print_order).unwrap();
     writeln!(src, "const TLCGET: bool = {};", g.tlcget).unwrap();
@@ -2092,7 +2093,8 @@ fn compile_inner(
     if live_sim {
         rt = live_sim_runtime(&rt);
     }
-    let cons_print = cons_prints && print_order;
+    // TLC evaluates the VIEW of a successor right after the constraints, before its invariants
+    let cons_print = (cons_prints || warn_order && cons.iter().chain(&acons).chain([&key_code]).any(|c| g.can_warn(c))) && print_order;
     if cons_print {
         rt = cons_print_runtime(&rt);
     }
@@ -2142,10 +2144,13 @@ fn live_sim_runtime(rt: &str) -> String {
     ])
 }
 
-/// `rt` with the hooks of `CONS_PRINT_RT`: what the constraints print on a successor, and the
-/// invariants on one outside them, held in TLC's place among what the actions print
+/// `rt` with the hooks of `CONS_PRINT_RT`: what the constraints and the VIEW print on a
+/// successor, and the invariants on one outside the constraints, held in TLC's place among what
+/// the actions print; the VIEW evaluated for the state graph prints nothing
 fn cons_print_runtime(rt: &str) -> String {
     hook(rt, &[
+        ("fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {\n", "fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {\n    let _quiet = Capturing::start();\n"),
+        ("            match fresh_fp(t, Some(&mut ws.mine)) {\n", "            match held_at(&mut ws.held, i as u32, || fresh_fp(t, Some(&mut ws.mine))) {\n"),
         (
             "        if !in_model(s, t) {\n            if let Some(f) = out_of_model(s, sfp, t, l) {\n                return Some(f);\n            }\n            continue;\n        }\n",
             "        if let Some(f) = held_at(&mut ws.held, i as u32, || (!in_model(s, t)).then(|| out_of_model(s, sfp, t, l))) {\n            if f.is_some() {\n                return f;\n            }\n            continue;\n        }\n",
