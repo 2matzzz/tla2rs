@@ -2871,8 +2871,8 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option
         }
         if unseen {
             match check_out_of_model(&t) {
-                Some(SMsg::InvEval(inv, e)) => {
-                    failed = Some(Again::Inv(t, l, inv, e));
+                Some(SMsg::InvEval(..)) => {
+                    failed = Some(Again::Inv);
                     break;
                 }
                 Some(_) => break,
@@ -2930,8 +2930,8 @@ fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, 
         }
         if unseen {
             match check_out_of_model(t) {
-                Some(SMsg::InvEval(inv, e)) => {
-                    failed = Some(Again::Inv(*t, l, inv, e));
+                Some(SMsg::InvEval(..)) => {
+                    failed = Some(Again::Inv);
                     std::panic::panic_any(EagerStop);
                 }
                 Some(_) => std::panic::panic_any(EagerStop),
@@ -2952,9 +2952,10 @@ fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, 
 
 /// Where `eval_replay` stopped at an evaluation error
 enum Again {
-    /// An invariant of a new successor (with its action) failed: TLC then exits with 255, and the
-    /// successor, added, is not queued
-    Inv(State, u32, &'static str, EvalErr),
+    /// An invariant of a new successor failed: the successor, added, is not queued. TLC then exits
+    /// with 255 and, with -continue, reports this error twice with its behavior; the checker ends
+    /// the pass there and reports nothing more (intentional difference `error-reentry`)
+    Inv,
     /// The CONSTRAINT or the ACTION_CONSTRAINT failed on a successor (with its action)
     Cons(State, u32, EvalErr),
     /// The VIEW failed on a successor of the state being expanded
@@ -2963,27 +2964,20 @@ enum Again {
 
 impl Again {
     fn is_inv(&self) -> bool {
-        matches!(self, Again::Inv(..))
+        matches!(self, Again::Inv)
     }
 }
 
-/// With -continue, TLC reports the error `eval_replay` stopped at with a behavior: an invariant as
-/// a failed invariant with its behavior, then as the error itself with the behavior again
-/// (`tests/tlc/AgainTwice`, `PrintAgain-TwiceContinue`); a constraint as the error with the behavior
-/// to the successor, and the VIEW with the behavior to the state being expanded, whose successors
-/// it then evaluates again (`AgainCon-*Continue`). `show` prints the behavior, with the successor
-/// if any
+/// With -continue, TLC reports the error `eval_replay` stopped at with a behavior: a constraint as
+/// the error with the behavior to the successor, and the VIEW with the behavior to the state being
+/// expanded, whose successors it then evaluates again (`AgainCon-*Continue`). An invariant is not
+/// reported (see `Again::Inv`). `show` prints the behavior, with the successor if any
 fn again_failed(a: &Again, show: &dyn Fn(Option<(State, u32)>)) {
     if !flag(&CONTINUE) {
         return;
     }
     match a {
-        Again::Inv(t, l, inv, e) => {
-            report_msg(&SMsg::InvEval(inv, e.clone()), true);
-            show(Some((*t, *l)));
-            report_eval_as(e, false);
-            show(Some((*t, *l)));
-        }
+        Again::Inv => {}
         Again::Cons(t, l, e) => {
             report_eval_as(e, false);
             show(Some((*t, *l)));
@@ -4354,16 +4348,11 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if pseudo && shown > 0 {
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
     }
-    // With -continue, TLC reports the exception before it evaluates again
-    let mut code = continued_inv_eval(&f.msg, f.in_model).unwrap_or(code);
     if let Some(s) = again {
         let (added, failed) = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
         distinct += added;
         left += added as usize - failed.as_ref().is_some_and(Again::is_inv) as usize;
         if let Some(a) = failed {
-            if a.is_inv() {
-                code = 255;
-            }
             if let Some(trace) = &again_trace {
                 again_failed(&a, &|x| {
                     if PRINT_ORDER {
@@ -4391,17 +4380,6 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     }
     println!("{generated} states generated, {distinct} distinct states found, {left} states left on queue.");
     exit(code);
-}
-
-/// With -continue, TLC reports a failed invariant as without it, then stops with an exception it
-/// did not expect (measured on TLC 2.19): prints that and returns its exit code
-fn continued_inv_eval(msg: &SMsg, in_model: bool) -> Option<i32> {
-    let SMsg::InvEval(_, e) = msg else { return None };
-    if !flag(&CONTINUE) || !in_model {
-        return None;
-    }
-    report_eval_as(e, true);
-    Some(255)
 }
 
 fn finish(opt: &Opt, t0: std::time::Instant, generated: u64, distinct: u64, depth: u32, left: usize) {
@@ -5176,17 +5154,13 @@ fn run_liveness(opt: &Opt) {
                     Found::New(w, idx, msg) => {
                         let code = report_msg(&msg, true);
                         g.print_trace((base[w] + idx) as u32, None, true);
-                        let mut code = continued_inv_eval(&msg, true).unwrap_or(code);
-                        if let SMsg::InvEval(_, e) = &msg {
+                        if matches!(msg, SMsg::InvEval(..)) {
                             let p = g.parent.get(base[w] + idx).0 as usize;
                             let s = g.state(p);
                             let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
                             distinct += added as usize;
                             queued = added as usize - failed.as_ref().is_some_and(Again::is_inv) as usize;
                             if let Some(a) = failed {
-                                if a.is_inv() {
-                                    code = 255;
-                                }
                                 again_failed(&a, &|x| g.print_trace(p as u32, x.as_ref().map(|(t, l)| (t, *l)), false));
                             }
                         }
