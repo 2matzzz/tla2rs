@@ -1,0 +1,10 @@
+key ac113e70714a120de0c601efd66806670a4ea6f328c3d35fd4d1432bec48a9cf
+tlc Version 2.19
+rc 75
+Invariant NotZeroQ is violated
+2 states generated 2 distinct states found 2 states left on queue
+trace 0
+states 2 f1f9794f116b2e8e567104f4b899344b5a4830f11a8c475d91e27480a28380e6
+edges 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+messages 5 e40271389cf7ecc77ad987095643b3b6f366b43944edd0a29843ac0a527565b4
+errors 3 875d1eadff59a5949ac86771286ad4d07b7bcc89a58329acc7e4706893f891b3

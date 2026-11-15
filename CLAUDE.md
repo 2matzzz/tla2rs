@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1206 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1213 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -904,10 +904,15 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After the CONSTRAINT, the ACTION_CONSTRAINT
   or the VIEW fails to evaluate on a successor, it reports the error and then generates the
   successors once more in the same way, up to the error (`tests/tlc/AgainCon*`, also with liveness
-  checking). After an error while computing or checking
+  checking); with `-continue`, an error there is reported again with the behavior to the successor,
+  or for the VIEW to the state being expanded, whose successors it then evaluates again
+  (`again_failed`, also in specs that print nowhere; `AgainCon-*Continue`). After an error while
+  computing or checking
   the initial states (in Init, the CONSTRAINT, an invariant or a property), it reports the error
   and then computes and checks them again from the start, printing again up to the error
-  (`init_again_prints`; `tests/tlc/PrintAgain*`). In a spec that reads TLCGet these passes handle
+  (`init_again_prints`; `tests/tlc/PrintAgain*`). With `-continue` that pass reports again the
+  invariants a state violates and goes on, also in a spec that prints nowhere (`AgainInit`). In a
+  spec that reads TLCGet these passes handle
   each state as Init or an action computes it, as the search does (see "TLCGet and TLCSet")
 - TLC evaluates the CONSTRAINT, then the ACTION_CONSTRAINT, on each successor as soon as an action
   yields it (also one already seen), and the invariants of a successor outside them right after:
@@ -1156,11 +1161,20 @@ Refused at run time: several workers (TLC's counts and registers are then those 
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
 `-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
 
-Not followed: rebuilding a behavior where the registers make the actions yield other states than the search
-found. TLC then shows the states up to the step it cannot rebuild (with `-continue` it then reports a
-`NullPointerException`); the checker shows the behavior the search found, or fails to rebuild it (`TlcGetReplay`'s
-`Reg` stops changing so that its behaviors are rebuilt). None of the corpus's models is affected: the skipped ones that read
-them use TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
+Intentional difference (README.md, "Intentional differences"): when the registers make Init or the actions
+yield other states than the search found, TLC cannot rebuild the behavior. It stops with `Failed to recover the
+initial state from its fingerprint.` and `This is probably a TLC bug(...)` (exit 1, no counts), or shows the
+behavior cut short and goes on (with `-continue` it then fails on a `NullPointerException`, which changes its
+verdict and counts). The checker shows the behavior the search found, and reports the verdict, counts and exit code
+the search gives (TLC's wherever its rebuild does not decide them). When its quiet replay (`replay`) cannot find the
+states, it runs the search again in another process (`tg_rerun`): the same binary and arguments, without the files
+it writes, quiet, with `TLA2RS_TG_FIND` naming a directory with the fingerprints to find. One worker and the same
+registers make that run compute the same states in the same order, so it notes each wanted state as it computes it
+(`tg_find`) and exits once it has them all. Nothing is kept per state: the cost is a second run up to that point
+(its time and the memory the search took there, in the other process, released when it ends), once per behavior
+the replay cannot rebuild. The states found are kept (`TG_KNOWN`) and passed to later runs, so that a run reaching
+a behavior reported before with `-continue` evaluates it as the first run did. Checked by hand only, since TLC's
+output there is not the right one: specs where what an action yields grows with a register that only grows.
 
 ### Arguments written out at each use
 
