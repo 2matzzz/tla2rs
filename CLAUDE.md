@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1158 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1167 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -854,10 +854,17 @@ when it starts. The warnings:
   spec that can warn but never does, a checker whose code can warn without PRINT_ORDER
   (`WARN_RERUN`) exits at its first warning when tla2rs runs it (`WARN_EXIT`, `w` in TLA2RS_GROW),
   and tla2rs builds it again with PRINT_ORDER (`compile`'s `warn_order`) and checks from the start.
+  Code can warn when it calls `except_warning` or a function generated for a recursive operator
+  that can (`Gen::can_warn`): Init, the actions, the invariants, the CONSTRAINT, the
+  ACTION_CONSTRAINT, the action properties and the VIEW. Those of the constraints and the VIEW
+  (which TLC evaluates on a successor right after the constraints) are then held in their place
+  like what a constraint prints (`CONS_PRINT_RT`; the VIEW the checker evaluates again for
+  `-dumpgraph` stays quiet; `tests/tlc/ExceptCheck*`).
   A warning of what TLC evaluates for its liveness graph (the predicates of a property, a fair
   action and its subscript) comes where TLC evaluates it, among the lines of the actions: a checker
   whose liveness code can warn exits at its first warning in the same way, and is built again with
-  `LIVE_SIM_RT` (see below; `live::compile`'s `warn_order`; `tests/tlc/ExceptLive*`).
+  `LIVE_SIM_RT` (see below; `live::compile`'s `warn_order`; `tests/tlc/ExceptLive*`,
+  `ExceptCheck-Live`).
   Not followed: other places where the compiler evaluates a constant without the warnings it notes
   (`Gen::try_const`)
 
@@ -912,8 +919,8 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   state` (`lasso_prefix_prints`; `tests/tlc/PrintLasso*`)
 
 When Init, Next, an invariant, an action property or what TLC evaluates for its liveness graph prints
-(`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of Init, Next, an
-invariant or what TLC evaluates for its liveness graph warned, see above), the checker marks each state `init` or `next` pushes and the start of each action
+(`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of code that can
+warn did, see above), the checker marks each state `init` or `next` pushes and the start of each action
 (`mark_push`, `mark_action`, generated only then), holds what Print and PrintT print while it
 computes states, and prints those lines as it handles the states (`Capturing`, `Held` in
 `runtime.rs`); `print_states_tlc` shows a behavior as above. Such specs are searched without

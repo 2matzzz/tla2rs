@@ -1459,6 +1459,24 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Whether generated `code` can print an EXCEPT warning: it calls `except_warning`, or a
+    /// function generated for a recursive operator that can
+    pub fn can_warn(&self, code: &str) -> bool {
+        let calls = |c: &str, name: &str| {
+            c.match_indices(&format!("{name}(")).any(|(i, _)| !c[..i].ends_with(|ch: char| ch.is_alphanumeric() || ch == '_'))
+        };
+        let mut warn: BTreeSet<&str> = self.rec_code.iter().filter(|(_, c)| c.contains("except_warning(")).map(|(n, _)| n.as_str()).collect();
+        loop {
+            let more: Vec<&str> =
+                self.rec_code.iter().filter(|(n, c)| !warn.contains(n.as_str()) && warn.iter().any(|w| calls(c, w))).map(|(n, _)| n.as_str()).collect();
+            if more.is_empty() {
+                break;
+            }
+            warn.extend(more);
+        }
+        code.contains("except_warning(") || warn.iter().any(|w| calls(code, w))
+    }
+
     /// The functions generated for recursive operators, with the depth guard they share
     pub fn rec_functions(&self) -> String {
         let mut s = format!(
