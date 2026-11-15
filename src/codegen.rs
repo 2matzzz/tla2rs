@@ -8638,6 +8638,19 @@ impl Gen<'_> {
         }
     }
 
+    /// Whether a value of type `src` with no fields (or a set of them) placed where type t is
+    /// expected is one TLC holds as a tuple and t keeps that: the spec builds no empty function of
+    /// that type (`empty_text`), and t is a function over part of a type (or a set of them) with
+    /// the bit (`tuple_at`)
+    fn tuple_held(&self, src: &Ty, t: &Ty) -> bool {
+        self.empty_text() == Some("<<>>")
+            && match (src, t) {
+                (Ty::Rec(fs), Ty::PFun(..)) => fs.is_empty() && self.tuple_at(t).is_some(),
+                (Ty::Set(a), Ty::Set(b)) => self.pos_set(t) && self.tuple_held(a, b),
+                _ => false,
+            }
+    }
+
     /// The number of intervals a set of integers of type e may be, when e is held as a bitmask
     /// and they fit in 64 bits (otherwise 0)
     fn iv_count(e: &Ty) -> u32 {
@@ -8850,7 +8863,7 @@ impl Gen<'_> {
             Path::Idx(i) if is_tuple_fields(fs) => match i.strip() {
                 Expr::Num(k) if *k >= 1 && (*k as usize) <= fs.len() => *k as usize - 1,
                 // An index from the state into a tuple whose elements' shapes are laid out alike
-                _ if !self.reshows(i) && fs.iter().all(|(_, ft)| self.same_layout(ft, &fs[0].1) && self.shape_slots(ft) == self.shape_slots(&fs[0].1)) => {
+                _ if !fs.is_empty() && !self.reshows(i) && fs.iter().all(|(_, ft)| self.same_layout(ft, &fs[0].1) && self.shape_slots(ft) == self.shape_slots(&fs[0].1)) => {
                     let (ic, _) = self.gen_int(i, env).ok()?;
                     let n = self.shape_slots(&fs[0].1);
                     return Some((format!("sh_pos({ic}, 0, {n})"), n, fs[0].1.clone()));
@@ -9142,6 +9155,10 @@ impl Gen<'_> {
             }
             return Some(self.shape_of(val, t, &env2));
         };
+        // A value with no fields has no part to update, and keeps its shape
+        if matches!(t, Ty::Rec(fs) if fs.is_empty()) {
+            return Some(c.to_string());
+        }
         let (at, k, pt) = self.part_at(t, first, env)?;
         if k == 0 {
             return Some(c.to_string());
@@ -9235,13 +9252,38 @@ impl Gen<'_> {
         }
         let join = |parts: Vec<String>| if parts.is_empty() { "0".to_string() } else { parts.join(" | ") };
         if matches!(e.strip(), Expr::Ident(..) | Expr::Prime(_) | Expr::Field(..) | Expr::App(..)) || matches!(e.strip(), Expr::Call(h, _) if h == "Head") {
-            return match self.part_shape(e, env) {
+            let part = self.part_shape(e, env).or_else(|| {
+                // A variable with no fields that no shape follows, which TLC holds as a tuple
+                let v = match e.strip() {
+                    Expr::Ident(v, _) => v,
+                    Expr::Prime(x) => match x.strip() {
+                        Expr::Ident(v, _) => v,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                if env.locals.contains_key(v) || !self.is_var(v) {
+                    return None;
+                }
+                let vt = self.var_ty(v);
+                self.tuple_held(&vt, t).then(|| ("1".to_string(), vt))
+            });
+            return match part {
                 Some((c, et)) if self.same_layout(&et, t) && self.shape_slots(&et) == n => c,
                 // The type with no fields where a function over part of a type is expected
                 Some((c, Ty::Rec(fs))) if fs.is_empty() && matches!(t, Ty::PFun(..)) => match self.tuple_at(t) {
                     Some(at) => format!("(({c}) << {at})"),
                     None => "0".into(),
                 },
+                // A set of such values where a set of such functions is expected: the empty
+                // function's slot gets the bit
+                Some((c, Ty::Set(x))) if matches!(x.as_ref(), Ty::Rec(fs) if fs.is_empty()) && self.pos_set(t) => {
+                    let Ty::Set(y) = t else { unreachable!() };
+                    let Some(at) = self.tuple_at(y).filter(|_| matches!(y.as_ref(), Ty::PFun(..))) else { return "0".into() };
+                    let Ok(rc) = self.gen_as(e, env, t) else { return "0".into() };
+                    let x = self.fresh("x");
+                    self.set_shape_build(&rc, t, &x, &format!("((({c}) & 1) << {at})")).unwrap_or_else(|_| "0".into())
+                }
                 _ => "0".into(),
             };
         }
@@ -9716,6 +9758,7 @@ impl Gen<'_> {
                 // the state that may hold them
                 Expr::Ident(v, _) => {
                     on.contains(v)
+                        || g.is_var(v) && g.tuple_held(&g.var_ty(v), t)
                         || ex.get(v).is_some_and(|s| match g.const_form(s, &Env::default()) {
                             Some((sv @ Value::Set(_), f)) => {
                                 let Value::Set(xs) = &sv else { unreachable!() };

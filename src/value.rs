@@ -128,6 +128,9 @@ impl Ord for Value {
             // value (`tests/tlc/RecFunEq`)
             (Rec(a), Fun(b)) => rec_vs_fun(a, b),
             (Fun(a), Rec(b)) => rec_vs_fun(b, a).reverse(),
+            // As TLC: the empty function (held as <<>>) has the smallest domain
+            (Tuple(a), Fun(_)) if a.is_empty() => std::cmp::Ordering::Less,
+            (Fun(_), Tuple(b)) if b.is_empty() => std::cmp::Ordering::Greater,
             _ => self.rank().cmp(&o.rank()),
         }
     }

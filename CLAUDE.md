@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1191 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1197 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -167,7 +167,13 @@ build an empty tuple, the type with no fields in one that may build both), the v
 "State graphs"; `Gen::tuple_at`): set by `<<>>` and kept where the value is copied, taken out of a set or put in one,
 while `:>`, `@@` and a function constructor build a function. The bit is no part of the value, which TLC finds equal
 to the empty function: the first state reached keeps its text, and a set holding both keeps the one written first,
-as in TLC (`tests/tlc/EmptyBothShow*`). ToString lists both texts for such a value. ToString of a bag from the state
+as in TLC (`tests/tlc/EmptyBothShow*`). A variable of the type with no fields that no shape follows, and a set of
+such values, put where a function over part of a type (or a set of them) is expected gets the bit in a spec that
+builds no such empty function, where the value is always the tuple (`Gen::tuple_held`; `tests/tlc/EmptyTupleIntoFuns*`),
+and EXCEPT on the type with no fields changes nothing, so the value keeps its bit (`tests/tlc/ExceptEmptyHeld*`). The
+compiler orders the empty function (held as `<<>>`) before every other function, as TLC does by the size of the
+domain, so ToString lists `{<< >>, (4 :> 1)}` in the checker's order (`value::Value::cmp`;
+`tests/tlc/EmptyFunStrOrder*`). ToString lists both texts for such a value. ToString of a bag from the state
 is refused when compiling: its counts are unbounded, and the window of values nearest 0 does not cut them.
 
 Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
