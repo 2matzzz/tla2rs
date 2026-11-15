@@ -24,7 +24,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
 - `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1222 currently
-  pass: 1213 match TLC and 9 are intentional differences, reported as `intent`; see "Intentional differences"). Run
+  pass: 1202 match TLC and 20 are intentional differences, reported as `intent`; see "Intentional differences"). Run
   it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch either
   search path (extra arguments are passed on to every run; `scripts/all.sh X.cfg ...` checks those only)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -898,13 +898,10 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
 - After a new successor fails to evaluate an invariant, it shows the behavior and then generates
   every successor of the state it was expanding once more (`eval_replay`): the actions print again
   in order, a successor not seen yet is added and queued (so it counts as distinct and left on
-  queue) and its invariants are checked, up to the first that fails; one that fails to evaluate
-  again makes it exit with 255. With `-continue` it reports the exception it did not expect before
-  that pass, and one that fails to evaluate again there as a failed invariant with its behavior,
-  then as the error itself with the behavior again (`again_failed`; `tests/tlc/AgainTwice`,
-  `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After the CONSTRAINT, the ACTION_CONSTRAINT
-  or the VIEW fails to evaluate on a successor, it reports the error and then generates the
-  successors once more in the same way, up to the error (`tests/tlc/AgainCon*`, also with liveness
+  queue) and its invariants are checked, up to the first that fails. One that fails to evaluate
+  ends the pass there and is not reported (see the intentional difference `error-reentry` below;
+  `tests/tlc/PrintAgain-Twice`, `AgainTwice`). After the CONSTRAINT, the ACTION_CONSTRAINT or the
+  VIEW fails to evaluate on a successor, it reports the error and then generates the successors once more in the same way, up to the error (`tests/tlc/AgainCon*`, also with liveness
   checking); with `-continue`, an error there is reported again with the behavior to the successor,
   or for the VIEW to the state being expanded, whose successors it then evaluates again
   (`again_failed`, also in specs that print nowhere; `AgainCon-*Continue`). After an error while
@@ -929,6 +926,21 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   Init and the steps up to the state the cycle starts at, then shows those states, then evaluates
   each step of the cycle just before the state it leads to, and the step back before `Back to
   state` (`lasso_prefix_prints`; `tests/tlc/PrintLasso*`)
+
+Intentional difference (README.md, "Intentional differences"): after an invariant fails to evaluate on a new
+successor, TLC's exit code for that one error depends on how its own handling enters itself again. With
+`-continue` it reports the error a second time, as an exception it did not expect, and exits with 255
+(`PrintAgain-Continue`, `OptContinueRing-Err`); without, it exits with 76. When the pass over the successors
+above meets another successor that fails to evaluate an invariant, it exits with 255, and with `-continue`
+reports that failure twice, each time with its behavior (`PrintAgain-Twice`, `PrintAgain-TwiceContinue`,
+`AgainTwice*`, `TlcGetReplay-Twice*`). The rule tla2rs follows: the error that stopped the search is reported
+once, as TLC reports it without `-continue` (exit 76); the pass after it is done as TLC does it (what it
+prints, the states it adds and queues and so the counts are those of evaluations TLC really makes), and an
+error it meets only ends it. A run that stops at such an error thus gives the same output with and without
+`-continue`. Tested as the intentional difference `error-reentry` (see "Intentional differences");
+`PrintAgain.behaviors.sh` and `TlcGetReplay.behaviors.sh` check the behavior where TLC printed more. Not
+changed: an error in the CONSTRAINT, the ACTION_CONSTRAINT, the VIEW or the liveness checks, which TLC reports as
+an unexpected exception with an exit code that does not depend on `-continue` (`report_eval_as`, `AgainCon*`).
 
 When Init, Next, an invariant, an action property or what TLC evaluates for its liveness graph prints
 (`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of code that can
@@ -997,8 +1009,6 @@ Not followed:
 - What TLC evaluates for its liveness graph under a VIEW or a SYMMETRY (not measured with printing;
   the checker evaluates on the successors as generated), and with several orders of solution, which
   TLC takes in an order that changes from run to run
-- For a spec that prints nowhere, an invariant that fails to evaluate again in the pass after the
-  behavior with `-continue` is still reported once (its code is kept as it was)
 
 Other messages tla2rs words as TLC does, measured on TLC 2.19:
 
@@ -1501,8 +1511,9 @@ others are not). Measured on TLC 2.19 (`tests/tlc/Opt*`):
   state; a violation by an initial state is reported once (`INITS_REPORTED`: `initial_states` also runs to rebuild
   behaviors). A step violating an action property is reported after its successor is added and checked
   (`SWork::acts`, reported in `insert_candidates` in successor order) and the search goes on. The run ends as a run
-  without errors (exit 0). A deadlock stops it as before; a failed invariant is reported as before and then as an
-  unexpected exception, exit 255 (`continued_inv_eval`). `-batched` is not used with it
+  without errors (exit 0). A deadlock stops it as before, and so does an invariant that fails to evaluate (TLC then
+  also reports it as an unexpected exception and exits with 255, which tla2rs does not copy: intentional
+  difference `error-reentry`, see "Messages and printed lines"). `-batched` is not used with it
 - `-difftrace`: each state after the first shows the conjuncts that differ from the previous state (`trace_text`),
   except that TLC prints the last state of a behavior of three states or more in full (`diff_prev`); a behavior of
   two states has its second state diffed

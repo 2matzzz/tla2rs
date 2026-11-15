@@ -1,0 +1,13 @@
+key 74ffb2987c86904e1736e68a154d2d31ecf420b2ecff53e1d92ca0874b4df5fd
+intent error-reentry
+differs messages errors exit
+verdict Invariant NotTwo is violated
+generated 4
+distinct 4
+queue 0
+trace 7 d767d41a9b686b5784ddc79ab909591794d14f94703c7f3c7b84d2d4e03d2614
+states 4 bc91e315a417efdb2e0911d918bb9e8c5a56bcbc5b75bafce4eb4401ae5d7424
+edges 3 554681d70473ff0a507bcf15a30525e74c75790ace5a26e11eb57d9847defe29
+messages 5 e6568cb9b6185ef4886f95ad506e012ab280b66f45f0e2cbbc1ca83aeefb0871
+errors 4 be61e2f9627780fc339096e51dcce2f97dc8c35bde3ce029458da990a4041661
+exit 76

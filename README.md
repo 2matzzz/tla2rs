@@ -379,6 +379,12 @@ bounds the size of a model with temporal properties (one property per thread, so
   `-continue`, then fails on a `NullPointerException`). tla2rs shows the behavior the search found, with TLC's
   verdict, counts and exit code otherwise. To find its states it runs the search again in another process up to
   where it computed them (see CLAUDE.md, "TLCGet and TLCSet")
+- After an invariant fails to evaluate, TLC's exit code depends on how its error handling enters itself again: with
+  `-continue` it reports the error a second time as an unexpected exception and exits with 255 (76 without), and
+  when the pass it then makes over the successors of the same state meets a second such failure, it exits with
+  255, with `-continue` reporting that failure twice with its behavior. tla2rs reports the error that stopped the
+  search once, as TLC does without `-continue` (exit 76), and keeps what that pass prints and the states it adds
+  to the counts; an error the pass meets only ends it (see CLAUDE.md, "Messages and printed lines")
 
 ## Cross-checking against TLC
 
