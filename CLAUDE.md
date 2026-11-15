@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1148 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1158 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -894,9 +894,8 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   checking). After an error while computing or checking
   the initial states (in Init, the CONSTRAINT, an invariant or a property), it reports the error
   and then computes and checks them again from the start, printing again up to the error
-  (`init_again_prints`; `tests/tlc/PrintAgain*`). In a spec that reads TLCGet it checks each state as
-  Init computes it there too; the registers go on changing and the counts stay where they were
-  (`tests/tlc/TlcGetAgain*`)
+  (`init_again_prints`; `tests/tlc/PrintAgain*`). In a spec that reads TLCGet these passes handle
+  each state as Init or an action computes it, as the search does (see "TLCGet and TLCSet")
 - TLC evaluates the CONSTRAINT, then the ACTION_CONSTRAINT, on each successor as soon as an action
   yields it (also one already seen), and the invariants of a successor outside them right after:
   what they print comes after what the action printed before the successor. When a constraint
@@ -1120,14 +1119,23 @@ the next state and stops at the start of the next action (`step_prints`, `mark_a
 replays of a behavior leave the registers as they were (`tg_quiet`). With TLCGET an invariant is evaluated once
 per state (`eval_invariants`), and an expansion that fails is not evaluated again (`expand_caught`).
 
+The passes TLC makes again after an evaluation error (see "Messages and printed lines") handle each state as it is
+computed too, and the registers go on changing, so they can compute states the first pass did not
+(`tests/tlc/TlcGetAgain*`, `TlcGetReplay*`). Generating the successors again (`eval_replay_eager`) runs at level 0
+and adds, queues and checks a new successor as the search does, the counts it reads following. Computing the
+initial states again (`init_again_eager`) adds and queues a new one and reports an invariant it violates (with
+`-continue` it goes on, also reporting again a state the first pass reported); TLC then gives the states this pass
+generated, the distinct states of both passes, and exit 0 unless the pass stops at an error.
+
 Refused at run time: several workers (TLC's counts and registers are then those of its threads and shared queue),
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
 `-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
 
-Not followed: with TLCGet, the pass TLC makes again after a successor fails to evaluate an invariant (see
-"Messages and printed lines"), which reads and sets the registers again (the `UnsetInv` probe in `TlcGetReg` was
-dropped for this). None of the corpus's models becomes checkable: the skipped ones that read them use
-TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
+Not followed: rebuilding a behavior where the registers make the actions yield other states than the search
+found. TLC then shows the states up to the step it cannot rebuild (with `-continue` it then reports a
+`NullPointerException`); the checker shows the behavior the search found, or fails to rebuild it (`TlcGetReplay`'s
+`Reg` stops changing so that its behaviors are rebuilt). None of the corpus's models is affected: the skipped ones that read
+them use TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
 
 ### Arguments written out at each use
 

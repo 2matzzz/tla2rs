@@ -2717,6 +2717,9 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
 /// the invariant and the error (TLC then exits with 255; see `again_failed`): the last one added
 /// is not queued then
 fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option<Again>) {
+    if TLCGET {
+        return eval_replay_eager(s, sfp, visited);
+    }
     let mut buf = vec![];
     let cap = Capturing::start();
     let _ = tg_quiet(|| successors(s, &mut buf, true));
@@ -2761,6 +2764,54 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option
     if !stopped {
         held.flush(u32::MAX);
     }
+    if dumping() {
+        dump_write(&mut out);
+    }
+    (added.len() as u64, failed)
+}
+
+/// `eval_replay` with TLCGET: each successor is handled as `next` computes it, as in the search,
+/// at level 0. The registers go on changing, so the actions may yield successors the search did
+/// not; the counts follow the states added and queued (`tests/tlc/TlcGetReplay`)
+fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option<Again>) {
+    tg_set_level(0);
+    let mut out = String::new();
+    let mut added = std::collections::HashSet::new();
+    let mut failed = None;
+    let mut hook = |t: &State, l: u32| {
+        let Ok(inm) = std::panic::catch_unwind(|| in_model(s, t)) else { std::panic::panic_any(EagerStop) };
+        let (mut unseen, mut new) = (true, false);
+        if inm {
+            match std::panic::catch_unwind(|| dump_fp(t)) {
+                Ok(Some(fp)) => {
+                    dump_edge(&mut out, sfp, &fp, l);
+                    unseen = !visited(fp) && added.insert(fp);
+                    new = unseen;
+                    if new {
+                        dump_node(&mut out, &fp, t, false);
+                        tg_added();
+                    }
+                }
+                Ok(None) => dump_unpacked(&mut out, sfp, t, l),
+                Err(_) => std::panic::panic_any(EagerStop),
+            }
+        }
+        if unseen {
+            match check_out_of_model(t) {
+                Some(SMsg::InvEval(inv, e)) => {
+                    failed = Some((*t, l, inv, e));
+                    std::panic::panic_any(EagerStop);
+                }
+                Some(_) => std::panic::panic_any(EagerStop),
+                None if new => tg_queued(1),
+                None => {}
+            }
+        }
+        if check_action_props(s, t).is_some() {
+            std::panic::panic_any(EagerStop);
+        }
+    };
+    let _ = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, &mut vec![]))));
     if dumping() {
         dump_write(&mut out);
     }
@@ -3091,24 +3142,26 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // TLC shows no behavior for an evaluation error in the initial states, only the counts so far.
     // An error that is not one of its own evaluation errors, raised while checking an initial
     // state (CONSTRAINT, invariant, property), comes with that state.
-    fn report(e: &EvalErr, state: Option<&State>) {
+    fn report(e: &EvalErr, state: Option<&State>, first: &std::collections::HashSet<Fp>) -> Option<InitAgain> {
         report_eval_as(e, false);
         if let Some(s) = state.filter(|_| !tlc_eval_exception(e) && !matches!(e, EvalErr::Type(_))) {
             println!("While working on the initial state:\n{}\n", show(s));
         }
         if !matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
-            init_again_prints();
+            return init_again_prints(first);
         }
+        None
     }
-    fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize) -> ! {
-        report(&e, state);
-        finish(e, while_, generated, distinct)
+    fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize, first: &std::collections::HashSet<Fp>) -> ! {
+        let again = report(&e, state, first);
+        let (generated, distinct) = again.map_or((generated, distinct), |a| (a.generated, distinct + a.added));
+        finish(e, while_, generated, distinct, again.is_some_and(|a| a.clean))
     }
-    fn finish(e: EvalErr, while_: &str, generated: u64, distinct: usize) -> ! {
+    fn finish(e: EvalErr, while_: &str, generated: u64, distinct: usize, clean: bool) -> ! {
         fp_note(&e);
         eprintln!("  (while {while_})");
         println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
-        exit(init_eval_code(&e));
+        exit(if clean { 0 } else { init_eval_code(&e) });
     }
     let mut inits = Vec::new();
     // The states computed before an error are still checked first, as TLC checks each one as soon
@@ -3129,16 +3182,21 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // TLC stops generating at once only on its own exceptions; after a fingerprint error while
     // checking a state it still generates (and counts, without keeping or checking) the remaining
     // initial states (`ModelChecker.DoInitFunctor`)
-    let mut pending: Option<(EvalErr, String, usize)> = None;
+    let mut pending: Option<(EvalErr, String, usize, bool)> = None;
     macro_rules! halt {
         ($e:expr, $while_:expr, $s:expr) => {{
             let e = $e;
             if fp_err(&e) {
-                report(&e, Some($s));
-                pending = Some((e, $while_.to_string(), out.len()));
+                let again = report(&e, Some($s), &seen);
+                let mut distinct = out.len();
+                if let Some(a) = again {
+                    generated = a.generated;
+                    distinct += a.added;
+                }
+                pending = Some((e, $while_.to_string(), distinct, again.is_some_and(|a| a.clean)));
                 return;
             }
-            stop(e, &$while_, Some($s), generated, out.len())
+            stop(e, &$while_, Some($s), generated, out.len(), &seen)
         }};
     }
     let mut handle = |s: State| {
@@ -3244,8 +3302,8 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         }
     }
     held.flush(u32::MAX);
-    if let Some((e, while_, distinct)) = pending {
-        finish(e, &while_, generated, distinct);
+    if let Some((e, while_, distinct, clean)) = pending {
+        finish(e, &while_, generated, distinct, clean);
     }
     INITS_REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = failed {
@@ -3255,7 +3313,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             println!("Error: {m}\nWhile working on the initial state:\n{}\n", show_with(&s, null));
             exit(255);
         }
-        stop(e, "computing the initial states", None, generated, out.len());
+        stop(e, "computing the initial states", None, generated, out.len(), &seen);
     }
     (out, generated)
 }
@@ -3264,10 +3322,16 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
 /// again from the start to report where the error is (`ModelChecker.doInit`, with `CallStackTool`),
 /// printing again what Init, the CONSTRAINT, the invariants and the properties print, up to the
 /// error. With TLCGET it checks each state as Init computes it, as the first time; the registers go
-/// on changing and the counts stay
-fn init_again_prints() {
+/// on changing, so Init may compute states the first pass did not (`first` holds those it kept):
+/// TLC adds them and reports an invariant they violate, as the first pass does. Then TLC's counts
+/// are what this pass generated and the states added by both, and it exits with 0 unless the pass
+/// stops at an error (`tests/tlc/TlcGetReplay-Init*`)
+fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain> {
     if !PRINT_ORDER {
-        return;
+        return None;
+    }
+    if TLCGET {
+        return Some(init_again_eager(first));
     }
     let mut seen = std::collections::HashSet::new();
     // Whether the pass goes on after s
@@ -3280,15 +3344,6 @@ fn init_again_prints() {
         }
         INVARIANTS.iter().chain(INIT_PROPS).all(|(_, f)| matches!(std::panic::catch_unwind(|| f(s)), Ok(true)))
     };
-    if TLCGET {
-        let mut hook = |s: &State, _: u32| {
-            if !check(s) {
-                std::panic::panic_any(EagerStop);
-            }
-        };
-        let _ = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut vec![]))));
-        return;
-    }
     let cap = Capturing::start();
     let mut inits = vec![];
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).is_err();
@@ -3296,12 +3351,79 @@ fn init_again_prints() {
     for (k, s) in inits.iter().enumerate() {
         held.flush(k as u32 + 1);
         if !check(s) {
-            return;
+            return None;
         }
     }
     if failed {
         held.flush(u32::MAX);
     }
+    None
+}
+
+/// What `init_again_prints` makes of the initial states with TLCGET
+#[derive(Clone, Copy)]
+struct InitAgain {
+    generated: u64,
+    added: usize,
+    /// The pass did not stop at an error
+    clean: bool,
+}
+
+fn init_again_eager(first: &std::collections::HashSet<Fp>) -> InitAgain {
+    let mut seen = std::collections::HashSet::new();
+    let (mut generated, mut added, mut errored) = (0u64, 0usize, false);
+    let mut hook = |s: &State, _: u32| {
+        generated += 1;
+        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else {
+            errored = true;
+            std::panic::panic_any(EagerStop)
+        };
+        if let Some(w) = pack(s).filter(|_| in_model) {
+            let fp = state_fp(s, &w);
+            if !seen.insert(fp) {
+                return;
+            }
+            if !first.contains(&fp) {
+                added += 1;
+                tg_added();
+                tg_queued(1);
+                if dumping() {
+                    let mut buf = String::new();
+                    dump_node(&mut buf, &fp, s, true);
+                    dump_write(&mut buf);
+                }
+            }
+        }
+        for (name, f) in INVARIANTS {
+            match std::panic::catch_unwind(|| f(s)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!("Error: Invariant {name} is violated by the initial state:\n{}\n", init_text(s));
+                    if !flag(&CONTINUE) {
+                        std::panic::panic_any(EagerStop);
+                    }
+                }
+                Err(_) => {
+                    errored = true;
+                    std::panic::panic_any(EagerStop);
+                }
+            }
+        }
+        for (_, f) in INIT_PROPS {
+            match std::panic::catch_unwind(|| f(s)) {
+                Ok(true) => {}
+                r => {
+                    errored = r.is_err();
+                    std::panic::panic_any(EagerStop);
+                }
+            }
+        }
+    };
+    let r = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut vec![]))));
+    if r.is_err_and(|p| !p.is::<EagerStop>()) {
+        errored = true;
+    }
+    InitAgain { generated, added, clean: !errored }
 }
 
 /// Whether the violations of the initial states have been reported (-continue)
