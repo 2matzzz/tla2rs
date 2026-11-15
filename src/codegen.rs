@@ -8417,7 +8417,10 @@ impl Gen<'_> {
         // a value of a type with no fields as `empty_text`
         let empty_fun = matches!(t, Ty::PFun(..)) || matches!(t, Ty::Rec(fs) if fs.is_empty());
         if empty_fun && matches!(v, Value::Tuple(xs) if xs.is_empty()) && self.shows_empty_fun(t) {
-            return vec!["<< >>".into()];
+            return match self.tuple_at(t) {
+                Some(_) => vec!["<<>>".into(), "<< >>".into()],
+                None => vec!["<< >>".into()],
+            };
         }
         let plain = crate::compile::show_value(self.atoms, v);
         let has = self.shape_slots(t) > 0 || self.shows_empty_fun(t);
@@ -8500,16 +8503,16 @@ impl Gen<'_> {
     }
 
     /// Whether a value of type t may hold an empty function over part of a type or a value of a
-    /// type with no fields that TLC holds as a function, which it prints `<< >>` as the checker
-    /// does (see `empty_tuples`)
+    /// type with no fields that the checker prints `<< >>`, as TLC does for one it holds as a
+    /// function (see `tuple_at`)
     fn shows_empty_fun(&self, t: &Ty) -> bool {
-        !self.empty_tuples
-            && match t {
-                Ty::PFun(..) => true,
-                Ty::Set(e) | Ty::Seq(e) | Ty::Fun(_, e) | Ty::Opt(e) => self.shows_empty_fun(e),
-                Ty::Rec(fs) => fs.is_empty() || fs.iter().any(|(_, f)| self.shows_empty_fun(f)),
-                _ => false,
-            }
+        match t {
+            Ty::PFun(..) => true,
+            Ty::Set(e) | Ty::Seq(e) | Ty::Fun(_, e) | Ty::Opt(e) => self.shows_empty_fun(e),
+            Ty::Rec(fs) if fs.is_empty() => self.empty_text() != Some("<<>>"),
+            Ty::Rec(fs) => fs.iter().any(|(_, f)| self.shows_empty_fun(f)),
+            _ => false,
+        }
     }
 
     /// The bits of shape a value of type t has: one for a set of integers; one per interval its
@@ -8538,14 +8541,9 @@ impl Gen<'_> {
                     1
                 }
             }
-            Ty::Fun(d, c) | Ty::PFun(d, c) if self.fun_shaped(d) && !is_sparse_fun(t) => {
-                let k = self.shape_slots(c) as u64;
-                match d.size() {
-                    Some(m) if k > 0 && m * k <= self.sh_bits as u64 => (m * k) as u32,
-                    _ => 0,
-                }
-            }
-            Ty::Rec(fs) if !fs.is_empty() && fs.iter().all(|(n, f)| !matches!(f, Ty::Opt(_)) && n != ATOM_FIELD && n != VAL_FIELD) => {
+            Ty::Fun(..) | Ty::PFun(..) => return self.value_slots(t) + self.tuple_at(t).is_some() as u32,
+            Ty::Rec(fs) if fs.is_empty() => self.tuple_at(t).is_some() as u32,
+            Ty::Rec(fs) if fs.iter().all(|(n, f)| !matches!(f, Ty::Opt(_)) && n != ATOM_FIELD && n != VAL_FIELD) => {
                 fs.iter().map(|(_, f)| self.shape_slots(f)).sum()
             }
             _ => 0,
@@ -8554,6 +8552,31 @@ impl Gen<'_> {
             0
         } else {
             n
+        }
+    }
+
+    /// The bits of shape of the values of a function of type t (see `shape_slots`)
+    fn value_slots(&self, t: &Ty) -> u32 {
+        let (Ty::Fun(d, c) | Ty::PFun(d, c)) = t else { return 0 };
+        if !self.fun_shaped(d) || is_sparse_fun(t) {
+            return 0;
+        }
+        let k = self.shape_slots(c) as u64;
+        match d.size() {
+            Some(m) if k > 0 && m * k <= self.sh_bits as u64 => (m * k) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Where the bit of shape is that is set while TLC holds a value of type t as a tuple, which
+    /// it prints `<<>>` when empty, where an empty function prints `<< >>`: after the values' bits
+    /// of a function over part of a type in a spec that may build an empty tuple, and the only bit
+    /// of the type with no fields in a spec that may build both (see `empty_text`)
+    fn tuple_at(&self, t: &Ty) -> Option<u32> {
+        match t {
+            Ty::PFun(..) if self.empty_tuples => Some(self.value_slots(t)).filter(|n| *n < self.sh_bits),
+            Ty::Rec(fs) if fs.is_empty() && self.empty_text().is_none() => Some(0),
+            _ => None,
         }
     }
 
@@ -8751,12 +8774,13 @@ impl Gen<'_> {
                     let (ic, _) = self.gen_int(i, env).ok()?;
                     Some((format!("sh_pos({ic}, 1, {k})"), k, e.as_ref().clone()))
                 }
-                Ty::Fun(d, e) | Ty::PFun(d, e) if self.shape_slots(t) > 0 => {
+                Ty::Fun(d, e) | Ty::PFun(d, e) if self.value_slots(t) > 0 => {
                     let k = self.shape_slots(e);
                     let kc = self.gen_as(i, env, d).ok()?;
                     let did = self.ty_id(d).ok()?;
                     Some((format!("(idx_{did}({kc}) as u64 * {k})"), k, e.as_ref().clone()))
                 }
+                Ty::PFun(_, e) if self.shape_slots(t) > 0 => Some(("SHB".into(), 0, e.as_ref().clone())),
                 _ => None,
             };
         };
@@ -8908,7 +8932,11 @@ impl Gen<'_> {
                 }
                 b
             }
-            Ty::Fun(d, c) | Ty::PFun(d, c) if self.shape_slots(t) > 0 => {
+            Ty::Fun(..) | Ty::PFun(..) if self.tuple_at(t).is_some() && matches!(v, Value::Tuple(xs) if xs.is_empty()) => {
+                ((!matches!(f, Form::Fcn(_))) as u128) << self.tuple_at(t).unwrap()
+            }
+            Ty::Rec(fs) if fs.is_empty() => (self.tuple_at(t).is_some() && !matches!(f, Form::Fcn(_))) as u128,
+            Ty::Fun(d, c) | Ty::PFun(d, c) if self.value_slots(t) > 0 => {
                 let k = self.shape_slots(c) as u64;
                 let entries: Vec<(Value, &Value, Form)> = match v {
                     Value::Fun(m) => m.iter().enumerate().map(|(i, (key, x))| (key.clone(), x, f.part(2 * i + 1))).collect(),
@@ -9151,6 +9179,11 @@ impl Gen<'_> {
         if matches!(e.strip(), Expr::Ident(..) | Expr::Prime(_) | Expr::Field(..) | Expr::App(..)) || matches!(e.strip(), Expr::Call(h, _) if h == "Head") {
             return match self.part_shape(e, env) {
                 Some((c, et)) if self.same_layout(&et, t) && self.shape_slots(&et) == n => c,
+                // The type with no fields where a function over part of a type is expected
+                Some((c, Ty::Rec(fs))) if fs.is_empty() && matches!(t, Ty::PFun(..)) => match self.tuple_at(t) {
+                    Some(at) => format!("(({c}) << {at})"),
+                    None => "0".into(),
+                },
                 _ => "0".into(),
             };
         }
@@ -9158,8 +9191,11 @@ impl Gen<'_> {
         if self.pos_set(t) && matches!(e.strip(), Expr::SetLit(_) | Expr::Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, ..) | Expr::SetFilter(..) | Expr::SetMap(..)) {
             return self.pos_set_shape(e, t, env).unwrap_or_else(|_| "0".into());
         }
+        // The values of a function TLC builds over part of a type, when their shapes are followed
+        let vals = self.value_slots(t) > 0;
         match (e.strip(), t) {
             (Expr::Bin(BOp::Range, ..), _) if Self::int_set(t) => "1".into(),
+            (Expr::Tuple(xs), Ty::PFun(..) | Ty::Rec(_)) if xs.is_empty() && self.tuple_at(t).is_some() => self.shl(1u128 << self.tuple_at(t).unwrap()),
             // A function TLC builds, held as one where a sequence is expected, and the shape of
             // its values when the same for each
             (Expr::FunCons(x, s, body), Ty::Seq(et)) => {
@@ -9194,7 +9230,7 @@ impl Gen<'_> {
                 }
             }
             // [x \in S |-> e] with S from the state: e's shape at each element of S
-            (Expr::FunCons(x, s, body), Ty::PFun(d, et)) if !self.reshows(s) => {
+            (Expr::FunCons(x, s, body), Ty::PFun(d, et)) if vals && !self.reshows(s) => {
                 let k = self.shape_slots(et);
                 let Ok((sc, st)) = self.gen(s, env, None) else { return "0".into() };
                 let xt = Self::elem_of(&st);
@@ -9204,7 +9240,7 @@ impl Gen<'_> {
             }
             (Expr::Except(base, ups), Ty::Seq(_) | Ty::Fun(..) | Ty::PFun(..) | Ty::Rec(_)) => self.except_shape(base, ups, t, env),
             // d :> e: e's shape at d
-            (Expr::Call(op, xs), Ty::Fun(d, c) | Ty::PFun(d, c)) if op == ":>" && xs.len() == 2 => {
+            (Expr::Call(op, xs), Ty::Fun(d, c) | Ty::PFun(d, c)) if vals && op == ":>" && xs.len() == 2 => {
                 let sv = self.shape_of(&xs[1], c, env);
                 if sv == "0" || self.reshows(&xs[0]) {
                     return "0".into();
@@ -9214,7 +9250,7 @@ impl Gen<'_> {
                 format!("sh_put(0, idx_{did}({kc}) as u64 * {k}, {}, {sv})", self.shl(mask(k)))
             }
             // A record held as a function over its field names: each value at its name
-            (Expr::RecLit(xs), Ty::Fun(d, c) | Ty::PFun(d, c)) => {
+            (Expr::RecLit(xs), Ty::Fun(d, c) | Ty::PFun(d, c)) if vals => {
                 let Ty::Enum(ids) = d.as_ref() else { return "0".into() };
                 let k = self.shape_slots(c) as u64;
                 let mut parts = vec![];
@@ -9227,8 +9263,8 @@ impl Gen<'_> {
                 }
                 join(parts)
             }
-            // f @@ g: f's shapes where it is defined, g's elsewhere
-            (Expr::Call(op, xs), Ty::Fun(d, c) | Ty::PFun(d, c)) if op == "@@" && xs.len() == 2 => {
+            // f @@ g: f's shapes where it is defined, g's elsewhere, held as a function
+            (Expr::Call(op, xs), Ty::Fun(d, c) | Ty::PFun(d, c)) if vals && op == "@@" && xs.len() == 2 => {
                 let (sa, sb) = (self.shape_of(&xs[0], t, env), self.shape_of(&xs[1], t, env));
                 if sa == "0" && sb == "0" || self.reshows(&xs[0]) {
                     return "0".into();
@@ -9237,8 +9273,9 @@ impl Gen<'_> {
                 let Ok(ac) = self.gen_as(&xs[0], env, &pt) else { return "0".into() };
                 let k = self.shape_slots(c);
                 format!(
-                    "{{ let __a = {ac}; let mut __m: Shw = 0; for __i in 0..__a.len() {{ if __a[__i].0 {{ __m |= {} << (__i as u64 * {k}); }} }} (({sa}) & __m) | (({sb}) & !__m) }}",
-                    self.shl(mask(k))
+                    "{{ let __a = {ac}; let mut __m: Shw = 0; for __i in 0..__a.len() {{ if __a[__i].0 {{ __m |= {} << (__i as u64 * {k}); }} }} (({sa}) & __m) | (({sb}) & !__m & {}) }}",
+                    self.shl(mask(k)),
+                    self.shl(mask(self.value_slots(t)))
                 )
             }
             (Expr::Un(UOp::Domain, x), _) if Self::int_set(t) => {
@@ -9616,6 +9653,7 @@ impl Gen<'_> {
             }
             match e.strip() {
                 Expr::Bin(BOp::Range, ..) | Expr::Un(UOp::Domain, _) => true,
+                Expr::Tuple(xs) if xs.is_empty() => g.tuple_at(t).is_some(),
                 // A name bound by \E over a constant set holding such values, or over a set from
                 // the state that may hold them
                 Expr::Ident(v, _) => {
@@ -9794,6 +9832,7 @@ impl Gen<'_> {
                          format!(\"{{{{{{}}}}}}\", xs.iter().map(|&(j, x)| {shown}).collect::<Vec<_>>().join(\", \"))"
                     )
                 }
+                Ty::Rec(fs) if fs.is_empty() => "if b & 1 == 1 { \"<<>>\".into() } else { \"<< >>\".into() }".into(),
                 Ty::Rec(fs) => {
                     let tuple = is_tuple_fields(fs);
                     let mut parts = vec![];
@@ -9819,11 +9858,19 @@ impl Gen<'_> {
                     )
                 }
                 Ty::Seq(_) => format!("if b & 1 == 1 && v.len == 0 {{ \"<< >>\".into() }} else {{ fmt_{id}(v) }}"),
+                Ty::PFun(..) if self.value_slots(&t) == 0 => {
+                    let empty = if is_sparse_fun(&t) { "v.len == 0" } else { "v.iter().all(|x| !x.0)" };
+                    format!("if {empty} && b & 1 == 1 {{ \"<<>>\".into() }} else {{ fmt_{id}(v) }}")
+                }
                 // As `fmt_` prints functions (`gen_types`), each value with its shape
                 Ty::Fun(d, c) | Ty::PFun(d, c) => {
                     let k = self.shape_slots(c);
                     let did = self.ty_id(d)?;
                     let part = matches!(t, Ty::PFun(..));
+                    let none = match self.tuple_at(&t) {
+                        Some(at) => format!("if b >> {at} & 1 == 1 {{ \"<<>>\".into() }} else {{ \"<< >>\".into() }}"),
+                        None => "\"<< >>\".into()".into(),
+                    };
                     let shown = self.fmt_part(c, if part { "&x.1" } else { "x" }, &format!("j as u64 * {k}"))?;
                     let ps = format!(
                         "let ps: Vec<(usize, String)> = v.iter().enumerate(){}.map(|(j, x)| (j, {shown})).collect(); ",
@@ -9841,7 +9888,7 @@ impl Gen<'_> {
                             let fs: Vec<String> = ks.iter().map(|n| crate::compile::field_name(n).to_string()).collect();
                             format!(
                                 "const K: [&str; {n}] = [{}]; const F: [bool; {n}] = [{}]; {ps}\
-                                 if ps.is_empty() {{ return \"<< >>\".into(); }} \
+                                 if ps.is_empty() {{ return {none}; }} \
                                  if ps.iter().all(|(j, _)| F[*j]) {{ return format!(\"[{{}}]\", ps.iter().map(|(j, x)| format!(\"{{}} |-> {{}}\", K[*j], x)).collect::<Vec<_>>().join(\", \")); }} \
                                  format!(\"({{}})\", ps.iter().map(|(j, x)| format!(\"{{:?}} :> {{}}\", K[*j], x)).collect::<Vec<_>>().join(\" @@ \"))",
                                 names.join(", "),
@@ -9856,7 +9903,7 @@ impl Gen<'_> {
                         _ => {
                             let ints = matches!(d.as_ref(), Ty::Int(..) | Ty::IntAtom(..));
                             format!(
-                                "{ps}if ps.is_empty() {{ return \"<< >>\".into(); }} \
+                                "{ps}if ps.is_empty() {{ return {none}; }} \
                                  if {ints} && ps.iter().enumerate().all(|(i, (j, _))| fmt_{did}(&dec_{did}(*j as u64)) == (i + 1).to_string()) {{ \
                                  return format!(\"<<{{}}>>\", ps.into_iter().map(|(_, x)| x).collect::<Vec<_>>().join(\", \")); }} {pairs}"
                             )

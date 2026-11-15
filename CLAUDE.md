@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1113 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1115 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -154,17 +154,20 @@ checking again from the start with room for M` and builds again with M for that 
 until no wider window fits in the strings that can be added, where the miss is an evaluation error
 (`tests/tlc/ToStringWide*`: 3, 3, 2 and 0 rebuilds). A type with few enough values is listed whole, as before.
 An empty function over part of a type (`PFun`) prints `<< >>` in a checker, which is TLC's text for one it holds
-as a function, so ToString lists that text for it (`Gen::shows_empty_fun`; `tests/tlc/EmptyFunToString*`). TLC
-prints `<<>>` for one it holds as a tuple, which the checker cannot tell apart, so a spec that may build an empty
+as a function, so ToString lists that text for it (`Gen::shows_empty_fun`; `tests/tlc/EmptyFunToString*`). The
+empty tuple and the empty function over a constant empty set (`[x \in {} |-> e]`) share one type with no fields,
+which the checker prints by what the spec may build (`Gen::empty_text`): `<< >>` in a spec that builds no empty
 tuple (`<<>>`, Tail, SubSeq, `\o`, SelectSeq or SortSeq in any definition, or a constant holding one:
-`compile::makes_empty_tuples`) lists no text for it, and ToString of it stops the checker with an evaluation error.
-The empty tuple and the empty function over a constant empty set (`[x \in {} |-> e]`) share one type with no
-fields, so the checker prints a value of it by what the spec may build (`Gen::empty_text`): `<< >>` in a spec that
-builds no empty tuple, `<<>>` in one that builds no such empty function (`[x \in S |-> e]`, `[S -> T]` or
-Permutations(S) over an S not written to have an element, or `@@` of two values that may both be empty:
-`compile::makes_empty_funs`), and `<< >>` with no text listed for ToString, which stops there, in a spec that may
-build both. This holds alone and inside sets, records, tuples, functions and optional fields of records, in
-states, Print, PrintT and ToString (`tests/tlc/EmptyTupleShow*`, `EmptyFunShow*`). ToString of a bag from the state
+`compile::makes_empty_tuples`), and `<<>>` in one that builds no such empty function (`[x \in S |-> e]`, `[S -> T]`
+or Permutations(S) over an S not written to have an element, or `@@` of two values that may both be empty:
+`compile::makes_empty_funs`). This holds alone and inside sets, records, tuples, functions and optional fields of
+records, in states, Print, PrintT and ToString (`tests/tlc/EmptyTupleShow*`, `EmptyFunShow*`). Where TLC may hold a
+value of either type as a tuple, which it prints `<<>>` when empty (a function over part of a type in a spec that may
+build an empty tuple, the type with no fields in one that may build both), the value has a bit of shape for it (see
+"State graphs"; `Gen::tuple_at`): set by `<<>>` and kept where the value is copied, taken out of a set or put in one,
+while `:>`, `@@` and a function constructor build a function. The bit is no part of the value, which TLC finds equal
+to the empty function: the first state reached keeps its text, and a set holding both keeps the one written first,
+as in TLC (`tests/tlc/EmptyBothShow*`). ToString lists both texts for such a value. ToString of a bag from the state
 is refused when compiling: its counts are unbounded, and the window of values nearest 0 does not cut them.
 
 Measured on the models that used to need `-setcap` / `-seqcap` (rebuilds, and the capacity they end with):
