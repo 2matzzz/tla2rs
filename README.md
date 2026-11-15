@@ -313,12 +313,14 @@ bounds the size of a model with temporal properties (one property per thread, so
 - TLC's warning that a PlusCal algorithm changed since its translation is reproduced only for algorithms without
   procedures, calls, returns, macros, PlusCal options, names the translator would rename (two equal labels, say) or
   labels it would add; for the others tla2rs prints a note on stderr and no warning
-- TLC's warning that an EXCEPT names an argument or field the value does not have is printed as TLC prints it (each
-  text once, the first with TLC's note about `-nowarning`; for an EXCEPT applied to @, at the pair @ belongs to), also for an EXCEPT of constant level inside Init, an
+- TLC's warning that an EXCEPT names an argument or field the value does not have is printed as TLC prints it (the
+  first warning of a run with TLC's note about `-nowarning` and that text at most once more without it, any other
+  text once; for an EXCEPT applied to @, at the pair @ belongs to), also for an EXCEPT of constant level inside Init, an
   action or an invariant, which the compiler evaluates once: the checker warns each time TLC would evaluate it, and
   when it starts for the set of a `\E` that TLC splits the next-state relation through (TLC evaluates that set once).
   TLC prints it as it computes and checks each state, so a warning of a later successor comes after the error on an
-  earlier one: a checker that meets a warning of Init, an action or an invariant while exploring makes tla2rs print
+  earlier one: a checker that meets a warning of Init, an action, an invariant or the liveness checks (the predicates of a
+  property, a fair action and its subscript) while exploring makes tla2rs print
   `tla2rs: an EXCEPT warned while exploring; checking again from the start with the lines printed in TLC's order`,
   build the checker again to print its lines as it does for `Print` and `PrintT`, and run it from the start (output
   printed before the line is repeated); a spec that never warns keeps the faster search

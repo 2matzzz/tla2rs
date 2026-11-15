@@ -1898,9 +1898,9 @@ fn compile_inner(
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
     crate::live::take_live_prints();
-    let live_code = crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts, next_prints);
+    let live_code = crate::live::compile(&mut g, &fair_defs, &assumed, &live_parts, next_prints, WARN_ORDER.with(|w| w.get()));
     startup.live = crate::live::take_live_prints().into_iter().map(|l| user_line(&l)).collect();
-    let (live_code, live_sim) = match live_code? {
+    let (live_code, live_sim, live_warns) = match live_code? {
         Ok(c) => c,
         Err(crate::live::Rejected(m, code)) => {
             // TLC converts the temporal formulas before it evaluates the ASSUMEs
@@ -2028,7 +2028,7 @@ fn compile_inner(
     writeln!(src, "static INVARIANTS: &[(&str, fn(&State) -> bool)] = &[{}];", inv_list.join(", ")).unwrap();
     writeln!(src, "const INV_PRINTS: bool = {inv_prints};").unwrap();
     // An EXCEPT warning is a printed line, which TLC prints as it computes and checks each state
-    let warns = [&init_code, &next_code, &inv_code, &rec_fns].iter().any(|c| c.contains("except_warning("));
+    let warns = live_warns || [&init_code, &next_code, &inv_code, &rec_fns].iter().any(|c| c.contains("except_warning("));
     let print_order = print_order || act_prints || live_sim || warns && WARN_ORDER.with(|w| w.get());
     writeln!(src, "const PRINT_ORDER: bool = {print_order};").unwrap();
     writeln!(src, "const WARN_RERUN: bool = {};", warns && !print_order).unwrap();
