@@ -379,6 +379,10 @@ bounds the size of a model with temporal properties (one property per thread, so
   `-continue`, then fails on a `NullPointerException`). tla2rs shows the behavior the search found, with TLC's
   verdict, counts and exit code otherwise. To find its states it runs the search again in another process up to
   where it computed them (see CLAUDE.md, "TLCGet and TLCSet")
+- After an evaluation error in the initial states, TLC computes them again to show where the error is. With
+  `TLCGet` / `TLCSet`, that pass can yield other states and end without an error (it reports a violation, or with
+  `-continue` goes on), and TLC then exits with 0 although the error stopped the search. tla2rs exits with the code
+  of that error (75), with TLC's verdict and counts
 
 ## Cross-checking against TLC
 

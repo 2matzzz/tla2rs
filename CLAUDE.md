@@ -24,7 +24,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
 - `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1222 currently
-  pass: 1213 match TLC and 9 are intentional differences, reported as `intent`; see "Intentional differences"). Run
+  pass: 1211 match TLC and 11 are intentional differences, reported as `intent`; see "Intentional differences"). Run
   it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch either
   search path (extra arguments are passed on to every run; `scripts/all.sh X.cfg ...` checks those only)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -1156,7 +1156,9 @@ computed too, and the registers go on changing, so they can compute states the f
 and adds, queues and checks a new successor as the search does, the counts it reads following. Computing the
 initial states again (`init_again_eager`) adds and queues a new one and reports an invariant it violates (with
 `-continue` it goes on, also reporting again a state the first pass reported); TLC then gives the states this pass
-generated, the distinct states of both passes, and exit 0 unless the pass stops at an error.
+generated and the distinct states of both passes. When the pass ends without an error, TLC exits with 0; the
+checker exits with the code of the error that stopped the search (intentional difference `again-init-exit`,
+`tests/tlc/TlcGetReplay-Init`, `-InitContinue`).
 
 Refused at run time: several workers (TLC's counts and registers are then those of its threads and shared queue),
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
