@@ -23,11 +23,11 @@ prints variables in), `src/runtime.rs` (`fresh_fp`: the state whose VIEW TLC fin
 (`member_unsorted`: how TLC unites sets; `lazy_fun_string`: how it prints a function it cannot enumerate;
 `tuple_fun_eq`: how it compares a tuple with a function over keys that are not all integers; `walk_eq` and
 `gen_member_of`: how it reaches such a pair inside other values and in a set written out; `tuple_fun_search`: how
-it searches a sorted set of such functions for a tuple) follow TLC 2.19's
+it searches a sorted set of such functions for a tuple, or of tuples for such a function) follow TLC 2.19's
 behaviour as measured and as read from its classes in tla2tools.jar (`ModuleNode.getVariableDecls`, `Context`,
 `TLCStateMut.fingerPrint`, `SetEnumValue.cup`, `FcnLambdaValue.toString`, `FcnRcdValue.equals`, `TupleValue.equals`,
 `ModelChecker.DoInitFunctor`, `SetEnumValue.member`, `ValueVec.search`, `TupleValue.compareTo`,
-`FcnRcdValue.compareTo`, `FcnRcdValue.compareToInterval`, `FcnRcdValue.toTuple`, `TupleValue.toFcnRcd`,
+`FcnRcdValue.compareTo`, `FcnRcdValue.compareToInterval`, `FcnRcdValue.compareOtherInterval`, `FcnRcdValue.toTuple`, `TupleValue.toFcnRcd`,
 `IntValue.compareTo`, `ModelValue.compareTo`). They are written for tla2rs; no code of TLC is copied.
 
 `src/runtime.rs` (`tlc_lasso`, `tableau_graph`, `tlc_search`, `tlc_fp`) and `src/live.rs` (`tlc_live`, `tableau`)
