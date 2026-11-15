@@ -1,0 +1,13 @@
+key c12b4099d70ae9e6229402ce8540b4461b80d244dd3225304ef1fdd0dfbfae97
+intent recount
+differs generated
+verdict Evaluating invariant InTrio failed
+generated 3
+distinct 2
+queue 0
+trace 2 e325dec5832b5aa39b2b648abe5e50dcee6e4bde64fe8b5a77b89d8f9314ce30
+states 2 1d850e66fdfc07811f64bdad72e3a3379ddd6e8e70d657a857218591d5c23789
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 6 7a80827cd6cf481734560df07ad75aeb80a270daf116dd39b9860b33cf803fbc
+errors 2 ad4ef82529ad79062f872994001f81cfeb6f69124929f8031ca7717ac19ea8b6
+exit 76

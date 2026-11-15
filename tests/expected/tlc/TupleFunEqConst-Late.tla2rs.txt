@@ -1,0 +1,13 @@
+key 0f2e9923e516d881873d885d2b2e184cf47e41d455b301ef8e49fdbd07b1bdfd
+intent recount
+differs generated
+verdict Evaluating invariant InvLate failed
+generated 3
+distinct 2
+queue 0
+trace 2 8c9a926a0c34f8afaf038a4866326f14f0fb49d008edeac28b469f90e6ca877b
+states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 4cd1103b411064268af58ee85b7142bc6ae295f3faddfb49c644f17644d33a4d
+errors 2 5341fdf52e174a70b3cc113892a01b504cb9e6c4087874bc088e72b3fc051678
+exit 76

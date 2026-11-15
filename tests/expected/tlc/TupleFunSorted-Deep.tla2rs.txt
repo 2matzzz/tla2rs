@@ -1,0 +1,13 @@
+key c22d9e94185dab8693f23e758d4c7be07af4f7d25388d7335cb353e3ebcb3f07
+intent recount
+differs generated
+verdict Evaluating invariant InDeep failed
+generated 3
+distinct 2
+queue 0
+trace 2 2bc6d6a97d403b5aa4903594cf06ffadcaf983f0a387994468aa04058ce41816
+states 2 01d12605d88a1f25dcec970e21b3bb737ee7ae445786ec7d68ee8f2b7efc425b
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 c49381ff8d5fb92284d1bd4e9654ae2f51821e5f1389081e78277c7f38b3a1f2
+errors 2 6d3c81a89c321b00979aa35ceac5144190f9c7d8ef262bc8698f3396455d3b08
+exit 76

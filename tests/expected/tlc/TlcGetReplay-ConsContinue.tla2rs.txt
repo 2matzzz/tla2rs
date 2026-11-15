@@ -1,0 +1,13 @@
+key c213157db68b38cc945ee72f9d1c829d25cf302a041348610d5298a31c29e750
+intent recount
+differs generated
+verdict Evaluation error
+generated 8
+distinct 6
+queue 4
+trace 2 34d5cfab6b193a274acc2fa643e0aaddb95ec0772f235c0798647915fc36240d
+states 6 8637a81a332883b39247e3fa9b536aa71cbcaf19cc7a4a13ec3e37f687a023ce
+edges 4 b13a9ab0bfb5823ae33de995d8496c0572a67c37fcdff267d740113443267c5c
+messages 30 65ac59e5b29b91d815b89fcee1dba648ae443fff7c644bfe7d68ca987b4b15ca
+errors 3 33f4c389be4a349126381dbd8a218a5d7e4f60f0ec6f87621cd84f30d3f9d7f0
+exit 255

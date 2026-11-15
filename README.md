@@ -400,6 +400,11 @@ bounds the size of a model with temporal properties (one property per thread, so
   violation for the second. tla2rs decides on that graph with every step kept, and reports the violation for both:
   TLC's counterexample where TLC finds one, otherwise a lasso of its own, which TLC confirms (see CLAUDE.md,
   "Counterexamples")
+- After an evaluation error, TLC evaluates the initial states, or the successors of the state it was expanding,
+  once more to show where the error is. It counts the new states that pass meets as distinct and queued, but
+  leaves the states of one of the two passes out of its generated count, so it can report more distinct states
+  than generated (6 generated and 7 distinct on `tests/tlc/TlcGetReplay`). tla2rs counts as generated every state
+  both passes generate, so the count is that of the run and never below the distinct count
 
 ## Cross-checking against TLC
 

@@ -1,0 +1,13 @@
+key 79f0e481ce2a6212e82324823bfb5acd3333c1c46f30d9a73442414fe7b1b60b
+intent recount
+differs generated
+verdict Evaluating invariant StrLeft failed
+generated 4
+distinct 3
+queue 0
+trace 3 88a7566166f093cbcefe038d4b50bb208c60d1042f329a082a803670c4d1a6d7
+states 3 8e9a1cee22af14e1bef2a13613e87ee3ce57dc2d4880441fac320cfb977d23d5
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 4 77cc75dbc72118d2f3704420772bf88f33dee0606f080ded784e6a91b8e16e8f
+errors 2 8aeebeec15c25403c05a5549d7ce53072dca89bbe8fb91534f63e27d904c1b36
+exit 76

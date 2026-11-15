@@ -63,20 +63,22 @@ fi
 # A cfg line `\* crosscheck: intent NAME [behaviors=FILE]` declares an intentional difference listed in
 # tests/intent.txt: tla2rs's result is compared with the one pinned next to TLC's (X.tla2rs.txt), the
 # fields NAME does not list must still equal TLC's, and FILE (next to the cfg) checks the behaviors
-# tla2rs prints (see "Intentional differences" in CLAUDE.md)
+# tla2rs prints (see "Intentional differences" in CLAUDE.md). A cfg that shows several differences has
+# one such line for each, and the fields any of them lists may differ
 intent=""; intent_allowed=""; intent_check=""
-if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*intent[[:space:]].*' "$cfg"); then
-  read -r intent more <<< "${a#*crosscheck:*intent}"
+while read -r a; do
+  read -r name more <<< "${a#*crosscheck:*intent}"
   for x in ${more-}; do
     case "$x" in
       behaviors=*) intent_check="$(cd "$(dirname "$cfg")" && pwd)/${x#behaviors=}" ;;
       *) echo "ERROR $cfg: unknown word in the intent line: $x"; exit 1 ;;
     esac
   done
-  intent_allowed=$(awk -v n="$intent" '$1 == n {print $2}' "$(cd "$(dirname "$0")/.." && pwd)/tests/intent.txt")
-  [[ -n "$intent_allowed" ]] || { echo "ERROR $cfg: intent $intent is not listed in tests/intent.txt"; exit 1; }
-  [[ -z "$intent_check" || -f "$intent_check" ]] || { echo "ERROR $cfg: no behavior check $intent_check"; exit 1; }
-fi
+  allowed=$(awk -v n="$name" '$1 == n {print $2}' "$(cd "$(dirname "$0")/.." && pwd)/tests/intent.txt")
+  [[ -n "$allowed" ]] || { echo "ERROR $cfg: intent $name is not listed in tests/intent.txt"; exit 1; }
+  intent="${intent:+$intent }$name"; intent_allowed="${intent_allowed:+$intent_allowed,}$allowed"
+done < <(grep -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*intent[[:space:]].*' "$cfg" || true)
+[[ -z "$intent_check" || -f "$intent_check" ]] || { echo "ERROR $cfg: no behavior check $intent_check"; exit 1; }
 # With TLC's `-dump [dot,...] FILE`, that file is compared instead of the state graph (TLC writes
 # only one dump), and with `-view` the counterexample is read as TLC prints it then (see
 # src/options.rs). TLC adds the extension .dump or .dot when the name lacks it. With `-userFile

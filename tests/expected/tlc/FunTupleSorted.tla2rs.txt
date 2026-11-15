@@ -1,0 +1,13 @@
+key 3a830c87296684e51c5c82a0968f3111de479ac00992058c8d80533b8d512406
+intent recount
+differs generated
+verdict Evaluating invariant InStr failed
+generated 3
+distinct 2
+queue 0
+trace 2 25e94fa0cb8316b73c0c7c65f47ded1ed1e344067747c258d5484f65950a6596
+states 2 4dc7d7691fbb6c8350822e38f1ec20e02e34261ba8b6566f12f7c7e7f8723e50
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 e530d2d7fbfc785395ad5e8d5de1c5c2331541f080e9fa22d5944fc5b654cfcc
+errors 2 0d60be382fcbcc9b25fc34c9e395ee9b39c42bb05c260bc55bdf5345dd75cb84
+exit 76

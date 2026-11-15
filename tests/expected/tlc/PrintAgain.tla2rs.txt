@@ -1,0 +1,13 @@
+key 9c7bb3299cf5fd63981a48c3b724ed4ffc77d000cc9a2167a63322c26d0b5db5
+intent recount
+differs generated
+verdict Evaluating invariant Bad failed
+generated 17
+distinct 11
+queue 7
+trace 2 e334756ef27b9ec49bef74204afba49a538d52d481e945ade73b3b65dce4c528
+states 11 fdc8491f4a54540760cc7b7c1fbb4413bc2eefd4cf486a5202b4025d37db728a
+edges 12 e1199ff17702125c0e25b522898a969372ce2cd8c41ef8a5a220f95eb2154936
+messages 44 183652630fa80ded521fd07dd01dee778f59dda80cfc40c75d47326921cbf829
+errors 2 c12b681ef91618906ec3d521774d19efe8ed2e0d7e1b639658800ed18f869fbf
+exit 76

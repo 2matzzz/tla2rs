@@ -1,0 +1,13 @@
+key 48b58fe001aca4f77fe6d2c1134f614a069f166acb0d1959cffebec911b27f41
+intent recount
+differs generated
+verdict Evaluating invariant InQuad failed
+generated 3
+distinct 2
+queue 0
+trace 2 2bc6d6a97d403b5aa4903594cf06ffadcaf983f0a387994468aa04058ce41816
+states 2 01d12605d88a1f25dcec970e21b3bb737ee7ae445786ec7d68ee8f2b7efc425b
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 0b29de65366f3888ade222369c520d7d578dc5585fb6fb2ac76470e5fd80ca8e
+errors 2 127dd8a48acaae30c12198bcb12cabf0fa84d651e20d613cf1c0fa8a13287626
+exit 76

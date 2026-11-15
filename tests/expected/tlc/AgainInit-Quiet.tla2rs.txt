@@ -1,0 +1,13 @@
+key 5d1bbb8e0651123621e6f3d9d15433aaceb4a3f837bf5d00d16c89de3134a7ff
+intent recount
+differs generated
+verdict Invariant NotZeroQ is violated
+generated 4
+distinct 2
+queue 2
+trace 0
+states 2 f1f9794f116b2e8e567104f4b899344b5a4830f11a8c475d91e27480a28380e6
+edges 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+messages 5 e40271389cf7ecc77ad987095643b3b6f366b43944edd0a29843ac0a527565b4
+errors 3 875d1eadff59a5949ac86771286ad4d07b7bcc89a58329acc7e4706893f891b3
+exit 75
