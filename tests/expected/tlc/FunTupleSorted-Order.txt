@@ -1,0 +1,10 @@
+key b2d992501b2c67e4a648ec4a431cb08ceceb013d5c4060e804fd3bb853a3b917
+tlc Version 2.19
+rc 76
+Evaluating invariant InOrder failed
+2 states generated 2 distinct states found 0 states left on queue
+trace 2 25e94fa0cb8316b73c0c7c65f47ded1ed1e344067747c258d5484f65950a6596
+states 2 4dc7d7691fbb6c8350822e38f1ec20e02e34261ba8b6566f12f7c7e7f8723e50
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 1e42b06dfa44e8f029c1c8efdbc4d3a0b6fd94ee7bfe2c0f0224a85becf36989
+errors 2 98a9f620535f508a23e2be90e68ba938e2a5985672279a401f2cab92a6dedc8b
