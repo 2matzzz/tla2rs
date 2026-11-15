@@ -23,9 +23,10 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1213 currently
-  pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
-  either search path (extra arguments are passed on to every run)
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1222 currently
+  pass: 1213 match TLC and 9 are intentional differences, reported as `intent`; see "Intentional differences"). Run
+  it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch either
+  search path (extra arguments are passed on to every run; `scripts/all.sh X.cfg ...` checks those only)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
   one worker, and it compares the verdict, generated and distinct state counts, the states left on
   TLC's queue (see "The states left on queue"), the counterexample (its states and
@@ -1173,8 +1174,10 @@ registers make that run compute the same states in the same order, so it notes e
 (`tg_find`) and exits once it has them all. Nothing is kept per state: the cost is a second run up to that point
 (its time and the memory the search took there, in the other process, released when it ends), once per behavior
 the replay cannot rebuild. The states found are kept (`TG_KNOWN`) and passed to later runs, so that a run reaching
-a behavior reported before with `-continue` evaluates it as the first run did. Checked by hand only, since TLC's
-output there is not the right one: specs where what an action yields grows with a register that only grows.
+a behavior reported before with `-continue` evaluates it as the first run did. Tested as the intentional
+difference `tlcget-rebuild` (see "Intentional differences") by `tests/tlc/TlcGetLost*`, a spec where what an action
+yields grows with a register that only grows; `TlcGetLost.behaviors.sh` checks that every behavior printed is one
+of the spec.
 
 ### Arguments written out at each use
 
@@ -1248,6 +1251,37 @@ Checked by setting the bound to 0 and comparing, at run time, each set enumerate
 Not done: a large constant set of another form (a filter, a set of images, a union) is still written out, also where its membership is tested (`x \in {f \in [D -> R] : P}` compares x with each element), and an `\A` over a constant set in an action that assigns variables is unrolled per element.
 
 When compiling, the constant evaluator (`value.rs`, for ASSUMEs and constant definitions) goes through such a set without building it as TLC does: `[D -> R]`, `\X`, `[f : S]` and `SUBSET S` (`BigSet`, from parts that are sets) are enumerated from their parts in `\E`, `\A` and `{x \in S : P}` (`each_elem`), in the order of their values, which is TLC's. Measured on TLC 2.19 (`tests/tlc/BigConst`, `BigConstErr`): of more than its limit of a million elements (its `-maxSetSize`), TLC enumerates them there and in CHOOSE over SUBSET, and stops with "Attempted to construct a set with too many elements (>1000000)." for CHOOSE over the others and for `{e : x \in S}` over any (`TOO_MANY`). A filter of one of these (of any size, but a name a BIND label binds, whose value is kept) is gone through element by element, its condition evaluated as each element is taken, while TLC builds a filter of an interval or of a set it holds element by element first (as the evaluator does). A quantifier over one variable takes the next element before it evaluates its body for one, as TLC does (seen where taking it evaluates a filter's condition that prints). Not done: over several variables (`\E a \in S, b \in T`), TLC varies the first fastest and takes the next combination ahead, while the evaluator varies the last fastest; this shows only where printing or an error depends on the order. `CarTalkPuzzle` `Model_3` (corpus, `skip`) is the case that needed it: `{B \in [1..5 -> 1..121] : ...}` has 121^5 (about 2.6 * 10^10) functions; the ASSUME now evaluates, but the evaluator goes through about 50,000 of them a second (67 million, 0.26%, in the first 22 minutes of a run capped at 30), so it would take about six days; TLC did not finish in 2 hours either.
+
+### Intentional differences
+
+tla2rs does not copy TLC where TLC is wrong: a bug TLC itself reports, Java internals (an exit code that depends on
+an internal exception), a verdict that contradicts TLA+ semantics, impossible counts (more distinct states than
+generated, a violation with exit 0). Each such difference has an entry in README.md and README.ja.md and a line in
+`tests/intent.txt`: its name and the fields of the summary it may change (`verdict`, `generated`, `distinct`,
+`queue`, `trace`, `states`, `edges`, `dump`, `messages`, `errors`, `userfile`, `exit`); every other field must
+still equal TLC's. A configuration that shows it is tested like any other, with one more line in its cfg:
+
+    \* crosscheck: intent NAME [behaviors=FILE]
+
+- TLC's output stays the reference: `expected.sh` writes `tests/expected/<dir>/X.txt` as for any configuration.
+  It also runs tla2rs and writes its result, field by field, to `X.tla2rs.txt` next to it (the pin), under the same
+  key, so both go stale together; the pin's `differs` line lists the fields where it differs from TLC's. Review the
+  pin as you would the code: it is what tla2rs must give from then on, in every mode (`-batched`, `-metal`)
+- `crosscheck.sh` compares tla2rs with the pin in every field, and TLC's file with the pin in every field
+  `tests/intent.txt` does not list (a graph TLC did not end is not compared). Narrowing rules do not apply
+- A counterexample that differs from TLC's must be shown to be a behavior of the spec: a lasso is given to TLC
+  (`-lassocheck`, as for any liveness counterexample of tla2rs's own), and any other needs `behaviors=FILE`, a
+  script next to the cfg that gets the checker's output and exits 0 only if every behavior printed is one of the
+  spec (`tests/tlc/TlcGetLost.behaviors.sh` follows each step with the spec's actions). It runs on every check
+- `all.sh` reports the configuration as `intent X.cfg (intentional difference NAME; differs from TLC in: ...)`,
+  never as `ok`. If TLC's file ever gives the pinned result (a new jar), it reports `agrees` instead, which is not
+  a failure: the difference is gone, so remove the intent line and the pin
+
+For a new intentional difference: add its entry to both READMEs and its line to `tests/intent.txt`, add the intent
+line to each cfg that shows it (with `behaviors=` where the counterexample is not a lasso), run
+`scripts/expected.sh` on those cfgs (it prints `pinned X.cfg (...; differs from TLC in: ...)`), check that the
+`differs` lines are what the entry says, and commit the cfgs, `X.txt` and `X.tla2rs.txt`. When a later change to
+tla2rs changes a pinned result on purpose, `scripts/expected.sh -force X.cfg` writes it again.
 
 ### The corpus
 

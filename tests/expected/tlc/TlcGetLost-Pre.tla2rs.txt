@@ -1,0 +1,13 @@
+key bdb612ec67fba10983621190af36e77b5e9925c0fdc659e133caa9e1366da08b
+intent tlcget-rebuild
+differs generated distinct queue trace messages errors exit
+verdict Invariant Pre is violated
+generated 25
+distinct 24
+queue 11
+trace 5 0d969df47b02c55c308d2e94617da8b6a5059b1fec51ba31499d985c50314f4e
+states 24 7bae055e0d81fc4c4257b4f2bea3adec642c041e3befe60d5eb054231a409cf5
+edges 24 638491172111e1dea26953a9eb4456715ee524bdd63d5c23abbb86925ecf1c42
+messages 36 5e329151cbac6b0190a6b5e8930b47256c989a27392df72c5a04496f8a764b24
+errors 2 c0fe06b0f7a12d3c73445587e6732350786aba8538cc5da26a79d4a376ef40f8
+exit 12

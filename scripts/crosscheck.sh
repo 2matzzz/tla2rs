@@ -7,6 +7,7 @@
 # For a configuration in examples/ or tests/tlc/, TLC's side is the static result in tests/expected/,
 # written by scripts/expected.sh; this script does not run TLC for them. A missing or stale result
 # fails the check. For any other configuration it runs TLC.
+# A cfg with an intent line is also compared with tla2rs's pinned result (see below).
 #   scripts/crosscheck.sh --expected X.cfg        write X's result if missing or stale (expected.sh)
 #   scripts/crosscheck.sh --expected-force X.cfg  rewrite it
 #   scripts/crosscheck.sh --expected-check X.cfg  rerun TLC and compare with the file, without writing
@@ -58,6 +59,23 @@ fi
 if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*args[[:space:]].*' "$cfg"); then
   read -r -a more <<< "${a#*args}"
   extra+=("${more[@]}")
+fi
+# A cfg line `\* crosscheck: intent NAME [behaviors=FILE]` declares an intentional difference listed in
+# tests/intent.txt: tla2rs's result is compared with the one pinned next to TLC's (X.tla2rs.txt), the
+# fields NAME does not list must still equal TLC's, and FILE (next to the cfg) checks the behaviors
+# tla2rs prints (see "Intentional differences" in CLAUDE.md)
+intent=""; intent_allowed=""; intent_check=""
+if a=$(grep -m1 -oE '^[[:space:]]*\\\*[[:space:]]*crosscheck:[[:space:]]*intent[[:space:]].*' "$cfg"); then
+  read -r intent more <<< "${a#*crosscheck:*intent}"
+  for x in ${more-}; do
+    case "$x" in
+      behaviors=*) intent_check="$(cd "$(dirname "$cfg")" && pwd)/${x#behaviors=}" ;;
+      *) echo "ERROR $cfg: unknown word in the intent line: $x"; exit 1 ;;
+    esac
+  done
+  intent_allowed=$(awk -v n="$intent" '$1 == n {print $2}' "$(cd "$(dirname "$0")/.." && pwd)/tests/intent.txt")
+  [[ -n "$intent_allowed" ]] || { echo "ERROR $cfg: intent $intent is not listed in tests/intent.txt"; exit 1; }
+  [[ -z "$intent_check" || -f "$intent_check" ]] || { echo "ERROR $cfg: no behavior check $intent_check"; exit 1; }
 fi
 # With TLC's `-dump [dot,...] FILE`, that file is compared instead of the state graph (TLC writes
 # only one dump), and with `-view` the counterexample is read as TLC prints it then (see
@@ -261,11 +279,19 @@ keep_graph() {
 expected_text() { echo "key $key"; echo "tlc $(grep -m1 -oE 'Version [0-9.]+' tlc.out || true)"; echo "rc $rc_tlc"; echo "$a"; }
 fresh=0
 [[ -n "$expected" && -f "$expected" && "$(sed -n 1p "$expected")" == "key $key" ]] && fresh=1
+# tla2rs's pinned result for an intentional difference, written by expected.sh with TLC's and under the
+# same key, so both go stale together
+pin=""; pin_fresh=0; pin_write=0
+if [[ -n "$intent" ]]; then
+  [[ -n "$expected" && -z "${p:-}" ]] || { echo "ERROR $cfg_rel: an intent line is only for examples/ and tests/tlc/"; exit 1; }
+  pin="${expected%.txt}.tla2rs.txt"
+  [[ -f "$pin" && "$(sed -n 1p "$pin")" == "key $key" ]] && pin_fresh=1
+fi
 
 if [[ $mode != compare ]]; then
   [[ -n "$expected" ]] || { echo "ERROR $cfg_rel: not in examples/, tests/tlc/ or the corpus"; exit 1; }
   [[ $mode != expected-from || $large == 1 ]] || { echo "ERROR $cfg_rel: --expected-from is only for a model listed as large in tests/corpus.txt"; exit 1; }
-  if [[ $mode == expected && $fresh == 1 ]]; then echo "fresh $cfg_rel"; exit 0; fi
+  if [[ $mode == expected && $fresh == 1 && ( -z "$intent" || $pin_fresh == 1 ) ]]; then echo "fresh $cfg_rel"; exit 0; fi
 fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -274,28 +300,34 @@ cp "$cfg_abs" "$work/$c"
 cd "$work"
 
 if [[ $mode != compare ]]; then
-  if [[ $mode == expected-from ]]; then
-    cp "$from_out" tlc.out; rc_tlc=$from_rc; a=$(result tlc)
-  else
-    run_tlc
-  fi
-  if [[ -z "$(echo "$a" | head -1)" ]]; then
-    echo "ERROR $cfg_rel: no verdict from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
-    exit 1
-  fi
-  keep_graph tlc.dot tlc
-  if [[ $mode == expected-check ]]; then
-    if [[ -f "$expected" ]] && diff -q <(expected_text | sed 1,2d) <(sed 1,2d "$expected") > /dev/null && [[ $fresh == 1 ]]; then
-      echo "same $cfg_rel"
+  # With an intent line and TLC's file fresh, only the pin is written
+  if [[ $mode != expected || $fresh == 0 ]]; then
+    if [[ $mode == expected-from ]]; then
+      cp "$from_out" tlc.out; rc_tlc=$from_rc; a=$(result tlc)
     else
-      echo "DIFF $cfg_rel"; diff <(sed 1,2d "$expected" 2>/dev/null) <(expected_text | sed 1,2d) | sed 's/^/    /'
-      [[ $fresh == 1 ]] || echo "    (the key is stale or the file is missing)"
+      run_tlc
     fi
-    exit 0
+    if [[ -z "$(echo "$a" | head -1)" ]]; then
+      echo "ERROR $cfg_rel: no verdict from TLC (exit $rc_tlc)"; sed 's/^/    tlc: /' tlc.out | grep -vE 'Parsing|Semantic' | head -10
+      exit 1
+    fi
+    keep_graph tlc.dot tlc
+    if [[ $mode == expected-check ]]; then
+      if [[ -f "$expected" ]] && diff -q <(expected_text | sed 1,2d) <(sed 1,2d "$expected") > /dev/null && [[ $fresh == 1 ]]; then
+        echo "same $cfg_rel"
+      else
+        echo "DIFF $cfg_rel"; diff <(sed 1,2d "$expected" 2>/dev/null) <(expected_text | sed 1,2d) | sed 's/^/    /'
+        [[ $fresh == 1 ]] || echo "    (the key is stale or the file is missing)"
+      fi
+      exit 0
+    fi
+    mkdir -p "$(dirname "$expected")"
+    expected_text > "$expected.tmp$$" && mv "$expected.tmp$$" "$expected"
+    echo "updated $cfg_rel"; fresh=1
   fi
-  mkdir -p "$(dirname "$expected")"
-  expected_text > "$expected.tmp$$" && mv "$expected.tmp$$" "$expected"
-  echo "updated $cfg_rel"; exit 0
+  [[ -n "$intent" && $mode != expected-from ]] || exit 0
+  # Run tla2rs below and write its pinned result instead of comparing
+  pin_write=1
 fi
 
 s0=$(date +%s.%N)
@@ -303,6 +335,11 @@ rc_rs=0; tlc_cached=0
 if [[ -n "$expected" ]]; then
   if [[ $fresh == 0 ]]; then
     echo "$t: no TLC result, or a stale one, in ${expected#"$root"/}"
+    echo "  STALE: run scripts/expected.sh $cfg_rel"
+    exit 1
+  fi
+  if [[ -n "$intent" && $pin_write == 0 && $pin_fresh == 0 ]]; then
+    echo "$t: no pinned tla2rs result, or a stale one, in ${pin#"$root"/}"
     echo "  STALE: run scripts/expected.sh $cfg_rel"
     exit 1
   fi
@@ -355,6 +392,118 @@ norm() { case "$1" in 0|10|11|12|13|75|76|255) echo "$1" ;; *) echo error ;; esa
 a="$a
 exit=$(norm $rc_tlc)"; b="$b
 exit=$(norm $rc_rs)"
+# A failure, as a line expected.sh counts when it is writing a pin
+fail_line() { if [[ $pin_write == 1 ]]; then echo "ERROR $cfg_rel: $1"; else echo "  $1"; fi; }
+# TLC confirms the lasso the checker printed (see the liveness counterexample below)
+lasso_note=""
+confirm_lasso() {
+  if [[ ! -f Tla2rsLasso.tla ]]; then
+    fail_line "LASSO NOT CHECKED: $(grep -m1 'lasso check is not written' rs.out || echo 'the checker wrote no lasso check')"
+    exit 1
+  fi
+  # The states of the lasso (with -continue, the behaviors to violated invariants come before it)
+  n_lasso=$(sed -n '/^Error: Temporal propert/,$p' rs.out | grep -cE '^State [0-9]+: <' || true)
+  # TLC's answer depends only on the jar, the generated check and the spec's modules, so a
+  # confirmation is kept in target/crosscheck/lasso under a hash of those, and TLC runs again only
+  # when tla2rs writes a different lasso (CROSSCHECK_NO_CACHE=1 always runs it)
+  lasso_key=$({ echo "lasso v1 $n_lasso"; shasum -a 256 "$jar" | cut -d' ' -f1; [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
+    for f in Tla2rsLasso.tla Tla2rsLasso.cfg "${modules[@]/%/.tla}"; do echo "== $f"; cat "$f"; done; } | shasum -a 256 | cut -d' ' -f1)
+  lasso_ok="$root/target/crosscheck/lasso/$lasso_key"
+  if [[ -n "${CROSSCHECK_NO_CACHE:-}" || ! -f "$lasso_ok" ]]; then
+    rc_lasso=0
+    set_tlc_cp
+    mkdir -p "$work/jtmp"
+    java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
+    found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
+    if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
+      fail_line "LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
+      grep -E '^Error|distinct states found|No error' lasso.out | head -5 | sed 's/^/    tlc: /'
+      exit 1
+    fi
+    mkdir -p "$(dirname "$lasso_ok")" && touch "$lasso_ok"
+    lasso_note="  (lasso of $n_lasso states confirmed by TLC)"
+  else
+    lasso_note="  (lasso of $n_lasso states confirmed by TLC earlier; cached)"
+  fi
+}
+print_times() {
+  local note="" rebuilt=""
+  [[ $tlc_cached == 0 ]] || note=" cached"
+  [[ $grown -eq 0 ]] || rebuilt="; rebuilt $grown more times with more room"
+  [[ $reordered -eq 0 ]] || rebuilt="$rebuilt; rebuilt $reordered more times for the order of strings made"
+  [[ $warned -eq 0 ]] || rebuilt="$rebuilt; rebuilt once for an EXCEPT warning"
+  printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build%s)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)" "$rebuilt"
+}
+# A summary as one `<field> <value>` line per field named in tests/intent.txt ("-" for none)
+fields() {
+  awk 'NR == 1 {print "verdict " ($0 == "" ? "-" : $0); next}
+    NR == 2 {g = d = q = "-"; if ($0 != "") {g = $1; d = $4; if ($0 ~ /left on queue/) q = $8}
+      print "generated " g; print "distinct " d; print "queue " q; next}
+    /^exit=/ {print "exit " substr($0, 6); next}
+    {print}'
+}
+# An intentional difference (see "Intentional differences" in CLAUDE.md). tla2rs's result must equal
+# the pinned one in every field; TLC's must equal it in every field tests/intent.txt does not list for
+# the difference (a graph TLC did not end is not compared); and a counterexample that is not TLC's
+# must be checked: a lasso by TLC, any other by the cfg's behaviors= script. When expected.sh writes
+# the pin, the same checks run and the pin is written instead of compared. No narrowing rule applies.
+intent_compare() {
+  local fa fb differs f bad="" checked="" out rc=0 pinned
+  fa=$(fields <<< "$a"); fb=$(fields <<< "$b")
+  differs=$(awk 'NR == FNR {v[$1] = $0; next}
+    v[$1] != $0 && !(($1 == "states" || $1 == "edges") && v[$1] == $1 " incomplete") {printf "%s%s", (n++ ? " " : ""), $1}' <(echo "$fa") <(echo "$fb"))
+  for f in $differs; do [[ ",$intent_allowed," == *",$f,"* ]] || bad="$bad $f"; done
+  if [[ -n $bad ]]; then
+    fail_line "DIFFERS FROM TLC in fields that intent $intent does not list ($intent_allowed):$bad"
+    diff <(echo "$fa") <(echo "$fb") | sed 's/^/    /'
+    exit 1
+  fi
+  if [[ " $differs " == *" trace "* ]] && ! grep -q '^trace 0$' <<< "$fb"; then
+    if grep -q '^verdict Temporal property violated' <<< "$fb"; then
+      confirm_lasso; checked="; lasso confirmed by TLC"
+    elif [[ -z $intent_check ]]; then
+      fail_line "BEHAVIORS NOT CHECKED: the counterexample differs from TLC's, and the intent line names no behaviors= check"
+      exit 1
+    fi
+  fi
+  if [[ -n $intent_check ]]; then
+    out=$(bash "$intent_check" rs.out 2>&1) || rc=$?
+    if [[ $rc != 0 ]]; then
+      fail_line "BEHAVIORS NOT VALID (${intent_check#"$root"/}): $(tail -1 <<< "$out")"
+      exit 1
+    fi
+    checked="$checked; behaviors checked by ${intent_check##*/}"
+  fi
+  if [[ $pin_write == 1 ]]; then
+    { echo "key $key"; echo "intent $intent"; echo "differs ${differs:--}"; echo "$fb"; } > "$pin.tmp$$" && mv "$pin.tmp$$" "$pin"
+    if [[ -z $differs ]]; then
+      echo "agrees $cfg_rel: TLC gives tla2rs's result, so intent $intent no longer applies; remove the intent line"
+    else
+      echo "pinned $cfg_rel (intent $intent; differs from TLC in: $differs)"
+    fi
+    exit 0
+  fi
+  print_times
+  pinned=$(sed 1,3d "$pin")
+  if [[ "$fb" != "$pinned" ]]; then
+    echo "  MISMATCH with tla2rs's pinned result (${pin#"$root"/}, intent $intent)"
+    diff <(echo "$pinned") <(echo "$fb") | sed 's/^/    /'
+    sed 's/^/    rs.err: /' rs.err | head -20
+    exit 1
+  fi
+  if [[ -z $differs ]]; then
+    echo "  AGREES(intent $intent: TLC now gives the pinned result; remove the intent line): $(tr '\n' ' ' <<< "$fb")"
+    exit 0
+  fi
+  if [[ "$(sed -n 2,3p "$pin")" != "intent $intent"$'\n'"differs $differs" ]]; then
+    echo "  PIN OUT OF DATE: written for $(sed -n 2p "$pin"), $(sed -n 3p "$pin"); now intent $intent, differs $differs: run scripts/expected.sh -force $cfg_rel"
+    exit 1
+  fi
+  echo "  INTENT(intentional difference $intent; differs from TLC in: $differs$checked): $(tr '\n' ' ' <<< "$fb")"
+  [[ -z $lasso_note ]] || echo "$lasso_note"
+  exit 0
+}
+[[ -z "$intent" ]] || intent_compare
 # `\* crosscheck: ignore-exit` skips the exit-code comparison, for a case where TLC reports an
 # error but exits with 0 (an error in a temporal property on an initial state)
 if has_rule ignore-exit; then
@@ -398,7 +547,6 @@ fi
 # violates the properties, with one distinct state per state of the lasso. That holds only if the
 # lasso starts in an initial state, each step is a step of the spec, it satisfies the spec's fairness
 # and violates a property
-lasso_note=""
 if grep -q '^Temporal property violated' <<< "$a" && [[ "$(grep '^trace ' <<< "$a")" != "$(grep '^trace ' <<< "$b")" ]]; then
   lasso_why=$(grep -m1 -oE "the counterexample is tla2rs's own, not TLC's \(.*\)|TLC's search found no counterexample" rs.err | sed -E "s/.*not TLC's \((.*)\)$/\1/" || true)
   if [[ -n $lasso_why ]]; then
@@ -407,40 +555,9 @@ if grep -q '^Temporal property violated' <<< "$a" && [[ "$(grep '^trace ' <<< "$
   fi
 fi
 if [[ "$a" == "$b" ]] && grep -q '^trace lasso' <<< "$b"; then
-  if [[ ! -f Tla2rsLasso.tla ]]; then
-    echo "  LASSO NOT CHECKED: $(grep -m1 'lasso check is not written' rs.out || echo 'the checker wrote no lasso check')"
-    exit 1
-  fi
-  # The states of the lasso (with -continue, the behaviors to violated invariants come before it)
-  n_lasso=$(sed -n '/^Error: Temporal propert/,$p' rs.out | grep -cE '^State [0-9]+: <' || true)
-  # TLC's answer depends only on the jar, the generated check and the spec's modules, so a
-  # confirmation is kept in target/crosscheck/lasso under a hash of those, and TLC runs again only
-  # when tla2rs writes a different lasso (CROSSCHECK_NO_CACHE=1 always runs it)
-  lasso_key=$({ echo "lasso v1 $n_lasso"; shasum -a 256 "$jar" | cut -d' ' -f1; [[ $uses_cm == 0 ]] || echo "community $cm_sha256"
-    for f in Tla2rsLasso.tla Tla2rsLasso.cfg "${modules[@]/%/.tla}"; do echo "== $f"; cat "$f"; done; } | shasum -a 256 | cut -d' ' -f1)
-  lasso_ok="$root/target/crosscheck/lasso/$lasso_key"
-  if [[ -n "${CROSSCHECK_NO_CACHE:-}" || ! -f "$lasso_ok" ]]; then
-    rc_lasso=0
-    set_tlc_cp
-    mkdir -p "$work/jtmp"
-    java -Djava.io.tmpdir="$work/jtmp" -XX:+UseParallelGC -cp "$tlc_cp" tlc2.TLC -workers 1 -config Tla2rsLasso.cfg Tla2rsLasso.tla > lasso.out 2>&1 || rc_lasso=$?
-    found=$(grep -oE '[0-9,]+ distinct states found' lasso.out | tail -1 | tr -d ',' | cut -d' ' -f1 || true)
-    if [[ $rc_lasso != 13 || "$found" != "$n_lasso" ]] || ! grep -q 'Temporal properties were violated' lasso.out; then
-      echo "  LASSO NOT CONFIRMED by TLC (exit $rc_lasso, ${found:-no} distinct states for a lasso of $n_lasso)"
-      grep -E '^Error|distinct states found|No error' lasso.out | head -5 | sed 's/^/    tlc: /'
-      exit 1
-    fi
-    mkdir -p "$(dirname "$lasso_ok")" && touch "$lasso_ok"
-    lasso_note="  (lasso of $n_lasso states confirmed by TLC)"
-  else
-    lasso_note="  (lasso of $n_lasso states confirmed by TLC earlier; cached)"
-  fi
+  confirm_lasso
 fi
-note=""; [[ $tlc_cached == 1 ]] && note=" cached"
-rebuilt=""; [[ $grown -gt 0 ]] && rebuilt="; rebuilt $grown more times with more room"
-[[ $reordered -gt 0 ]] && rebuilt="$rebuilt; rebuilt $reordered more times for the order of strings made"
-[[ $warned -gt 0 ]] && rebuilt="$rebuilt; rebuilt once for an EXCEPT warning"
-printf '%-14s TLC %6.2fs%s | tla2rs %6.2fs (incl. build%s)\n' "$t" "$(echo "$s1 - $s0" | bc)" "$note" "$(echo "$s2 - $s1" | bc)" "$rebuilt"
+print_times
 if [[ "$a" == "$b" ]]; then
   if [[ $distinct_only == 1 ]]; then
     echo "  MATCH(distinct only; TLC counts \\/-duplicates$graph_note): $(echo "$a" | tr '\n' ' ')"

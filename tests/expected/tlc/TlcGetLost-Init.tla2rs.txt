@@ -1,0 +1,13 @@
+key 5c66724c3a23e6c19b8bf5f1924bbe3676e86fbe9d944efe98f3f6258da3ba66
+intent tlcget-rebuild
+differs trace messages
+verdict Invariant InitLost is violated
+generated 7
+distinct 7
+queue 3
+trace 3 eb059ff4b2a713022cf6f8520f95f67cc826d1f8290566676db3aa939c0d6aab
+states 7 b939b9e2f6d086f33b78205f5789979e04dbf8b7048c167ee2c11ccf6b5863a8
+edges 6 189ac550dfef0b3a90daac554930bbd7f8a1bba39c325fa910903d9791776744
+messages 14 b7cf10f55640e8a1c1b4fc995ea62b9b711b819b5e825f5b5b6026e31727345d
+errors 2 530ee5891c88804b6924b0af1ea37dc05ecf1dea64730aa7cba562c48b45c65d
+exit 12

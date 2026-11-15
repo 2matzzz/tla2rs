@@ -1,0 +1,13 @@
+key 5426e46c8b67a303ea8202ef8a361d1a3d1189291d8628a380ce75c44ed2a1d9
+intent tlcget-rebuild
+differs generated distinct queue trace states edges messages errors exit
+verdict Invariant First is violated
+generated 21
+distinct 20
+queue 9
+trace 6 f40121f09a5bd367dac16c07cf9040d5e4cda9fcaf5afb4de27aeb100752c089
+states 20 fa4674f61f6bb070520eab8fbbeecfd505d18e98ae42f19a1a7556fa86a996c1
+edges 20 456561b713e1417585f8623503c1c86f92fb7d463ebac7907a7e0a904dd57008
+messages 34 5b64d527cfbe4e8ddaceabcc5a985f2f1bfffd93b99d877fc7993c08b6037bfe
+errors 4 4202bcfff954d02fb2f543a6b7ee816eff4037d55aad13aaeff7a0a6e698072a
+exit 11

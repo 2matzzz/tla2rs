@@ -1,0 +1,6 @@
+# Intentional differences from TLC: where TLC is wrong, tla2rs does not copy it (README.md, "Intentional
+# differences"; CLAUDE.md, "Intentional differences" says how they are tested). One line per difference:
+#   <name> <fields of the summary that may differ from TLC's, comma-separated> # what TLC does and why
+# The fields are verdict, generated, distinct, queue, trace, states, edges, dump, messages, errors,
+# userfile and exit; every other field must still equal TLC's.
+tlcget-rebuild generated,distinct,queue,trace,states,edges,messages,errors,exit # TLC cannot rebuild a behavior when TLCGet registers make Init or the actions yield other states than the search found (its own "probably a TLC bug", or a cut-short behavior and, with -continue, a NullPointerException); tla2rs shows the behavior the search found
