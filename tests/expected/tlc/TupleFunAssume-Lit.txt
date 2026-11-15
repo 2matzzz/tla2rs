@@ -1,0 +1,10 @@
+key cd6b6000286af87a7e5b324c49b9d3b48cd2037408a6631f3ba83943411d7b8e
+tlc Version 2.19
+rc 10
+Evaluating assumption line 8, col 8 to line 8, col 67 of module TupleFunAssume failed
+
+trace 0
+states incomplete
+edges incomplete
+messages 3 c0fdd3ab2f9727514e64a863960045a293333478a0a95f638da6809540521b05
+errors 1 1cdb96dd1976371357463960f589e6877bbf948b7dba2bf90bd5bebec5e1d794

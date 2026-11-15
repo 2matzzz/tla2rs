@@ -4076,7 +4076,8 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
             }
         }
     }
-    if let SMsg::Eval(e) | SMsg::InvEval(_, e) | SMsg::ActionEval(_, e) = &f.msg {
+    // TLC reports a failed invariant on a successor with the message alone
+    if let SMsg::Eval(e) | SMsg::ActionEval(_, e) = &f.msg {
         fp_note(e);
     }
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
@@ -4887,7 +4888,6 @@ fn run_liveness(opt: &Opt) {
                                 code = 255;
                                 again_failed(&a, &|t, l| g.print_trace(p as u32, Some((t, l)), false));
                             }
-                            fp_note(e);
                         }
                         code
                     }

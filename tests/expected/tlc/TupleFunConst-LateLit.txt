@@ -1,0 +1,10 @@
+key 54130933294160873de8aa2a3e7f352c22f41c5842027b943e36e529604e7df8
+tlc Version 2.19
+rc 76
+Evaluating invariant InvLateLit failed
+2 states generated 2 distinct states found 0 states left on queue
+trace 2 6d43c8f4fd0d7c9c8d37465f10abc8ea1351c1c1525dd66e2517114f8ee72b59
+states 2 6c8cc9a5a7e355f86295e92fafca786d106ed1b1901da870230ba3fbac1c32cc
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 c465f50b05438facd3dfca5ef0ba2447efe1c6fa8a72748fe32b4aedb9d262e6
+errors 2 d12e5ca66bcd5dff605999e3daefccb9f2221d5ce0d5cbfb52dba81f0eb7f416
