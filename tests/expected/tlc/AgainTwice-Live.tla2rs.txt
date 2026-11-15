@@ -1,0 +1,13 @@
+key 79c85d0793f6829c51519130ea72db00f083cd3be41ca4888169617d7b5e189f
+intent error-reentry
+differs trace messages errors exit
+verdict Evaluating invariant BadTwice failed
+generated 13
+distinct 11
+queue 6
+trace 2 f38f2bf53c7d438ba9d496720bb00764f9e084befa7cb3fb75f62f41d5ab6d01
+states 11 fdc8491f4a54540760cc7b7c1fbb4413bc2eefd4cf486a5202b4025d37db728a
+edges 12 e1199ff17702125c0e25b522898a969372ce2cd8c41ef8a5a220f95eb2154936
+messages 3 51d0ca68caf39054b34a7bd678b71a48ba946e82a5efe8535570c211cf978f40
+errors 2 0448cb4a43bdb68a7bb84cfa319abb06915da9ef36fa932220532f63662d08bf
+exit 76
