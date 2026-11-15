@@ -1,0 +1,10 @@
+key 178b32d64e59278ea5cd634bef585a930f70ae506d1af35ce6246ad40f0c414b
+tlc Version 2.19
+rc 255
+Evaluation error
+11 states generated 4 distinct states found 1 states left on queue
+trace 3 86159294270ec8d799199dd0b57da37a65127a4afd87c0b0eaca19ac8ac7ed00
+states 4 38bdbef3b437e49f03f771855ce6cf438c58d5e4f14dba77fc9c097f8c29cd06
+edges 5 594db52b023a86477c6f92bbfa9483c527e66151620bb2d4bcdc11d5908202db
+messages 44 47777a2fec77ad50893a6e1be1b5e4af23aa8ec32411fb83fbef5feb66cde732
+errors 3 33f4c389be4a349126381dbd8a218a5d7e4f60f0ec6f87621cd84f30d3f9d7f0

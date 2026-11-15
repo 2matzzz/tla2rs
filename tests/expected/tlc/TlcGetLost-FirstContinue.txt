@@ -1,0 +1,10 @@
+key 9ac43da573dbae7245e38facdb37fdff97046a08c922860cc0caa0789953b1d5
+tlc Version 2.19
+rc 255
+Invariant First is violated
+2 states generated 4 distinct states found 2 states left on queue
+trace 2 204c1a00a332cf9cb090a373b2b2dd0f3437490ebc4ec288a21a242f3b75d684
+states 4 beb4725a539ff1f55503b672ccb11c38f855bf9e625b5a0f890e11c5953d163f
+edges 3 b2a1a891691e049e560dcc50a86e3e35e455d7ae00054b90f2194d4a8214f29c
+messages 17 0666693d834636816874baa52a754529fc79fe16ed0f50cb5029af402e00cb90
+errors 5 ef3c92b4a5158faa62ba3f8eb4eacd89dbb75ed396bd7231e1f67770987a83db

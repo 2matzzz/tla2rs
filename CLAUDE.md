@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1158 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1174 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -891,10 +891,15 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   `PrintAgain-TwiceContinue`, `PrintAgain-LiveTwice`). After the CONSTRAINT, the ACTION_CONSTRAINT
   or the VIEW fails to evaluate on a successor, it reports the error and then generates the
   successors once more in the same way, up to the error (`tests/tlc/AgainCon*`, also with liveness
-  checking). After an error while computing or checking
+  checking); with `-continue`, an error there is reported again with the behavior to the successor,
+  or for the VIEW to the state being expanded, whose successors it then evaluates again
+  (`again_failed`, also in specs that print nowhere; `AgainCon-*Continue`). After an error while
+  computing or checking
   the initial states (in Init, the CONSTRAINT, an invariant or a property), it reports the error
   and then computes and checks them again from the start, printing again up to the error
-  (`init_again_prints`; `tests/tlc/PrintAgain*`). In a spec that reads TLCGet these passes handle
+  (`init_again_prints`; `tests/tlc/PrintAgain*`). With `-continue` that pass reports again the
+  invariants a state violates and goes on, also in a spec that prints nowhere (`AgainInit`). In a
+  spec that reads TLCGet these passes handle
   each state as Init or an action computes it, as the search does (see "TLCGet and TLCSet")
 - TLC evaluates the CONSTRAINT, then the ACTION_CONSTRAINT, on each successor as soon as an action
   yields it (also one already seen), and the invariants of a successor outside them right after:
@@ -1115,8 +1120,9 @@ action is evaluated. A spec that uses them (`TLCGET` in the generated checker, w
 so: the generated code calls `pushed` after each state it computes, and the runtime adds and checks that state
 there (`expand_eager_one`, and the initial states in `initial_states`); the step to a state that stops the search
 unwinds out of the action. To show a behavior, each step evaluates the actions in order up to the one that yields
-the next state and stops at the start of the next action (`step_prints`, `mark_action`); the checker's own
-replays of a behavior leave the registers as they were (`tg_quiet`). With TLCGET an invariant is evaluated once
+the next state and stops at the start of the next action (`step_prints`, `mark_action`); the states of a
+behavior are those the search computed (`TG_STATES`), so the checker evaluates nothing else to find them. With
+TLCGET an invariant is evaluated once
 per state (`eval_invariants`), and an expansion that fails is not evaluated again (`expand_caught`).
 
 The passes TLC makes again after an evaluation error (see "Messages and printed lines") handle each state as it is
@@ -1131,11 +1137,17 @@ Refused at run time: several workers (TLC's counts and registers are then those 
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
 `-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
 
-Not followed: rebuilding a behavior where the registers make the actions yield other states than the search
-found. TLC then shows the states up to the step it cannot rebuild (with `-continue` it then reports a
-`NullPointerException`); the checker shows the behavior the search found, or fails to rebuild it (`TlcGetReplay`'s
-`Reg` stops changing so that its behaviors are rebuilt). None of the corpus's models is affected: the skipped ones that read
-them use TLCGet("config") or a simulation mode, and `MCKVsnap`'s `BaitInv` is not in its cfg.
+When the registers make Init or the actions yield other states than the search found, TLC cannot look a state of
+the behavior up as it rebuilds it (`print_states_tg`; `tests/tlc/TlcGetLost*`). A step before the state being
+expanded stops it with `Failed to recover the initial state from its fingerprint.` and `This is probably a TLC
+bug(2 FP).`, FP being TLC's fingerprint of the state (`tlc_fp`), before the behavior's header; the step to the
+state being expanded or to its successor stops it after the states shown, with `bug(4)` or `bug(5)` and the state
+after `State :`. Each exits with 1 and prints no counts, also with `-continue`. When Init does not yield the first
+state (the header is printed first only for a behavior to a successor), or the step from an initial state being
+expanded does not yield its successor, TLC stops showing the behavior and goes on as after a behavior shown
+(`TG_LOST`). With `-continue` it then fails on a `NullPointerException`: an invariant violated becomes an
+invariant that failed to evaluate with that message, and the exception it did not expect after such a failure is
+that one.
 
 ### Arguments written out at each use
 

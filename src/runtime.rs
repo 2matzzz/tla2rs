@@ -833,6 +833,25 @@ static TG_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static TG_QUEUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static TG_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TG_REGS: std::sync::Mutex<Option<std::collections::BTreeMap<i64, i64>>> = std::sync::Mutex::new(None);
+/// Each state the search computed, with the action of its first computation: the registers can
+/// make the actions yield other states when a behavior is rebuilt, so its states are taken from here
+static TG_STATES: std::sync::Mutex<Option<std::collections::HashMap<Fp, (State, u32)>>> = std::sync::Mutex::new(None);
+/// Showing the last behavior stopped at a state TLC could not look up, and TLC went on (see
+/// `print_states_tg`)
+static TG_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What TLC reports with -continue after such a behavior
+const TG_LOST_NPE: &str = "Cannot read field \"state\" because \"currentStateInfo\" is null";
+
+fn tg_note(s: &State, l: u32) {
+    if let Some(w) = pack(s) {
+        let fp = state_fp(s, &w);
+        TG_STATES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(fp).or_insert((*s, l));
+    }
+}
+
+fn tg_lost() -> bool {
+    TLCGET && TG_LOST.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
 
 fn tg_level() -> i64 {
     TG_LEVEL.load(std::sync::atomic::Ordering::Relaxed) as i64
@@ -1367,17 +1386,15 @@ fn str_order_finish() {
 }
 
 /// The step s -> t evaluated again as TLC does while showing a behavior: the actions in order up
-/// to the one that yields t, printing what they print
-fn step_prints(s: &State, t: &State, level: usize) {
-    let same = |x: &State| match (pack(x), pack(t)) {
-        (Some(a), Some(b)) => state_fp(x, &a) == state_fp(t, &b),
-        _ => x == t,
-    };
+/// to the one that yields t, printing what they print. Returns that action, None if none yields t
+fn step_prints(s: &State, t: &State, level: usize) -> Option<u32> {
     if TLCGET {
         // Printed as evaluated, and the actions after the one that yields t are not evaluated
         tg_set_level(level as u64);
-        let mut hook = |x: &State, _: u32| {
-            if same(x) {
+        let mut found = None;
+        let mut hook = |x: &State, l: u32| {
+            if found.is_none() && same_state(x, t) {
+                found = Some(l);
                 STEP_DONE.with(|d| d.set(true));
             }
         };
@@ -1386,18 +1403,26 @@ fn step_prints(s: &State, t: &State, level: usize) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, &mut buf)));
         });
         STEP_DONE.with(|d| d.set(false));
-        return;
+        return found;
     }
     let cap = Capturing::start();
     let mut buf = vec![];
     let _ = successors(s, &mut buf, true);
     let held = cap.finish();
-    let Some(j) = buf.iter().position(|(x, _)| same(x)) else { return };
+    let j = buf.iter().position(|(x, _)| same_state(x, t))?;
     let last = held.cap.push_acts[j];
     for (_, a, l) in &held.cap.lines {
         if *a <= last {
             put_line(l);
         }
+    }
+    Some(buf[j].1)
+}
+
+fn same_state(x: &State, t: &State) -> bool {
+    match (pack(x), pack(t)) {
+        (Some(a), Some(b)) => state_fp(x, &a) == state_fp(t, &b),
+        _ => x == t,
     }
 }
 
@@ -1417,6 +1442,9 @@ fn eval_again_prints(s: &State, e: &EvalErr) {
 /// Shows a behavior as TLC does with PRINT_ORDER: `k` is the number of the state that was being
 /// expanded (the states after it are successors), `extra` one more state after the trace
 fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)>) -> usize {
+    if TLCGET {
+        return print_states_tg(trace, k, extra);
+    }
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     let state = |n: usize, (s, l): &(State, u32), prev: Option<&State>| print_step(&format!("State {n}: <{}>", name(*l)), s, prev);
     if k >= 2 {
@@ -1448,6 +1476,72 @@ fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)
         state(n, &x, diff_prev(n - 1, len, trace.last().map(|t| &t.0)));
     }
     n
+}
+
+/// `print_states_tlc` with TLCGET, where the registers can make Init and the actions yield other
+/// states than the search found (the states come from `TG_STATES`). TLC looks each state up as it
+/// rebuilds the behavior. When Init does not yield the first state, or the step from an initial
+/// state being expanded does not yield the next, it stops showing the behavior and goes on
+/// (`TG_LOST`); when another step does not, it stops with exit 1 (`tests/tlc/TlcGetLost*`)
+fn print_states_tg(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)>) -> usize {
+    TG_LOST.store(false, std::sync::atomic::Ordering::Relaxed);
+    let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
+    let header = || println!("Error: The behavior up to this point is:");
+    let fail = |code: u32, t: &State| -> ! {
+        println!("Error: Failed to recover the initial state from its fingerprint.");
+        if code == 2 {
+            println!("Error: This is probably a TLC bug(2 {}).", tlc_fp(t).map_or(0, |f| f as i64));
+        } else {
+            println!("Error: This is probably a TLC bug({code}).");
+            print_step("State :", t, None);
+        }
+        exit(1)
+    };
+    let mut states: Vec<(State, u32)> = trace.to_vec();
+    states.extend(extra);
+    let len = states.len();
+    let k = k.max(1);
+    if k >= 2 {
+        let mut v = vec![];
+        tg_set_level(0);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
+        if !v.iter().any(|s| same_state(s, &states[0].0)) {
+            // Only a behavior to a successor has its header first
+            if len > k {
+                header();
+            }
+            TG_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        states[0].1 = u32::MAX;
+        for i in 1..k - 1 {
+            match step_prints(&states[i - 1].0, &states[i].0, i) {
+                Some(l) => states[i].1 = l,
+                None => fail(2, &states[i].0),
+            }
+        }
+    }
+    header();
+    let state = |i: usize, states: &[(State, u32)]| {
+        print_step(&format!("State {}: <{}>", i + 1, name(states[i].1)), &states[i].0, diff_prev(i, len, (i > 0).then(|| &states[i - 1].0)))
+    };
+    for i in 0..k - 1 {
+        state(i, &states);
+    }
+    for i in k - 1..len {
+        if i > 0 {
+            match step_prints(&states[i - 1].0, &states[i].0, i) {
+                Some(l) => states[i].1 = l,
+                None if k == 1 => {
+                    TG_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return i;
+                }
+                None => fail(if i == k - 1 { 4 } else { 5 }, &states[i].0),
+            }
+        }
+        state(i, &states);
+    }
+    len
 }
 
 /// The state that left variables unassigned (with the label of its action, `u32::MAX` for an
@@ -2713,9 +2807,7 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
 /// added the first time, so it is passed over now) and queues them, checks the invariants of new
 /// successors and of those outside the model, and the action properties of all, and stops at the
 /// first that fails. `visited` tells whether a fingerprint was visited by the search. Returns the
-/// states added, and the successor (and its action) whose invariant failed to evaluate again, with
-/// the invariant and the error (TLC then exits with 255; see `again_failed`): the last one added
-/// is not queued then
+/// states added, and where the pass stopped at an evaluation error (see `Again`)
 fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option<Again>) {
     if TLCGET {
         return eval_replay_eager(s, sfp, visited);
@@ -2731,7 +2823,13 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option
     for (i, (t, l)) in buf.into_iter().enumerate() {
         held.flush(i as u32 + 1);
         stopped = true;
-        let Ok(inm) = std::panic::catch_unwind(|| in_model(s, &t)) else { break };
+        let inm = match std::panic::catch_unwind(|| in_model(s, &t)) {
+            Ok(v) => v,
+            Err(p) => {
+                failed = Some(Again::Cons(t, l, describe_panic(p)));
+                break;
+            }
+        };
         let mut unseen = true;
         if inm {
             match std::panic::catch_unwind(|| dump_fp(&t)) {
@@ -2743,13 +2841,16 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option
                     }
                 }
                 Ok(None) => dump_unpacked(&mut out, sfp, &t, l),
-                Err(_) => break,
+                Err(p) => {
+                    failed = Some(Again::View(*s, describe_panic(p)));
+                    break;
+                }
             }
         }
         if unseen {
             match check_out_of_model(&t) {
                 Some(SMsg::InvEval(inv, e)) => {
-                    failed = Some((t, l, inv, e));
+                    failed = Some(Again::Inv(t, l, inv, e));
                     break;
                 }
                 Some(_) => break,
@@ -2779,7 +2880,13 @@ fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, 
     let mut added = std::collections::HashSet::new();
     let mut failed = None;
     let mut hook = |t: &State, l: u32| {
-        let Ok(inm) = std::panic::catch_unwind(|| in_model(s, t)) else { std::panic::panic_any(EagerStop) };
+        let inm = match std::panic::catch_unwind(|| in_model(s, t)) {
+            Ok(v) => v,
+            Err(p) => {
+                failed = Some(Again::Cons(*t, l, describe_panic(p)));
+                std::panic::panic_any(EagerStop)
+            }
+        };
         let (mut unseen, mut new) = (true, false);
         if inm {
             match std::panic::catch_unwind(|| dump_fp(t)) {
@@ -2793,13 +2900,16 @@ fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, 
                     }
                 }
                 Ok(None) => dump_unpacked(&mut out, sfp, t, l),
-                Err(_) => std::panic::panic_any(EagerStop),
+                Err(p) => {
+                    failed = Some(Again::View(*s, describe_panic(p)));
+                    std::panic::panic_any(EagerStop)
+                }
             }
         }
         if unseen {
             match check_out_of_model(t) {
                 Some(SMsg::InvEval(inv, e)) => {
-                    failed = Some((*t, l, inv, e));
+                    failed = Some(Again::Inv(*t, l, inv, e));
                     std::panic::panic_any(EagerStop);
                 }
                 Some(_) => std::panic::panic_any(EagerStop),
@@ -2818,19 +2928,50 @@ fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, 
     (added.len() as u64, failed)
 }
 
-type Again = (State, u32, &'static str, EvalErr);
+/// Where `eval_replay` stopped at an evaluation error
+enum Again {
+    /// An invariant of a new successor (with its action) failed: TLC then exits with 255, and the
+    /// successor, added, is not queued
+    Inv(State, u32, &'static str, EvalErr),
+    /// The CONSTRAINT or the ACTION_CONSTRAINT failed on a successor (with its action)
+    Cons(State, u32, EvalErr),
+    /// The VIEW failed on a successor of the state being expanded
+    View(State, EvalErr),
+}
 
-/// With -continue, an invariant that failed to evaluate again in `eval_replay`: TLC reports it as
+impl Again {
+    fn is_inv(&self) -> bool {
+        matches!(self, Again::Inv(..))
+    }
+}
+
+/// With -continue, TLC reports the error `eval_replay` stopped at with a behavior: an invariant as
 /// a failed invariant with its behavior, then as the error itself with the behavior again
-/// (`tests/tlc/AgainTwice`, `PrintAgain-TwiceContinue`). `show` prints the behavior to the successor
-fn again_failed((t, l, inv, e): &Again, show: &dyn Fn(&State, u32)) {
+/// (`tests/tlc/AgainTwice`, `PrintAgain-TwiceContinue`); a constraint as the error with the behavior
+/// to the successor, and the VIEW with the behavior to the state being expanded, whose successors
+/// it then evaluates again (`AgainCon-*Continue`). `show` prints the behavior, with the successor
+/// if any
+fn again_failed(a: &Again, show: &dyn Fn(Option<(State, u32)>)) {
     if !flag(&CONTINUE) {
         return;
     }
-    report_msg(&SMsg::InvEval(inv, e.clone()), true);
-    show(t, *l);
-    report_eval_as(e, false);
-    show(t, *l);
+    match a {
+        Again::Inv(t, l, inv, e) => {
+            report_msg(&SMsg::InvEval(inv, e.clone()), true);
+            show(Some((*t, *l)));
+            report_eval_as(e, false);
+            show(Some((*t, *l)));
+        }
+        Again::Cons(t, l, e) => {
+            report_eval_as(e, false);
+            show(Some((*t, *l)));
+        }
+        Again::View(s, e) => {
+            report_eval_as(e, false);
+            show(None);
+            eval_again_prints(s, e);
+        }
+    }
 }
 
 /// Where the checker spills when `-tmpdir` is not given: the system's temp dir, unless it is a tmpfs
@@ -3294,7 +3435,10 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     if TLCGET {
         // TLC handles each initial state as Init computes it (see TLCGET)
         tg_set_level(0);
-        let mut hook = |s: &State, _: u32| handle(*s);
+        let mut hook = |s: &State, _: u32| {
+            tg_note(s, u32::MAX);
+            handle(*s)
+        };
         failed = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err());
     } else {
         for s in std::mem::take(&mut inits) {
@@ -3327,14 +3471,15 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
 /// are what this pass generated and the states added by both, and it exits with 0 unless the pass
 /// stops at an error (`tests/tlc/TlcGetReplay-Init*`)
 fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain> {
-    if !PRINT_ORDER {
+    if !PRINT_ORDER && !flag(&CONTINUE) {
         return None;
     }
     if TLCGET {
         return Some(init_again_eager(first));
     }
     let mut seen = std::collections::HashSet::new();
-    // Whether the pass goes on after s
+    // Whether the pass goes on after s. With -continue TLC reports again the invariants a state
+    // violates and goes on (`tests/tlc/AgainInit`)
     let mut check = |s: &State| {
         let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else { return false };
         if let Some(w) = pack(s).filter(|_| in_model) {
@@ -3342,7 +3487,14 @@ fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain>
                 return true;
             }
         }
-        INVARIANTS.iter().chain(INIT_PROPS).all(|(_, f)| matches!(std::panic::catch_unwind(|| f(s)), Ok(true)))
+        for (name, f) in INVARIANTS {
+            match std::panic::catch_unwind(|| f(s)) {
+                Ok(true) => {}
+                Ok(false) if flag(&CONTINUE) => println!("Error: Invariant {name} is violated by the initial state:\n{}\n", init_text(s)),
+                _ => return false,
+            }
+        }
+        INIT_PROPS.iter().all(|(_, f)| matches!(std::panic::catch_unwind(|| f(s)), Ok(true)))
     };
     let cap = Capturing::start();
     let mut inits = vec![];
@@ -3712,6 +3864,7 @@ fn expand_eager_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChun
 
 /// One successor handled as in `expand_safety_one`
 fn eager_succ(s: &State, sfp: Fp, t: State, l: u32, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+    tg_note(&t, l);
     ws.buf.clear();
     ws.buf.push((t, l));
     ws.cand.clear();
@@ -3850,7 +4003,13 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
         ws.held.flush(i as u32 + 1);
         match eval_invariants(t) {
             Ok(None) => {}
-            Ok(Some(inv)) if flag(&CONTINUE) => report_continued(seen, &SFound::new(tfp, None, SMsg::Inv(inv))),
+            Ok(Some(inv)) if flag(&CONTINUE) => {
+                report_continued(seen, &SFound::new(tfp, None, SMsg::Inv(inv)));
+                // TLC fails on the behavior it could not show, as on the invariant
+                if tg_lost() {
+                    return Some(SFound::new(tfp, None, SMsg::InvEval(inv, EvalErr::Other(TG_LOST_NPE.into()))));
+                }
+            }
             Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
             Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
@@ -3962,7 +4121,12 @@ fn fp_chain(seen: &dyn Visited, target: Fp) -> Option<Vec<Fp>> {
 
 /// Rebuilds the actual states by replaying a sequence of fingerprints from an initial state.
 fn replay(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
-    tg_quiet(|| replay_in(chain))
+    if TLCGET {
+        let g = TG_STATES.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.as_ref()?;
+        return chain.iter().map(|fp| m.get(fp).copied()).collect();
+    }
+    replay_in(chain)
 }
 
 fn replay_in(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
@@ -4184,15 +4348,17 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if let Some(s) = again {
         let (added, failed) = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
         distinct += added;
-        left += added as usize - failed.is_some() as usize;
+        left += added as usize - failed.as_ref().is_some_and(Again::is_inv) as usize;
         if let Some(a) = failed {
-            code = 255;
+            if a.is_inv() {
+                code = 255;
+            }
             if let Some(trace) = &again_trace {
-                again_failed(&a, &|t, l| {
+                again_failed(&a, &|x| {
                     if PRINT_ORDER {
-                        print_states_tlc(&trace, trace.len(), Some((*t, l)));
+                        print_states_tlc(trace, trace.len(), x);
                     } else {
-                        print_states(&trace, Some((*t, l)));
+                        print_states(trace, x);
                     }
                 });
             }
@@ -4205,7 +4371,7 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
     }
-    if let (SMsg::Eval(e), true) = (&f.msg, shown > 0) {
+    if let (SMsg::Eval(e), true) = (&f.msg, shown > 0 || TLCGET && TG_LOST.load(std::sync::atomic::Ordering::Relaxed)) {
         if let Some(chain) = fp_chain(seen, f.fp) {
             if let Some((s, _)) = replay(&chain).and_then(|t| t.last().copied()) {
                 eval_again_prints(&s, e);
@@ -4223,7 +4389,11 @@ fn continued_inv_eval(msg: &SMsg, in_model: bool) -> Option<i32> {
     if !flag(&CONTINUE) || !in_model {
         return None;
     }
-    report_eval_as(e, true);
+    if tg_lost() {
+        report_eval_as(&EvalErr::Other(TG_LOST_NPE.into()), true);
+    } else {
+        report_eval_as(e, true);
+    }
     Some(255)
 }
 
@@ -5005,10 +5175,12 @@ fn run_liveness(opt: &Opt) {
                             let s = g.state(p);
                             let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
                             distinct += added as usize;
-                            queued = added as usize - failed.is_some() as usize;
+                            queued = added as usize - failed.as_ref().is_some_and(Again::is_inv) as usize;
                             if let Some(a) = failed {
-                                code = 255;
-                                again_failed(&a, &|t, l| g.print_trace(p as u32, Some((t, l)), false));
+                                if a.is_inv() {
+                                    code = 255;
+                                }
+                                again_failed(&a, &|x| g.print_trace(p as u32, x.as_ref().map(|(t, l)| (t, *l)), false));
                             }
                         }
                         code
@@ -5032,9 +5204,12 @@ fn run_liveness(opt: &Opt) {
                     Found::Untraced(p, e) => {
                         let code = report_msg(&SMsg::Untraced(e), true);
                         let s = g.state(p as usize);
-                        let (added, _) = eval_replay(&s, state_fp(&s, &g.states.get(p as usize)), &|fp| seen.contains(fp));
+                        let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p as usize)), &|fp| seen.contains(fp));
                         distinct += added as usize;
                         queued = added as usize;
+                        if let Some(a) = failed.filter(|a| !a.is_inv()) {
+                            again_failed(&a, &|x| g.print_trace(p, x.as_ref().map(|(t, l)| (t, *l)), false));
+                        }
                         code
                     }
                     Found::Eval(p, e) => {
