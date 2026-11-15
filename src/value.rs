@@ -476,7 +476,7 @@ pub const CHOOSE_NONE: &str = "Attempted to compute the value of an expression o
 /// expression (as opposed to expressions tla2rs cannot evaluate here).
 const EVAL_FAILURES: [&str; 14] = [
     "Attempted to check equality of string ",
-    "Attempted to compare integer with non-integer:",
+    "Attempted to compare integer with non-integer",
     "Attempted to compare an integer with non-integer:",
     TOO_MANY,
     "The first argument of BagOfAll should be an operator",
@@ -507,6 +507,16 @@ pub fn bag_of_all_literal(atoms: &Atoms, body: &Expr) -> Option<String> {
 fn written_elems(e: &Expr) -> Option<&[Expr]> {
     match e {
         Expr::Label(n, _, b) if n.starts_with('#') || crate::ast::pos_of(n).is_some() => written_elems(b),
+        Expr::SetLit(xs) => Some(xs),
+        _ => None,
+    }
+}
+
+/// The elements of a set written out in a definition, behind the names of the definitions that
+/// hold it
+pub fn def_elems(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::Label(n, _, b) if !is_bind(n) => def_elems(b),
         Expr::SetLit(xs) => Some(xs),
         _ => None,
     }
@@ -1224,6 +1234,14 @@ impl ConstEval<'_> {
                 } else {
                     let s = self.eval(set, env)?;
                     match &s {
+                        // A definition TLC fails to sort is built again where it is used, as written
+                        Value::Set(ss) if def_elems(set).is_some() && Self::unsortable(ss) => {
+                            let es: Vec<Value> = def_elems(set).unwrap().iter().map(|x| self.eval(x, env)).collect::<R<_>>()?;
+                            match self.tuple_fun_scan(&v, &es)? {
+                                Some(b) => b,
+                                None => return self.bin(*op, v, s),
+                            }
+                        }
                         Value::Set(ss) => match self.tuple_fun_search(&v, ss)? {
                             Some(b) => b,
                             None => return self.bin(*op, v, s),
@@ -1653,65 +1671,68 @@ impl ConstEval<'_> {
             return Ok(None);
         }
         for e in es {
-            let eq = match tuple_fun_values(e, x).or_else(|| tuple_fun_values(x, e)) {
-                Some((t, f)) => {
-                    if t.len() != f.len() {
-                        continue;
-                    }
-                    let mut eq = true;
-                    for (i, (k, v)) in f.iter().enumerate() {
-                        let Value::Int(k) = k else {
-                            return Err(format!("Attempted to compare an integer with non-integer:\n{}.", self.show(k)));
-                        };
-                        if *k != i as i64 + 1 || !self.tlc_eq(v, &t[i])? {
-                            eq = false;
-                            break;
-                        }
-                    }
-                    eq
-                }
-                None => self.tlc_eq(e, x)?,
-            };
-            if eq {
+            if self.tlc_eq(e, x)? {
                 return Ok(Some(true));
             }
         }
         Ok(Some(false))
     }
 
-    /// `x \in S` for a tuple x and a sorted set S that holds functions over keys that are not all
-    /// integers: TLC searches S by halves, comparing x with each element it visits by size, then
+    /// `x \in S` for a sorted set S of tuples and functions where x is a tuple and S holds a
+    /// function over keys that are not all integers, or x is such a function and S holds a tuple:
+    /// TLC searches S by halves in its order, comparing x with each element it visits by size, then
     /// key by key, where a key that is not an integer stops it (`Gen::tuple_fun_search`). None when
-    /// S holds no such function, or values other than functions
+    /// S holds no such element, or values other than tuples and functions
     fn tuple_fun_search(&self, x: &Value, s: &BTreeSet<Value>) -> R<Option<bool>> {
-        let Value::Tuple(t) = x else { return Ok(None) };
-        if !s.iter().any(|e| tuple_fun_values(x, e).is_some()) || !s.iter().all(|e| matches!(e, Value::Fun(_))) {
+        if !s.iter().any(|e| tuple_fun_values(x, e).is_some() || tuple_fun_values(e, x).is_some())
+            || !s.iter().all(|e| matches!(e, Value::Tuple(_) | Value::Fun(_)))
+        {
             return Ok(None);
         }
-        let xs: Vec<&BTreeMap<Value, Value>> = s.iter().filter_map(|e| if let Value::Fun(f) = e { Some(f) } else { None }).collect();
+        let mut xs: Vec<&Value> = s.iter().collect();
+        xs.sort_by(|a, b| self.tuple_fun_cmp(a, b).unwrap_or_else(|_| a.cmp(b)));
         let (mut lo, mut hi) = (0, xs.len());
         while lo < hi {
             let mid = (lo + hi) >> 1;
-            let f = xs[mid];
-            let mut c = t.len().cmp(&f.len());
-            if c.is_eq() {
-                for (i, (k, v)) in f.iter().enumerate() {
-                    let Value::Int(k) = k else {
-                        return Err(format!("Attempted to compare integer with non-integer:\n{}.", self.show(k)));
-                    };
-                    c = (i as i64 + 1).cmp(k).then_with(|| t[i].cmp(v));
-                    if c.is_ne() {
-                        break;
-                    }
-                }
-            }
-            match c {
+            match self.tuple_fun_cmp(x, xs[mid])? {
                 std::cmp::Ordering::Equal => return Ok(Some(true)),
                 std::cmp::Ordering::Less => hi = mid,
                 std::cmp::Ordering::Greater => lo = mid + 1,
             }
         }
         Ok(Some(false))
+    }
+
+    /// a against b in TLC's order of tuples and functions: a tuple and a function by size, then the
+    /// function's keys against the indices and the values, where a key that is not an integer stops
+    /// it (TLC words it with a colon only when the tuple is on the left); others as `Value::cmp`
+    fn tuple_fun_cmp(&self, a: &Value, b: &Value) -> R<std::cmp::Ordering> {
+        let (t, f, tuple_left) = match (a, b) {
+            (Value::Tuple(t), Value::Fun(f)) => (t, f, true),
+            (Value::Fun(f), Value::Tuple(t)) => (t, f, false),
+            _ => return Ok(a.cmp(b)),
+        };
+        let mut c = t.len().cmp(&f.len());
+        if c.is_eq() {
+            for (i, (k, v)) in f.iter().enumerate() {
+                let Value::Int(k) = k else {
+                    let colon = if tuple_left { ":" } else { "" };
+                    return Err(format!("Attempted to compare integer with non-integer{colon}\n{}.", self.show(k)));
+                };
+                c = (i as i64 + 1).cmp(k).then_with(|| t[i].cmp(v));
+                if c.is_ne() {
+                    break;
+                }
+            }
+        }
+        Ok(if tuple_left { c } else { c.reverse() })
+    }
+
+    /// Whether TLC fails to sort the set s and holds it as written: it holds a tuple and a function
+    /// over keys that are not all integers of the same size, whose comparison fails
+    pub fn unsortable(s: &BTreeSet<Value>) -> bool {
+        let sizes: BTreeSet<usize> = s.iter().filter_map(|e| if let Value::Tuple(t) = e { Some(t.len()) } else { None }).collect();
+        s.iter().any(|e| matches!(e, Value::Fun(f) if sizes.contains(&f.len()) && f.keys().any(|k| !matches!(k, Value::Int(_)))))
     }
 
     fn show(&self, v: &Value) -> String {
@@ -1751,6 +1772,22 @@ impl ConstEval<'_> {
             }
             Ok(true)
         };
+        // A tuple and a function over keys that are not all integers: TLC walks the function's
+        // keys in its order, and one that is not an integer stops it
+        if let Some((t, f)) = tuple_fun_values(a, b).or_else(|| tuple_fun_values(b, a)) {
+            if t.len() != f.len() {
+                return Ok(false);
+            }
+            for (i, (k, v)) in f.iter().enumerate() {
+                let Int(k) = k else {
+                    return Err(format!("Attempted to compare an integer with non-integer:\n{}.", self.show(k)));
+                };
+                if *k != i as i64 + 1 || !self.tlc_eq(v, &t[i])? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         Ok(match (a, b) {
             (Tuple(t), Atom(x)) if s(b) => {
                 let chars: Vec<Value> = self.atoms.name(*x).chars().map(|c| Atom(self.atoms.intern(false, &c.to_string()))).collect();

@@ -3049,7 +3049,11 @@ impl<'a> Gen<'a> {
         // built when it is written there
         let in_tuple = c.contains("Attempted to compare integer with non-integer")
             && matches!(e.strip(), Expr::Bin(BOp::In | BOp::NotIn, x, _) if matches!(x.strip(), Expr::Tuple(_)) && self.built(x, env));
-        if can_fail && !c.contains("Attempted to check equality of string") && (in_tuple || self.fp_source(e, env)) {
+        // A constant comparison of a tuple with a function fails inside a value built on the left
+        let eq_left = c.contains("Attempted to compare an integer with non-integer")
+            && matches!(e.strip(), Expr::Bin(BOp::Eq | BOp::Neq, a, _) if self.built(a, env))
+            && self.is_const(e, env);
+        if can_fail && !c.contains("Attempted to check equality of string") && (in_tuple || eq_left || self.fp_source(e, env)) {
             return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
         }
         Ok((c, t))
@@ -3075,7 +3079,7 @@ impl<'a> Gen<'a> {
         use Expr::*;
         match e {
             Label(n, _, b) if n.starts_with('#') => self.built(b, env),
-            Label(_, _, b) => !self.is_const(e, env) && self.built(b, env),
+            Label(_, _, b) => (!self.is_const(e, env) || self.held_unsorted(e, env)) && self.built(b, env),
             SetLit(_) | Tuple(_) | RecLit(_) => true,
             // TLC holds a set of functions or records it can enumerate as the set of its elements,
             // which it does not count as built there (`k \notin [{1} -> {1}]`, measured)
@@ -3084,6 +3088,13 @@ impl<'a> Gen<'a> {
             Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.built(a, env) || self.built(b, env),
             _ => false,
         }
+    }
+
+    /// Whether e is a definition of a set written out that TLC fails to sort, which it builds
+    /// again where it is used (`ConstEval::unsortable`)
+    fn held_unsorted(&self, e: &Expr, env: &Env) -> bool {
+        crate::value::def_elems(e).is_some()
+            && matches!(self.ce.eval(e, &env.vals), Ok(Value::Set(s)) if crate::value::ConstEval::unsortable(&s))
     }
 
     fn gen_inner(&mut self, e: &Expr, env: &Env, want: Option<&Ty>) -> R<(String, Ty)> {
