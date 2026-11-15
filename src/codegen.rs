@@ -534,18 +534,18 @@ impl<'a> Gen<'a> {
         )))
     }
 
-    /// `x \in S` for a tuple x and a sorted set S (from a definition or the state) of functions
-    /// over keys that are not all integers, or for such a function x and a sorted set S of tuples
-    /// (of one length or of several, held as sequences). TLC searches S by halves with its order
-    /// (`ValueVec.search`), comparing x with each element it visits (`TupleValue.compareTo` and
-    /// `FcnRcdValue.compareToInterval` for a tuple x, `FcnRcdValue.compareOtherInterval` for a
-    /// function x): by size, then key by key in TLC's order, where a key that is not an integer
-    /// stops it with an error, and an integer key against the index, then the values. None when
-    /// the types are not such a pair
+    /// `x \in S` for a tuple x (also one held as a sequence) and a sorted set S (from a definition
+    /// or the state) of functions over keys that are not all integers, or for such a function x
+    /// and a sorted set S of tuples (of one length or of several, held as sequences). TLC
+    /// searches S by halves with its order (`ValueVec.search`), comparing x with each element it
+    /// visits (`TupleValue.compareTo` and `FcnRcdValue.compareToInterval` for a tuple x,
+    /// `FcnRcdValue.compareOtherInterval` for a function x): by size, then key by key in TLC's
+    /// order, where a key that is not an integer stops it with an error, and an integer key
+    /// against the index, then the values. None when the types are not such a pair
     fn tuple_fun_search(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<Option<String>> {
         let et = Self::elem_of(st);
         let fun_left = tuple_fun_pair(&et, xt) || (matches!(et, Ty::Seq(_)) && other_keys_fun(xt));
-        if !fun_left && !tuple_fun_pair(xt, &et) {
+        if !fun_left && !tuple_fun_pair(xt, &et) && !(matches!(xt, Ty::Seq(_)) && other_keys_fun(&et)) {
             return Ok(None);
         }
         let (tt, fty) = if fun_left { (&et, xt) } else { (xt, &et) };
@@ -2363,11 +2363,16 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// TLC's message when it compares a value of type xt with a value it cannot compare it with
-    /// (`compareTo`, as in a search of a sorted set), for a tuple or a string (measured)
-    fn compare_fails_msg(&self, xt: &Ty) -> Option<&'static str> {
+    /// TLC's message when it compares a value of type xt with a value of type et it cannot compare
+    /// it with (`compareTo`, as in a search of a sorted set), for a tuple, a string, an integer, or
+    /// a record against a tuple (measured)
+    fn compare_fails_msg(&self, xt: &Ty, et: &Ty) -> Option<&'static str> {
         if tuple_elems(xt).is_some() {
             Some("Attempted to compare the function {} with the value:\n{}")
+        } else if matches!(xt, Ty::Int(..)) {
+            Some("Attempted to compare integer {} with non-integer:\n{}")
+        } else if matches!(xt, Ty::Rec(fs) if !fs.is_empty()) && tuple_elems(et).is_some_and(|e| !e.is_empty()) {
+            Some("Attempted to compare record:\n{}\nwith non-record\n{}")
         } else if matches!(xt, Ty::Enum(v) if !v.is_empty() && v.iter().all(|&a| !self.atoms.is_model(a))) {
             Some("Attempted to compare string {} with non-string:\n{}")
         } else {
@@ -2388,7 +2393,7 @@ impl<'a> Gen<'a> {
                     return Ok(code);
                 }
                 let empty = if is_sparse(st) { format!("(({c}).len == 0)") } else { format!("({c} == 0)") };
-                if let Some(f) = self.compare_fails_msg(xt) {
+                if let Some(f) = self.compare_fails_msg(xt, &et) {
                     let it = self.s_iter(c, st)?;
                     let n = self.s_card(c, st);
                     let (xid, eid) = (self.ty_id(xt)?, self.ty_id(&et)?);
@@ -5354,6 +5359,10 @@ impl<'a> Gen<'a> {
                         if matches!(self.tuple_cmp(t, xt)?, Cmp::Fails(_)) && self.walkable(t, xt) {
                             special = true;
                             parts.push(format!("{{ let __fp = FpSource::enter(); {code} }}"));
+                        } else if tuple_elems(t).is_some() && matches!(xt, Ty::Int(..)) {
+                            // A tuple asked whether it equals an integer fails (`tests/tlc/IntTupleIn`)
+                            special = true;
+                            parts.push(code);
                         } else {
                             parts.push(code);
                         }
@@ -5686,8 +5695,8 @@ impl<'a> Gen<'a> {
                 // A set from a definition is sorted: TLC searches it, comparing x first with the
                 // element in the middle
                 if !written {
-                    if let Some(f) = self.compare_fails_msg(xt) {
-                        let e = set.iter().nth(set.len() / 2).unwrap();
+                    let e = set.iter().nth(set.len() / 2).unwrap();
+                    if let Some(f) = self.compare_fails_msg(xt, &ty_of_value(e)?) {
                         let et = crate::ppr::ppr(&crate::compile::show_value(self.atoms, e));
                         let xid = self.ty_id(xt)?;
                         return Ok(format!("{{ let __b: bool = eval_error(format!({f:?}, ppr(&fmt_{xid}(&{x})), {et:?})); __b }}"));

@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1158 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1170 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -1027,7 +1027,8 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   makes them unequal (`tests/tlc/TupleFunNest*`, `Gen::walk_eq`). In a set written out, TLC asks each
   element in turn whether it equals the value, with the same error and a fingerprint error from the
   set (`tests/tlc/TupleFunIn*`). A sorted set of such functions (from a definition or the state) is
-  searched by halves in TLC's order instead, starting at index n/2: the tuple compares with each
+  searched by halves in TLC's order instead, starting at index n/2: the tuple (also one held as a
+  sequence, `Append(s, 1)`: `tests/tlc/SeqFunSorted*`) compares with each
   element it visits by size, then key by key in TLC's order (model values before integers), where a
   key that is not an integer stops it with `Attempted to compare integer with non-integer:` (no
   "an") and the key followed by `.`, raised inside the tuple (a fingerprint error when the tuple is
@@ -1044,12 +1045,17 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   error even for a function constructor (`tests/tlc/FunTupleSorted*`)
 - A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
-  tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
+  tuple otherwise, also when a set written out asks each tuple in turn whether it equals an integer
+  (`x \in {<<1>>}`, with a fingerprint error from the set except in an invariant on a successor:
+  `tests/tlc/IntTupleIn*`); a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
   set of tuples:` and the product (`tests/tlc/TupleVals*`)
-- A tuple or a string in a set it cannot be compared with, when the set is sorted (from the state or
-  a definition): TLC searches the set and fails on its first comparison, with the element at index
-  n/2 in its order: `Attempted to compare the function <<1, 3>> with the value:` or `Attempted to
-  compare string "x" with non-string:`, then that element (`tests/tlc/SortedCmp*`). A set written
+- A tuple, a string or an integer in a set it cannot be compared with, or a record in a set of
+  tuples, when the set is sorted (from the state or a definition): TLC searches the set and fails on
+  its first comparison, with the element at index n/2 in its order: `Attempted to compare the
+  function <<1, 3>> with the value:`, `Attempted to compare string "x" with non-string:` or
+  `Attempted to compare integer 1 with non-integer:`, then that element (`tests/tlc/SortedCmp*`,
+  `IntTupleIn-Trio`, `IntTupleIn-State`); `Attempted to compare record:`, the record, `with
+  non-record`, then that element (`tests/tlc/RecTupleSorted*`). A set written
   out where it is used is compared with element by element instead
 - A value that is not an integer in an interval: `Attempted to check if the value:`, the value, `is
   in the integer interval 5..6`
