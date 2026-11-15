@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1113 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1126 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -995,7 +995,9 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
 - After an error raised inside a value TLC built from an expression written there (a set `{...}`, a
   tuple `<<...>>`, a product `S \X T`, a set of functions or records it cannot enumerate, set
   operations on those), TLC reports a second error after the behavior (or the initial state): `TLC
-  was unable to fingerprint.` with the same reason (and its `Fingerprint Stack Trace`, dropped). Not
+  was unable to fingerprint.` with the same reason (and its `Fingerprint Stack Trace`, dropped), but
+  not after a failed invariant on a successor, which it reports with the message alone
+  (`tests/tlc/TupleFunConst-Late*`). Not
   after `x \in S` for S from the state or a constant definition, `x \in 5..6`, `\E y \in {5, 6} : y =
   x`, `t[i]` for t from the state, or `k \notin [{1} -> {1}]`, nor when a string's or a tuple's own
   comparison fails (`<<"a">> \in {"ab"}`, `<<1, 2>> # s`) (`tests/tlc/FpErr*`). Code generation
@@ -1021,9 +1023,14 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   searched by halves in TLC's order instead, starting at index n/2: the tuple compares with each
   element it visits by size, then key by key in TLC's order (model values before integers), where a
   key that is not an integer stops it with `Attempted to compare integer with non-integer:` (no
-  "an") and the key followed by `.`, without a fingerprint error, and an integer key against the
-  index, then the values, decide which half it goes on in (`tests/tlc/TupleFunSorted*`,
-  `Gen::tuple_fun_search`). So the search may pass every element without an error
+  "an") and the key followed by `.`, raised inside the tuple (a fingerprint error when the tuple is
+  written there, not when it comes from a definition), and an integer key against the index, then
+  the values, decide which half it goes on in (`tests/tlc/TupleFunSorted*`,
+  `Gen::tuple_fun_search`). So the search may pass every element without an error. All of this
+  holds when every operand is constant: the compiler evaluates such a test as TLC does
+  (`ConstEval::tuple_fun_scan`, `tuple_fun_search`), and the checker raises the error where TLC
+  evaluates it, in Init, an action or an invariant, and in an ASSUME when it starts
+  (`tests/tlc/TupleFunConst*`, `TupleFunAssume*`)
 - A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
   tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the

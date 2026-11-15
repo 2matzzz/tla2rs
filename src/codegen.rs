@@ -3016,7 +3016,11 @@ impl<'a> Gen<'a> {
         if (lazy_fun(e) || in_lazy) && (can_fail || c.contains("arith_error")) {
             return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
         }
-        if can_fail && !c.contains("Attempted to check equality of string") && self.fp_source(e, env) {
+        // A sorted set searched for a tuple fails inside the tuple (`tuple_fun_search`), which TLC
+        // built when it is written there
+        let in_tuple = c.contains("Attempted to compare integer with non-integer")
+            && matches!(e.strip(), Expr::Bin(BOp::In | BOp::NotIn, x, _) if matches!(x.strip(), Expr::Tuple(_)) && self.built(x, env));
+        if can_fail && !c.contains("Attempted to check equality of string") && (in_tuple || self.fp_source(e, env)) {
             return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
         }
         Ok((c, t))
