@@ -532,33 +532,6 @@ impl TExpr {
         }
     }
 
-    /// TLC's tableau ignores boolean constants: a particle's consistency (TBPar.isLocallyConsistent)
-    /// and a state's (TBGraphNode.isConsistent) look at state predicates only. So a constant that
-    /// simplify leaves under [] or <> (`<>TRUE` negated is `[]FALSE`) holds in every state, outside
-    /// the forms <>[]A and []<>A, which TLC checks without the tableau. Called on the simplified
-    /// negation, whose top-level junctions are those TLC's DNF splits
-    fn tableau_bools(self) -> TExpr {
-        match self {
-            TExpr::Conj(xs) => TExpr::Conj(xs.into_iter().map(|x| x.tableau_bools()).collect()),
-            TExpr::Disj(xs) => TExpr::Disj(xs.into_iter().map(|x| x.tableau_bools()).collect()),
-            e if matches!(&e, TExpr::Even(b) if matches!(b.as_ref(), TExpr::All(c) if c.level() < 3)) => e,
-            e if matches!(&e, TExpr::All(b) if matches!(b.as_ref(), TExpr::Even(c) if c.level() <= 2)) => e,
-            TExpr::All(b) => TExpr::All(b.bools_true().into()),
-            TExpr::Even(b) => TExpr::Even(b.bools_true().into()),
-            e => e,
-        }
-    }
-    fn bools_true(self) -> TExpr {
-        match self {
-            TExpr::Bool(_) => TExpr::Bool(true),
-            TExpr::Neg(b) => TExpr::Neg(b.bools_true().into()),
-            TExpr::Conj(xs) => TExpr::Conj(xs.into_iter().map(|x| x.bools_true()).collect()),
-            TExpr::Disj(xs) => TExpr::Disj(xs.into_iter().map(|x| x.bools_true()).collect()),
-            TExpr::All(b) => TExpr::All(b.bools_true().into()),
-            TExpr::Even(b) => TExpr::Even(b.bools_true().into()),
-            e => e,
-        }
-    }
     fn to_ltl(&self) -> Ltl {
         match self {
             TExpr::Bool(b) => Ltl::Bool(*b),
@@ -625,7 +598,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             return Ok(Ok(TExpr::Bool(*b)));
         }
         // A predicate of constant level is a boolean constant to TLC, which evaluates it here
-        // (Liveness.astToLive); see TExpr::tableau_bools for what that changes. What it printed
+        // (Liveness.astToLive); see tb_consistent for how the tableau takes it. What it printed
         // then was noted by live_const_error
         if !reads_state(g, e) {
             let quiet = crate::value::PRINTED.with(|p| p.replace(None));
@@ -1004,8 +977,13 @@ struct Tableau {
     init: usize,
 }
 
-/// TBPar.isLocallyConsistent: no state predicate both in a particle and negated in it
+/// TBPar.isLocallyConsistent: no state predicate both in a particle and negated in it. And no
+/// FALSE: TLC does not look at boolean constants here, so to it every behavior violates `<>TRUE`,
+/// whose negation is `[]FALSE` (README, "Intentional differences")
 fn tb_consistent(p: &[LN]) -> bool {
+    if p.contains(&LN::Bool(false)) {
+        return false;
+    }
     let neg: Vec<&LN> = p
         .iter()
         .filter_map(|x| match x {
@@ -1363,7 +1341,7 @@ fn split_disjuncts(neg: TExpr) -> Option<Vec<(Ltl, Vec<TExpr>, Vec<TExpr>, Vec<T
                     let TExpr::Even(c) = *b else { unreachable!() };
                     if c.level() <= 1 { aes.push(*c) } else { aea.push(*c) }
                 }
-                ln => rest.push(ln.tableau_bools().to_ltl()),
+                ln => rest.push(ln.to_ltl()),
             }
         }
         taken |= !(aes.is_empty() && aea.is_empty() && ea.is_empty());
@@ -1423,7 +1401,7 @@ pub fn compile(
     for ((name, _, _), t) in parts.iter().zip(&texprs) {
         let neg = TExpr::junction(atexprs.iter().cloned().chain([TExpr::Neg(t.clone().into())]), true).push_neg(false).simplify();
         let lp_list = |xs: &[TExpr]| format!("&[{}]", xs.iter().map(lp_src).collect::<Vec<_>>().join(", "));
-        match automaton(&neg.clone().tableau_bools().to_ltl(), MAX_AUTOMATON) {
+        match automaton(&neg.to_ltl(), MAX_AUTOMATON) {
             Ok((nodes, nacc)) => props.push(format!("LProp {{ name: {name:?}, nodes: &[{}], nacc: {nacc}, ae_state: &[], ae_action: &[], ea: &[] }}", lnodes(&nodes))),
             Err(m) => {
                 // Too large for one automaton: as TLC does, each disjunct of the normal form on

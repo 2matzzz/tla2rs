@@ -379,6 +379,11 @@ bounds the size of a model with temporal properties (one property per thread, so
   `-continue`, then fails on a `NullPointerException`). tla2rs shows the behavior the search found, with TLC's
   verdict, counts and exit code otherwise. To find its states it runs the search again in another process up to
   where it computed them (see CLAUDE.md, "TLCGet and TLCSet")
+- TLC evaluates a part of constant level of a temporal property to TRUE or FALSE, and its tableau does not look at
+  such constants: a constant under `[]` or `<>` holds in every state of the property's negation. So it reports
+  properties that every behavior satisfies, such as `<>TRUE`, `<>(N = 2)` with N = 2, `P ~> TRUE` and `~[]FALSE`,
+  as violated (exit 13, with a counterexample). tla2rs takes each constant at its value and finds no error there.
+  TLC checks `<>[]` and `[]<>` of a constant without its tableau, and gets those right
 
 ## Cross-checking against TLC
 
