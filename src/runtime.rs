@@ -5795,16 +5795,27 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
         println!("Error: The following behavior constitutes a counter-example:");
     };
     let hold = || println!("Temporal properties hold ({} properties, {} fairness conditions, {} edges).", NPROPS, FAIRS.len(), edges);
-    // Under a VIEW or a SYMMETRY the graph TLC searches is not the folded graph (see `fold_puts`),
-    // so TLC's search on TLC's graph decides
+    // Under a VIEW or a SYMMETRY the graph TLC searches is not the folded graph (see `fold_puts`):
+    // a lasso TLC finds on it is shown, and when it finds none, the same graph with every step
+    // kept decides (see `TFound`)
     let mut why_own = None;
     if folded() {
-        match tlc_lasso(g, &st, &inits, &[], &at) {
-            Ok(None) => {
+        let found = match tlc_lasso(g, &st, &inits, &[], &at, false) {
+            Ok(TFound::None(true)) => tlc_lasso(g, &st, &inits, &[], &at, true),
+            r => r,
+        };
+        match found {
+            Ok(TFound::None(_)) => {
                 hold();
                 return true;
             }
-            Ok(Some((tfp, prefix, postfix))) => {
+            Ok(TFound::Every((prefix, cycle))) => {
+                header();
+                eprintln!("tla2rs: the liveness verdict under VIEW or SYMMETRY is tla2rs's own, not TLC's (a step TLC's liveness graph leaves out)");
+                print_lasso(g, &prefix, &cycle);
+                return false;
+            }
+            Ok(TFound::Tlc(tfp, prefix, postfix)) => {
                 header();
                 if let Err(why) = tlc_print_lasso(g, &tfp, &prefix, &postfix) {
                     eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})");
@@ -5826,12 +5837,12 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
         return true;
     };
     header();
-    match why_own.map_or_else(|| tlc_lasso(g, &st, &inits, selfs.as_slice(), &at), Err) {
-        Ok(Some((tfp, prefix, postfix))) => match tlc_print_lasso(g, &tfp, &prefix, &postfix) {
+    match why_own.map_or_else(|| tlc_lasso(g, &st, &inits, selfs.as_slice(), &at, false), Err) {
+        Ok(TFound::Tlc(tfp, prefix, postfix)) => match tlc_print_lasso(g, &tfp, &prefix, &postfix) {
             Ok(()) => return false,
             Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
         },
-        Ok(None) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
+        Ok(_) => eprintln!("tla2rs: TLC's search found no counterexample on this graph; showing tla2rs's own"),
         Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
     }
     print_lasso(g, &prefix, &cycle);
@@ -6313,11 +6324,13 @@ impl TStack {
 /// its nodes (a state, and a particle of the tableau if there is one), each node's transitions in
 /// TLC's order (target, check_action bits), whether TLC wrote the node (a node it never wrote is
 /// left out of the search), the initial nodes, the promises each node fulfils, and the state atoms
-/// and enabled fairness conditions of the state TLC evaluated its check_state on
+/// and enabled fairness conditions of the state TLC evaluated its check_state on; and the action
+/// of each transition, for a lasso of tla2rs's own
 #[derive(Default)]
 struct TGraph {
     state: Vec<u32>,
     succ: Vec<Vec<(u32, TBits)>>,
+    lab: Vec<Vec<u32>>,
     written: Vec<bool>,
     inits: Vec<u32>,
     fulfils: Vec<u64>,
@@ -6326,8 +6339,8 @@ struct TGraph {
 
 /// A successor in TLC's liveness graph: the state the graph keeps for its fingerprint, the action
 /// atoms and fairness steps of the step to it, the state atoms of the successor itself (under a VIEW
-/// or a SYMMETRY, not always those of the state the graph keeps), and its place among the
-/// successors as generated (`u32::MAX`: the stuttering step)
+/// or a SYMMETRY, not always those of the state the graph keeps), its place among the
+/// successors as generated (`u32::MAX`: the stuttering step), and its action
 #[derive(Clone, Copy)]
 struct TPut {
     t: u32,
@@ -6335,6 +6348,7 @@ struct TPut {
     fb: FMask,
     tb: u64,
     k: u32,
+    l: u32,
 }
 
 /// Whether the graph folds states by a VIEW or a SYMMETRY
@@ -6354,7 +6368,7 @@ fn fold_gen(s: &State, st: &Steps, at: &dyn Fn(&State) -> Option<u32>) -> Result
         return Err("an error while generating successors again");
     }
     let mut out = vec![];
-    for (k, &(t, _)) in buf.iter().enumerate() {
+    for (k, &(t, l)) in buf.iter().enumerate() {
         if !in_model(s, &t) {
             continue;
         }
@@ -6362,7 +6376,7 @@ fn fold_gen(s: &State, st: &Steps, at: &dyn Fn(&State) -> Option<u32>) -> Result
         let (ab, fb) = step_bits(s, &t).map_err(|_| "an error in evaluating a temporal property on a step")?;
         let tb = state_bits(&t, SATOMS_TABLEAU).map_err(|_| "an error in evaluating a temporal property on a state")?;
         let kept = if (i as usize) < st.n() { st.sbits(i as usize) } else { 0 };
-        out.push((TPut { t: i, ab, fb, tb: tb | (kept & !SATOMS_TABLEAU), k: k as u32 }, t));
+        out.push((TPut { t: i, ab, fb, tb: tb | (kept & !SATOMS_TABLEAU), k: k as u32, l }, t));
     }
     Ok(out)
 }
@@ -6391,7 +6405,7 @@ fn fold_puts(g: &Graph, st: &Steps, s: usize, at: &dyn Fn(&State) -> Option<u32>
     let me = g.state(s);
     let gens = fold_gen(&me, st, at)?;
     let mut puts: Vec<TPut> = gens.iter().map(|x| x.0).collect();
-    puts.push(TPut { t: s as u32, ab: st.stut(s), fb: 0, tb: st.sbits(s), k: u32::MAX });
+    puts.push(TPut { t: s as u32, ab: st.stut(s), fb: 0, tb: st.sbits(s), k: u32::MAX, l: STUTTER });
     let state = |i: usize| if i < gens.len() { gens[i].1 } else { me };
     let mut by_target: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
     let mut same = Vec::with_capacity(puts.len());
@@ -6413,16 +6427,10 @@ fn fold_puts(g: &Graph, st: &Steps, s: usize, at: &dyn Fn(&State) -> Option<u32>
 /// part; then for the first component that has every []<> part and fulfils every promise of the
 /// tableau, the path to it (getPath: breadth first from the initial nodes), and the cycle
 /// (LiveWorker.dfsPostFix: greedily to the steps and nodes that fulfil the []<> parts and the
-/// promises, then bfsPostFix: back to the start). Under a VIEW or a SYMMETRY this decides the
-/// verdict too, `at` giving the number of the state the graph keeps for an actual state.
-#[allow(clippy::type_complexity)]
-fn tlc_lasso(
-    g: &Graph,
-    st: &Steps,
-    inits: &[u32],
-    selfs: &[(u32, u32)],
-    at: &dyn Fn(&State) -> Option<u32>,
-) -> Result<Option<(Vec<u64>, Vec<u32>, Vec<u32>)>, &'static str> {
+/// promises, then bfsPostFix: back to the start). Under a VIEW or a SYMMETRY, `at` gives the
+/// number of the state the graph keeps for an actual state, and with `every` the graph keeps every
+/// step TLC's leaves out (see `TFound`).
+fn tlc_lasso(g: &Graph, st: &Steps, inits: &[u32], selfs: &[(u32, u32)], at: &dyn Fn(&State) -> Option<u32>, every: bool) -> Result<TFound, &'static str> {
     let tl = match &TLC_LIVE {
         Ok(t) => t,
         Err(m) => return Err(m),
@@ -6460,7 +6468,7 @@ fn tlc_lasso(
             fold_puts(g, st, s, at)?
         } else {
             let mut puts: Vec<TPut> = vec![];
-            let stut = TPut { t: s as u32, ab: st.stut(s), fb: 0, tb: st.sbits(s), k: u32::MAX };
+            let stut = TPut { t: s as u32, ab: st.stut(s), fb: 0, tb: st.sbits(s), k: u32::MAX, l: STUTTER };
             let mut k = 0u32;
             let mut sa = self_at[s].iter().peekable();
             for e in st.edges(s) {
@@ -6468,8 +6476,8 @@ fn tlc_lasso(
                     puts.push(stut);
                     sa.next();
                 }
-                let (t, _, ab, fb) = st.edge(e);
-                puts.push(TPut { t, ab, fb, tb: st.sbits(t as usize), k: u32::MAX });
+                let (t, l, ab, fb) = st.edge(e);
+                puts.push(TPut { t, ab, fb, tb: st.sbits(t as usize), k: u32::MAX, l });
                 k += 1;
             }
             for _ in sa {
@@ -6519,6 +6527,7 @@ fn tlc_lasso(
             gen.push(puts[..puts.len() - 1].to_vec());
         }
     }
+    let dropped = std::cell::Cell::new(false);
     for oos in tl.oos {
         let cstate = |(sb, fen): (u64, FMask)| -> TBits {
             oos.check_state.iter().enumerate().fold(0, |b, (j, p)| b | (p.eval(sb, fen, 0, 0) as TBits) << j)
@@ -6531,36 +6540,63 @@ fn tlc_lasso(
             // A transition to a state already expanded is added once (DiskGraph.getPtr and
             // GraphNode.transExists: the first in the set's order), to any other state once per
             // entry of the set, which differ only under a VIEW or a SYMMETRY
-            None => TGraph {
-                state: (0..n as u32).collect(),
-                succ: (0..n)
-                    .map(|s| {
-                        let mut v: Vec<(u32, TBits)> = Vec::with_capacity(order[s].len());
-                        let mut expanded: std::collections::HashSet<u32> = std::collections::HashSet::new();
-                        for p in &order[s] {
-                            if fold && (p.t as usize) < s && !expanded.insert(p.t) {
-                                continue;
+            None => {
+                let mut pg = TGraph {
+                    state: (0..n as u32).collect(),
+                    written: vec![true; n],
+                    inits: inits.to_vec(),
+                    sclass: (0..n).map(here).collect(),
+                    ..Default::default()
+                };
+                for s in 0..n {
+                    let mut v: Vec<(u32, TBits)> = Vec::with_capacity(order[s].len());
+                    let mut l: Vec<u32> = Vec::with_capacity(order[s].len());
+                    let mut expanded: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    for p in &order[s] {
+                        let b = cact(here(s), p.ab, p.fb);
+                        if fold && (p.t as usize) < s && !expanded.insert(p.t) && !every {
+                            if !v.contains(&(p.t, b)) {
+                                dropped.set(true);
                             }
-                            v.push((p.t, cact(here(s), p.ab, p.fb)));
+                            continue;
                         }
-                        v
-                    })
-                    .collect(),
-                written: vec![true; n],
-                inits: inits.to_vec(),
-                fulfils: vec![],
-                sclass: (0..n).map(here).collect(),
-            },
-            Some(tab) => tableau_graph(g, n, tab, oos.init_cnt, inits, st, &order, &gen, &cact, at)?,
+                        v.push((p.t, b));
+                        l.push(p.l);
+                    }
+                    pg.succ.push(v);
+                    pg.lab.push(l);
+                }
+                pg
+            }
+            Some(tab) => tableau_graph(g, n, tab, oos.init_cnt, inits, st, &order, &gen, &cact, at, every, &dropped)?,
         };
         let cs: Vec<TBits> = pg.sclass.iter().map(|&c| cstate(c)).collect();
         for pem in oos.pems {
-            if let Some((prefix, postfix)) = tlc_search(&pg, &cs, pem, oos.promises)? {
-                return Ok(Some((tfp, prefix, postfix)));
+            if every {
+                if let Some((start, _, inc)) = tlc_component(&pg, &cs, pem, oos.promises) {
+                    return Ok(TFound::Every(every_lasso(&pg, &cs, pem, oos.promises, start, &inc)?));
+                }
+            } else if let Some((prefix, postfix)) = tlc_search(&pg, &cs, pem, oos.promises)? {
+                return Ok(TFound::Tlc(tfp, prefix, postfix));
             }
         }
     }
-    Ok(None)
+    Ok(TFound::None(dropped.get()))
+}
+
+/// What a search of TLC's liveness graph found. Under a VIEW or a SYMMETRY TLC's graph keeps only
+/// the first of the steps from a state into one it has expanded already (into the same node of the
+/// tableau), and two such steps differ in their action atoms and fairness steps, which are those of
+/// the actual successor. The graph with every step kept has every lasso TLC's has, and also those
+/// through the steps TLC leaves out.
+enum TFound {
+    /// No counterexample, and whether TLC's graph left out a step that differs from those it kept
+    None(bool),
+    /// TLC's lasso: TLC's fingerprints of the graph's states, then the path and the cycle as
+    /// `tlc_search` gives them
+    Tlc(Vec<u64>, Vec<u32>, Vec<u32>),
+    /// A lasso of the graph with every step kept
+    Every(Lasso),
 }
 
 /// TLC's liveness graph with a tableau (LiveCheck.TableauLiveChecker): a node per state and
@@ -6584,6 +6620,8 @@ fn tableau_graph(
     gen: &[Vec<TPut>],
     cact: &dyn Fn((u64, FMask), u64, FMask) -> TBits,
     at: &dyn Fn(&State) -> Option<u32>,
+    every: bool,
+    dropped: &std::cell::Cell<bool>,
 ) -> Result<TGraph, &'static str> {
     let fold = folded();
     let cons = |ti: usize, b: u64| tab[ti].preds.iter().all(|&(a, p)| (b >> a & 1 == 1) == p);
@@ -6599,6 +6637,7 @@ fn tableau_graph(
         pg.state.push(s);
         tidx.push(ti);
         pg.succ.push(vec![]);
+        pg.lab.push(vec![]);
         pg.written.push(false);
         pg.fulfils.push(tab[ti as usize].fulfils);
         pg.sclass.push(here(s as usize));
@@ -6617,12 +6656,14 @@ fn tableau_graph(
         }
     }
     let mut done = vec![false; n];
-    // A transition from `node` (of state s) to state t with particle ti1 unless it has one: the
-    // node of t if new, and whether it is new
-    let link = |pg: &mut TGraph, tidx: &mut Vec<u32>, rows: &mut Vec<Vec<(u32, u32)>>, node: u32, t: u32, ti1: u32, bits: TBits| -> Option<(u32, bool)> {
+    // A transition from `node` (of state s) to state t with particle ti1 unless it has one (with
+    // `every`, one with the same bits): the node of t if new, and whether it is new
+    let link = |pg: &mut TGraph, tidx: &mut Vec<u32>, rows: &mut Vec<Vec<(u32, u32)>>, node: u32, t: u32, ti1: u32, bits: TBits, l: u32| -> Option<(u32, bool)> {
         let ex = rows.get(t as usize).and_then(|r| r.iter().find(|x| x.0 == ti1)).map(|x| x.1);
         if let Some(e) = ex {
-            if pg.succ[node as usize].iter().any(|x| x.0 == e) {
+            let same = pg.succ[node as usize].contains(&(e, bits));
+            if same || !every && pg.succ[node as usize].iter().any(|x| x.0 == e) {
+                dropped.set(dropped.get() || !same);
                 return None;
             }
         }
@@ -6631,6 +6672,7 @@ fn tableau_graph(
             None => new_node(pg, tidx, rows, t, ti1),
         };
         pg.succ[node as usize].push((id, bits));
+        pg.lab[node as usize].push(l);
         Some((id, ex.is_none()))
     };
     // A node new to a state already taken, being given its transitions: the node, the steps from
@@ -6653,12 +6695,12 @@ fn tableau_graph(
                 let h = fold_sclass(&a)?;
                 let (ab, _) = step_bits(&a, &a).map_err(|_| "an error in evaluating a temporal property on a step")?;
                 let tb = state_bits(&a, SATOMS_TABLEAU).map_err(|_| "an error in evaluating a temporal property on a state")?;
-                let mut steps = vec![(TPut { t: s1 as u32, ab, fb: 0, tb: tb | (st.sbits(s1) & !SATOMS_TABLEAU), k: u32::MAX }, Some(a))];
+                let mut steps = vec![(TPut { t: s1 as u32, ab, fb: 0, tb: tb | (st.sbits(s1) & !SATOMS_TABLEAU), k: u32::MAX, l: STUTTER }, Some(a))];
                 steps.extend(fold_gen(&a, st, at)?.into_iter().map(|(p, t)| (p, Some(t))));
                 (steps, h)
             }
             _ => {
-                let mut steps = vec![(TPut { t: s1 as u32, ab: st.stut(s1), fb: 0, tb: st.sbits(s1), k: u32::MAX }, None)];
+                let mut steps = vec![(TPut { t: s1 as u32, ab: st.stut(s1), fb: 0, tb: st.sbits(s1), k: u32::MAX, l: STUTTER }, None)];
                 steps.extend(gen[s1].iter().map(|&p| (p, None)));
                 (steps, here(s1))
             }
@@ -6676,7 +6718,7 @@ fn tableau_graph(
                     if !cons(ti1 as usize, p.tb) {
                         continue;
                     }
-                    let Some((id, new)) = link(&mut pg, &mut tidx, &mut rows, node0, p.t, ti1, cact(here(s), p.ab, p.fb)) else { continue };
+                    let Some((id, new)) = link(&mut pg, &mut tidx, &mut rows, node0, p.t, ti1, cact(here(s), p.ab, p.fb), p.l) else { continue };
                     if !(new && tdone) {
                         continue;
                     }
@@ -6711,7 +6753,7 @@ fn tableau_graph(
                             continue;
                         }
                         let bits = cact(f.here, p2.ab, p2.fb);
-                        if let Some((id2, true)) = link(&mut pg, &mut tidx, &mut rows, node, p2.t, ti2, bits) {
+                        if let Some((id2, true)) = link(&mut pg, &mut tidx, &mut rows, node, p2.t, ti2, bits, p2.l) {
                             if done.get(p2.t as usize) == Some(&true) {
                                 let l = late(&mut pg, id2, a2)?;
                                 stack.push(l);
@@ -6726,12 +6768,11 @@ fn tableau_graph(
     Ok(pg)
 }
 
-/// TLC's search on its liveness graph for one possible error model (LiveWorker.checkSccs,
-/// checkComponent, getPath, dfsPostFix and bfsPostFix): the nodes from an initial node to the
-/// start of the component found, and the nodes of the cycle as TLC lists them (printed from the
-/// last), as states. None if no component is a counterexample.
+/// TLC's depth-first search for components (LiveWorker.checkSccs and checkComponent) for one
+/// possible error model: the first component that is a counterexample, as its start, its nodes,
+/// and which nodes it has
 #[allow(clippy::type_complexity)]
-fn tlc_search(pg: &TGraph, cs: &[TBits], pem: &TPem, promises: usize) -> Result<Option<(Vec<u32>, Vec<u32>)>, &'static str> {
+fn tlc_component(pg: &TGraph, cs: &[TBits], pem: &TPem, promises: usize) -> Option<(usize, Vec<u32>, Vec<bool>)> {
     let gs = &pg.succ;
     let n = pg.state.len();
     const MAX_PTR: i64 = 0x4000_0000_0000_0000;
@@ -6819,7 +6860,19 @@ fn tlc_search(pg: &TGraph, cs: &[TBits], pem: &TPem, promises: usize) -> Result<
             }
         }
     }
-    let Some((start, comp, inc)) = found else { return Ok(None) };
+    found
+}
+
+/// TLC's search on its liveness graph for one possible error model (LiveWorker.checkSccs,
+/// checkComponent, getPath, dfsPostFix and bfsPostFix): the nodes from an initial node to the
+/// start of the component found, and the nodes of the cycle as TLC lists them (printed from the
+/// last), as states. None if no component is a counterexample.
+#[allow(clippy::type_complexity)]
+fn tlc_search(pg: &TGraph, cs: &[TBits], pem: &TPem, promises: usize) -> Result<Option<(Vec<u32>, Vec<u32>)>, &'static str> {
+    let Some((start, comp, inc)) = tlc_component(pg, cs, pem, promises) else { return Ok(None) };
+    let gs = &pg.succ;
+    let n = pg.state.len();
+    let ea = |b: TBits| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
     // The path from an initial node (getPath)
     let mut prefix: Vec<u32> = vec![];
     if pg.inits.contains(&(start as u32)) {
@@ -6993,6 +7046,87 @@ fn tlc_search(pg: &TGraph, cs: &[TBits], pem: &TPem, promises: usize) -> Result<
     Ok(Some((prefix, postfix)))
 }
 
+/// A lasso through the component that `tlc_component` found from node `start` for error model
+/// `pem`: the path to it from an initial node, breadth first, then a cycle from `start` that goes
+/// through a node of each []<>S part and of each promise, takes a step of each []<>A part, and
+/// returns, by steps within the component that keep the <>[]A parts
+fn every_lasso(pg: &TGraph, cs: &[TBits], pem: &TPem, promises: usize, start: usize, inc: &[bool]) -> Result<Lasso, &'static str> {
+    let ea = |b: TBits| pem.ea_action.iter().all(|&j| b >> j & 1 == 1);
+    // Breadth first from the nodes `from` by the steps `ok` allows, to a node `goal` holds of or
+    // by a step `edge` holds of: the node it starts from and the steps as (node, action, bits)
+    #[allow(clippy::type_complexity)]
+    let bfs = |from: &[usize], ok: &dyn Fn(usize, TBits) -> bool, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(TBits) -> bool| -> Option<(usize, Vec<(usize, u32, TBits)>)> {
+        let mut prev: std::collections::HashMap<usize, (usize, u32, TBits)> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<usize> = from.iter().copied().collect();
+        let mut q: std::collections::VecDeque<usize> = from.iter().copied().collect();
+        while let Some(u) = q.pop_front() {
+            for (&(t, b), &l) in pg.succ[u].iter().zip(&pg.lab[u]) {
+                let t = t as usize;
+                if !ok(t, b) {
+                    continue;
+                }
+                if goal(t) || edge(b) {
+                    let mut out = vec![(t, l, b)];
+                    let mut x = u;
+                    while let Some(&(p, l2, b2)) = prev.get(&x) {
+                        out.push((x, l2, b2));
+                        x = p;
+                    }
+                    out.reverse();
+                    return Some((x, out));
+                }
+                if seen.insert(t) {
+                    prev.insert(t, (u, l, b));
+                    q.push_back(t);
+                }
+            }
+        }
+        None
+    };
+    let never = |_: usize| false;
+    let no_step = |_: TBits| false;
+    let inits: Vec<usize> = pg.inits.iter().map(|&s| s as usize).filter(|&s| pg.written[s]).collect();
+    let (first, path) = if inits.contains(&start) {
+        (start, vec![])
+    } else {
+        bfs(&inits, &|t, _| pg.written[t], &|t| t == start, &no_step).ok_or("no path to the component")?
+    };
+    let mut prefix: Vec<(u32, u32)> = vec![(pg.state[first], u32::MAX)];
+    prefix.extend(path.iter().map(|&(y, l, _)| (pg.state[y], l)));
+    let within = |t: usize, b: TBits| inc[t] && ea(b);
+    let mut cyc: Vec<(usize, u32, TBits)> = vec![];
+    let mut cur = start;
+    let mut go = |cyc: &mut Vec<(usize, u32, TBits)>, goal: &dyn Fn(usize) -> bool, edge: &dyn Fn(TBits) -> bool| -> Result<(), &'static str> {
+        let (_, steps) = bfs(&[cur], &within, goal, edge).ok_or("no cycle in the component")?;
+        cur = steps[steps.len() - 1].0;
+        cyc.extend(steps);
+        Ok(())
+    };
+    let met = |cyc: &[(usize, u32, TBits)], f: &dyn Fn(usize) -> bool| f(start) || cyc.iter().any(|x| f(x.0));
+    for &j in pem.ae_state {
+        let here = |y: usize| cs[y] >> j & 1 == 1;
+        if !met(&cyc, &here) {
+            go(&mut cyc, &here, &no_step)?;
+        }
+    }
+    for p in 0..promises {
+        let here = |y: usize| pg.fulfils[y] >> p & 1 == 1;
+        if !met(&cyc, &here) {
+            go(&mut cyc, &here, &no_step)?;
+        }
+    }
+    for &j in pem.ae_action {
+        let step = |b: TBits| b >> j & 1 == 1;
+        if !cyc.iter().any(|x| step(x.2)) {
+            go(&mut cyc, &never, &step)?;
+        }
+    }
+    if !cyc.last().is_some_and(|x| x.0 == start) {
+        go(&mut cyc, &|y| y == start, &no_step)?;
+    }
+    Ok((prefix, cyc.iter().map(|&(y, l, _)| (pg.state[y], l)).collect()))
+}
+
 /// Prints TLC's lasso: the prefix, then the cycle (from the last of `postfix`), each state rebuilt
 /// from its predecessor by the first action that yields it (Tool.getState), a state equal to the
 /// one before it left out
@@ -7137,13 +7271,14 @@ fn print_lasso(g: &Graph, prefix: &[(u32, u32)], cycle: &[(u32, u32)]) {
 /// cycle starts at the node numbered `entry` (from 1) and returns to it by a step of action `back`
 /// (none: it ends stuttering), replayed on actual states: from the first state, an initial one,
 /// each step takes the successor whose fingerprint is the next node's, by the same action if one
-/// is. Without a VIEW, the state the cycle returns to has the fingerprint of the entry but may be
-/// another member of its symmetry class, so the cycle is followed again from there until it
-/// returns to a state it went through at the entry (at most once per permutation). With a VIEW the
-/// actual states need not repeat at all (a view can leave out a counter that only grows), so the
-/// lasso returns to its entry under the VIEW: the result names the successor it returns by, which
-/// the lasso check folds into the entry as TLC does. If a step has no such successor (TLC cannot
-/// rebuild such a behavior either), the states the graph keeps are shown instead.
+/// is. The state the cycle returns to has the fingerprint of the entry but may be another member
+/// of its symmetry class, or another state of its view, so the cycle is followed again from there
+/// until it returns to a state it went through at the entry (at most once per permutation, and
+/// `VIEW_ROUNDS` times under a VIEW). With a VIEW the actual states need not repeat at all (a view
+/// can leave out a counter that only grows), so failing that the lasso returns to its entry under
+/// the VIEW after the first round: the result names the successor it returns by, which the lasso
+/// check folds into the entry as TLC does. If a step has no such successor (TLC cannot rebuild
+/// such a behavior either), the states the graph keeps are shown instead.
 /// Returns the states, and the number of the state returned to, the action, and that successor.
 #[allow(clippy::type_complexity)]
 fn lasso_states(g: &Graph, path: &[(u32, u32)], entry: usize, back: Option<u32>) -> (Vec<(State, u32)>, Option<(usize, u32, Option<State>)>) {
@@ -7172,26 +7307,32 @@ fn lasso_states(g: &Graph, path: &[(u32, u32)], entry: usize, back: Option<u32>)
     }
     let Some(lb) = back else { return (out, None) };
     let entry_fp = fp_of(path[entry - 1].0);
-    // The states at the entry on each round, by their number
+    // The states at the entry on each round, by their number; under a VIEW, the lasso that
+    // returns after the first round under the VIEW
     let mut entries = vec![entry];
-    for _ in 0..=PERMS.len() {
-        let Some((y, _)) = step(&out[out.len() - 1].0, entry_fp, lb) else { return kept() };
+    let mut first = None;
+    let rounds = if HAS_VIEW { PERMS.len().max(VIEW_ROUNDS) } else { PERMS.len() };
+    for _ in 0..=rounds {
+        let Some((y, _)) = step(&out[out.len() - 1].0, entry_fp, lb) else { return first.unwrap_or_else(&kept) };
         let wy = pack(&y);
         if let Some(&k) = entries.iter().find(|&&k| pack(&out[k - 1].0) == wy) {
             return (out, Some((k, lb, None)));
         }
-        if HAS_VIEW {
-            return (out, Some((entry, lb, Some(y))));
+        if HAS_VIEW && first.is_none() {
+            first = Some((out.clone(), Some((entry, lb, Some(y)))));
         }
         out.push((y, lb));
         entries.push(out.len());
         for &(s, l) in &path[entry..] {
-            let Some(t) = step(&out[out.len() - 1].0, fp_of(s), l) else { return kept() };
+            let Some(t) = step(&out[out.len() - 1].0, fp_of(s), l) else { return first.unwrap_or_else(&kept) };
             out.push(t);
         }
     }
-    kept()
+    first.unwrap_or_else(&kept)
 }
+
+/// How many times `lasso_states` follows a cycle under a VIEW for it to repeat an actual state
+const VIEW_ROUNDS: usize = 8;
 
 /// With `-lassocheck DIR`, writes DIR/Tla2rsLasso.tla and .cfg: a spec whose only behavior is the
 /// lasso `states` (as printed), returning to state `back` (1-based) or ending stuttering, for TLC

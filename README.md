@@ -361,12 +361,11 @@ bounds the size of a model with temporal properties (one property per thread, so
   own, which TLC checks (`-lassocheck`); the checker says why on stderr. Such a lasso is replayed on actual states,
   as TLC rebuilds a behavior; when a value the view leaves out only grows, the lasso returns to its first state of
   the cycle under the view only, and the check folds states by the same view
-- Under `VIEW` or `SYMMETRY`, whether a temporal property holds is decided as TLC decides it: on TLC's liveness
-  graph, not on the graph folded by the view or the permutations. TLC keeps each successor as generated (a step that
-  changes only what the view leaves out is a step of its action, not stuttering), checks its tableau on the
-  successor itself, and keeps only the first step into a state it has already expanded, so its verdict can differ
-  from what the spec's behaviors give (`tests/tlc/LiveFold-Twice` has a fair behavior that violates the property,
-  and TLC reports no error). The checker builds that graph in memory beside the state graph
+- Under `VIEW` or `SYMMETRY`, whether a temporal property holds is decided on TLC's liveness graph, not on the graph
+  folded by the view or the permutations. TLC keeps each successor as generated (a step that changes only what the
+  view leaves out is a step of its action, not stuttering) and checks its tableau on the successor itself. Where TLC
+  finds a violation there, the checker prints TLC's counterexample; for the steps TLC leaves out of that graph, see
+  "Intentional differences". The checker builds that graph in memory beside the state graph
 - With `VIEW` and `SYMMETRY` together, a state is reduced as TLC reduces it: the smallest of its permutations (values
   compared as TLC compares them, variables in the order TLC prints them), and then the view of that state. This
   compares whole permuted states, which costs more than comparing views did
@@ -394,6 +393,13 @@ bounds the size of a model with temporal properties (one property per thread, so
   255, with `-continue` reporting that failure twice with its behavior. tla2rs reports the error that stopped the
   search once, as TLC does without `-continue` (exit 76), and keeps what that pass prints and the states it adds
   to the counts; an error the pass meets only ends it (see CLAUDE.md, "Messages and printed lines")
+- Under `VIEW` or `SYMMETRY`, TLC's liveness graph keeps only the first of the steps from a state into one it has
+  already expanded, although they can be steps of different actions and so differ for fairness. TLC can then miss a
+  fair behavior that violates a property, depending on the order of the actions: `tests/tlc/LiveFold-Twice` and
+  `LiveFold-TwiceGo` differ only in the order of `Back \/ Go`, and TLC reports no error for the first and the
+  violation for the second. tla2rs decides on that graph with every step kept, and reports the violation for both:
+  TLC's counterexample where TLC finds one, otherwise a lasso of its own, which TLC confirms (see CLAUDE.md,
+  "Counterexamples")
 
 ## Cross-checking against TLC
 
