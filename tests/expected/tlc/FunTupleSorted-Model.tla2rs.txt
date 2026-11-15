@@ -1,0 +1,13 @@
+key a1dcd393ddfc3de0818ab816cca7e0865fa01493cb602581e0b1b487adda700b
+intent recount
+differs generated
+verdict Evaluating invariant InModel failed
+generated 3
+distinct 2
+queue 0
+trace 2 25e94fa0cb8316b73c0c7c65f47ded1ed1e344067747c258d5484f65950a6596
+states 2 4dc7d7691fbb6c8350822e38f1ec20e02e34261ba8b6566f12f7c7e7f8723e50
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 eb9eb4a8c0b1cf8ed8bbd0665ef726d45900097aaf174ab805590208494e0f25
+errors 2 809b0a5a2e785b964ca4fd158c203bdd3874bf0f11425d41d08a841bd300c0f0
+exit 76

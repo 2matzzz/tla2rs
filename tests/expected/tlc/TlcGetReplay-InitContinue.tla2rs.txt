@@ -1,8 +1,8 @@
-key 7cdc9c8063826ad4972e48e6aad982c2cd1ba853de07458d8cb54204b616588d
-intent again-init-exit
-differs exit
+key ab35399fda9c1ca4eb502a74111f1690f1b34a3f4f238342965c6cf54217a9d2
+intent again-init-exit recount
+differs generated exit
 verdict Invariant BadInit is violated
-generated 2
+generated 3
 distinct 3
 queue 3
 trace 0

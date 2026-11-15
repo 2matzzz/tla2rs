@@ -1,8 +1,8 @@
-key 74ffb2987c86904e1736e68a154d2d31ecf420b2ecff53e1d92ca0874b4df5fd
-intent error-reentry
-differs messages errors exit
+key 4c8aed5f9df95f826600f8a1e260014d4c78b1065204ef0c19bc0527f73f91e1
+intent error-reentry recount
+differs generated messages errors exit
 verdict Invariant NotTwo is violated
-generated 4
+generated 5
 distinct 4
 queue 0
 trace 7 d767d41a9b686b5784ddc79ab909591794d14f94703c7f3c7b84d2d4e03d2614

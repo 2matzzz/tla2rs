@@ -1,8 +1,8 @@
-key 699fb0dfe2c04a28daa92cc22d3218112cd5303f31ffeb1f953a37235b6716cc
-intent error-reentry
-differs messages errors exit
+key 7f9e0d148b40bf1865b2beb1aa9c8763004b90dfbd59345f51c1774b319ad2e8
+intent error-reentry recount
+differs generated messages errors exit
 verdict Evaluating invariant Bad failed
-generated 6
+generated 8
 distinct 7
 queue 4
 trace 2 34d5cfab6b193a274acc2fa643e0aaddb95ec0772f235c0798647915fc36240d

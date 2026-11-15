@@ -24,7 +24,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
 - `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1222 currently
-  pass: 1196 match TLC and 26 are intentional differences, reported as `intent`; see "Intentional differences"). Run
+  pass: 1062 match TLC and 160 are intentional differences, reported as `intent`; see "Intentional differences"). Run
   it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch either
   search path (extra arguments are passed on to every run; `scripts/all.sh X.cfg ...` checks those only)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -901,7 +901,7 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
 - After a new successor fails to evaluate an invariant, it shows the behavior and then generates
   every successor of the state it was expanding once more (`eval_replay`): the actions print again
   in order, a successor not seen yet is added and queued (so it counts as distinct and left on
-  queue) and its invariants are checked, up to the first that fails. One that fails to evaluate
+  queue, but in TLC not as generated; see `recount` below) and its invariants are checked, up to the first that fails. One that fails to evaluate
   ends the pass there and is not reported (see the intentional difference `error-reentry` below;
   `tests/tlc/PrintAgain-Twice`, `AgainTwice`). After the CONSTRAINT, the ACTION_CONSTRAINT or the
   VIEW fails to evaluate on a successor, it reports the error and then generates the successors once more in the same way, up to the error (`tests/tlc/AgainCon*`, also with liveness
@@ -944,6 +944,20 @@ error it meets only ends it. A run that stops at such an error thus gives the sa
 `PrintAgain.behaviors.sh` and `TlcGetReplay.behaviors.sh` check the behavior where TLC printed more. Not
 changed: an error in the CONSTRAINT, the ACTION_CONSTRAINT, the VIEW or the liveness checks, which TLC reports as
 an unexpected exception with an exit code that does not depend on `-continue` (`report_eval_as`, `AgainCon*`).
+
+Intentional difference `recount`: the passes above (over the successors after an error in an invariant, the
+CONSTRAINT, the ACTION_CONSTRAINT or the VIEW; over the successors of the state whose actions failed; over the
+initial states) generate states, and TLC counts the new ones as distinct and queued but leaves the states of one
+pass out of its generated count: those of the pass after the error, or, over the initial states with TLCGet, those
+of the first pass. So it can report more distinct states than generated (`TlcGetReplay`: 6 generated, 7
+distinct; `TlcGetReplay-InitCount`: 1 and 3), and where it does not, the count is still not that of the run
+(`PrintAgain`: 13 generated, 11 distinct, while the pass generates four successors, x = 12 and x = 22 among
+them, not seen before). The checker counts as generated every state each pass generates, as the search counts a
+successor (`Replay::generated`, what `eval_again_prints` returns, `InitAgain::generated`): 17 on `PrintAgain`. It
+computes the initial states and the successors of a failed expansion again for that also where nothing prints.
+Not counted: the evaluations that rebuild a behavior, which TLC makes for every counterexample. 149
+configurations show it (`tests/tlc/AgainCon*`, `PrintAgain*`, `TlcGetReplay*`, the `TupleFun*` family and
+others); one whose error comes with no such pass, or whose pass generates nothing, matches TLC.
 
 When Init, Next, an invariant, an action property or what TLC evaluates for its liveness graph prints
 (`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of code that can
@@ -1169,7 +1183,8 @@ computed too, and the registers go on changing, so they can compute states the f
 and adds, queues and checks a new successor as the search does, the counts it reads following. Computing the
 initial states again (`init_again_eager`) adds and queues a new one and reports an invariant it violates (with
 `-continue` it goes on, also reporting again a state the first pass reported); TLC then gives the states this pass
-generated and the distinct states of both passes. When the pass ends without an error, TLC exits with 0; the
+generated and the distinct states of both passes (the checker counts what both passes generated, see `recount` in
+"Messages and printed lines"). When the pass ends without an error, TLC exits with 0; the
 checker exits with the code of the error that stopped the search (intentional difference `again-init-exit`,
 `tests/tlc/TlcGetReplay-Init`, `-InitContinue`).
 
@@ -1277,6 +1292,9 @@ generated, a violation with exit 0). Each such difference has an entry in README
 still equal TLC's. A configuration that shows it is tested like any other, with one more line in its cfg:
 
     \* crosscheck: intent NAME [behaviors=FILE]
+
+A configuration that shows several differences has one such line for each (`behaviors=` on any of them), and may
+differ from TLC in the fields any of them lists; the pin's `intent` line names them all.
 
 - TLC's output stays the reference: `expected.sh` writes `tests/expected/<dir>/X.txt` as for any configuration.
   It also runs tla2rs and writes its result, field by field, to `X.tla2rs.txt` next to it (the pin), under the same

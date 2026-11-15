@@ -1,0 +1,13 @@
+key 49a63227aeca9accf76d1c4189b73c21410f5f73c3a7e4d0f647cc77ebf1aaa9
+intent recount
+differs generated
+verdict Evaluating invariant ConcatErr failed
+generated 4
+distinct 3
+queue 0
+trace 3 88a7566166f093cbcefe038d4b50bb208c60d1042f329a082a803670c4d1a6d7
+states 3 8e9a1cee22af14e1bef2a13613e87ee3ce57dc2d4880441fac320cfb977d23d5
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 4 4fa2476edfbe4d1fe9398d7cc481e598ae2e6733b71b65e1fa19493b1790cf4c
+errors 2 c6a1e7d2ac7f4b166369b05fcd601a5a1876256da5cb74ec1a1f966b735eee82
+exit 76

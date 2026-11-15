@@ -394,6 +394,11 @@ bounds the size of a model with temporal properties (one property per thread, so
   255, with `-continue` reporting that failure twice with its behavior. tla2rs reports the error that stopped the
   search once, as TLC does without `-continue` (exit 76), and keeps what that pass prints and the states it adds
   to the counts; an error the pass meets only ends it (see CLAUDE.md, "Messages and printed lines")
+- After an evaluation error, TLC evaluates the initial states, or the successors of the state it was expanding,
+  once more to show where the error is. It counts the new states that pass meets as distinct and queued, but
+  leaves the states of one of the two passes out of its generated count, so it can report more distinct states
+  than generated (6 generated and 7 distinct on `tests/tlc/TlcGetReplay`). tla2rs counts as generated every state
+  both passes generate, so the count is that of the run and never below the distinct count
 
 ## Cross-checking against TLC
 

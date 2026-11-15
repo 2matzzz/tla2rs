@@ -15,6 +15,13 @@
 # For a cfg with an intent line, it also runs tla2rs and writes its pinned result, X.tla2rs.txt, when
 # missing or stale (see "Intentional differences" in CLAUDE.md); -check does not.
 set -uo pipefail
+# cfg paths are taken from where the script is run, not from the repository root it works in
+cfgs=()
+for x in "$@"; do
+  [[ "$x" == *.cfg && "$x" != /* ]] && x="$PWD/$x"
+  cfgs+=("$x")
+done
+set -- ${cfgs[@]+"${cfgs[@]}"}
 cd "$(dirname "$0")/.."
 # tla2rs --graph reduces TLC's state graph to the hashes kept in the files
 cargo build --release --quiet || exit 1
@@ -35,8 +42,10 @@ if [[ $corpus == 1 ]]; then
   scripts/corpus.sh ${large[@]+"${large[@]}"} -list |
     xargs -P "${JOBS:-$jobs}" -L1 bash -c 'scripts/crosscheck.sh "$MODE" "$CORPUS_DIR/$0" "$CORPUS_DIR/$1"' | tee "$log"
 else
+  for x in "$@"; do [[ -f "$x" ]] || echo "ERROR $x: no such cfg"; done | tee "$log"
   if [[ $# -gt 0 ]]; then printf '%s\n' "$@"; else printf '%s\n' examples/*.cfg tests/tlc/*.cfg; fi |
-    xargs -P "${JOBS:-4}" -I{} scripts/crosscheck.sh "$mode" {} | tee "$log"
+    while read -r x; do [[ -f "$x" ]] && echo "$x"; done |
+    xargs -P "${JOBS:-4}" -I{} scripts/crosscheck.sh "$mode" {} | tee -a "$log"
 fi
 summary=$(awk '{n[$1]++} END{for (k in n) printf "%s%s %d", (s++ ? ", " : ""), k, n[k]}' "$log")
 echo "total: $summary"
