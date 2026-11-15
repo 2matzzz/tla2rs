@@ -24,7 +24,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
 - `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1222 currently
-  pass: 1213 match TLC and 9 are intentional differences, reported as `intent`; see "Intentional differences"). Run
+  pass: 1212 match TLC and 10 are intentional differences, reported as `intent`; see "Intentional differences"). Run
   it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch either
   search path (extra arguments are passed on to every run; `scripts/all.sh X.cfg ...` checks those only)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -722,16 +722,46 @@ give another verdict (measured on TLC 2.19, `tests/tlc/LiveFold`; read from `Set
 - A node new to a state already expanded gets its transitions, and its check_state, from the actual successor that
   made it, not from the state kept for its fingerprint
 
-So under a VIEW or a SYMMETRY the verdict is TLC's search on this graph (`tlc_lasso`, which generates each state's
-successors again for it, `fold_puts`), not the checker's own search on the folded graph. The checker follows TLC's
+TLC's verdict on this graph can contradict the spec (intentional difference `liveness-graph`, see "Intentional
+differences"). What tla2rs takes as correct under a VIEW or a SYMMETRY: a property is violated when a fair lasso of
+TLC's liveness graph with every step kept violates it. Its nodes are the states the search keeps, one per view or
+symmetry class (with a tableau, also TLC's nodes made from an actual successor), and from each node every step the
+actions generate from its state enters the node of the successor's fingerprint, with the atoms of that actual step.
+Every step of a lasso is then a step of the spec, and consecutive steps meet up to the view or the permutation:
+
+- Under a SYMMETRY whose permutations leave the spec and the properties unchanged (what makes symmetry reduction
+  sound), the lassos of this graph are exactly the images of the fair behaviors that violate a property, so the
+  verdict is the spec's
+- A VIEW is an abstraction: the verdict is the spec's when the view keeps all that the actions, the fairness and the
+  properties depend on, and otherwise that of the behaviors as the view shows them. Searching the actual states
+  instead would make it exact but need not end when the view leaves out a value that only grows (`LiveView`),
+  which is what a VIEW is for
+
+TLC's graph is a subgraph of this one with the same atoms, so a violation TLC finds is one of it; but a step TLC
+leaves out can be the only one that makes a violating behavior fair. In `LiveFold-Twice` the state with y = 1 has
+two steps into the view of the initial state, by Back and by Go; TLC keeps Back's, so no cycle takes Go, strong
+fairness of Go fails on every cycle, and TLC finds no error, while the behavior that takes Go each time (x flips on
+each Go) is fair and never settles. In `TwiceGo`, with Go first, TLC finds it. Of the VIEW and SYMMETRY liveness
+configurations (`LiveFold*`, `LiveSym*`, `LiveTabSym`, `LiveView`, `SfWf-View`, `OptNoWarning-*`), only
+`LiveFold-Twice` gets another verdict; in the others TLC's is the spec's.
+
+So under a VIEW or a SYMMETRY the checker first runs TLC's search on TLC's graph (`tlc_lasso`, which generates each
+state's successors again for it, `fold_puts`) and prints TLC's lasso if it finds one. If it finds none and TLC's
+graph left out a step whose atoms differ from those of the step it kept (`TFound::None(true)`), the same search for a
+component (`tlc_component`) runs on the graph with every step kept (`every`), and a lasso through the component it
+finds is printed as tla2rs's own (`every_lasso`; stderr says "the liveness verdict under VIEW or SYMMETRY is
+tla2rs's own, not TLC's (a step TLC's liveness graph leaves out)"). The checker's own search on the folded graph is
+not used for the verdict: it misses the violations TLC finds in `LiveFold-ViewLoop`, `SymLoop`, `ViewSucc` and
+`Late` (measured), whose lassos take a step that changes only what the view or the permutation hides, or need the
+tableau or ENABLED evaluated on the actual successor. The checker follows TLC's
 search when there are at most 128 predicates in an order of solution (held as `u128` bit masks when there are more
 than 64, `ManyFair-Viol`), a tableau of at most 4096 particles and 64 promises, no value that `tlc_fp` cannot
 fingerprint as TLC does, and no `-fp` other than 0 among TLC's options (`crosscheck.sh` passes `-fp 0` unless a cfg's
 `args` choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own,
 not TLC's", with the reason; under a VIEW or a SYMMETRY also "the liveness verdict under VIEW or SYMMETRY is tla2rs's
 own"). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
-after `MATCH` (`lasso confirmed instead: <reason>`). All 69 liveness violations of `examples/` and `tests/tlc/` print
-TLC's lasso (most by following TLC's search, some by coincidence), 19 of them through a tableau (`LiveTab`,
+after `MATCH` (`lasso confirmed instead: <reason>`). All 69 liveness violations TLC reports in `examples/` and
+`tests/tlc/` print TLC's lasso (most by following TLC's search, some by coincidence), 19 of them through a tableau (`LiveTab`,
 `LiveTabSym`, `LiveFold-ViewLoopEv`, `SymLoopEv`, `ViewSucc`, `Late`, `Live-Spec*-Starve`, `Live-SpillNext-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`,
 `LiveConst-Leads`, `LiveAssumed-Leads`).
 
@@ -755,9 +785,10 @@ own, it replays the lasso on actual states, as TLC rebuilds a
 behavior from fingerprints (`lasso_states` in the runtime): from the initial state, each step takes the successor
 whose fingerprint is the next node's, by the same action if one is. Under a SYMMETRY the cycle can come back to
 another member of the entry's class; it is followed again until it repeats an actual state, which takes at most one
-round per permutation (`tests/tlc/LiveSymTurn`: two rounds). Under a VIEW the actual states need not repeat at all:
+round per permutation (`tests/tlc/LiveSymTurn`: two rounds). Under a VIEW it is followed again too, up to 8 rounds
+(`VIEW_ROUNDS`; `LiveFold-Twice`: two rounds, as x flips on each Go), but the actual states need not repeat at all:
 in `tests/tlc/LiveView` and the corpus's `MCDistributedReplicatedLog` a value the view leaves out only grows. The
-lasso then returns to its entry under the VIEW only. Its last step goes to the actual successor (`Tla2rsGoBack`), and
+lasso then returns to its entry under the VIEW only, after the first round. Its last step goes to the actual successor (`Tla2rsGoBack`), and
 the cfg gets the spec's VIEW with the position added (`Tla2rsView == <<tla2rsAt, V>>`, and the spec's SYMMETRY if it
 has one), so TLC folds that successor into the entry as its own search does. A step with no successor of the right
 fingerprint (TLC cannot rebuild such a behavior either, tlaplus/tlaplus#1045) leaves the states the graph keeps,

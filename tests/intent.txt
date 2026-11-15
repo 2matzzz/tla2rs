@@ -4,3 +4,4 @@
 # The fields are verdict, generated, distinct, queue, trace, states, edges, dump, messages, errors,
 # userfile and exit; every other field must still equal TLC's.
 tlcget-rebuild generated,distinct,queue,trace,states,edges,messages,errors,exit # TLC cannot rebuild a behavior when TLCGet registers make Init or the actions yield other states than the search found (its own "probably a TLC bug", or a cut-short behavior and, with -continue, a NullPointerException); tla2rs shows the behavior the search found
+liveness-graph verdict,trace,messages,errors,exit # under a VIEW or a SYMMETRY TLC's liveness graph keeps only the first of the steps from a state into one it has expanded already, so it can miss a fair behavior that violates a property, depending on the order of the actions; tla2rs decides on that graph with every step kept
