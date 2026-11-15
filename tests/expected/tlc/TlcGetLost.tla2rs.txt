@@ -1,0 +1,13 @@
+key 97f98bfc59e95c2ba87cc6e2f1508ebd171f61dedcfac4e842b6a905b2909367
+intent tlcget-rebuild
+differs generated distinct queue trace messages errors exit
+verdict Invariant Lost is violated
+generated 5
+distinct 5
+queue 2
+trace 3 abc0819430bba04b5e6bd0bcce4052f228d2326e0336056ea2e918f5d83fb552
+states 5 2f39fed959c1a45481acdf41d247ddf6cc887e650edf36c08e51b58d7c85831d
+edges 4 e82f507f720e996cf4e89c24602069a2714b04bdebf13622d67bd3886cef1a49
+messages 12 2e6cc12beeadfddedaa0249900984d990a29950b08d8e9b854453f324cf937d2
+errors 2 9391c6b6c336e2dd85f42c443a68b9ce89e5a55cbebb3a678672da874718269d
+exit 12

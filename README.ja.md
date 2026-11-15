@@ -169,6 +169,7 @@ shasum -a 256 ~/.tla/CommunityModules-deps.jar
 ```
 
 TLC 2.19 はこの jar の Java の上書きを読み込めない。2023 年 12 月から 2026 年 11 月までの、試したリリースはどれも TLC 2.19 に無いクラスを使っていて、どんな仕様でも `NoClassDefFoundError: tlc2/value/impl/KSubsetValue` で止まる。そこで `crosscheck.sh` は jar からモジュールだけを `target/community/` に取り出して TLC に渡す。そういう仕様の結果ファイルのキーには jar のハッシュも入る。`tests/expected/` と比べるだけなら jar は要らない。`all.sh` は 4 構成ずつ並行に回す（`JOBS=N` で変えられる）。TLC の結果は構成ごとに `tests/expected/` にコミットしてある。中身は判定・状態数・反例の長さとハッシュ・終了コード・状態グラフとメッセージのハッシュと、jar・cfg・引数・仕様が読むモジュール・`src/graph.rs`・`src/trace.rs`・`src/messages.rs` のハッシュである。時刻・指紋の種・liveness の反例の形は TLC の実行ごとに変わるので記録せず、ファイルはどの実行でも同じになる。`crosscheck.sh` と `all.sh` はこのファイルと比べるだけで、構成そのものに TLC は回さない（回すのはラッソの確認だけ）。ファイルが無いか古いときは失敗にする。TLC を回すのは `scripts/expected.sh [cfg ...]` だけで、無いものと古いものだけを書き、ほかには触らないので、2 回目は何も変えない。`expected.sh -check` は TLC を回し直して食い違うファイルを報告し、書き込みはしない。`-force` はすべて書き直す。ビルドした検査器は、生成コードと rustc の版のハッシュで `target/crosscheck/build` に残す(`CROSSCHECK_NO_CACHE=1` で毎回ビルドし直す)。
+意図して TLC と変えたところ（上の節）を示す構成は、cfg にそのことを書く。TLC の結果は基準として `tests/expected/` に残し、tla2rs の結果はレビューしたファイルとしてその隣に固定する。違いに関わらない部分は TLC と同じでなければならず、TLC と違う反例は仕様の振る舞いであることを確かめる。`all.sh` はその構成を `intent` と表示し、TLC が同じ結果を出すようになれば `agrees` と表示する（CLAUDE.md の「Intentional differences」）。
 
 ```
 $ scripts/all.sh

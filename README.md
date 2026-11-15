@@ -427,6 +427,11 @@ runs TLC: it writes missing and stale files and leaves the others alone, so a se
 `expected.sh -check` reruns TLC and reports any file that differs, without writing; `-force` rewrites them all.
 Built checkers are kept in `target/crosscheck/build` under a hash of the generated code and the rustc version
 (`CROSSCHECK_NO_CACHE=1` builds them from scratch).
+A configuration that shows an intentional difference (see above) says so in its cfg: TLC's result stays in
+`tests/expected/` as the reference, tla2rs's result is pinned in a reviewed file next to it, every part outside the
+difference must still equal TLC's, a counterexample that differs is checked to be a behavior of the spec, and `all.sh`
+reports the configuration as `intent`, or as `agrees` once TLC gives the same result (see CLAUDE.md, "Intentional
+differences").
 
 ```
 $ scripts/all.sh

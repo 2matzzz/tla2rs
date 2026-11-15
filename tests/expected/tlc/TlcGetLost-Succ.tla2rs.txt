@@ -1,0 +1,13 @@
+key c56d11d6b4c8f3a207b111d32b8fcd19af83a93639a64732504e94e8a5919c38
+intent tlcget-rebuild
+differs generated distinct queue trace messages errors exit
+verdict Invariant Succ is violated
+generated 6
+distinct 6
+queue 2
+trace 3 fcd485cf52b46bf8230c8d0f4efa7f327c976c0a70910c134c7e0b5f7f71197e
+states 6 c42d0aa3f9b1e92f76f40af7e88f15555676790c9045170571ecf81932b3b125
+edges 5 6f4215c20ada5aa224c0372ca938d5e238ecb7de02f5ee319d60229a0a77c4f3
+messages 13 88dff89a4b993cfde51e41506f5bea2f443aafd2940582374a8bb119e3640f8e
+errors 2 83c8f306800410f00893f587910044a172640e560e0e9b827bbc5bd0046602e4
+exit 12

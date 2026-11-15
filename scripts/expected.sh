@@ -12,6 +12,8 @@
 # matches are rewritten, so a second run changes nothing. -force reruns TLC for every file. -check
 # reruns TLC and reports any file whose content differs, without writing. JOBS=N runs N at a time
 # (default 4, 2 with -corpus and 1 with -large).
+# For a cfg with an intent line, it also runs tla2rs and writes its pinned result, X.tla2rs.txt, when
+# missing or stale (see "Intentional differences" in CLAUDE.md); -check does not.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # tla2rs --graph reduces TLC's state graph to the hashes kept in the files

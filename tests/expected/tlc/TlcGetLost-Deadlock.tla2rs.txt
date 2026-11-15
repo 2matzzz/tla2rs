@@ -1,0 +1,13 @@
+key af9d2efcb5d375decc46ce3bc6c5e9d8cde42d46ef2d680b5d2bf75a094504fd
+intent tlcget-rebuild
+differs trace messages errors
+verdict Deadlock reached
+generated 3
+distinct 3
+queue 0
+trace 3 13f695fdc20dc480e1d3fcdde679a1cf3122db3993d31cd246cffa8af5e11d38
+states 3 77792d8b63a72b8ca75e1734fd642c370feeacc608ebf94f8aaf6c701d05b823
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 8 47c33178169acc73748181ef06b0e65b5d86d02b3daf17d31188fe48be690d32
+errors 2 e7435d78e8bc34f8134c901382e2a0104ab86ecac2c0d6799ed6d82e236aaa21
+exit 11

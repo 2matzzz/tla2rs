@@ -1,0 +1,10 @@
+key 97f98bfc59e95c2ba87cc6e2f1508ebd171f61dedcfac4e842b6a905b2909367
+tlc Version 2.19
+rc 1
+Invariant Lost is violated
+
+trace 1 d608d896d21052fbff7650c2c3ce8c5a3de970f7bae9143c1069542c219d8438
+states incomplete
+edges incomplete
+messages 14 c1496c22c8c94b68f1020da6ff575f5e182ab6e3527723c4160e23bf91c2f2fc
+errors 4 254ae4c8a72f0af4362762badded228bbaa0c1617f560d17f37e7777a632edab
