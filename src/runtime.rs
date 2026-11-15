@@ -833,24 +833,121 @@ static TG_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static TG_QUEUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static TG_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TG_REGS: std::sync::Mutex<Option<std::collections::BTreeMap<i64, i64>>> = std::sync::Mutex::new(None);
-/// Each state the search computed, with the action of its first computation: the registers can
-/// make the actions yield other states when a behavior is rebuilt, so its states are taken from here
-static TG_STATES: std::sync::Mutex<Option<std::collections::HashMap<Fp, (State, u32)>>> = std::sync::Mutex::new(None);
-/// Showing the last behavior stopped at a state TLC could not look up, and TLC went on (see
-/// `print_states_tg`)
-static TG_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// What TLC reports with -continue after such a behavior
-const TG_LOST_NPE: &str = "Cannot read field \"state\" because \"currentStateInfo\" is null";
+/// The states of behaviors that evaluating again could not rebuild, found by running the search
+/// again (`tg_rerun`): with TLCGET the registers can make Init and the actions yield other states
+/// than the search found
+static TG_KNOWN: std::sync::Mutex<Option<std::collections::HashMap<Fp, (State, u32)>>> = std::sync::Mutex::new(None);
+/// In such a run: the states to find, the directory to write them to (`TLA2RS_TG_FIND`), and
+/// those found so far
+static TG_FIND: std::sync::OnceLock<Option<(std::collections::HashSet<Fp>, std::path::PathBuf)>> = std::sync::OnceLock::new();
+static TG_FOUND: std::sync::Mutex<Vec<(Packed, Fp, u32)>> = std::sync::Mutex::new(Vec::new());
 
-fn tg_note(s: &State, l: u32) {
-    if let Some(w) = pack(s) {
-        let fp = state_fp(s, &w);
-        TG_STATES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(fp).or_insert((*s, l));
+/// A file of states with their actions, as `tg_rerun` passes them
+fn tg_write(path: &std::path::Path, states: &[(Packed, Fp, u32)]) -> std::io::Result<()> {
+    let mut out = vec![];
+    let mut rec = vec![];
+    for &(w, fp, l) in states {
+        out.extend_from_slice(&l.to_le_bytes());
+        to_bytes(&[(w, fp)], &mut rec);
+        out.extend_from_slice(&rec);
+    }
+    std::fs::write(path, out)
+}
+
+fn tg_read(path: &std::path::Path) -> Vec<(Packed, Fp, u32)> {
+    let b = std::fs::read(path).unwrap_or_default();
+    b.chunks_exact(4 + PACK_BYTES)
+        .map(|c| {
+            let (w, fp) = from_bytes(&c[4..]);
+            (w, fp, u32::from_le_bytes(c[..4].try_into().unwrap()))
+        })
+        .collect()
+}
+
+fn tg_find_target() -> Option<&'static (std::collections::HashSet<Fp>, std::path::PathBuf)> {
+    TG_FIND
+        .get_or_init(|| {
+            let dir = std::path::PathBuf::from(std::env::var_os("TLA2RS_TG_FIND")?);
+            let known = tg_read(&dir.join("known"));
+            let mut g = TG_KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+            let m = g.get_or_insert_with(Default::default);
+            for (w, fp, l) in known {
+                m.insert(fp, (unpack(&w), l));
+            }
+            let want = tg_read(&dir.join("chain")).into_iter().map(|x| x.1).collect();
+            Some((want, dir))
+        })
+        .as_ref()
+}
+
+/// A state the search computes (TLCGET): in a run started by `tg_rerun`, notes it if it is one to
+/// find, and ends the run once all are found
+fn tg_find(s: &State, l: u32) {
+    let Some((want, dir)) = tg_find_target() else { return };
+    let Some(w) = pack(s) else { return };
+    let fp = state_fp(s, &w);
+    if !want.contains(&fp) {
+        return;
+    }
+    let mut g = TG_FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    if g.iter().any(|x| x.1 == fp) {
+        return;
+    }
+    g.push((w, fp, l));
+    if g.len() == want.len() {
+        let code = if tg_write(&dir.join("found"), &g).is_ok() { 0 } else { 1 };
+        std::process::exit(code);
     }
 }
 
-fn tg_lost() -> bool {
-    TLCGET && TG_LOST.swap(false, std::sync::atomic::Ordering::Relaxed)
+/// Finds the states of a behavior by running the search again, in another process, from the
+/// start up to where it computed them all: one worker and the same registers make it compute the
+/// same states in the same order. Nothing is kept per state; it costs what the search took to
+/// reach them, once per behavior evaluating again could not rebuild
+fn tg_rerun(chain: &[Fp]) {
+    if tg_find_target().is_some() {
+        return;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = default_tmpdir().join(format!("tla2rs-rerun-{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let run = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        tg_write(&dir.join("chain"), &chain.iter().map(|&fp| ([0; WORDS], fp, 0)).collect::<Vec<_>>())?;
+        let known: Vec<(Packed, Fp, u32)> = TG_KNOWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flatten()
+            .filter_map(|(&fp, (s, l))| pack(s).map(|w| (w, fp, *l)))
+            .collect();
+        tg_write(&dir.join("known"), &known)?;
+        // The files the search writes are left to this run
+        let mut args = vec![];
+        let mut it = std::env::args().skip(1);
+        while let Some(a) = it.next() {
+            if matches!(a.as_str(), "-userfile" | "-dumpgraph" | "-dumpstates") {
+                it.next();
+            } else {
+                args.push(a);
+            }
+        }
+        std::process::Command::new(std::env::current_exe()?)
+            .args(args)
+            .env("TLA2RS_TG_FIND", &dir)
+            .env_remove("TLA2RS_ORDER")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        let mut g = TG_KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        for (w, fp, l) in tg_read(&dir.join("found")) {
+            m.insert(fp, (unpack(&w), l));
+        }
+        Ok(())
+    };
+    let _ = run();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn tg_level() -> i64 {
@@ -1386,15 +1483,17 @@ fn str_order_finish() {
 }
 
 /// The step s -> t evaluated again as TLC does while showing a behavior: the actions in order up
-/// to the one that yields t, printing what they print. Returns that action, None if none yields t
-fn step_prints(s: &State, t: &State, level: usize) -> Option<u32> {
+/// to the one that yields t, printing what they print
+fn step_prints(s: &State, t: &State, level: usize) {
+    let same = |x: &State| match (pack(x), pack(t)) {
+        (Some(a), Some(b)) => state_fp(x, &a) == state_fp(t, &b),
+        _ => x == t,
+    };
     if TLCGET {
         // Printed as evaluated, and the actions after the one that yields t are not evaluated
         tg_set_level(level as u64);
-        let mut found = None;
-        let mut hook = |x: &State, l: u32| {
-            if found.is_none() && same_state(x, t) {
-                found = Some(l);
+        let mut hook = |x: &State, _: u32| {
+            if same(x) {
                 STEP_DONE.with(|d| d.set(true));
             }
         };
@@ -1403,26 +1502,18 @@ fn step_prints(s: &State, t: &State, level: usize) -> Option<u32> {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next(s, &mut buf)));
         });
         STEP_DONE.with(|d| d.set(false));
-        return found;
+        return;
     }
     let cap = Capturing::start();
     let mut buf = vec![];
     let _ = successors(s, &mut buf, true);
     let held = cap.finish();
-    let j = buf.iter().position(|(x, _)| same_state(x, t))?;
+    let Some(j) = buf.iter().position(|(x, _)| same(x)) else { return };
     let last = held.cap.push_acts[j];
     for (_, a, l) in &held.cap.lines {
         if *a <= last {
             put_line(l);
         }
-    }
-    Some(buf[j].1)
-}
-
-fn same_state(x: &State, t: &State) -> bool {
-    match (pack(x), pack(t)) {
-        (Some(a), Some(b)) => state_fp(x, &a) == state_fp(t, &b),
-        _ => x == t,
     }
 }
 
@@ -1442,9 +1533,6 @@ fn eval_again_prints(s: &State, e: &EvalErr) {
 /// Shows a behavior as TLC does with PRINT_ORDER: `k` is the number of the state that was being
 /// expanded (the states after it are successors), `extra` one more state after the trace
 fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)>) -> usize {
-    if TLCGET {
-        return print_states_tg(trace, k, extra);
-    }
     let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
     let state = |n: usize, (s, l): &(State, u32), prev: Option<&State>| print_step(&format!("State {n}: <{}>", name(*l)), s, prev);
     if k >= 2 {
@@ -1476,72 +1564,6 @@ fn print_states_tlc(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)
         state(n, &x, diff_prev(n - 1, len, trace.last().map(|t| &t.0)));
     }
     n
-}
-
-/// `print_states_tlc` with TLCGET, where the registers can make Init and the actions yield other
-/// states than the search found (the states come from `TG_STATES`). TLC looks each state up as it
-/// rebuilds the behavior. When Init does not yield the first state, or the step from an initial
-/// state being expanded does not yield the next, it stops showing the behavior and goes on
-/// (`TG_LOST`); when another step does not, it stops with exit 1 (`tests/tlc/TlcGetLost*`)
-fn print_states_tg(trace: &[(State, u32)], k: usize, extra: Option<(State, u32)>) -> usize {
-    TG_LOST.store(false, std::sync::atomic::Ordering::Relaxed);
-    let name = |l: u32| if l == u32::MAX { "Initial predicate" } else { LABELS[l as usize] };
-    let header = || println!("Error: The behavior up to this point is:");
-    let fail = |code: u32, t: &State| -> ! {
-        println!("Error: Failed to recover the initial state from its fingerprint.");
-        if code == 2 {
-            println!("Error: This is probably a TLC bug(2 {}).", tlc_fp(t).map_or(0, |f| f as i64));
-        } else {
-            println!("Error: This is probably a TLC bug({code}).");
-            print_step("State :", t, None);
-        }
-        exit(1)
-    };
-    let mut states: Vec<(State, u32)> = trace.to_vec();
-    states.extend(extra);
-    let len = states.len();
-    let k = k.max(1);
-    if k >= 2 {
-        let mut v = vec![];
-        tg_set_level(0);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut v)));
-        if !v.iter().any(|s| same_state(s, &states[0].0)) {
-            // Only a behavior to a successor has its header first
-            if len > k {
-                header();
-            }
-            TG_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
-            return 0;
-        }
-        states[0].1 = u32::MAX;
-        for i in 1..k - 1 {
-            match step_prints(&states[i - 1].0, &states[i].0, i) {
-                Some(l) => states[i].1 = l,
-                None => fail(2, &states[i].0),
-            }
-        }
-    }
-    header();
-    let state = |i: usize, states: &[(State, u32)]| {
-        print_step(&format!("State {}: <{}>", i + 1, name(states[i].1)), &states[i].0, diff_prev(i, len, (i > 0).then(|| &states[i - 1].0)))
-    };
-    for i in 0..k - 1 {
-        state(i, &states);
-    }
-    for i in k - 1..len {
-        if i > 0 {
-            match step_prints(&states[i - 1].0, &states[i].0, i) {
-                Some(l) => states[i].1 = l,
-                None if k == 1 => {
-                    TG_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return i;
-                }
-                None => fail(if i == k - 1 { 4 } else { 5 }, &states[i].0),
-            }
-        }
-        state(i, &states);
-    }
-    len
 }
 
 /// The state that left variables unassigned (with the label of its action, `u32::MAX` for an
@@ -3081,6 +3103,9 @@ fn main() {
             std::process::exit(1);
         }
     }
+    if TLCGET {
+        tg_find_target();
+    }
     str_order_start(opt.workers);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // A spec without [][Next]_v: TLC computes and checks the initial states, then stops; when
@@ -3436,7 +3461,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         // TLC handles each initial state as Init computes it (see TLCGET)
         tg_set_level(0);
         let mut hook = |s: &State, _: u32| {
-            tg_note(s, u32::MAX);
+            tg_find(s, u32::MAX);
             handle(*s)
         };
         failed = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut inits))).err());
@@ -3864,7 +3889,7 @@ fn expand_eager_one(w: &Packed, sfp: Fp, seen: &Shards, opt: &Opt, c: &mut SChun
 
 /// One successor handled as in `expand_safety_one`
 fn eager_succ(s: &State, sfp: Fp, t: State, l: u32, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
-    tg_note(&t, l);
+    tg_find(&t, l);
     ws.buf.clear();
     ws.buf.push((t, l));
     ws.cand.clear();
@@ -4003,13 +4028,7 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
         ws.held.flush(i as u32 + 1);
         match eval_invariants(t) {
             Ok(None) => {}
-            Ok(Some(inv)) if flag(&CONTINUE) => {
-                report_continued(seen, &SFound::new(tfp, None, SMsg::Inv(inv)));
-                // TLC fails on the behavior it could not show, as on the invariant
-                if tg_lost() {
-                    return Some(SFound::new(tfp, None, SMsg::InvEval(inv, EvalErr::Other(TG_LOST_NPE.into()))));
-                }
-            }
+            Ok(Some(inv)) if flag(&CONTINUE) => report_continued(seen, &SFound::new(tfp, None, SMsg::Inv(inv))),
             Ok(Some(inv)) => return Some(SFound::new(tfp, None, SMsg::Inv(inv))),
             Err((inv, e)) => return Some(SFound::new(tfp, None, SMsg::InvEval(inv, e))),
         }
@@ -4120,13 +4139,21 @@ fn fp_chain(seen: &dyn Visited, target: Fp) -> Option<Vec<Fp>> {
 }
 
 /// Rebuilds the actual states by replaying a sequence of fingerprints from an initial state.
+/// With TLCGET, when the registers make Init or the actions yield other states than the search
+/// found, the states are found by running the search again (`tg_rerun`)
 fn replay(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
-    if TLCGET {
-        let g = TG_STATES.lock().unwrap_or_else(|e| e.into_inner());
-        let m = g.as_ref()?;
-        return chain.iter().map(|fp| m.get(fp).copied()).collect();
+    let r = tg_quiet(|| replay_in(chain));
+    if r.is_some() || !TLCGET {
+        return r;
     }
-    replay_in(chain)
+    let known = |chain: &[Fp]| {
+        let g = TG_KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        chain.iter().map(|fp| g.as_ref().and_then(|m| m.get(fp).copied())).collect::<Option<Vec<_>>>()
+    };
+    known(chain).or_else(|| {
+        tg_rerun(chain);
+        known(chain)
+    })
 }
 
 fn replay_in(chain: &[Fp]) -> Option<Vec<(State, u32)>> {
@@ -4371,7 +4398,7 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if matches!(f.msg, SMsg::Eval(EvalErr::Incomplete(_))) {
         generated += show_incomplete(shown);
     }
-    if let (SMsg::Eval(e), true) = (&f.msg, shown > 0 || TLCGET && TG_LOST.load(std::sync::atomic::Ordering::Relaxed)) {
+    if let (SMsg::Eval(e), true) = (&f.msg, shown > 0) {
         if let Some(chain) = fp_chain(seen, f.fp) {
             if let Some((s, _)) = replay(&chain).and_then(|t| t.last().copied()) {
                 eval_again_prints(&s, e);
@@ -4389,11 +4416,7 @@ fn continued_inv_eval(msg: &SMsg, in_model: bool) -> Option<i32> {
     if !flag(&CONTINUE) || !in_model {
         return None;
     }
-    if tg_lost() {
-        report_eval_as(&EvalErr::Other(TG_LOST_NPE.into()), true);
-    } else {
-        report_eval_as(e, true);
-    }
+    report_eval_as(e, true);
     Some(255)
 }
 

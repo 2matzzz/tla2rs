@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1174 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1165 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -1120,9 +1120,8 @@ action is evaluated. A spec that uses them (`TLCGET` in the generated checker, w
 so: the generated code calls `pushed` after each state it computes, and the runtime adds and checks that state
 there (`expand_eager_one`, and the initial states in `initial_states`); the step to a state that stops the search
 unwinds out of the action. To show a behavior, each step evaluates the actions in order up to the one that yields
-the next state and stops at the start of the next action (`step_prints`, `mark_action`); the states of a
-behavior are those the search computed (`TG_STATES`), so the checker evaluates nothing else to find them. With
-TLCGET an invariant is evaluated once
+the next state and stops at the start of the next action (`step_prints`, `mark_action`); the checker's own
+replays of a behavior leave the registers as they were (`tg_quiet`). With TLCGET an invariant is evaluated once
 per state (`eval_invariants`), and an expansion that fails is not evaluated again (`expand_caught`).
 
 The passes TLC makes again after an evaluation error (see "Messages and printed lines") handle each state as it is
@@ -1137,17 +1136,20 @@ Refused at run time: several workers (TLC's counts and registers are then those 
 and temporal properties (TLC's liveness checking evaluates the spec again in an order of its own). Without
 `-workers`, such a checker runs one worker. `-batched` and `-metal` run the default path, as with PRINT_ORDER.
 
-When the registers make Init or the actions yield other states than the search found, TLC cannot look a state of
-the behavior up as it rebuilds it (`print_states_tg`; `tests/tlc/TlcGetLost*`). A step before the state being
-expanded stops it with `Failed to recover the initial state from its fingerprint.` and `This is probably a TLC
-bug(2 FP).`, FP being TLC's fingerprint of the state (`tlc_fp`), before the behavior's header; the step to the
-state being expanded or to its successor stops it after the states shown, with `bug(4)` or `bug(5)` and the state
-after `State :`. Each exits with 1 and prints no counts, also with `-continue`. When Init does not yield the first
-state (the header is printed first only for a behavior to a successor), or the step from an initial state being
-expanded does not yield its successor, TLC stops showing the behavior and goes on as after a behavior shown
-(`TG_LOST`). With `-continue` it then fails on a `NullPointerException`: an invariant violated becomes an
-invariant that failed to evaluate with that message, and the exception it did not expect after such a failure is
-that one.
+Intentional difference (README.md, "Intentional differences"): when the registers make Init or the actions
+yield other states than the search found, TLC cannot rebuild the behavior. It stops with `Failed to recover the
+initial state from its fingerprint.` and `This is probably a TLC bug(...)` (exit 1, no counts), or shows the
+behavior cut short and goes on (with `-continue` it then fails on a `NullPointerException`, which changes its
+verdict and counts). The checker shows the behavior the search found, and reports the verdict, counts and exit code
+the search gives (TLC's wherever its rebuild does not decide them). When its quiet replay (`replay`) cannot find the
+states, it runs the search again in another process (`tg_rerun`): the same binary and arguments, without the files
+it writes, quiet, with `TLA2RS_TG_FIND` naming a directory with the fingerprints to find. One worker and the same
+registers make that run compute the same states in the same order, so it notes each wanted state as it computes it
+(`tg_find`) and exits once it has them all. Nothing is kept per state: the cost is a second run up to that point
+(its time and the memory the search took there, in the other process, released when it ends), once per behavior
+the replay cannot rebuild. The states found are kept (`TG_KNOWN`) and passed to later runs, so that a run reaching
+a behavior reported before with `-continue` evaluates it as the first run did. Checked by hand only, since TLC's
+output there is not the right one: specs where what an action yields grows with a register that only grows.
 
 ### Arguments written out at each use
 
