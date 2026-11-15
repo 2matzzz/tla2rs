@@ -1,0 +1,10 @@
+key 8bf54bc4bdb5eeffd3cd1f097fd8fae722cefa0348b0b5fe403a8b3d44215f95
+tlc Version 2.19
+rc 0
+Invariant BadInit is violated
+2 states generated 3 distinct states found 3 states left on queue
+trace 0
+states 3 9c4b90d1957bddf9348b8353b8fef2166cc862ef8160a782c4df7e1aefe9d532
+edges 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+messages 14 de6e3e7aabcfbc1e9ce4637e169ffb563f21ddc0703221471afac71979b5ff35
+errors 3 a97c36ee43757fd82b6e76f50cae983ca7c05de11e2b62bc6d7f5bf0991ebede
