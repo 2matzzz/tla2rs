@@ -3321,13 +3321,15 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize, first: &std::collections::HashSet<Fp>) -> ! {
         let again = report(&e, state, first);
         let (generated, distinct) = again.map_or((generated, distinct), |a| (a.generated, distinct + a.added));
-        finish(e, while_, generated, distinct, again.is_some_and(|a| a.clean))
+        finish(e, while_, generated, distinct)
     }
-    fn finish(e: EvalErr, while_: &str, generated: u64, distinct: usize, clean: bool) -> ! {
+    // The error stopped the search, so it decides the exit code even when the pass that computes
+    // the initial states again ends without one (intentional difference `again-init-exit`)
+    fn finish(e: EvalErr, while_: &str, generated: u64, distinct: usize) -> ! {
         fp_note(&e);
         eprintln!("  (while {while_})");
         println!("{generated} states generated, {distinct} distinct states found, {distinct} states left on queue.");
-        exit(if clean { 0 } else { init_eval_code(&e) });
+        exit(init_eval_code(&e));
     }
     let mut inits = Vec::new();
     // The states computed before an error are still checked first, as TLC checks each one as soon
@@ -3348,7 +3350,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
     // TLC stops generating at once only on its own exceptions; after a fingerprint error while
     // checking a state it still generates (and counts, without keeping or checking) the remaining
     // initial states (`ModelChecker.DoInitFunctor`)
-    let mut pending: Option<(EvalErr, String, usize, bool)> = None;
+    let mut pending: Option<(EvalErr, String, usize)> = None;
     macro_rules! halt {
         ($e:expr, $while_:expr, $s:expr) => {{
             let e = $e;
@@ -3359,7 +3361,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                     generated = a.generated;
                     distinct += a.added;
                 }
-                pending = Some((e, $while_.to_string(), distinct, again.is_some_and(|a| a.clean)));
+                pending = Some((e, $while_.to_string(), distinct));
                 return;
             }
             stop(e, &$while_, Some($s), generated, out.len(), &seen)
@@ -3471,8 +3473,8 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
         }
     }
     held.flush(u32::MAX);
-    if let Some((e, while_, distinct, clean)) = pending {
-        finish(e, &while_, generated, distinct, clean);
+    if let Some((e, while_, distinct)) = pending {
+        finish(e, &while_, generated, distinct);
     }
     INITS_REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = failed {
@@ -3493,8 +3495,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
 /// error. With TLCGET it checks each state as Init computes it, as the first time; the registers go
 /// on changing, so Init may compute states the first pass did not (`first` holds those it kept):
 /// TLC adds them and reports an invariant they violate, as the first pass does. Then TLC's counts
-/// are what this pass generated and the states added by both, and it exits with 0 unless the pass
-/// stops at an error (`tests/tlc/TlcGetReplay-Init*`)
+/// are what this pass generated and the states added by both (`tests/tlc/TlcGetReplay-Init*`)
 fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain> {
     if !PRINT_ORDER && !flag(&CONTINUE) {
         return None;
@@ -3542,19 +3543,14 @@ fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain>
 struct InitAgain {
     generated: u64,
     added: usize,
-    /// The pass did not stop at an error
-    clean: bool,
 }
 
 fn init_again_eager(first: &std::collections::HashSet<Fp>) -> InitAgain {
     let mut seen = std::collections::HashSet::new();
-    let (mut generated, mut added, mut errored) = (0u64, 0usize, false);
+    let (mut generated, mut added) = (0u64, 0usize);
     let mut hook = |s: &State, _: u32| {
         generated += 1;
-        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else {
-            errored = true;
-            std::panic::panic_any(EagerStop)
-        };
+        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else { std::panic::panic_any(EagerStop) };
         if let Some(w) = pack(s).filter(|_| in_model) {
             let fp = state_fp(s, &w);
             if !seen.insert(fp) {
@@ -3580,27 +3576,15 @@ fn init_again_eager(first: &std::collections::HashSet<Fp>) -> InitAgain {
                         std::panic::panic_any(EagerStop);
                     }
                 }
-                Err(_) => {
-                    errored = true;
-                    std::panic::panic_any(EagerStop);
-                }
+                Err(_) => std::panic::panic_any(EagerStop),
             }
         }
-        for (_, f) in INIT_PROPS {
-            match std::panic::catch_unwind(|| f(s)) {
-                Ok(true) => {}
-                r => {
-                    errored = r.is_err();
-                    std::panic::panic_any(EagerStop);
-                }
-            }
+        if !INIT_PROPS.iter().all(|(_, f)| matches!(std::panic::catch_unwind(|| f(s)), Ok(true))) {
+            std::panic::panic_any(EagerStop);
         }
     };
-    let r = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut vec![]))));
-    if r.is_err_and(|p| !p.is::<EagerStop>()) {
-        errored = true;
-    }
-    InitAgain { generated, added, clean: !errored }
+    let _ = with_pushed(&mut hook, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(&mut vec![]))));
+    InitAgain { generated, added }
 }
 
 /// Whether the violations of the initial states have been reported (-continue)
