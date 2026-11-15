@@ -2129,7 +2129,7 @@ fn live_sim_runtime(rt: &str) -> String {
     hook(rt, &[
         (
             "            out.push((s, w, fp));\n            tg_added();\n            tg_queued(1);\n",
-            "            out.push((s, w, fp));\n            tg_added();\n            tg_queued(1);\n            if let Err(SMsg::Live(_, e)) = live_sim_init(&s) {\n                stop(e, \"evaluating a temporal property on an initial state\", Some(&s), generated, out.len());\n            }\n",
+            "            out.push((s, w, fp));\n            tg_added();\n            tg_queued(1);\n            if let Err(SMsg::Live(_, e)) = live_sim_init(&s) {\n                stop(e, \"evaluating a temporal property on an initial state\", Some(&s), generated, out.len(), &seen);\n            }\n",
         ),
         (
             "        match state_bits(s, SATOMS_TABLEAU) {\n",
