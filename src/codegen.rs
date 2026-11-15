@@ -535,49 +535,74 @@ impl<'a> Gen<'a> {
     }
 
     /// `x \in S` for a tuple x and a sorted set S (from a definition or the state) of functions
-    /// over keys that are not all integers. TLC searches S by halves with its order
-    /// (`ValueVec.search`), comparing x with each element it visits (`TupleValue.compareTo`,
-    /// `FcnRcdValue.compareToInterval`): by size, then key by key in TLC's order, where a key that
-    /// is not an integer stops it with an error, and an integer key against the index, then the
-    /// values. None when the types are not such a pair
+    /// over keys that are not all integers, or for such a function x and a sorted set S of tuples
+    /// (of one length or of several, held as sequences). TLC searches S by halves with its order
+    /// (`ValueVec.search`), comparing x with each element it visits (`TupleValue.compareTo` and
+    /// `FcnRcdValue.compareToInterval` for a tuple x, `FcnRcdValue.compareOtherInterval` for a
+    /// function x): by size, then key by key in TLC's order, where a key that is not an integer
+    /// stops it with an error, and an integer key against the index, then the values. None when
+    /// the types are not such a pair
     fn tuple_fun_search(&mut self, c: &str, st: &Ty, x: &str, xt: &Ty) -> R<Option<String>> {
         let et = Self::elem_of(st);
-        if !tuple_fun_pair(xt, &et) {
+        let fun_left = tuple_fun_pair(&et, xt) || (matches!(et, Ty::Seq(_)) && other_keys_fun(xt));
+        if !fun_left && !tuple_fun_pair(xt, &et) {
             return Ok(None);
         }
-        let ft = match &et {
+        let (tt, fty) = if fun_left { (&et, xt) } else { (xt, &et) };
+        let ft = match fty {
             Ty::Fun(d, r) => Ty::PFun(d.clone(), r.clone()),
             t => t.clone(),
         };
         let Ty::PFun(kt, vt) = &ft else { return Ok(None) };
-        let elems: Vec<Ty> = tuple_elems(xt).unwrap().into_iter().cloned().collect();
+        // The parts of the tuple, each compared at its index (a sequence's are all alike)
+        let (parts, len) = match tt {
+            Ty::Seq(t) => (vec![(t.as_ref().clone(), "__t.items[__i]".to_string())], "(__t.len as i64)".to_string()),
+            _ => {
+                let elems: Vec<Ty> = tuple_elems(tt).unwrap().into_iter().cloned().collect();
+                let n = elems.len();
+                (elems.into_iter().enumerate().map(|(i, t)| (t, format!("__t{}", rec_field(n, i)))).collect(), n.to_string())
+            }
+        };
         let mut arms = vec![];
-        for (i, t) in elems.iter().enumerate() {
+        for (i, (t, place)) in parts.iter().enumerate() {
             let Ok(j) = join(vt, t) else { return Ok(None) };
             let v = self.coerce("__v".into(), vt, &j)?;
-            let e = self.coerce(format!("__t{}", rec_field(elems.len(), i)), t, &j)?;
+            let e = self.coerce(place.clone(), t, &j)?;
             let cmp = self.tlc_cmp(&j, "(&__a)", "(&__b)")?;
-            arms.push(format!("{i} => {{ let (__a, __b) = ({e}, {v}); ({cmp}) as i64 }},"));
+            let (a, b) = if fun_left { (v, e) } else { (e, v) };
+            let arm = if matches!(tt, Ty::Seq(_)) { "_".to_string() } else { i.to_string() };
+            arms.push(format!("{arm} => {{ let (__a, __b) = ({a}, {b}); ({cmp}) as i64 }},"));
+        }
+        if !matches!(tt, Ty::Seq(_)) {
+            arms.push("_ => unreachable!()".into());
         }
         let kid = self.ty_id(kt)?;
-        let fail = format!("{{ let __b: i64 = eval_error(format!(\"Attempted to compare integer with non-integer:\\n{{}}.\", ppr(&fmt_{kid}(&__k)))); __b }}");
+        // TLC words the two directions differently: a colon only when the tuple is on the left
+        let colon = if fun_left { "" } else { ":" };
+        let fail = format!("{{ let __b: i64 = eval_error(format!(\"Attempted to compare integer with non-integer{colon}\\n{{}}.\", ppr(&fmt_{kid}(&__k)))); __b }}");
+        let o = if fun_left { "__k - (__i as i64 + 1)" } else { "__i as i64 + 1 - __k" };
         let key = if matches!(kt.as_ref(), Ty::IntAtom(..)) {
-            format!("if __k < i64::MIN + 65536 {{ {fail}; }} let __o = __i as i64 + 1 - __k;")
+            format!("if __k < i64::MIN + 65536 {{ {fail}; }} let __o = {o};")
         } else {
             format!("{fail}; let __o = 0i64;")
         };
-        let f = self.coerce("__xs[__mid]".into(), &et, &ft)?;
         let it = self.fun_iter("__f", &ft, true)?;
+        let (pre, visit, size) = if fun_left {
+            let f = self.coerce(x.to_string(), xt, &ft)?;
+            (format!("let __f = {f}; let __ks: Vec<_> = {it}.collect();"), "let __t = __xs[__mid];".to_string(), format!("__ks.len() as i64 - {len}"))
+        } else {
+            let f = self.coerce("__xs[__mid]".into(), &et, &ft)?;
+            (format!("let __t = {x};"), format!("let __f = {f}; let __ks: Vec<_> = {it}.collect();"), format!("{len} - __ks.len() as i64"))
+        };
         let order = self.tlc_cmp(&et, "x", "y")?;
         let sit = self.s_iter("__s", st)?;
-        let n = elems.len();
         Ok(Some(format!(
-            "{{ let __t = {x}; let __s = {c}; let mut __xs: Vec<{}> = {sit}.collect(); __xs.sort_by(|x, y| {order}); \
+            "{{ {pre} let __s = {c}; let mut __xs: Vec<{}> = {sit}.collect(); __xs.sort_by(|x, y| {order}); \
              let (mut __lo, mut __hi, mut __found) = (0usize, __xs.len(), false); \
-             while __lo < __hi {{ let __mid = (__lo + __hi) >> 1; let __f = {f}; let __ks: Vec<_> = {it}.collect(); \
-             let mut __c = {n} - __ks.len() as i64; \
+             while __lo < __hi {{ let __mid = (__lo + __hi) >> 1; {visit} \
+             let mut __c = {size}; \
              if __c == 0 {{ for (__i, &(__k, __v)) in __ks.iter().enumerate() {{ {key} \
-             let __o = if __o != 0 {{ __o }} else {{ match __i {{ {} _ => unreachable!() }} }}; if __o != 0 {{ __c = __o; break; }} }} }} \
+             let __o = if __o != 0 {{ __o }} else {{ match __i {{ {} }} }}; if __o != 0 {{ __c = __o; break; }} }} }} \
              if __c == 0 {{ __found = true; break; }} if __c < 0 {{ __hi = __mid; }} else {{ __lo = __mid + 1; }} }} __found }}",
             et.repr(),
             arms.join(" ")
@@ -3013,7 +3038,11 @@ impl<'a> Gen<'a> {
         // where an arithmetic operation fails (`tests/tlc/PowFun`)
         let lazy_fun = |x: &Expr| matches!(x.strip(), Expr::FunCons(..));
         let in_lazy = matches!(e.strip(), Expr::Bin(BOp::In | BOp::NotIn, a, _) if lazy_fun(a));
-        if (lazy_fun(e) || in_lazy) && (can_fail || c.contains("arith_error")) {
+        // Not where only its comparison with the tuples of a sorted set fails (see
+        // tuple_fun_search), which is outside that value (`tests/tlc/FunTupleSorted-Lambda`)
+        let search_fails = c.matches("compare integer with non-integer\\n").count();
+        let lazy_fails = c.matches("eval_error").count() > search_fails || c.contains("mixed_eq(");
+        if (lazy_fun(e) || in_lazy) && (lazy_fails || c.contains("arith_error")) {
             return Ok((format!("{{ let __fp = FpSource::enter(); {c} }}"), t));
         }
         // A sorted set searched for a tuple fails inside the tuple (`tuple_fun_search`), which TLC
@@ -7870,7 +7899,12 @@ impl<'a> Gen<'a> {
 /// Whether `tt` is a tuple and `ft` a function over keys that are not all integers (a model value,
 /// a string), which TLC compares key by key (see `Gen::tuple_fun_eq`)
 fn tuple_fun_pair(tt: &Ty, ft: &Ty) -> bool {
-    matches!(ft, Ty::PFun(kt, _) | Ty::Fun(kt, _) if !matches!(kt.as_ref(), Ty::Int(..))) && tuple_elems(tt).is_some_and(|e| !e.is_empty())
+    other_keys_fun(ft) && tuple_elems(tt).is_some_and(|e| !e.is_empty())
+}
+
+/// Whether `ft` is a function over keys that are not all integers (a model value, a string)
+fn other_keys_fun(ft: &Ty) -> bool {
+    matches!(ft, Ty::PFun(kt, _) | Ty::Fun(kt, _) if !matches!(kt.as_ref(), Ty::Int(..)))
 }
 
 /// How a comparison involving tuples turns out in TLC (see `Gen::tuple_cmp`)

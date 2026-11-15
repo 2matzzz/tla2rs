@@ -1,0 +1,10 @@
+key c152edbfb3a597d968fa9bf686c5752ff6242a310f5f9891db105e1037bbaf36
+tlc Version 2.19
+rc 76
+Evaluating invariant InLens failed
+2 states generated 2 distinct states found 0 states left on queue
+trace 2 25e94fa0cb8316b73c0c7c65f47ded1ed1e344067747c258d5484f65950a6596
+states 2 4dc7d7691fbb6c8350822e38f1ec20e02e34261ba8b6566f12f7c7e7f8723e50
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 d1fa0787cc36de2c0ba97e15ede0da4dd2f11de011aab1ab18714d96ec75e666
+errors 2 f54e92c726df1a626737f09efb01fb16cc5ff0bb8dfd2cb4d3e18626fcb94c23

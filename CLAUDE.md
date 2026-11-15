@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1126 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1138 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -1030,7 +1030,11 @@ Other messages tla2rs words as TLC does, measured on TLC 2.19:
   holds when every operand is constant: the compiler evaluates such a test as TLC does
   (`ConstEval::tuple_fun_scan`, `tuple_fun_search`), and the checker raises the error where TLC
   evaluates it, in Init, an action or an invariant, and in an ASSUME when it starts
-  (`tests/tlc/TupleFunConst*`, `TupleFunAssume*`)
+  (`tests/tlc/TupleFunConst*`, `TupleFunAssume*`). Such a function in a sorted set of tuples (of one
+  length or several) is searched the same way from the function's side: by size, then its keys in
+  TLC's order against the indices, a key that is not an integer stopping it with `Attempted to
+  compare integer with non-integer` (no colon) and the key followed by `.`, without a fingerprint
+  error even for a function constructor (`tests/tlc/FunTupleSorted*`)
 - A tuple compared with an integer: `Attempted to check equality of the function <<1, 3>> with the
   value:` and the integer when the tuple is on the left, `... of integer 1 with non-integer:` and the
   tuple otherwise; a non-tuple in a product: `Attempted to check if non-tuple`, the value, `is in the
