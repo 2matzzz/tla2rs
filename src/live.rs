@@ -636,7 +636,7 @@ fn to_texpr(g: &mut Gen, e: &Expr, env: &HashMap<String, Value>, atoms: &mut Ato
             }
         }
         return Ok(Ok(if action_level(e) {
-            TExpr::Action(atoms.action(g, &box_to_or(e), box_to_or(&subscript_first(e)), env)?, tag())
+            TExpr::Action(atoms.action(g, &box_to_or(e), box_to_or(&subscript_first(e0)), env)?, tag())
         } else {
             TExpr::State(atoms.state(g, e, env)?, tag())
         }));
@@ -1377,14 +1377,17 @@ fn split_disjuncts(neg: TExpr) -> Option<Vec<(Ltl, Vec<TExpr>, Vec<TExpr>, Vec<T
 /// constant bindings), under which each part is checked; `parts` are (name, formula, constant
 /// bindings). A formula TLC rejects comes back as Ok(Err(..)). `next_prints` tells whether the
 /// next-state relation or the constraints print; with the code comes whether what TLC evaluates
-/// while it builds its liveness graph prints (see `LIVE_SIM_RT` in the runtime).
+/// while it builds its liveness graph prints (see `LIVE_SIM_RT` in the runtime), and whether it
+/// can warn about an EXCEPT. Its warnings count as printing only with `warn_order` (see
+/// `compile::compile`).
 pub fn compile(
     g: &mut Gen,
     fair: &[FairDef],
     assumed: &[(Expr, HashMap<String, Value>)],
     parts: &[(String, Expr, HashMap<String, Value>)],
     next_prints: bool,
-) -> R<Result<(String, bool), Rejected>> {
+    warn_order: bool,
+) -> R<Result<(String, bool, bool), Rejected>> {
     // The spec's temporal conjuncts matter only when there are properties to check
     let assumed = if parts.is_empty() { &[][..] } else { assumed };
     let mut atoms = Atoms::default();
@@ -1499,7 +1502,8 @@ pub fn compile(
     // them, for `LIVE_SIM_RT`. A node of the tableau new to a state already expanded makes TLC
     // generate that state's successors again
     let fair_prints = fair.iter().any(|f| crate::codegen::prints(&f.action) || crate::codegen::prints(&f.sub));
-    let sim = !parts.is_empty() && (atoms.prints || fair_prints || (has_tableau && next_prints));
+    let warns = !parts.is_empty() && src.contains("except_warning(");
+    let sim = !parts.is_empty() && (atoms.prints || fair_prints || (has_tableau && next_prints) || warns && warn_order);
     if sim {
         let mut tl = vec![];
         for (i, (e, env)) in atoms.action_tlc.iter().enumerate() {
@@ -1517,7 +1521,7 @@ pub fn compile(
         writeln!(src, "static TLC_AATOMS: &[fn(&State, &State) -> bool] = &[{}];", tl.join(", ")).unwrap();
         writeln!(src, "static TLC_FSTEPS: &[fn(&State, &State) -> bool] = &[{}];", fs.join(", ")).unwrap();
     }
-    Ok(Ok((src, sim)))
+    Ok(Ok((src, sim, warns)))
 }
 
 /// The position of the first identifier named v written in e

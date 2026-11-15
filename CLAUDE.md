@@ -23,7 +23,7 @@ It has no crate dependencies.
   "Messages and printed lines")
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
-- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1113 currently
+- `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1121 currently
   pass). Run it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch
   either search path (extra arguments are passed on to every run)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -813,8 +813,8 @@ How TLC words an evaluation error depends on where it happens, measured on the `
 
 TLC prints a warning only when it has not printed the same text before, and its first warning of
 a run carries the note `(Use the -nowarning option to disable this warning.)`, so the same warning
-can come a second time, without the note, and then never again (measured on TLC 2.19,
-`tests/tlc/ExceptWarn*`, `SparseFun`, `LazyFun`). The checker prints warnings so (`put_line`,
+can come a second time, without the note, and then never again; any other text comes once (measured
+on TLC 2.19, `tests/tlc/ExceptWarn*`, `ExceptLive-Two`, `SparseFun`, `LazyFun`). The checker prints warnings so (`put_line`,
 starting from those among STARTUP_PRINTS), and so does `compile::Startup::lines` for what TLC prints
 when it starts. The warnings:
 
@@ -851,8 +851,12 @@ when it starts. The warnings:
   spec that can warn but never does, a checker whose code can warn without PRINT_ORDER
   (`WARN_RERUN`) exits at its first warning when tla2rs runs it (`WARN_EXIT`, `w` in TLA2RS_GROW),
   and tla2rs builds it again with PRINT_ORDER (`compile`'s `warn_order`) and checks from the start.
+  A warning of what TLC evaluates for its liveness graph (the predicates of a property, a fair
+  action and its subscript) comes where TLC evaluates it, among the lines of the actions: a checker
+  whose liveness code can warn exits at its first warning in the same way, and is built again with
+  `LIVE_SIM_RT` (see below; `live::compile`'s `warn_order`; `tests/tlc/ExceptLive*`).
   Not followed: other places where the compiler evaluates a constant without the warnings it notes
-  (`Gen::try_const`), and the order of a warning that only the liveness checks raise
+  (`Gen::try_const`)
 
 TLC warns that SYMMETRY and constraints are dangerous when it checks temporal properties. It prints
 these warnings after the Print and PrintT of the constant definitions and before those of the
@@ -906,8 +910,8 @@ ASSUMEs print once, when TLC starts. In Init, the actions and the invariants:
   state` (`lasso_prefix_prints`; `tests/tlc/PrintLasso*`)
 
 When Init, Next, an invariant, an action property or what TLC evaluates for its liveness graph prints
-(`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of Init, Next or an
-invariant warned, see above), the checker marks each state `init` or `next` pushes and the start of each action
+(`PRINT_ORDER` in the generated checker, set by `compile.rs`; also once an EXCEPT of Init, Next, an
+invariant or what TLC evaluates for its liveness graph warned, see above), the checker marks each state `init` or `next` pushes and the start of each action
 (`mark_push`, `mark_action`, generated only then), holds what Print and PrintT print while it
 computes states, and prints those lines as it handles the states (`Capturing`, `Held` in
 `runtime.rs`); `print_states_tlc` shows a behavior as above. Such specs are searched without
@@ -956,12 +960,13 @@ How many times a line is printed, measured on TLC 2.19 with one worker (each wit
   `WF_v(A)` is the step predicate `~ENABLED <<A>>_v \/ <<A>>_v`, so ENABLED is evaluated once per
   step, and a step predicate `<<A>>_v` (also `[A]_v`) compares v first and does not evaluate A on a
   step that leaves it unchanged. On each new initial state, before its invariants, it evaluates the
-  formula's particles. When any of this prints (`live::compile`), the checker evaluates it the same
+  formula's particles. When any of this prints, or warns about an EXCEPT once the checker met such a
+  warning (`live::compile`), the checker evaluates it the same
   way (`LIVE_SIM_RT`, hooked into the runtime by `compile::live_sim_runtime`) and its own
   evaluations of the same predicates quietly
 
-The code pasted for this (`LIVE_SIM_RT`) is generated only for a spec that prints, so the code of
-other specs is the same as before.
+The code pasted for this (`LIVE_SIM_RT`) is generated only for a spec that prints (or warns there),
+so the code of other specs is the same as before.
 
 Not followed:
 
