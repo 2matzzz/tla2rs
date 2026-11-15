@@ -384,6 +384,10 @@ bounds the size of a model with temporal properties (one property per thread, so
   properties that every behavior satisfies, such as `<>TRUE`, `<>(N = 2)` with N = 2, `P ~> TRUE` and `~[]FALSE`,
   as violated (exit 13, with a counterexample). tla2rs takes each constant at its value and finds no error there.
   TLC checks `<>[]` and `[]<>` of a constant without its tableau, and gets those right
+- After an evaluation error in the initial states, TLC computes them again to show where the error is. With
+  `TLCGet` / `TLCSet`, that pass can yield other states and end without an error (it reports a violation, or with
+  `-continue` goes on), and TLC then exits with 0 although the error stopped the search. tla2rs exits with the code
+  of that error (75), with TLC's verdict and counts
 
 ## Cross-checking against TLC
 

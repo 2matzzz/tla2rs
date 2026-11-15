@@ -1,0 +1,13 @@
+key 0485c59ac7c25d0b2691e322590ba6b245a65d11350facb3d79fafe9ae8c794b
+intent again-init-exit
+differs exit
+verdict Invariant BadInit is violated
+generated 1
+distinct 2
+queue 2
+trace 0
+states 2 d57c25ff8420f5315a962f16ac54aa2b454b59f7ef96d0df8997113e4c7c7a7e
+edges 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+messages 9 dbbd93917703a14720fe6f5eba196231e0d39a04824da306b5c8d9b876a78375
+errors 2 2de8b4785bb0989539b5f51c03b3e3328c6440916df1b90387dc9002d7f351a1
+exit 75
