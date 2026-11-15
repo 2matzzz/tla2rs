@@ -24,7 +24,7 @@ It has no crate dependencies.
 - `target/release/tla2rs --pcal-text FILE` prints the text TLC hashes for the PlusCal algorithm in FILE and its
   CRC-32 (see "PlusCal checksums")
 - `scripts/all.sh` cross-checks every configuration in `examples/` and `tests/tlc/` against TLC (all 1222 currently
-  pass: 1213 match TLC and 9 are intentional differences, reported as `intent`; see "Intentional differences"). Run
+  pass: 1209 match TLC and 13 are intentional differences, reported as `intent`; see "Intentional differences"). Run
   it after every change, and also as `scripts/all.sh -batched` and `scripts/all.sh -metal` when you touch either
   search path (extra arguments are passed on to every run; `scripts/all.sh X.cfg ...` checks those only)
 - `scripts/crosscheck.sh Spec.tla [X.cfg] [-deadlock]` cross-checks one configuration. Both TLC and tla2rs run with
@@ -663,7 +663,10 @@ the runtime; `tlc_live` in `src/live.rs` writes TLC's plan as `TLC_LIVE`). What 
   split into halves), its particles (`particleClosure`: the alpha rules of `/\` and `[]`, then the first beta rule
   of `\/` or `<>` that applies splits it in two, the particles of the first branch not among the second's coming
   first), then for each particle in turn the particles of the bodies of its `()` formulas, each new one appended.
-  A node pairs a state with a particle whose state predicates hold in it (boolean constants are ignored). The
+  A node pairs a state with a particle whose state predicates hold in it. TLC ignores boolean constants there, so
+  a particle with FALSE (from a constant under `[]` or `<>`, as in `[]FALSE`, the negation of `<>TRUE`) holds in
+  every state; tla2rs drops such a particle, and its own automaton takes each constant at its value (the
+  intentional difference `constant-temporal`, `tests/tlc/LiveConst*`). The
   promises are the `<>` subformulas; a particle fulfils `<>P` when it lacks `<>P` or has `P`
 - The liveness graph: the initial states in the order found; each state, expanded in BFS order, gets one transition
   per distinct successor in the model and one to itself (stuttering), in the order of the slots of a hash table of
@@ -733,7 +736,7 @@ own"). `crosscheck.sh` then confirms that lasso with TLC when it differs from TL
 after `MATCH` (`lasso confirmed instead: <reason>`). All 69 liveness violations of `examples/` and `tests/tlc/` print
 TLC's lasso (most by following TLC's search, some by coincidence), 19 of them through a tableau (`LiveTab`,
 `LiveTabSym`, `LiveFold-ViewLoopEv`, `SymLoopEv`, `ViewSucc`, `Late`, `Live-Spec*-Starve`, `Live-SpillNext-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`,
-`LiveConst-Leads`, `LiveAssumed-Leads`).
+`LiveAssumed-Leads`).
 
 TLC checks such a lasso as follows. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
 `.cfg` (`write_lasso_check` in the runtime, `src/lasso.rs`): a module that EXTENDS the spec with a variable for the
