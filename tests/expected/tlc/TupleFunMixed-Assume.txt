@@ -1,0 +1,10 @@
+key 2874f8eafbf7e9ca510b372d1a9b0eda989183075fd91bd92838246d8e121157
+tlc Version 2.19
+rc 10
+Evaluating assumption line 14, col 8 to line 14, col 32 of module TupleFunMixed failed
+
+trace 0
+states incomplete
+edges incomplete
+messages 3 012cfc6cf6b7634dfae304db8f308a1fbcb19309194ac09c5d04ec7a636e3310
+errors 1 e98d97727d987d97d68f8cf5ba89ef057d26f6094c5e2b690547f504ecf94162
