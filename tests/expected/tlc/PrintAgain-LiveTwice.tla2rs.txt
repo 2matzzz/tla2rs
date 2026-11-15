@@ -1,8 +1,8 @@
-key 738b48fd8d5bfab0c1375b6fef50ac0aa15035f2f7fb8b9efeeda89c810d41e0
-intent error-reentry
-differs trace messages errors exit
+key 5992ea7b8d56d9629723cff52863ce0f4153c1415e882e66b7b3c812e7e22e6b
+intent error-reentry recount
+differs generated trace messages errors exit
 verdict Evaluating invariant BadTwice failed
-generated 13
+generated 17
 distinct 11
 queue 6
 trace 2 e334756ef27b9ec49bef74204afba49a538d52d481e945ade73b3b65dce4c528

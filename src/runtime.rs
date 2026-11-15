@@ -1518,16 +1518,21 @@ fn step_prints(s: &State, t: &State, level: usize) {
 }
 
 /// After the behavior that ends with s, whose successors failed to evaluate: TLC evaluates them
-/// again to show where the error is, printing again what they print up to the error
-fn eval_again_prints(s: &State, e: &EvalErr) {
-    if !PRINT_ORDER || matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
-        return;
+/// again to show where the error is, printing again what they print up to the error. Returns the
+/// states generated again, which TLC does not count (intentional difference `recount`)
+fn eval_again_prints(s: &State, e: &EvalErr) -> u64 {
+    if matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
+        return 0;
     }
     tg_set_level(0);
     let cap = Capturing::start();
     let mut buf = vec![];
     let _ = successors(s, &mut buf, true);
-    cap.finish().flush(u32::MAX);
+    let mut held = cap.finish();
+    if PRINT_ORDER {
+        held.flush(u32::MAX);
+    }
+    buf.len() as u64
 }
 
 /// Shows a behavior as TLC does with PRINT_ORDER: `k` is the number of the state that was being
@@ -2828,9 +2833,9 @@ fn dump_succ(buf: &mut String, sfp: Fp, t: &State, l: u32) {
 /// an edge for each in the model to the graph, adds the ones it has not seen (the failing one was
 /// added the first time, so it is passed over now) and queues them, checks the invariants of new
 /// successors and of those outside the model, and the action properties of all, and stops at the
-/// first that fails. `visited` tells whether a fingerprint was visited by the search. Returns the
-/// states added, and where the pass stopped at an evaluation error (see `Again`)
-fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option<Again>) {
+/// first that fails. `visited` tells whether a fingerprint was visited by the search. Returns what
+/// the pass did (see `Replay`)
+fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> Replay {
     if TLCGET {
         return eval_replay_eager(s, sfp, visited);
     }
@@ -2842,8 +2847,10 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option
     let mut added = std::collections::HashSet::new();
     let mut failed = None;
     let mut stopped = true;
+    let mut generated = 0;
     for (i, (t, l)) in buf.into_iter().enumerate() {
         held.flush(i as u32 + 1);
+        generated += 1;
         stopped = true;
         let inm = match std::panic::catch_unwind(|| in_model(s, &t)) {
             Ok(v) => v,
@@ -2890,18 +2897,20 @@ fn eval_replay(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option
     if dumping() {
         dump_write(&mut out);
     }
-    (added.len() as u64, failed)
+    Replay { generated, added: added.len() as u64, failed }
 }
 
 /// `eval_replay` with TLCGET: each successor is handled as `next` computes it, as in the search,
 /// at level 0. The registers go on changing, so the actions may yield successors the search did
 /// not; the counts follow the states added and queued (`tests/tlc/TlcGetReplay`)
-fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, Option<Again>) {
+fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> Replay {
     tg_set_level(0);
     let mut out = String::new();
     let mut added = std::collections::HashSet::new();
     let mut failed = None;
+    let mut generated = 0;
     let mut hook = |t: &State, l: u32| {
+        generated += 1;
         let inm = match std::panic::catch_unwind(|| in_model(s, t)) {
             Ok(v) => v,
             Err(p) => {
@@ -2947,7 +2956,16 @@ fn eval_replay_eager(s: &State, sfp: Fp, visited: &dyn Fn(Fp) -> bool) -> (u64, 
     if dumping() {
         dump_write(&mut out);
     }
-    (added.len() as u64, failed)
+    Replay { generated, added: added.len() as u64, failed }
+}
+
+/// What `eval_replay` did. TLC adds and queues the new states it meets but does not count any state
+/// of the pass as generated, so that it can report more distinct states than generated; the checker
+/// counts them (intentional difference `recount`)
+struct Replay {
+    generated: u64,
+    added: u64,
+    failed: Option<Again>,
 }
 
 /// Where `eval_replay` stopped at an evaluation error
@@ -2971,21 +2989,23 @@ impl Again {
 /// With -continue, TLC reports the error `eval_replay` stopped at with a behavior: a constraint as
 /// the error with the behavior to the successor, and the VIEW with the behavior to the state being
 /// expanded, whose successors it then evaluates again (`AgainCon-*Continue`). An invariant is not
-/// reported (see `Again::Inv`). `show` prints the behavior, with the successor if any
-fn again_failed(a: &Again, show: &dyn Fn(Option<(State, u32)>)) {
+/// reported (see `Again::Inv`). `show` prints the behavior, with the successor if any. Returns the
+/// states generated again
+fn again_failed(a: &Again, show: &dyn Fn(Option<(State, u32)>)) -> u64 {
     if !flag(&CONTINUE) {
-        return;
+        return 0;
     }
     match a {
-        Again::Inv => {}
+        Again::Inv => 0,
         Again::Cons(t, l, e) => {
             report_eval_as(e, false);
             show(Some((*t, *l)));
+            0
         }
         Again::View(s, e) => {
             report_eval_as(e, false);
             show(None);
-            eval_again_prints(s, e);
+            eval_again_prints(s, e)
         }
     }
 }
@@ -3308,13 +3328,13 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
             println!("While working on the initial state:\n{}\n", show(s));
         }
         if !matches!(e, EvalErr::Type(_) | EvalErr::Incomplete(_)) {
-            return init_again_prints(first);
+            return Some(init_again_prints(first));
         }
         None
     }
     fn stop(e: EvalErr, while_: &str, state: Option<&State>, generated: u64, distinct: usize, first: &std::collections::HashSet<Fp>) -> ! {
         let again = report(&e, state, first);
-        let (generated, distinct) = again.map_or((generated, distinct), |a| (a.generated, distinct + a.added));
+        let (generated, distinct) = again.map_or((generated, distinct), |a| (generated + a.generated, distinct + a.added));
         finish(e, while_, generated, distinct)
     }
     // The error stopped the search, so it decides the exit code even when the pass that computes
@@ -3352,7 +3372,7 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
                 let again = report(&e, Some($s), &seen);
                 let mut distinct = out.len();
                 if let Some(a) = again {
-                    generated = a.generated;
+                    generated += a.generated;
                     distinct += a.added;
                 }
                 pending = Some((e, $while_.to_string(), distinct));
@@ -3489,21 +3509,19 @@ fn initial_states() -> (Vec<(State, Packed, Fp)>, u64) {
 /// error. With TLCGET it checks each state as Init computes it, as the first time; the registers go
 /// on changing, so Init may compute states the first pass did not (`first` holds those it kept):
 /// TLC adds them and reports an invariant they violate, as the first pass does. Then TLC's counts
-/// are what this pass generated and the states added by both (`tests/tlc/TlcGetReplay-Init*`)
-fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain> {
-    if !PRINT_ORDER && !flag(&CONTINUE) {
-        return None;
-    }
+/// are what this pass generated and the states added by both (`tests/tlc/TlcGetReplay-Init*`); the
+/// checker counts what both passes generated (intentional difference `recount`)
+fn init_again_prints(first: &std::collections::HashSet<Fp>) -> InitAgain {
     if TLCGET {
-        return Some(init_again_eager(first));
+        return init_again_eager(first);
     }
     let mut seen = std::collections::HashSet::new();
     // Whether the pass goes on after s. With -continue TLC reports again the invariants a state
     // violates and goes on (`tests/tlc/AgainInit`)
     let mut check = |s: &State| {
-        let Ok(in_model) = std::panic::catch_unwind(|| constraint(s)) else { return false };
-        if let Some(w) = pack(s).filter(|_| in_model) {
-            if !seen.insert(state_fp(s, &w)) {
+        let Ok(fp) = std::panic::catch_unwind(|| if constraint(s) { pack(s).map(|w| state_fp(s, &w)) } else { None }) else { return false };
+        if let Some(fp) = fp {
+            if !seen.insert(fp) {
                 return true;
             }
         }
@@ -3523,16 +3541,17 @@ fn init_again_prints(first: &std::collections::HashSet<Fp>) -> Option<InitAgain>
     for (k, s) in inits.iter().enumerate() {
         held.flush(k as u32 + 1);
         if !check(s) {
-            return None;
+            return InitAgain { generated: k as u64 + 1, added: 0 };
         }
     }
     if failed {
         held.flush(u32::MAX);
     }
-    None
+    InitAgain { generated: inits.len() as u64, added: 0 }
 }
 
-/// What `init_again_prints` makes of the initial states with TLCGET
+/// What `init_again_prints` makes of the initial states: the states it generated, and those it added
+/// (only with TLCGET, where Init can compute states the first pass did not)
 #[derive(Clone, Copy)]
 struct InitAgain {
     generated: u64,
@@ -4349,12 +4368,13 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
         println!("State {}: <a successor that tla2rs cannot represent>\n", shown + 1);
     }
     if let Some(s) = again {
-        let (added, failed) = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
-        distinct += added;
-        left += added as usize - failed.as_ref().is_some_and(Again::is_inv) as usize;
-        if let Some(a) = failed {
+        let r = eval_replay(&s, state_fp(&s, &pack(&s).unwrap()), &|fp| seen.contains(fp));
+        generated += r.generated;
+        distinct += r.added;
+        left += r.added as usize - r.failed.as_ref().is_some_and(Again::is_inv) as usize;
+        if let Some(a) = r.failed {
             if let Some(trace) = &again_trace {
-                again_failed(&a, &|x| {
+                generated += again_failed(&a, &|x| {
                     if PRINT_ORDER {
                         print_states_tlc(trace, trace.len(), x);
                     } else {
@@ -4374,7 +4394,7 @@ fn report_and_exit(seen: &dyn Visited, f: SFound, mut generated: u64, mut distin
     if let (SMsg::Eval(e), true) = (&f.msg, shown > 0) {
         if let Some(chain) = fp_chain(seen, f.fp) {
             if let Some((s, _)) = replay(&chain).and_then(|t| t.last().copied()) {
-                eval_again_prints(&s, e);
+                generated += eval_again_prints(&s, e);
             }
         }
     }
@@ -5157,11 +5177,12 @@ fn run_liveness(opt: &Opt) {
                         if matches!(msg, SMsg::InvEval(..)) {
                             let p = g.parent.get(base[w] + idx).0 as usize;
                             let s = g.state(p);
-                            let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
-                            distinct += added as usize;
-                            queued = added as usize - failed.as_ref().is_some_and(Again::is_inv) as usize;
-                            if let Some(a) = failed {
-                                again_failed(&a, &|x| g.print_trace(p as u32, x.as_ref().map(|(t, l)| (t, *l)), false));
+                            let r = eval_replay(&s, state_fp(&s, &g.states.get(p)), &|fp| seen.contains(fp));
+                            generated += r.generated;
+                            distinct += r.added as usize;
+                            queued = r.added as usize - r.failed.as_ref().is_some_and(Again::is_inv) as usize;
+                            if let Some(a) = r.failed {
+                                generated += again_failed(&a, &|x| g.print_trace(p as u32, x.as_ref().map(|(t, l)| (t, *l)), false));
                             }
                         }
                         code
@@ -5185,11 +5206,12 @@ fn run_liveness(opt: &Opt) {
                     Found::Untraced(p, e) => {
                         let code = report_msg(&SMsg::Untraced(e), true);
                         let s = g.state(p as usize);
-                        let (added, failed) = eval_replay(&s, state_fp(&s, &g.states.get(p as usize)), &|fp| seen.contains(fp));
-                        distinct += added as usize;
-                        queued = added as usize;
-                        if let Some(a) = failed.filter(|a| !a.is_inv()) {
-                            again_failed(&a, &|x| g.print_trace(p, x.as_ref().map(|(t, l)| (t, *l)), false));
+                        let r = eval_replay(&s, state_fp(&s, &g.states.get(p as usize)), &|fp| seen.contains(fp));
+                        generated += r.generated;
+                        distinct += r.added as usize;
+                        queued = r.added as usize;
+                        if let Some(a) = r.failed.filter(|a| !a.is_inv()) {
+                            generated += again_failed(&a, &|x| g.print_trace(p, x.as_ref().map(|(t, l)| (t, *l)), false));
                         }
                         code
                     }
@@ -5199,7 +5221,7 @@ fn run_liveness(opt: &Opt) {
                         let again = e.clone();
                         let code = report_msg(&SMsg::Eval(e), true);
                         g.print_trace(p, None, false);
-                        eval_again_prints(&g.state(p as usize), &again);
+                        generated += eval_again_prints(&g.state(p as usize), &again);
                         fp_note(&again);
                         if unassigned {
                             generated += show_incomplete(g.trace_len(p));

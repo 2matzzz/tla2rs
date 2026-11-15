@@ -1,8 +1,8 @@
-key 35e1bcca8c41221d7ff5319b901748dbaab2fb90be0e08f06e1cff26e06cd425
-intent tlcget-rebuild
-differs trace messages errors exit
+key 114fd538e936122ee0593625e7bab16b43b625b648b2f51c4769c0c007efc019
+intent tlcget-rebuild recount
+differs generated trace messages errors exit
 verdict Evaluating invariant Eval failed
-generated 2
+generated 4
 distinct 4
 queue 2
 trace 2 ba46aa2b5d9531bb1704c83f21c92bc396d636ddb330350008b1f7ee13285075

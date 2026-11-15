@@ -1,0 +1,13 @@
+key b3166a3dc15951fdf53c9fdb678e057e0c2eec2208a4a19dae40e81fc177421f
+intent recount
+differs generated
+verdict Evaluating invariant Lit failed
+generated 6
+distinct 3
+queue 0
+trace 3 93db0558c7f759335aa567780455957f98c87c3c948f4449f824b3b11dacc92b
+states 3 63f73a1bd721318a42f281b57c1de1fe3f525e729cca28e18292ca19d7801d00
+edges 4 72e3d534bb0a15bbc330d30ed0a1f66eceec811b12c6c10ffb6f0c0cb24f219f
+messages 4 60a11b24d8a563769b038d90ed31dd10b7d783204a7c1af983bb21b795f45451
+errors 2 465994afa209cbda43448bebad77fc30ac3ed9ae9c41890805209e50b41c1296
+exit 76

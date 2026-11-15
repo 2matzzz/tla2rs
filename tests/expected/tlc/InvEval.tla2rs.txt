@@ -1,0 +1,13 @@
+key c6e59f77c109f02f214393dc4011eea2c46f4bbc303e19960a776f7a425c58ac
+intent recount
+differs generated
+verdict Evaluating invariant Inv failed
+generated 4
+distinct 3
+queue 0
+trace 3 09c007f57320fdb61290bd41db5278f99827dfd871c7e4bd31a1f462ec3ed2f8
+states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 3 d29155e0ea94806ff5469b6abb00adc1242a3a789648768803bab8c0172afd03
+errors 2 b5718e3d34bf8895edaa52d249d1c8de638291adf1608797bd89707f65400f0b
+exit 76

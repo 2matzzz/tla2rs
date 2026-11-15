@@ -1,0 +1,13 @@
+key 0a4b7136f88a74a946f9c9cb3f9535ed8f95354fe32d98c12c62cf1ebdf8fc04
+intent recount
+differs generated
+verdict Evaluating invariant InPairs failed
+generated 3
+distinct 2
+queue 0
+trace 2 c413e83aca544452354af1c131b63fbf6cbbd6e65601c01b2f49a5172c851650
+states 2 895c1cccfde63e14a203e7f38b91e223a970b318140edcc5a2dec7839a3c5431
+edges 1 a79122992d53d358e6bbbbb98883d64fa0c15df3bcb08ff7b65a0580870af424
+messages 4 7dab010854a33a07879e85d99f5d8be2ca36b73d0633dcac0510358014987d51
+errors 2 fb40a9144c2ea50ccd8208e81652cc4a730945abf24578755cf5c855e7ca73f9
+exit 76

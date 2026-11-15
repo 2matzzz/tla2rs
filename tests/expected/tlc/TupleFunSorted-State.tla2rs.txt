@@ -1,0 +1,13 @@
+key 27952f3e80bea4d85ca170b2c9b8428666f490dae2133fd346baa92bc4c39a3a
+intent recount
+differs generated
+verdict Evaluating invariant InState failed
+generated 4
+distinct 3
+queue 0
+trace 3 898984d66f5358a8ff23829b89233722a7ac2317b6baae985fd18fbbfb667c87
+states 3 d0a43e69d88907148f340a0f843a1c23cfa5e24eafa1ee34d46f559a6b81afd0
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 4 197bd78b1a74fe584d563985d487acc06f9bb33f5731f4fd9b793f7e3fe63a7a
+errors 2 4e3bb03b498c8f26050849c7f8905b6e8ff100961a4a17ef0cf970df8f387e45
+exit 76

@@ -1,0 +1,13 @@
+key f63a794daa5f05e7112271574f720ef17a87eb1d2f514b538ffd388cb7b3bd58
+intent recount
+differs generated
+verdict Evaluating invariant InvCase failed
+generated 4
+distinct 3
+queue 0
+trace 3 09c007f57320fdb61290bd41db5278f99827dfd871c7e4bd31a1f462ec3ed2f8
+states 3 d3f6dbf10d9551094d72bd46d15a368a0a1fa0b6d9f6199e58f574f50399823f
+edges 2 8ba65ee1bbe8297e30cab4c5fc9b62a8caa0dbe7b89298edf1da2609beb24ae1
+messages 4 e665fd547018348d8c27bd3f6e4dd0e4a6f71eb1371c829c8c4ad4ac0d04e9f9
+errors 2 f304874efdfe94e2fd6221d372710c1009e538b97f33a2f56a7cff20be93af1b
+exit 76
