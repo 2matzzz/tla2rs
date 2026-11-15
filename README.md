@@ -371,6 +371,15 @@ bounds the size of a model with temporal properties (one property per thread, so
   compared as TLC compares them, variables in the order TLC prints them), and then the view of that state. This
   compares whole permuted states, which costs more than comparing views did
 
+### Intentional differences
+
+- With `TLCGet` / `TLCSet`, when the registers make Init or the actions yield other states than the search found,
+  TLC cannot rebuild the behavior: it stops with `Failed to recover the initial state from its fingerprint.` and
+  `This is probably a TLC bug(...)` (exit 1, no counts), or shows the behavior cut short and goes on (with
+  `-continue`, then fails on a `NullPointerException`). tla2rs shows the behavior the search found, with TLC's
+  verdict, counts and exit code otherwise. To find its states it runs the search again in another process up to
+  where it computed them (see CLAUDE.md, "TLCGet and TLCSet")
+
 ## Cross-checking against TLC
 
 `scripts/crosscheck.sh` runs the same configuration through TLC (`-workers 1`) and tla2rs and compares the verdict,
