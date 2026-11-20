@@ -1,0 +1,13 @@
+key e7ae41931800fb460cbdc1927b812cdb7ce974d31bafbabeaeaa974f1b52f7cc
+intent recount
+differs generated
+verdict Evaluating invariant SubsetAll failed
+generated 3
+distinct 2
+queue 0
+trace 2 22d2417714cdcc30fa6b9eca9600ab7a0c84766c943886d8c71d9f7840c96550
+states 2 5f855ea08379115641d611ebff643de04e7012091a9403064c4c3a0de1e64b78
+edges 1 f4a8ae8e74ddfb896a256de4e3099911dcaa6a9302591713898069b0bcd6e3d7
+messages 6 e9e1b4415db6e76184c9df720fe237192fabe8d641beb459423c82af323ec280
+errors 2 f31b3a93185e6c65e97582143117311b0a51a7c60437c903eeccca7147c5e25a
+exit 76
