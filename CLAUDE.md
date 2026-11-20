@@ -763,10 +763,13 @@ fingerprint as TLC does, and no `-fp` other than 0 among TLC's options (`crossch
 `args` choose one), and otherwise prints its own lasso and says why on stderr ("the counterexample is tla2rs's own,
 not TLC's", with the reason; under a VIEW or a SYMMETRY also "the liveness verdict under VIEW or SYMMETRY is tla2rs's
 own"). `crosscheck.sh` then confirms that lasso with TLC when it differs from TLC's, and says so
-after `MATCH` (`lasso confirmed instead: <reason>`). All 69 liveness violations TLC reports in `examples/` and
-`tests/tlc/` print TLC's lasso (most by following TLC's search, some by coincidence), 19 of them through a tableau (`LiveTab`,
-`LiveTabSym`, `LiveFold-ViewLoopEv`, `SymLoopEv`, `ViewSucc`, `Late`, `Live-Spec*-Starve`, `Live-SpillNext-Starve`, `LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`,
-`LiveAssumed-Leads`).
+after `MATCH` (`lasso confirmed instead: <reason>`). TLC reports 84 liveness violations in `examples/` and
+`tests/tlc/` (the `Temporal property violated` verdicts of `tests/expected/`). Four of them are the intentional
+difference `constant-temporal` (`LiveConst*`), where tla2rs finds no violation; the other 80 print TLC's lasso (most by
+following TLC's search, some by coincidence; `all.sh` reports no `lasso confirmed instead`), 35 of them with a tableau
+in their plan (a `tableau: Some` in the generated `TLC_LIVE`; among them `LiveTab*`, `LiveTabSym`,
+`LiveFold-ViewLoopEv`, `SymLoopEv`, `ViewSucc`, `Late`, `Live-Spec*-Starve`, `Live-SpillNext-Starve`,
+`LiveForms-NoneImplies`, `Peterson-Unfair`, `OptDiffTrace-Live`, `LiveAssumed-Leads`, `PrintLive-Ev`, `SpecConj-Mix`).
 
 TLC checks such a lasso as follows. With `-lassocheck DIR`, the checker writes `DIR/Tla2rsLasso.tla` and
 `.cfg` (`write_lasso_check` in the runtime, `src/lasso.rs`): a module that EXTENDS the spec with a variable for the
