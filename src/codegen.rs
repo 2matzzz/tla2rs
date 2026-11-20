@@ -3108,6 +3108,8 @@ impl<'a> Gen<'a> {
             // which it does not count as built there (`k \notin [{1} -> {1}]`, measured)
             RecSet(_) | FunSet(..) => !(self.is_const(e, env) && self.ce.enumerable(e, &env.vals)),
             Call(f, _) => f == "\\X",
+            // `x \in SUBSET T` written there (measured, `tests/tlc/SubsetNonSet*`)
+            Un(UOp::Subset, _) => true,
             Bin(BOp::Cup | BOp::Cap | BOp::SetMinus, a, b) => self.built(a, env) || self.built(b, env),
             _ => false,
         }
@@ -5361,6 +5363,41 @@ impl<'a> Gen<'a> {
         )))
     }
 
+    /// `x \in S` where x has a record type holding a model value or a value of another kind (only
+    /// VAL_FIELD and ATOM_FIELD), and S is a set whose membership is decided by the value's
+    /// structure (`S \X T`, `Seq(S)`, `[D -> R]`, SUBSET, a set of records, BOOLEAN, Nat, Int,
+    /// STRING, an interval): the value present is tested with its own type. None otherwise
+    fn member_boxed(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<Option<String>> {
+        use Expr::*;
+        let Ty::Rec(fs) = xt else { return Ok(None) };
+        let only = fs.iter().all(|(n, _)| n == crate::types::VAL_FIELD || n == crate::types::ATOM_FIELD);
+        if !crate::types::has_val(fs) || !only {
+            return Ok(None);
+        }
+        let structural = match s {
+            Call(f, _) => f == "\\X" || f == "Seq",
+            Un(UOp::Subset, _) | FunSet(..) | RecSet(_) | Bin(BOp::Range, ..) => true,
+            Ident(n, _) => ["BOOLEAN", "Nat", "Int", "STRING"].contains(&n.as_str()) && !env.locals.contains_key(n),
+            _ => crate::compile::bounded_seq(s).is_some(),
+        };
+        if !structural {
+            return Ok(None);
+        }
+        let v = self.fresh("v");
+        let mut arms = vec![];
+        for (i, (n, ft)) in fs.iter().enumerate() {
+            let Ty::Opt(inner) = ft else { return Ok(None) };
+            let e = self.fresh("e");
+            let f = format!("{v}{}", rec_field(fs.len(), i));
+            let test = self.gen_member(&e, inner, s, env)?;
+            arms.push((n == crate::types::VAL_FIELD, format!("if {f}.0 {{ let {e} = {f}.1; {test} }}")));
+        }
+        // The value of another kind first; one field is always present
+        arms.sort_by_key(|(val, _)| !val);
+        let chain: Vec<String> = arms.into_iter().map(|(_, c)| c).collect();
+        Ok(Some(format!("{{ let {v} = {x}; {} else {{ unreachable!() }} }}", chain.join(" else "))))
+    }
+
     fn gen_member_of(&mut self, x: &str, xt: &Ty, s: &Expr, env: &Env) -> R<String> {
         use Expr::*;
         // A set written out where it is used, holding tuples and x a string or the other way
@@ -5408,6 +5445,14 @@ impl<'a> Gen<'a> {
         // Whether TLC builds the set here as written, or has it sorted (see the clash below)
         let written = self.built(s, env);
         let s = s.strip();
+        // A value that is a model value or a value of another kind (types::VAL_FIELD), in a set
+        // whose membership is decided by the value's structure: TLC asks the value itself, so a
+        // tuple held in VAL_FIELD is tested as the tuple it is (issue #131: `x \in S \X T` stopped
+        // with "non-tuple", `x \in Seq(S)` and the like were FALSE), and a model value as a model
+        // value (FALSE, or TLC's error for SUBSET)
+        if let Some(code) = self.member_boxed(x, xt, s, env)? {
+            return Ok(code);
+        }
         // TLC stops with an error on a tuple in SUBSET S, [a : S], BOOLEAN, Nat, Int, or a..b, and
         // treats it as a function in [S -> T]; none of these is compiled
         if tuple_elems(xt).is_some() {
@@ -5436,7 +5481,7 @@ impl<'a> Gen<'a> {
                 }
                 return Ok(format!("({})", conj.join(" && ")));
             }
-            if matches!(s, Un(UOp::Subset, _) | RecSet(_) | Bin(BOp::Range, ..))
+            if matches!(s, RecSet(_) | Bin(BOp::Range, ..))
                 || matches!(s, Ident(n, _) if ["BOOLEAN", "Nat", "Int", "STRING"].contains(&n.as_str()))
             {
                 return Ok(eval_error_bool(&format!("Attempted to check if the tuple {x} is an element of {}", short(s))));
@@ -5444,7 +5489,19 @@ impl<'a> Gen<'a> {
         }
         match s {
             Un(UOp::Subset, t) => {
-                let Ty::Set(et) = xt else { return Ok("false".into()) };
+                // Any value that is not a set (a model value, an integer, a string, a Boolean, a
+                // tuple, a record, a function) stops TLC, which prints the value and SUBSET T
+                // enumerated (measured on TLC 2.19, `tests/tlc/SubsetNonSet*`)
+                let Ty::Set(et) = xt else {
+                    if let (Ok((sc, st)), Ok(xid)) = (self.gen(s, env, None), self.ty_id(xt)) {
+                        let sid = self.ty_id(&st)?;
+                        let f = "Attempted to check if the non-enumerable value\n{}\nis element of\n{}";
+                        return Ok(format!(
+                            "{{ let __s = {sc}; let __r: bool = eval_error(format!({f:?}, ppr(&fmt_{xid}(&{x})), ppr(&fmt_{sid}(&__s)))); __r }}"
+                        ));
+                    }
+                    return Ok(eval_error_bool(&format!("Attempted to check if the non-enumerable value {x} is element of {}", short(s))));
+                };
                 let e = self.fresh("e");
                 let inner = self.gen_member(&e, et, t, env)?;
                 let it = self.s_iter(x, xt)?;
