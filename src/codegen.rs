@@ -4426,7 +4426,7 @@ impl<'a> Gen<'a> {
                     parts.push(c);
                     tys.push((k.clone(), t));
                 }
-                (rec_build(&parts), Ty::Rec(tys))
+                rec_value(&parts, tys)
             }
             // A name bound to a function whose body prints (see `gen_bind`): its value once
             // computed, else its body at the argument
@@ -4484,6 +4484,10 @@ impl<'a> Gen<'a> {
             }
             App(f, x) => {
                 let (fc, ft) = self.gen_val(f, env)?;
+                // No value to apply, as for a field of one (`Field` below)
+                if is_bottom(&ft) {
+                    return Ok((format!("{{ let _ = {fc}; type_error(\"a function\", \"applied\") }}"), ft));
+                }
                 if let Ty::Rec(fs) = &ft {
                     if is_tuple_fields(fs) {
                         if self.try_const(x, env).is_some() {
@@ -4606,6 +4610,11 @@ impl<'a> Gen<'a> {
                     None => String::new(),
                 };
                 let (fc, ft0) = self.gen(f, env, want)?;
+                // No value has this type (an element of a set that is always empty), so this code
+                // never runs and the updates have nothing to apply to (issue #136)
+                if is_bottom(&ft0) {
+                    return Ok((fc, ft0));
+                }
                 let f_ups = ups;
                 let ups: Vec<(Vec<Path>, Expr)> = ups
                     .iter()
@@ -4789,7 +4798,7 @@ impl<'a> Gen<'a> {
                     parts.push(c);
                     tys.push((tuple_field(i), t));
                 }
-                (rec_build(&parts), Ty::Rec(tys))
+                rec_value(&parts, tys)
             }
             Choose(x, s, p) => {
                 // The first element in iteration order that satisfies p. Sets iterate in TLC's
@@ -8480,6 +8489,22 @@ fn fun_kv(t: &Ty) -> (Ty, Ty) {
 /// The type a function over part of a type is stored as: an optional value per element
 fn pfun_repr(d: &Ty, c: &Ty) -> Ty {
     Ty::Fun(d.clone().into(), Ty::Opt(c.clone().into()).into())
+}
+
+/// The type no value has (the element type of a set that is always empty)
+fn is_bottom(t: &Ty) -> bool {
+    matches!(t, Ty::Enum(v) if v.is_empty())
+}
+
+/// A record or tuple of these parts. With a field of the type no value has, it has no value either
+/// and takes that type: as a record type it would have no values to encode, and its encoding would
+/// divide by zero (issue #136). Its parts still run, in order, and stop as they would
+fn rec_value(parts: &[String], tys: Vec<(String, Ty)>) -> (String, Ty) {
+    if tys.iter().any(|(_, t)| is_bottom(t)) {
+        let b = Ty::Enum(vec![]);
+        return (format!("{{ let __u: {} = {{ let _ = {}; unreachable!() }}; __u }}", b.repr(), rec_build(parts)), b);
+    }
+    (rec_build(parts), Ty::Rec(tys))
 }
 
 /// The function type a bag is stored as: element -> count (0 when absent)
