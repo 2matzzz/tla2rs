@@ -131,6 +131,10 @@ impl Ord for Value {
             // As TLC: the empty function (held as <<>>) has the smallest domain
             (Tuple(a), Fun(_)) if a.is_empty() => std::cmp::Ordering::Less,
             (Fun(_), Tuple(b)) if b.is_empty() => std::cmp::Ordering::Greater,
+            // As TLC: a tuple is the function over 1..n, compared as functions are (issue #123,
+            // `tests/tlc/TupleFunOrder`: `{<<5>>, (2 :> 1)}`, `{<<2>>, (2 :> 1)}`)
+            (Tuple(a), Fun(b)) => tuple_vs_fun(a, b),
+            (Fun(a), Tuple(b)) => tuple_vs_fun(b, a).reverse(),
             _ => self.rank().cmp(&o.rank()),
         }
     }
@@ -139,6 +143,15 @@ impl Ord for Value {
 /// The atom of the string `name` in the registered Atoms, if the compiler numbered it
 pub fn string_atom(name: &str) -> Option<u32> {
     STRING_IDS.with(|s| s.borrow().as_ref()?.borrow().get(&(false, name.to_string())).copied())
+}
+
+/// A tuple against a function, as the function over 1..n: by the size of the domain, then key and
+/// value pair by pair
+fn tuple_vs_fun(t: &[Value], f: &BTreeMap<Value, Value>) -> std::cmp::Ordering {
+    t.len().cmp(&f.len()).then_with(|| {
+        let pairs = t.iter().enumerate().map(|(i, v)| (Value::Int(i as i64 + 1), v));
+        pairs.cmp(f.iter().map(|(k, v)| (k.clone(), v)))
+    })
 }
 
 /// A record against a function, as the function over its field names. A record with a field

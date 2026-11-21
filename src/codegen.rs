@@ -127,6 +127,11 @@ pub struct Gen<'a> {
     /// The variables whose sets of integers TLC may hold as intervals, with their first bit in
     /// the state's shape: the word, the first bit there and their number of bits (see `plan_shapes`)
     pub shaped: std::collections::BTreeMap<String, (u32, u32, u32)>,
+    /// The variables every assignment of which (but an EXCEPT of the variable itself) is a
+    /// function TLC builds as one, `[x \in S |-> e]`, `:>` or `@@`: a tuple the checker holds for
+    /// one is a function to TLC, which an EXCEPT key that is no integer tells apart
+    /// (`except_key_checks`)
+    pub fun_held: BTreeSet<String>,
     /// The bits of a word of shape: 64, or 128 when a variable needs more (see `plan_shapes`)
     pub sh_bits: u32,
     /// IFs whose condition prints inside the value being assigned to a variable with a shape, by
@@ -231,6 +236,7 @@ impl<'a> Gen<'a> {
             split_warns: vec![],
             split_strs: vec![],
             shaped: std::collections::BTreeMap::new(),
+            fun_held: BTreeSet::new(),
             sh_bits: 64,
             if_sites: HashMap::new(),
             if_replay: false,
@@ -1621,6 +1627,168 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// The type of an EXCEPT key, also of a string literal that is no string of the spec (an
+    /// empty enumeration then, which is of the kind of strings)
+    fn key_ty(&mut self, i: &Expr, env: &Env) -> Option<Ty> {
+        match (i.strip(), self.try_const(i, env)) {
+            (Expr::Str(_), None) => Some(Ty::Enum(vec![])),
+            (_, Some(v)) => self.lit_auto(&v, None).ok().map(|(_, t)| t),
+            (_, None) => self.gen(i, env, None).ok().map(|(_, t)| t),
+        }
+    }
+
+    /// Whether a key of type k can never be an element of a domain of type d: integers against
+    /// atoms (strings and model values)
+    fn kinds_apart(d: &Ty, k: &Ty) -> bool {
+        matches!((d, k), (Ty::Int(..), Ty::Enum(_)) | (Ty::Enum(_), Ty::Int(..)))
+    }
+
+    /// Code for whether the value `v` of type t is an integer; None when it cannot be
+    fn kind_int(v: &str, t: &Ty) -> Option<String> {
+        match t {
+            Ty::Int(..) => Some("true".into()),
+            Ty::IntAtom(..) => Some(format!("({v} >= i64::MIN + 65536)")),
+            _ => None,
+        }
+    }
+
+    /// Code for whether the value `v` of type t is a string (an atom that is no model value); None
+    /// when it cannot be
+    fn kind_str(&self, v: &str, t: &Ty) -> Option<String> {
+        match t {
+            Ty::Enum(ks) | Ty::IntAtom(_, _, ks) if ks.iter().all(|&a| self.atoms.is_model(a)) => None,
+            Ty::Enum(ks) if ks.iter().all(|&a| !self.atoms.is_model(a)) => Some("true".into()),
+            Ty::Enum(_) => Some(format!("IS_STR[{v} as usize]")),
+            Ty::IntAtom(..) => Some(format!("({v} < i64::MIN + 65536 && IS_STR[({v} - i64::MIN) as usize])")),
+            _ => None,
+        }
+    }
+
+    /// TLC's error for an EXCEPT key of another kind than the value it changes takes (issue #123,
+    /// measured on TLC 2.19, `tests/tlc/ExceptKey*`): a tuple (also empty, or a sequence) stops on
+    /// a key that is not an integer (`Attempted to apply tuple to a non-integer argument K.`), a
+    /// record on one that is not a string (`... apply record to a non-string argument K.`), and a
+    /// function compares the first element of its domain with the key, which stops on a string
+    /// against an integer (`Attempted to check equality of integer D with non-integer:` K) or an
+    /// integer against a string; a model value against either is only unequal, so the EXCEPT
+    /// changes nothing and warns, as does a function with an empty domain. Code evaluated before
+    /// the updates, walking each path through the steps whose place is known when compiling;
+    /// empty when no key can be of another kind
+    /// `fun_base`: TLC holds the value as a function (`fun_origin`), though the checker may hold
+    /// it as a tuple
+    fn except_key_checks(&mut self, t: &str, ft0: &Ty, ups: &[(Vec<Path>, Expr)], env: &Env, fun_base: bool) -> R<String> {
+        let mut out = String::new();
+        for (path, _) in ups {
+            let mut place = t.to_string();
+            let mut cur = ft0.clone();
+            let mut top = true;
+            for p in path {
+                if matches!(p, Path::Field(k) if k.starts_with('@')) {
+                    continue;
+                }
+                let as_fun = std::mem::replace(&mut top, false) && fun_base;
+                let key = match p {
+                    Path::Field(k) if k.starts_with('@') => continue,
+                    Path::Field(k) => Expr::Str(k.clone()),
+                    Path::Idx(i) => i.clone(),
+                };
+                // A constant key (a literal, `.a`) as its value; others as code. A string that is
+                // no string of the spec (so no atom) is a string all the same
+                let kv = self.fresh("k");
+                let (kc, show_k, is_int, is_str) = match (key.strip(), self.try_const(&key, env)) {
+                    (Expr::Str(s), None) => ("()".to_string(), format!("{:?}", format!("{s:?}")), None, Some("true".to_string())),
+                    (_, c) => {
+                        let generated = match c {
+                            Some(v) => self.lit_auto(&v, None),
+                            None => self.gen(&key, env, None),
+                        };
+                        let Ok((kc, kt)) = generated else { break };
+                        let kid = self.ty_id(&kt)?;
+                        // Whether the key is an integer, or a string (None: it cannot be)
+                        (kc, format!("ppr(&fmt_{kid}(&{kv}))"), Self::kind_int(&kv, &kt), self.kind_str(&kv, &kt))
+                    }
+                };
+                let not = |c: &Option<String>| match c.as_deref() {
+                    None => "true".to_string(),
+                    Some("true") => "false".to_string(),
+                    Some(c) => format!("!{c}"),
+                };
+                let tuple_like = match &cur {
+                    Ty::Seq(_) => true,
+                    Ty::Rec(fs) if fs.is_empty() => self.empty_text() == Some("<<>>"),
+                    Ty::Rec(fs) => is_tuple_fields(fs),
+                    _ => false,
+                };
+                let record = matches!(&cur, Ty::Rec(fs) if !fs.is_empty() && !is_tuple_fields(fs)
+                    && fs.iter().all(|(n, _)| n != ATOM_FIELD && n != VAL_FIELD));
+                let check = |out: &mut String, cond: String, msg: String| {
+                    if cond != "false" {
+                        write!(out, "{{ let {kv} = {kc}; if {cond} {{ eval_error({msg}) }} }} ").unwrap();
+                    }
+                };
+                if tuple_like && as_fun {
+                    // A function over 1..n to TLC: its first argument, 1, against the key; nothing
+                    // to compare with when empty
+                    let nonempty = match &cur {
+                        Ty::Seq(_) => Some(format!("({place}).len > 0")),
+                        Ty::Rec(fs) if !fs.is_empty() => Some("true".into()),
+                        _ => None,
+                    };
+                    if let (Some(ne), Some(ks)) = (nonempty, &is_str) {
+                        check(
+                            &mut out,
+                            format!("{ne} && {ks}"),
+                            format!("format!(\"Attempted to check equality of integer 1 with non-integer:\\n{{}}\", {show_k})"),
+                        );
+                    }
+                } else if tuple_like {
+                    check(&mut out, not(&is_int), format!("format!(\"Attempted to apply tuple to a non-integer argument {{}}.\", {show_k})"));
+                } else if record {
+                    check(&mut out, not(&is_str), format!("format!(\"Attempted to apply record to a non-string argument {{}}.\", {show_k})"));
+                } else if let Ty::Fun(d, _) | Ty::PFun(d, _) = &cur {
+                    // The first element of the domain, the value TLC compares the key with
+                    let did = self.ty_id(d)?;
+                    let first = match &cur {
+                        Ty::Fun(..) => d.size().filter(|n| *n > 0).map(|_| format!("Some(dec_{did}(0))")),
+                        Ty::PFun(..) if is_sparse_fun(&cur) => Some(format!("if ({place}).len > 0 {{ Some(({place}).items[0].0) }} else {{ None }}")),
+                        _ => d.size().map(|n| format!("(0..{n}u64).find(|&j| ({place})[j as usize].0).map(dec_{did})")),
+                    };
+                    // The domain's elements are all of one kind in TLC (it refuses to join
+                    // functions over integers and strings), so the first one's kind is checked
+                    // when the checker runs: the domain's type may have been widened by this very
+                    // EXCEPT, as the key's type joins it
+                    let (d_int, d_str) = (Self::kind_int("__d", d), self.kind_str("__d", d));
+                    let mut arms = vec![];
+                    if let (Some(di), Some(ks)) = (&d_int, &is_str) {
+                        arms.push(format!("if {di} && {ks} {{ eval_error(format!(\"Attempted to check equality of integer {{}} with non-integer:\\n{{}}\", ppr(&fmt_{did}(&__d)), {show_k})) }}"));
+                    }
+                    if let (Some(ds), Some(ki)) = (&d_str, &is_int) {
+                        arms.push(format!("if {ds} && {ki} {{ eval_error(format!(\"Attempted to check equality of string {{}} with non-string:\\n{{}}\", ppr(&fmt_{did}(&__d)), {show_k})) }}"));
+                    }
+                    if let (false, Some(first)) = (arms.is_empty(), first) {
+                        write!(out, "{{ let {kv} = {kc}; if let Some(__d) = {first} {{ {} }} }} ", arms.join(" ")).unwrap();
+                    }
+                }
+                // On to the next step where its place is known when compiling
+                match (&cur, p, self.try_const(&key, env)) {
+                    (Ty::Rec(fs), _, Some(Value::Int(k))) if is_tuple_fields(fs) && k >= 1 && k as usize <= fs.len() => {
+                        place = format!("{place}{}", rec_field(fs.len(), k as usize - 1));
+                        cur = fs[k as usize - 1].1.clone();
+                    }
+                    (Ty::Rec(fs), _, Some(Value::Atom(a))) if record => match fs.iter().position(|(n, _)| *n == self.atoms.name(a)) {
+                        Some(j) if !matches!(fs[j].1, Ty::Opt(_)) => {
+                            place = format!("{place}{}", rec_field(fs.len(), j));
+                            cur = fs[j].1.clone();
+                        }
+                        _ => break,
+                    },
+                    _ => break,
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// An EXCEPT step `[i]` into a tuple with i not constant: `!p[i] ... = v` becomes
     /// `!p = CASE i = 1 -> [@ EXCEPT ![1] ... = v] [] ... [] OTHER -> @`, since each element of a
     /// tuple may have its own type (an index outside the tuple leaves it unchanged, as in TLC)
@@ -1775,6 +1943,10 @@ impl<'a> Gen<'a> {
             (Path::Idx(i), Ty::Fun(d, c) | Ty::PFun(d, c)) => {
                 let c2 = self.widen_keys(c, rest, env);
                 let it = self.gen(i, env, Some(d)).ok().map(|(_, it)| it);
+                // A key of the other kind (a string for a function over integers, or the reverse)
+                // is outside the domain, or TLC's error (except_key_checks): the domain keeps its
+                // type, so that the function prints as TLC prints it
+                let it = it.filter(|it| !Self::kinds_apart(d, it));
                 let wider = it.filter(|it| it != d.as_ref() && !(it.kind_eq(d) && Self::trivial(it, d))).and_then(|it| join(d, &it).ok()).filter(|j| j != d.as_ref());
                 match (wider, t) {
                     (Some(j), _) => Ty::PFun(j.into(), c2.into()),
@@ -4434,6 +4606,7 @@ impl<'a> Gen<'a> {
                     None => String::new(),
                 };
                 let (fc, ft0) = self.gen(f, env, want)?;
+                let f_ups = ups;
                 let ups: Vec<(Vec<Path>, Expr)> = ups
                     .iter()
                     .map(|(p, v)| {
@@ -4463,9 +4636,21 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+                // A key of another kind than the value takes is TLC's error (except_key_checks),
+                // found on the value as it was, before its type is widened
+                let raw: Vec<(Vec<Path>, Expr)> = f_ups.iter().map(|(p, v)| (p.clone(), v.clone())).collect();
+                let e0 = self.fresh("e0");
+                let fun_base = self.fun_origin(f);
+                let mut checks = self.except_key_checks(&e0, &ft0, &raw, env, fun_base)?;
+                // On a value TLC builds there (`[<<>> EXCEPT !["a"] = 1]`) the error is also a
+                // fingerprint error, as for a set written out (measured)
+                if !checks.is_empty() && self.built(f, env) {
+                    checks = format!("{{ let __fp = FpSource::enter(); {checks}}} ");
+                }
+                let (head, fc) = if checks.is_empty() { (String::new(), fc) } else { (format!("let {e0} = {fc}; {checks}"), e0.clone()) };
                 let fc = if ft != ft0 { self.coerce(fc, &ft0, &ft)? } else { fc };
                 let t = self.fresh("t");
-                let mut s = format!("{{ let mut {t} = {fc}; ");
+                let mut s = format!("{{ {head}let mut {t} = {fc}; ");
                 for (path, val) in ups {
                     let mut place = t.clone();
                     let mut cur = ft.clone();
@@ -4477,6 +4662,11 @@ impl<'a> Gen<'a> {
                             // Name of this EXCEPT's @, attached during expansion
                             (Path::Field(k), _) if k.starts_with('@') => at_name = Some(k.clone()),
                             // An index outside the sequence leaves it unchanged, as in TLC
+                            // A key that is no integer: TLC's error, raised before (except_key_checks)
+                            (Path::Idx(i), Ty::Seq(_)) if !matches!(self.key_ty(i, env), Some(Ty::Int(..) | Ty::IntAtom(..))) => {
+                                outside = true;
+                                break;
+                            }
                             (Path::Idx(i), Ty::Seq(e)) => {
                                 let (ic, _) = self.gen_int(i, env)?;
                                 let iv = self.fresh("i");
@@ -4484,6 +4674,12 @@ impl<'a> Gen<'a> {
                                 conds.push(format!("{iv} >= 1 && {iv} <= ({place}).len as i64"));
                                 place = format!("{place}.items[({iv} - 1) as usize]");
                                 cur = e.as_ref().clone();
+                            }
+                            // A key of the other kind than the domain's: outside it, or TLC's
+                            // error, raised before (except_key_checks)
+                            (Path::Idx(i), Ty::Fun(d, _) | Ty::PFun(d, _)) if self.key_ty(i, env).is_some_and(|k| Self::kinds_apart(d, &k)) => {
+                                outside = true;
+                                break;
                             }
                             (Path::Idx(i), Ty::Fun(d, c)) => {
                                 // A bound variable with a known index needs neither conversion nor
@@ -4546,6 +4742,12 @@ impl<'a> Gen<'a> {
                             }
                             // A name that is no string of the spec, outside the domain (see resolve_path)
                             (Path::Field(_), Ty::Fun(d, _) | Ty::PFun(d, _)) if matches!(d.as_ref(), Ty::Enum(_)) => {
+                                outside = true;
+                                break;
+                            }
+                            // A key of a record that is no string: TLC's error, raised before
+                            // (except_key_checks)
+                            (Path::Idx(_), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
                                 outside = true;
                                 break;
                             }
@@ -6263,6 +6465,9 @@ impl<'a> Gen<'a> {
                     }
                     match rhs.strip() {
                         Except(base, ups) if matches!(base.strip(), Ident(n, _) if *n == v) && ups.iter().all(|(p, _)| self.widen_keys(&t, p, env) == t) => {
+                            let raw: Vec<(Vec<Path>, Expr)> = ups.iter().map(|(p, x)| (p.clone(), x.clone())).collect();
+                            let checks = self.except_key_checks(&place, &t, &raw, env, self.fun_held.contains(&v))?;
+                            out.push_str(&checks);
                             self.gen_except_into(&place, ups, &t, &env2, except_pos(base), out)?;
                         }
                         _ => match self.gen_set_update(&place, &v, rhs, &t, env) {
@@ -6774,6 +6979,11 @@ impl<'a> Gen<'a> {
                 match (step, &cur) {
                     // Name of this EXCEPT's @, attached during expansion
                     (Path::Field(k), _) if k.starts_with('@') => at_name = Some(k.clone()),
+                    // A key that is no integer: TLC's error, raised before (except_key_checks)
+                    (Path::Idx(i), Ty::Seq(_)) if !matches!(self.key_ty(i, env), Some(Ty::Int(..) | Ty::IntAtom(..))) => {
+                        outside = true;
+                        break;
+                    }
                     (Path::Idx(i), Ty::Seq(e)) => {
                         let (ic, _) = self.gen_int(i, env)?;
                         let iv = self.fresh("i");
@@ -6781,6 +6991,12 @@ impl<'a> Gen<'a> {
                         conds.push(format!("{iv} >= 1 && {iv} <= ({p}).len as i64"));
                         p = format!("{p}.items[({iv} - 1) as usize]");
                         cur = e.as_ref().clone();
+                    }
+                    // A key of the other kind than the domain's: outside it, or TLC's error,
+                    // raised before (except_key_checks)
+                    (Path::Idx(i), Ty::Fun(d, _) | Ty::PFun(d, _)) if self.key_ty(i, env).is_some_and(|k| Self::kinds_apart(d, &k)) => {
+                        outside = true;
+                        break;
                     }
                     (Path::Idx(i), Ty::Fun(d, c)) => {
                         let known = match i.strip() {
@@ -6840,6 +7056,12 @@ impl<'a> Gen<'a> {
                     }
                     // A name that is no string of the spec, outside the domain (see resolve_path)
                     (Path::Field(_), Ty::Fun(d, _) | Ty::PFun(d, _)) if matches!(d.as_ref(), Ty::Enum(_)) => {
+                        outside = true;
+                        break;
+                    }
+                    // A key of a record that is no string: TLC's error, raised before
+                    // (except_key_checks)
+                    (Path::Idx(_), Ty::Rec(fs)) if !is_tuple_fields(fs) => {
                         outside = true;
                         break;
                     }
@@ -9745,6 +9967,7 @@ impl Gen<'_> {
     /// Which variables need a shape: those that some assignment in Init or Next may give a value
     /// TLC holds as an interval, directly or from another such variable
     pub fn plan_shapes(&mut self, init: &Expr, next: &Expr) {
+        self.fun_held = self.fun_held_vars(init, next);
         // Words of 128 bits only when a variable needs more than 64
         self.shaped.clear();
         self.sh_bits = 128;
@@ -9765,6 +9988,60 @@ impl Gen<'_> {
                 used[w] += n;
             }
         }
+    }
+
+    /// Whether TLC holds the value of e as a function, by how it is written (see `fun_held`)
+    fn fun_origin(&self, e: &Expr) -> bool {
+        match e.strip() {
+            Expr::FunCons(..) => true,
+            Expr::Call(op, xs) => (op == ":>" || op == "@@") && xs.len() == 2,
+            Expr::Ident(v, _) => self.fun_held.contains(v),
+            _ => false,
+        }
+    }
+
+    /// The variables of `fun_held`: assigned in Init and Next (`x = e`, `x' = e`) only functions
+    /// TLC builds as functions, or an EXCEPT of the variable itself
+    fn fun_held_vars(&self, init: &Expr, next: &Expr) -> BTreeSet<String> {
+        fn walk(e: &Expr, init: bool, out: &mut Vec<(String, Expr)>) {
+            if let Expr::Bin(BOp::Eq | BOp::In, l, r) = e {
+                let v = match l.strip() {
+                    Expr::Ident(v, _) if init => Some(v.clone()),
+                    Expr::Prime(x) => match x.strip() {
+                        Expr::Ident(v, _) => Some(v.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(v) = v {
+                    out.push((v, r.as_ref().clone()));
+                }
+            }
+            e.children().into_iter().for_each(|c| walk(c, init, out));
+        }
+        let mut assigns = vec![];
+        walk(init, true, &mut assigns);
+        walk(next, false, &mut assigns);
+        let mut held = BTreeSet::new();
+        let mut not = BTreeSet::new();
+        for (v, r) in assigns {
+            let own = match r.strip() {
+                Expr::Except(b, _) => matches!(b.strip(), Expr::Ident(n, _) if *n == v),
+                Expr::Ident(n, _) => *n == v,
+                _ => false,
+            };
+            let fun = match r.strip() {
+                Expr::FunCons(..) => true,
+                Expr::Call(op, xs) => (op == ":>" || op == "@@") && xs.len() == 2,
+                _ => false,
+            };
+            if fun {
+                held.insert(v);
+            } else if !own {
+                not.insert(v);
+            }
+        }
+        held.difference(&not).cloned().collect()
     }
 
     /// The variables that some assignment in Init or Next may give a value TLC holds as an
