@@ -2004,6 +2004,9 @@ struct LiveGraph {
     /// (state, number of its edges before it) of each self-loop a successor makes, kept apart for
     /// TLC's order of successors (see `tlc_lasso`)
     selfs: Col<(u32, u32)>,
+    /// Per state, its fingerprint, as found (reading the states again to fingerprint them would
+    /// read back what spilled to disk)
+    sfp: Col<Fp>,
     ec: Classes<EClass>,
     sc: Classes<SClass>,
 }
@@ -2082,6 +2085,7 @@ impl LiveGraph {
         }
         self.ecls.extend(&c.ecls);
         self.selfs.extend_from_slice(&c.selfs);
+        self.sfp.extend_from_slice(&c.sfp);
     }
 }
 
@@ -2320,6 +2324,8 @@ struct LiveChunk {
     /// (state, number of its edges before it) of each self-loop a successor makes, kept apart for
     /// TLC's order of successors (see `tlc_lasso`)
     selfs: Vec<(u32, u32)>,
+    /// Per new state, its fingerprint
+    sfp: Vec<Fp>,
 }
 
 struct Chunk {
@@ -2420,6 +2426,7 @@ fn expand_one_succ(
             }
             c.states.push(w);
             c.parent.push((head as u32, l));
+            c.live.sfp.push(tfp);
             c.unqueued = true;
             held.flush(k as u32 + 1);
             match eval_invariants(&t) {
@@ -5101,6 +5108,24 @@ fn run_safety_batched(opt: &Opt) {
 /// The most states of a level the threads expand before what they found is merged (see
 /// `run_liveness`)
 const LEVEL_SLICE: usize = 1 << 20;
+/// The time each phase of a liveness check took (printed to stderr at the end only when
+/// TLA2RS_PHASES is set): the phase and seconds, summed over the phases of the same name
+static LIVE_PH: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
+fn live_ph(what: &str, t: std::time::Instant) {
+    let d = t.elapsed().as_secs_f64();
+    let mut v = LIVE_PH.lock().unwrap_or_else(|e| e.into_inner());
+    match v.iter_mut().find(|x| x.0 == what) {
+        Some(x) => x.1 += d,
+        None => v.push((what.to_string(), d)),
+    }
+}
+fn live_ph_print() {
+    if std::env::var_os("TLA2RS_PHASES").is_some() {
+        let v = LIVE_PH.lock().unwrap_or_else(|e| e.into_inner());
+        let parts: Vec<String> = v.iter().map(|(w, d)| format!("{w} {d:.3}s")).collect();
+        eprintln!("tla2rs: phases: {}", parts.join(", "));
+    }
+}
 fn run_liveness(opt: &Opt) {
     let check_deadlock = opt.check_deadlock;
     let workers = opt.workers;
@@ -5135,17 +5160,18 @@ fn run_liveness(opt: &Opt) {
             }
         }
     }
+    let mut live = LiveGraph::default();
     for ((_, w, fp), b) in inits.into_iter().zip(ibits) {
         if seen.insert(fp) {
             g.states.push(w);
             g.parent.push((u32::MAX, u32::MAX));
             g.sbits.push(b);
+            live.sfp.push(fp);
         }
     }
     println!("Finished computing initial states: {} distinct states generated. ({workers} workers)", g.states.len());
     let stop = std::sync::atomic::AtomicBool::new(false);
     let pool = Pool::new(workers);
-    let mut live = LiveGraph::default();
     let mut lo = 0usize;
     let mut depth = 1u32;
     let mut last = std::time::Instant::now();
@@ -5160,9 +5186,12 @@ fn run_liveness(opt: &Opt) {
         for from in (lo..hi).step_by(LEVEL_SLICE) {
             let to = (from + LEVEL_SLICE).min(hi);
             let n = to - from;
+            let tph = std::time::Instant::now();
             let chunks: Vec<Chunk> = pool.run(n, pool.piece(n, MIN_PIECE), |_, i, a, b| {
                 expand(&g, from + a, from + b, &seen, &stop, i, check_deadlock)
             });
+            live_ph("expand", tph);
+            let tph = std::time::Instant::now();
             let mut found = None;
             let mut base = vec![];
             let mut unqueued = false;
@@ -5180,6 +5209,7 @@ fn run_liveness(opt: &Opt) {
                     unqueued = c.unqueued && found.is_some();
                 }
             }
+            live_ph("merge", tph);
             if let Some((_, f)) = found {
                 let mut distinct = g.states.len();
                 // The states TLC queues as it evaluates again after an error (`eval_replay`)
@@ -5291,6 +5321,7 @@ fn run_liveness(opt: &Opt) {
         trim_heap();
         let ok = liveness(&g, live, workers);
         println!("Checked temporal properties in {:.3}s", t1.elapsed().as_secs_f64());
+        live_ph_print();
         let spilled = COL_SPILLED.load(std::sync::atomic::Ordering::Relaxed);
         if spilled > 0 {
             eprintln!(
@@ -5716,31 +5747,26 @@ fn par_map<T: Send>(lo: usize, hi: usize, threads: usize, f: &(dyn Fn(usize) -> 
 }
 fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
     let n = g.states.len();
+    let tph = std::time::Instant::now();
     // Fingerprint -> state index (at most 3/4 full, as the visited set)
     let cap = (n + n / 3 + 1).next_power_of_two().max(16);
     let mut keys = vec![0 as Fp; cap];
     let mut vals = vec![u32::MAX; cap];
     let mut zero_id = u32::MAX;
-    // The fingerprints and the edges' targets are worked out by the threads, a block at a time
-    const BLOCK: usize = 1 << 22;
-    for lo in (0..n).step_by(BLOCK) {
-        let fps = par_map(lo, (lo + BLOCK).min(n), workers, &|i| {
-            let w = g.states.get(i);
-            state_fp(&unpack(&w), &w)
-        });
-        for (i, fp) in (lo..).zip(fps) {
-            if fp == 0 {
-                zero_id = i as u32;
-                continue;
-            }
-            let mut k = (fp as usize) & (cap - 1);
-            while keys[k] != 0 {
-                k = (k + 1) & (cap - 1);
-            }
-            keys[k] = fp;
-            vals[k] = i as u32;
+    for i in 0..n {
+        let fp = live.sfp.get(i);
+        if fp == 0 {
+            zero_id = i as u32;
+            continue;
         }
+        let mut k = (fp as usize) & (cap - 1);
+        while keys[k] != 0 {
+            k = (k + 1) & (cap - 1);
+        }
+        keys[k] = fp;
+        vals[k] = i as u32;
     }
+    live.sfp = Col::new();
     let find = |keys: &[Fp], vals: &[u32], fp: Fp| -> u32 {
         if fp == 0 {
             return zero_id;
@@ -5756,8 +5782,12 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
             k = (k + 1) & (cap - 1);
         }
     };
+    live_ph("index", tph);
+    let tph = std::time::Instant::now();
     let lookup = |fp: Fp| find(&keys, &vals, fp);
     let edges = live.tfp.len();
+    // The edges' targets are worked out by the threads, a block at a time
+    const BLOCK: usize = 1 << 22;
     let mut dst: Col<u32> = Col::new();
     for lo in (0..edges).step_by(BLOCK) {
         let ts = par_map(lo, (lo + BLOCK).min(edges), workers, &|e| lookup(live.tfp.get(e)));
@@ -5765,6 +5795,7 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
         assert!(!ts.contains(&u32::MAX), "an edge of the state graph leads to a state it does not have");
         dst.extend_from_slice(&ts);
     }
+    live_ph("targets", tph);
     // Kept for TLC's liveness graph under a VIEW or a SYMMETRY (see `fold_gen`)
     let index = folded().then_some((keys, vals));
     live.tfp = Col::new();
@@ -5813,7 +5844,10 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
                             if quit() {
                                 continue;
                             }
-                            if let Some(l) = check_prop(&st, &LPROPS[i], &inits, &quit) {
+                            let tph = std::time::Instant::now();
+                            let r = check_prop(&st, &LPROPS[i], &inits, &quit);
+                            live_ph(&format!("prop{i}"), tph);
+                            if let Some(l) = r {
                                 first_bad.fetch_min(i, Relaxed);
                                 out.push((i, l));
                             }
@@ -5836,10 +5870,12 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
     // kept decides (see `TFound`)
     let mut why_own = None;
     if folded() {
+        let tph = std::time::Instant::now();
         let found = match tlc_lasso(g, &st, &inits, &[], &at, false) {
             Ok(TFound::None(true)) => tlc_lasso(g, &st, &inits, &[], &at, true),
             r => r,
         };
+        live_ph("tlc_lasso", tph);
         match found {
             Ok(TFound::None(_)) => {
                 hold();
@@ -5868,12 +5904,18 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
             }
         }
     }
+    let tph = std::time::Instant::now();
     let Some((prefix, cycle)) = own() else {
+        live_ph("search", tph);
         hold();
         return true;
     };
+    live_ph("search", tph);
     header();
-    match why_own.map_or_else(|| tlc_lasso(g, &st, &inits, selfs.as_slice(), &at, false), Err) {
+    let tph = std::time::Instant::now();
+    let tlc = why_own.map_or_else(|| tlc_lasso(g, &st, &inits, selfs.as_slice(), &at, false), Err);
+    live_ph("tlc_lasso", tph);
+    match tlc {
         Ok(TFound::Tlc(tfp, prefix, postfix)) => match tlc_print_lasso(g, &tfp, &prefix, &postfix) {
             Ok(()) => return false,
             Err(why) => eprintln!("tla2rs: the counterexample is tla2rs's own, not TLC's ({why})"),
@@ -5897,6 +5939,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
     }
     assert!(pr.q <= 1 << 16, "an automaton too large for the liveness search");
     let total = st.n() * pr.q;
+    let tph = std::time::Instant::now();
     // Reachable product nodes, in BFS order, with the number of their BFS parents in that order
     let mut rank = Rank::new(total, pr.q);
     let mut order: Vec<usize> = vec![];
@@ -5928,6 +5971,8 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         }
         h += 1;
     }
+    live_ph("bfs", tph);
+    let tph = std::time::Instant::now();
     let mut lasso = None;
     sccs(&pr, &order, order.len(), &|p| rank.get(p), &mut |c| {
         if quit() {
@@ -6016,6 +6061,7 @@ fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) 
         lasso = Some((prefix, cycle));
         true
     });
+    live_ph("tarjan", tph);
     lasso
 }
 /// Prints a lasso as TLC does: the states from an initial state to the entry of the cycle, then
