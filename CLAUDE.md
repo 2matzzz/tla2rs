@@ -89,7 +89,7 @@ It has no crate dependencies.
 | `src/pcal.rs` | TLC's check of the checksums a PlusCal translator wrote: the warnings for the root module and the modules it extends, and the algorithm's syntax tree as TLC's translator prints it (see "PlusCal checksums") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/ppr.rs` | TLC's pretty printer for values (`ppr`, ported from `tlc2.pprint` and checked against TLC's on 25,000 random values): used by the compiler for what Print and PrintT print when TLC starts, and pasted into every generated checker, which prints states and printed values with it |
-| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). Also the `-dumpgraph` output. `LIVE_SIM_RT` is pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
+| `src/runtime.rs` | The runtime pasted into generated code: the safety search without levels (see "The search without levels") and level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). Also the `-dumpgraph` output. `LIVE_SIM_RT` is pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
 
 ### Memory use (`runtime.rs`)
 
@@ -97,7 +97,8 @@ There are two paths, depending on what is checked.
 
 | | What is kept | Per state |
 |---|---|---|
-| Invariants only (`run_safety`) | The fingerprint and the fingerprint of the state it was first reached from, plus the states of the current and next level | 16 bytes (8 with `-notrace`) |
+| Invariants only, without levels (`run_async`) | The fingerprint and its smallest depth, plus the queued states | 16 bytes per slot (32 with `-fp128`), the table at most 7/10 full |
+| Invariants only, by levels (`run_levels`) | The fingerprint and the fingerprint of the state it was first reached from, plus the states of the current and next level | 16 bytes (8 with `-notrace`) |
 | With temporal properties (`run_liveness`) | The whole state graph (states, parents, edges with their atom and fairness bits) | State width + a few dozen bytes, plus hash maps over the product with each property's automaton during the search |
 
 The safety path never keeps states. A counterexample is rebuilt by walking fingerprints back to an initial state and
@@ -119,6 +120,25 @@ left behind even when the checker is killed. Without `-tmpdir` it goes to the sy
 tmpfs (`/tmp` on many Linux systems, where a file takes memory), to the directory of the checker's executable
 (`default_tmpdir`). A failed read of the spilled queue is a fatal error: skipping it could turn
 an incomplete search into "no error".
+
+### The search without levels
+
+`run_safety` first runs a search without levels (`run_async`): each worker expands states from a queue of its own,
+oldest first, and takes half of another's when its own is empty; the visited states are one table of fingerprints
+filled with compare-and-swap (`VTab`, doubled while no worker is inside a batch), each with the smallest depth it was
+reached at. A state reached again at a smaller depth is expanded again with it, only to lower its successors' depths,
+so the depth printed is the breadth-first one; its first expansion alone counts and checks successors and writes its
+edges to the state graph, so the counts and the graph are those of the search by levels. Each worker spills the
+newest part of its queue to files of its own past `-memlimit`.
+
+Where the order of expansion shows, it is not used (`async_fits`): PRINT_ORDER, a warning printed while exploring,
+TLCGET, the strings made (STR_ORDER), VIEW, SYMMETRY, shapes (`SHAPED`, set by `compile.rs`), `-continue`,
+`-dumpstates` and `-dumpcolors`; nor with `-batched`, `-metal` or temporal properties, which have their own paths.
+At any error (and when its table is full) it stops, drops what it wrote to the state graph, and the search by levels
+(`run_levels`) runs from the initial states and reports as TLC does, so an error costs a second search up to it.
+`TLA2RS_SEARCH=levels` selects the search by levels, and `TLA2RS_PHASES=1` prints on stderr how many states were
+expanded again. The checker takes the last `-workers`, so `\* crosscheck: rsargs -workers 4` runs a configuration
+with four workers (`tests/tlc/SkipWalk`, whose cells are reached by paths of different lengths).
 
 ### Capacities
 

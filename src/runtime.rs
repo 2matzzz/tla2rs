@@ -1246,12 +1246,17 @@ const WARN_EXIT: i32 = 74;
 /// it exits at once with WARN_EXIT, and tla2rs builds it again with PRINT_ORDER
 #[cold]
 fn except_warning(at: &str) {
-    if WARN_RERUN && !flag(&NOWARN) && std::env::var("TLA2RS_GROW").is_ok_and(|g| g.contains('w')) {
+    if warn_exits() {
         use std::io::Write;
         let _ = std::io::stdout().flush();
         std::process::exit(WARN_EXIT);
     }
     tlc_print(format!("{WARNING_MARK}Warning: The EXCEPT was applied to non-existing fields of the value at\n{at}"));
+}
+
+/// Whether a warning makes the checker exit (see `except_warning`)
+fn warn_exits() -> bool {
+    WARN_RERUN && !flag(&NOWARN) && std::env::var("TLA2RS_GROW").is_ok_and(|g| g.contains('w'))
 }
 
 /// A state pushed by `init` or `next`
@@ -3078,9 +3083,10 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from)
             .unwrap_or_else(default_tmpdir),
+        // The last one, so that arguments added after others can change it
         workers: args
             .iter()
-            .position(|a| a == "-workers")
+            .rposition(|a| a == "-workers")
             .and_then(|i| args.get(i + 1))
             .and_then(|w| w.parse().ok())
             .unwrap_or_else(|| if TLCGET { 1 } else { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) })
@@ -4227,21 +4233,36 @@ fn report_trace(seen: &dyn Visited, f: &SFound) -> usize {
 
 fn run_safety(opt: &Opt) {
     let t0 = std::time::Instant::now();
+    let (inits, generated) = initial_states();
+    println!("Finished computing initial states: {} distinct states generated. ({} workers)", inits.len(), opt.workers);
+    let first: Vec<Qitem> = inits.into_iter().map(|(_, w, fp)| (w, fp)).collect();
+    // The search without levels when nothing needs TLC's order; it hands an error over to the
+    // search by levels, which runs from the initial states again and reports it as TLC does
+    if async_fits() {
+        if let Some(mark) = dump_mark() {
+            if let Some(r) = run_async(opt, &first, t0) {
+                return finish(opt, t0, generated + r.generated, first.len() as u64 + r.distinct, r.depth, 0);
+            }
+            dump_rewind(mark);
+            *FP_ERR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *INCOMPLETE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    run_levels(opt, t0, first, generated)
+}
+
+/// The search by levels: each level is expanded in TLC's order (with one worker), so an error
+/// stops it where TLC stops, with TLC's counts, states left on queue and counterexample
+fn run_levels(opt: &Opt, t0: std::time::Instant, inits: Vec<Qitem>, mut generated: u64) {
     let seen = Shards::new(opt.keep_pred);
-    let (inits, mut generated) = initial_states();
     let mut frontier = Level::new(opt.mem_limit);
     let mut first = vec![];
-    for (_, w, fp) in inits {
+    for (w, fp) in inits {
         if seen.insert_with(fp, fp) {
             first.push((w, fp));
         }
     }
     let mut distinct = first.len() as u64;
-    println!(
-        "Finished computing initial states: {} distinct states generated. ({} workers)",
-        first.len(),
-        opt.workers
-    );
     frontier.extend(first, opt);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let pool = Pool::new(opt.workers);
@@ -4434,6 +4455,813 @@ fn finish(opt: &Opt, t0: std::time::Instant, generated: u64, distinct: u64, dept
     }
     println!("Model checking completed. No error has been found.");
     println!("Finished in {:.3}s", t0.elapsed().as_secs_f64());
+}
+
+// ---------------------------------------------------------------- the search without levels
+//
+// Each worker expands states from a queue of its own, oldest first, and takes half of another's
+// queue when its own is empty, so no worker waits for a level to end. The visited states are one
+// table of fingerprints that the workers fill with compare-and-swap, without locks. The order of
+// expansion is then only close to breadth first, so each state keeps the smallest depth it was
+// reached at: when a shorter path lowers it, the state is expanded again with that depth, which
+// lowers its successors' in turn (`AItem`). The counts are those of the search by levels, since
+// each state is expanded once as such; its other expansions only lower depths.
+//
+// The order in which states are reached decides what an error looks like (the counterexample,
+// the counts and the states left on queue), and in some specs also what the search finds. So
+// this search runs only where nothing else depends on that order (`async_fits`), and when it meets
+// any error it stops and leaves the run to the search by levels, which runs from the initial
+// states again and reports the error as TLC does.
+
+/// Set by compile.rs for a spec whose states carry a shape (see "State graphs"): the first state
+/// reached keeps its form, which shows in the state graph, in ToString, and so in invariants
+const SHAPED: bool = false;
+
+/// Whether the search without levels may run: not when the order of expansion shows, through
+/// printed lines or warnings, TLCGet, the strings made, VIEW or SYMMETRY (which state of a class
+/// is kept), shapes, -continue, the states of -dump, or the colors of -dump dot,colorize. A
+/// warning that makes the checker exit shows nothing: tla2rs builds it again with PRINT_ORDER.
+/// TLA2RS_SEARCH=levels selects the search by levels, to compare the two
+fn async_fits() -> bool {
+    !PRINT_ORDER
+        && (!WARN_RERUN || flag(&NOWARN) || warn_exits())
+        && !TLCGET
+        && !str_on()
+        && !HAS_VIEW
+        && PERMS.is_empty()
+        && !SHAPED
+        && !flag(&CONTINUE)
+        && !flag(&DUMP_STATES)
+        && !flag(&DUMP_COLORS)
+        && std::env::var("TLA2RS_SEARCH").map_or(true, |v| v != "levels")
+}
+
+/// Where the state graph ends before the search without levels (Some(None) without one), and
+/// the next id of a successor without a fingerprint. None if the file cannot tell where it is
+fn dump_mark() -> Option<Option<(u64, u64)>> {
+    use std::io::{Seek, Write};
+    let mut g = DUMP.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(w) = g.as_mut() else { return Some(None) };
+    w.flush().ok()?;
+    let at = w.get_mut().stream_position().ok()?;
+    Some(Some((at, DUMP_SEQ.load(std::sync::atomic::Ordering::Relaxed))))
+}
+
+/// Drops what the search without levels wrote to the state graph
+fn dump_rewind(mark: Option<(u64, u64)>) {
+    use std::io::{Seek, Write};
+    let Some((at, seq)) = mark else { return };
+    let mut g = DUMP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = g.as_mut() {
+        let r = w.flush().and_then(|_| w.get_mut().set_len(at)).and_then(|_| w.get_mut().seek(std::io::SeekFrom::Start(at)));
+        if let Err(e) = r {
+            eprintln!("cannot write the state graph: {e}");
+            std::process::exit(2);
+        }
+    }
+    DUMP_SEQ.store(seq, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Prefetches the cache line at p
+#[inline(always)]
+fn prefetch_line(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = p;
+    }
+}
+
+/// The 64-bit words of a fingerprint in a slot
+const VFPW: usize = FP_BITS / 64;
+
+/// A slot of the visited table: the fingerprint (0 in its first word: empty) and `m`, the
+/// smallest depth the state was reached at (`venc`). Slots fill whole cache lines.
+#[repr(C, align(16))]
+struct VSlot {
+    k: [std::sync::atomic::AtomicU64; VFPW],
+    m: std::sync::atomic::AtomicU64,
+}
+
+/// Set in `m` once the whole fingerprint is written
+const V_READY: u64 = 1 << 63;
+
+/// A depth as kept in `m`: larger for a smaller depth, so that `fetch_max` lowers it, and 0 for
+/// none yet
+#[inline]
+fn venc(d: u32) -> u64 {
+    V_READY | (u32::MAX - d) as u64
+}
+
+#[inline]
+fn vdec(m: u64) -> u32 {
+    u32::MAX - m as u32
+}
+
+#[inline]
+fn vwords(fp: Fp) -> (u64, u64) {
+    (fp as u64, (fp as u128 >> 64) as u64)
+}
+
+enum Visit {
+    /// The state was not in the table, and is now
+    New,
+    /// The state was there with a larger depth, now lowered: it is to be expanded again
+    Lowered,
+    Old,
+}
+
+/// An open-addressing table of `VSlot`s, probed linearly from the low bits of the fingerprint
+struct VTab {
+    ptr: *mut VSlot,
+    len: usize,
+}
+
+unsafe impl Send for VTab {}
+unsafe impl Sync for VTab {}
+
+impl VTab {
+    fn layout(len: usize) -> std::alloc::Layout {
+        std::alloc::Layout::array::<VSlot>(len).and_then(|l| l.align_to(64)).expect("the visited table is too large")
+    }
+
+    fn new(len: usize) -> Self {
+        // All zeros is an empty slot; the system gives the pages as they are touched
+        let ptr = unsafe { std::alloc::alloc_zeroed(Self::layout(len)) } as *mut VSlot;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(Self::layout(len));
+        }
+        VTab { ptr, len }
+    }
+
+    #[inline]
+    fn slot(&self, i: usize) -> &VSlot {
+        unsafe { &*self.ptr.add(i) }
+    }
+
+    #[inline]
+    fn prefetch(&self, lo: u64) {
+        prefetch_line(self.ptr.wrapping_add(lo as usize & (self.len - 1)) as *const u8);
+    }
+
+    /// Finds the fingerprint (lo, hi) or puts it in an empty slot, and lowers its depth to `enc`
+    /// (`venc`). None if the table is full. lo is not 0.
+    #[inline]
+    fn visit(&self, lo: u64, hi: u64, enc: u64) -> Option<Visit> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+        let mask = self.len - 1;
+        let mut i = lo as usize & mask;
+        for _ in 0..self.len {
+            let s = self.slot(i);
+            let mut k = s.k[0].load(Acquire);
+            if k == 0 {
+                match s.k[0].compare_exchange(0, lo, AcqRel, Acquire) {
+                    Ok(_) => {
+                        if VFPW > 1 {
+                            s.k[VFPW - 1].store(hi, Relaxed);
+                        }
+                        s.m.fetch_max(enc, Release);
+                        return Some(Visit::New);
+                    }
+                    Err(x) => k = x,
+                }
+            }
+            if k == lo {
+                // The rest of the fingerprint is written after its first word
+                let found = VFPW == 1 || {
+                    while s.m.load(Acquire) & V_READY == 0 {
+                        std::hint::spin_loop();
+                    }
+                    s.k[VFPW - 1].load(Relaxed) == hi
+                };
+                if found {
+                    // Most states are reached again at their depth or deeper: only read then, so
+                    // that the line is not taken from the other cores
+                    if (s.m.load(Acquire) as u32) >= (enc as u32) {
+                        return Some(Visit::Old);
+                    }
+                    let old = s.m.fetch_max(enc, AcqRel);
+                    return Some(if (old as u32) < (enc as u32) { Visit::Lowered } else { Visit::Old });
+                }
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+
+    /// The depth of a state in the table
+    fn depth(&self, lo: u64, hi: u64) -> Option<u32> {
+        use std::sync::atomic::Ordering::Acquire;
+        let mask = self.len - 1;
+        let mut i = lo as usize & mask;
+        for _ in 0..self.len {
+            let s = self.slot(i);
+            match s.k[0].load(Acquire) {
+                0 => return None,
+                k if k == lo && (VFPW == 1 || s.k[VFPW - 1].load(Acquire) == hi) => return Some(vdec(s.m.load(Acquire))),
+                _ => {}
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+}
+
+impl Drop for VTab {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) };
+    }
+}
+
+/// The table starts with this many slots and doubles when it is more than 7/10 full
+const V_START: usize = 1 << 20;
+
+/// A value alone on its cache lines, so that writing it does not slow those who read its
+/// neighbors
+#[repr(align(128))]
+struct APad<T>(T);
+
+/// The visited states. The table is replaced by one twice as large while no worker uses it: a
+/// worker uses it only between `enter` and `leave`, around a batch of states, and `added` waits
+/// for every worker to leave and keeps them out while it copies the table
+struct VSet {
+    tab: std::cell::UnsafeCell<VTab>,
+    /// The states whose fingerprint has 0 in its first word, which marks an empty slot
+    zero: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    /// The states in the table, added up after each batch
+    count: std::sync::atomic::AtomicUsize,
+    resizing: std::sync::atomic::AtomicBool,
+    active: Vec<APad<std::sync::atomic::AtomicBool>>,
+    resizes: std::sync::atomic::AtomicU64,
+    resize_us: std::sync::atomic::AtomicU64,
+}
+
+unsafe impl Sync for VSet {}
+
+impl VSet {
+    fn new(workers: usize, at_least: usize) -> Self {
+        VSet {
+            tab: std::cell::UnsafeCell::new(VTab::new(V_START.max((at_least * 2).next_power_of_two()))),
+            zero: std::sync::Mutex::new(std::collections::HashMap::new()),
+            count: std::sync::atomic::AtomicUsize::new(0),
+            resizing: std::sync::atomic::AtomicBool::new(false),
+            active: (0..workers).map(|_| APad(std::sync::atomic::AtomicBool::new(false))).collect(),
+            resizes: std::sync::atomic::AtomicU64::new(0),
+            resize_us: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The table, for a worker between `enter` and `leave` (or when no worker runs)
+    #[inline]
+    fn tab(&self) -> &VTab {
+        unsafe { &*self.tab.get() }
+    }
+
+    fn enter(&self, me: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            self.active[me].0.store(true, SeqCst);
+            if !self.resizing.load(SeqCst) {
+                return;
+            }
+            self.active[me].0.store(false, SeqCst);
+            while self.resizing.load(SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn leave(&self, me: usize) {
+        self.active[me].0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn visit(&self, tab: &VTab, fp: Fp, d: u32) -> Option<Visit> {
+        let (lo, hi) = vwords(fp);
+        let enc = venc(d);
+        if lo != 0 {
+            return tab.visit(lo, hi, enc);
+        }
+        let mut z = self.zero.lock().unwrap_or_else(|e| e.into_inner());
+        Some(match z.get_mut(&hi) {
+            None => {
+                z.insert(hi, enc);
+                Visit::New
+            }
+            Some(m) if (*m as u32) < (enc as u32) => {
+                *m = enc;
+                Visit::Lowered
+            }
+            Some(_) => Visit::Old,
+        })
+    }
+
+    fn depth(&self, tab: &VTab, fp: Fp) -> u32 {
+        let (lo, hi) = vwords(fp);
+        let d = if lo != 0 { tab.depth(lo, hi) } else { self.zero.lock().unwrap_or_else(|e| e.into_inner()).get(&hi).map(|m| vdec(*m)) };
+        d.unwrap_or(0)
+    }
+
+    /// Adds n states put in the table; when it is more than 7/10 full, doubles it. Called outside
+    /// `enter` and `leave`
+    fn added(&self, n: usize, workers: usize) {
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        let count = self.count.fetch_add(n, Relaxed) + n;
+        if count * 10 <= self.tab().len * 7 || self.resizing.compare_exchange(false, true, SeqCst, SeqCst).is_err() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        for a in &self.active {
+            while a.0.load(SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+        let old = self.tab();
+        if self.count.load(Relaxed) * 10 > old.len * 7 {
+            let new = VTab::new(old.len * 2);
+            par_ranges(old.len, workers, |lo, hi| {
+                use std::sync::atomic::Ordering::Acquire;
+                for i in lo..hi {
+                    let s = old.slot(i);
+                    let k = s.k[0].load(Acquire);
+                    if k != 0 {
+                        let _ = new.visit(k, s.k[VFPW - 1].load(Acquire), s.m.load(Acquire));
+                    }
+                }
+            });
+            unsafe { *self.tab.get() = new };
+            self.resizes.fetch_add(1, Relaxed);
+        }
+        self.resize_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+        self.resizing.store(false, SeqCst);
+    }
+
+    /// The largest depth of a state
+    fn max_depth(&self, workers: usize) -> u32 {
+        let tab = self.tab();
+        let best = std::sync::atomic::AtomicU32::new(0);
+        par_ranges(tab.len, workers, |lo, hi| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut m = 0;
+            for i in lo..hi {
+                let s = tab.slot(i);
+                if s.k[0].load(Relaxed) != 0 {
+                    m = m.max(vdec(s.m.load(Relaxed)));
+                }
+            }
+            best.fetch_max(m, Relaxed);
+        });
+        let z = self.zero.lock().unwrap_or_else(|e| e.into_inner());
+        z.values().map(|m| vdec(*m)).chain([best.into_inner()]).max().unwrap_or(0)
+    }
+}
+
+/// Runs f over 0..n cut into ranges, on up to `threads` threads
+fn par_ranges(n: usize, threads: usize, f: impl Fn(usize, usize) + Sync) {
+    let piece = n.div_ceil(threads.max(1)).max(1 << 16);
+    std::thread::scope(|sc| {
+        for lo in (0..n).step_by(piece).skip(1) {
+            let f = &f;
+            sc.spawn(move || f(lo, (lo + piece).min(n)));
+        }
+        f(0, piece.min(n));
+    });
+}
+
+/// A queue entry: a state, its fingerprint, and the depth to expand it at, with A_FIRST for
+/// its first expansion (which counts its successors and checks them) and without for another
+/// one after its depth was lowered
+type AItem = (Packed, Fp, u32);
+
+const A_FIRST: u32 = 1 << 31;
+
+const AITEM_BYTES: usize = PACK_BYTES + 4;
+
+/// The states a worker takes at a time
+const ABATCH: usize = 64;
+
+/// A worker's queue. Its states are expanded oldest first: `head`, then the states spilled to
+/// files (`segs`, oldest first), then `tail`. Once head and tail hold more than `budget` states,
+/// tail goes to the newest file, which is read back whole when head runs out
+struct AQueue {
+    head: std::collections::VecDeque<AItem>,
+    tail: std::collections::VecDeque<AItem>,
+    segs: std::collections::VecDeque<(std::fs::File, usize)>,
+    budget: usize,
+}
+
+impl AQueue {
+    /// Moves up to n of the oldest states to out
+    fn take(&mut self, n: usize, out: &mut Vec<AItem>) -> Result<(), String> {
+        if self.head.is_empty() {
+            match self.segs.pop_front() {
+                Some((mut f, k)) => {
+                    use std::io::{Read, Seek};
+                    let mut buf = vec![0u8; k * AITEM_BYTES];
+                    // Skipping the unreadable part and carrying on would leave states unexplored
+                    // while still reporting "no error"
+                    f.seek(std::io::SeekFrom::Start(0))
+                        .and_then(|_| f.read_exact(&mut buf))
+                        .map_err(|e| format!("cannot read the spilled queue back: {e}"))?;
+                    self.head.extend(buf.chunks_exact(AITEM_BYTES).map(|c| {
+                        let (w, fp) = from_bytes(c);
+                        (w, fp, u32::from_le_bytes(c[PACK_BYTES..].try_into().unwrap()))
+                    }));
+                }
+                None => std::mem::swap(&mut self.head, &mut self.tail),
+            }
+        }
+        let k = n.min(self.head.len());
+        out.extend(self.head.drain(..k));
+        Ok(())
+    }
+
+    /// Adds states, spilling the newest ones once head and tail hold more than the budget
+    fn put(&mut self, items: &mut Vec<AItem>, opt: &Opt) {
+        self.tail.extend(items.drain(..));
+        // Written in pieces of a quarter of the budget, and of 1024 states at least
+        if self.head.len() + self.tail.len() <= self.budget || self.tail.len() < (self.budget / 4).max(1 << 10) {
+            return;
+        }
+        if self.segs.back().is_none_or(|s| s.1 >= self.budget.max(1 << 12)) {
+            let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = opt.tmpdir.join(format!("tla2rs-{}-{seq}.q", std::process::id()));
+            match std::fs::File::options().create_new(true).read(true).write(true).open(&path) {
+                Ok(f) => {
+                    // Unlinked at once, as in `Level::extend`
+                    let _ = std::fs::remove_file(&path);
+                    self.segs.push_back((f, 0));
+                }
+                Err(e) => {
+                    eprintln!("warning: cannot spill the queue to {}: {e}", path.display());
+                    self.budget = usize::MAX;
+                    return;
+                }
+            }
+        }
+        let mut buf = Vec::with_capacity(self.tail.len() * AITEM_BYTES);
+        for (w, fp, d) in &self.tail {
+            for x in w {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            buf.extend_from_slice(&fp.to_le_bytes());
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        let (f, k) = self.segs.back_mut().unwrap();
+        use std::io::{Seek, Write};
+        // Appended after what an earlier read back left the position at
+        if let Err(e) = f.seek(std::io::SeekFrom::End(0)).and_then(|_| f.write_all(&buf)) {
+            eprintln!("warning: cannot spill the queue: {e}");
+            self.budget = usize::MAX;
+            return;
+        }
+        *k += self.tail.len();
+        SPILLED.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.tail.clear();
+        self.tail.shrink_to_fit();
+    }
+
+    /// Moves half of the states in memory, the oldest, to out (for another worker)
+    fn steal(&mut self, out: &mut Vec<AItem>) {
+        let from = if self.head.is_empty() { &mut self.tail } else { &mut self.head };
+        let k = from.len().div_ceil(2).min(1 << 12);
+        out.extend(from.drain(..k));
+    }
+}
+
+/// What the workers of the search without levels share
+struct ASearch<'a> {
+    opt: &'a Opt,
+    seen: VSet,
+    queues: Vec<APad<std::sync::Mutex<AQueue>>>,
+    /// The states queued or being expanded: the search ends when none is
+    pending: std::sync::atomic::AtomicUsize,
+    /// An error was met (or the table was full): the search by levels takes over
+    stop: std::sync::atomic::AtomicBool,
+    /// A failure to read the spilled queue back, which ends the run
+    fatal: std::sync::Mutex<Option<String>>,
+    /// Each worker's counts so far (generated, distinct, deepest), for the progress lines
+    counts: Vec<APad<[std::sync::atomic::AtomicU64; 3]>>,
+    running: std::sync::atomic::AtomicUsize,
+}
+
+/// A worker's working storage and counts
+struct AWork {
+    buf: Vec<(State, u32)>,
+    cand: Vec<(usize, Fp, Packed)>,
+    out: Vec<AItem>,
+    mine: ASeen,
+    dump: String,
+    generated: u64,
+    distinct: u64,
+    added: usize,
+    deepest: u32,
+    /// Expansions after a depth was lowered, and entries passed over as a later one lowered it
+    /// more
+    again: u64,
+    passed: u64,
+}
+
+/// The per-thread table of fingerprints looked up lately (as `Seen`), with the depth they were
+/// looked up with: a state reached again at a smaller depth goes to the shared table again
+struct ASeen(Vec<(Fp, u32)>);
+
+impl ASeen {
+    #[inline]
+    fn fresh(&mut self, fp: Fp, d: u32) -> bool {
+        if fp == 0 {
+            return true;
+        }
+        let e = &mut self.0[Seen::slot(fp)];
+        if e.0 == fp && e.1 <= d {
+            return false;
+        }
+        *e = (fp, d);
+        true
+    }
+}
+
+/// The counts of a search without levels that ended without an error, besides the initial states
+struct AResult {
+    generated: u64,
+    distinct: u64,
+    depth: u32,
+}
+
+/// Searches from the initial states without levels. None if it met an error.
+fn run_async(opt: &Opt, inits: &[Qitem], t0: std::time::Instant) -> Option<AResult> {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    let workers = opt.workers;
+    let sh = ASearch {
+        opt,
+        seen: VSet::new(workers, inits.len()),
+        queues: (0..workers)
+            .map(|_| {
+                let budget = opt.mem_limit / AITEM_BYTES / workers / 2;
+                APad(std::sync::Mutex::new(AQueue { head: Default::default(), tail: Default::default(), segs: Default::default(), budget }))
+            })
+            .collect(),
+        pending: std::sync::atomic::AtomicUsize::new(inits.len()),
+        stop: std::sync::atomic::AtomicBool::new(false),
+        fatal: std::sync::Mutex::new(None),
+        counts: (0..workers).map(|_| APad(Default::default())).collect(),
+        running: std::sync::atomic::AtomicUsize::new(workers),
+    };
+    // The initial states are new and have depth 1, dealt out to the workers in turn
+    let mut deal: Vec<Vec<AItem>> = vec![vec![]; workers];
+    for (i, &(w, fp)) in inits.iter().enumerate() {
+        let _ = sh.seen.visit(sh.seen.tab(), fp, 1);
+        deal[i % workers].push((w, fp, 1 | A_FIRST));
+    }
+    sh.seen.count.store(inits.len(), Relaxed);
+    for (q, mut d) in sh.queues.iter().zip(deal) {
+        q.0.lock().unwrap().put(&mut d, opt);
+    }
+    let main = std::thread::current();
+    let outs: Vec<AWork> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..workers)
+            .map(|me| {
+                let (sh, main) = (&sh, main.clone());
+                spawn_worker(sc, move || {
+                    let ws = async_worker(sh, me);
+                    if sh.running.fetch_sub(1, SeqCst) == 1 {
+                        main.unpark();
+                    }
+                    ws
+                })
+            })
+            .collect();
+        let mut last = std::time::Instant::now();
+        while sh.running.load(SeqCst) > 0 {
+            std::thread::park_timeout(std::time::Duration::from_secs(1));
+            if last.elapsed().as_secs() >= 10 && sh.running.load(SeqCst) > 0 {
+                last = std::time::Instant::now();
+                let (mut g, mut d, mut deep) = (0, inits.len() as u64, 0);
+                for c in &sh.counts {
+                    g += c.0[0].load(Relaxed);
+                    d += c.0[1].load(Relaxed);
+                    deep = deep.max(c.0[2].load(Relaxed));
+                }
+                println!(
+                    "Progress({deep}): {g} states generated, {d} distinct states found, {} states left on queue. ({:.0}s)",
+                    sh.pending.load(Relaxed),
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+        hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+    });
+    if let Some(m) = sh.fatal.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        eval_error(m);
+    }
+    let stats = std::env::var("TLA2RS_PHASES").is_ok();
+    if sh.stop.load(SeqCst) {
+        if stats {
+            eprintln!("search without levels: stopped at an error; searching by levels");
+        }
+        return None;
+    }
+    let (generated, distinct) = outs.iter().fold((0, 0), |(g, d), w| (g + w.generated, d + w.distinct));
+    let depth = sh.seen.max_depth(workers).max(1);
+    if stats {
+        let (again, passed) = outs.iter().fold((0, 0), |(a, p), w| (a + w.again, p + w.passed));
+        eprintln!(
+            "search without levels: {again} expansions again after a depth was lowered ({passed} entries passed over), {} table doublings in {:.3}s, {} slots",
+            sh.seen.resizes.load(Relaxed),
+            sh.seen.resize_us.load(Relaxed) as f64 / 1e6,
+            sh.seen.tab().len
+        );
+    }
+    Some(AResult { generated, distinct, depth })
+}
+
+/// A worker of the search without levels: takes states from its queue, or from another's, until
+/// no state is queued or being expanded anywhere
+fn async_worker(sh: &ASearch, me: usize) -> AWork {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    let workers = sh.queues.len();
+    let mut ws = AWork {
+        buf: Vec::with_capacity(64),
+        cand: Vec::with_capacity(64),
+        out: vec![],
+        mine: ASeen(vec![(0, 0); 1 << SEEN_BITS]),
+        dump: String::new(),
+        generated: 0,
+        distinct: 0,
+        added: 0,
+        deepest: 0,
+        again: 0,
+        passed: 0,
+    };
+    let mut batch: Vec<AItem> = Vec::with_capacity(ABATCH);
+    let mut idle = 0u32;
+    let mut rng = (me as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    while !sh.stop.load(Relaxed) {
+        if let Err(m) = sh.queues[me].0.lock().unwrap().take(ABATCH, &mut batch) {
+            sh.fatal.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(m);
+            sh.stop.store(true, SeqCst);
+            break;
+        }
+        if batch.is_empty() {
+            // Half of another worker's queue, trying them from one picked at random
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let mut got = vec![];
+            for k in 0..workers {
+                let v = (rng as usize).wrapping_add(k) % workers;
+                if v == me {
+                    continue;
+                }
+                if let Ok(mut q) = sh.queues[v].0.try_lock() {
+                    q.steal(&mut got);
+                }
+                if !got.is_empty() {
+                    break;
+                }
+            }
+            if !got.is_empty() {
+                sh.queues[me].0.lock().unwrap().put(&mut got, sh.opt);
+                idle = 0;
+                continue;
+            }
+            if sh.pending.load(SeqCst) == 0 {
+                break;
+            }
+            idle += 1;
+            if idle < 64 {
+                std::hint::spin_loop();
+            } else if idle < 128 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            continue;
+        }
+        idle = 0;
+        let n = batch.len();
+        sh.seen.enter(me);
+        let tab = sh.seen.tab();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for &(w, fp, tag) in &batch {
+                let d = tag & !A_FIRST;
+                let first = tag & A_FIRST != 0;
+                if !first {
+                    if sh.seen.depth(tab, fp) < d {
+                        ws.passed += 1;
+                        continue;
+                    }
+                    ws.again += 1;
+                }
+                if !async_expand(sh, tab, &w, fp, d, first, &mut ws) {
+                    return false;
+                }
+            }
+            true
+        }));
+        sh.seen.leave(me);
+        batch.clear();
+        if !matches!(r, Ok(true)) {
+            sh.stop.store(true, SeqCst);
+            break;
+        }
+        if !ws.out.is_empty() {
+            // Counted before the states that queued them are done with, so that the count does
+            // not reach 0 while there are states to expand
+            sh.pending.fetch_add(ws.out.len(), SeqCst);
+            sh.queues[me].0.lock().unwrap().put(&mut ws.out, sh.opt);
+        }
+        sh.pending.fetch_sub(n, SeqCst);
+        if ws.added > 0 {
+            sh.seen.added(std::mem::take(&mut ws.added), workers);
+        }
+        if dumping() && ws.dump.len() > 1 << 20 {
+            dump_write(&mut ws.dump);
+        }
+        let c = &sh.counts[me].0;
+        c[0].store(ws.generated, Relaxed);
+        c[1].store(ws.distinct, Relaxed);
+        c[2].store(ws.deepest as u64, Relaxed);
+    }
+    if !sh.stop.load(Relaxed) {
+        dump_write(&mut ws.dump);
+    }
+    ws
+}
+
+/// Expands one state at depth d: its first expansion as in `expand_safety_one` (counting and
+/// checking its successors, and writing its edges to the state graph); another only lowers the
+/// depths of its successors. False at an error, which the search by levels will report.
+fn async_expand(sh: &ASearch, tab: &VTab, w: &Packed, sfp: Fp, d: u32, first: bool, ws: &mut AWork) -> bool {
+    let s = unpack(w);
+    ws.buf.clear();
+    next(&s, &mut ws.buf);
+    if first {
+        ws.generated += ws.buf.len() as u64;
+        if ws.buf.is_empty() && sh.opt.check_deadlock {
+            return false;
+        }
+    }
+    ws.deepest = ws.deepest.max(d);
+    let nd = d + 1;
+    ws.cand.clear();
+    for (i, &(ref t, l)) in ws.buf.iter().enumerate() {
+        if !in_model(&s, t) {
+            if first && out_of_model(&s, sfp, t, l).is_some() {
+                return false;
+            }
+            continue;
+        }
+        if first {
+            if dumping() {
+                dump_succ(&mut ws.dump, sfp, t, l);
+            }
+            if check_action_props(&s, t).is_some() {
+                return false;
+            }
+        }
+        // The first expansion stops at a successor that does not pack; another passes over it
+        let Some(tw) = pack(t) else {
+            if first {
+                return false;
+            }
+            continue;
+        };
+        let fp = fingerprint(&tw);
+        if !ws.mine.fresh(fp, nd) {
+            continue;
+        }
+        tab.prefetch(vwords(fp).0);
+        ws.cand.push((i, fp, tw));
+    }
+    for k in 0..ws.cand.len() {
+        let (i, fp, tw) = ws.cand[k];
+        match sh.seen.visit(tab, fp, nd) {
+            Some(Visit::Old) => {}
+            Some(Visit::Lowered) => ws.out.push((tw, fp, nd)),
+            Some(Visit::New) => {
+                ws.distinct += 1;
+                ws.added += 1;
+                let t = &ws.buf[i].0;
+                if dumping() {
+                    dump_node(&mut ws.dump, &fp, t, false);
+                }
+                if !matches!(eval_invariants(t), Ok(None)) {
+                    return false;
+                }
+                ws.out.push((tw, fp, nd | A_FIRST));
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 /// The table used in batched mode. It lives in one contiguous allocation so the GPU can read it
