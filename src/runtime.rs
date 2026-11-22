@@ -3776,9 +3776,9 @@ impl Seen {
 
 // ---------------------------------------------------------------- successors looked up before they are built
 
-/// While `next` computes the successors of a state for `expand_safety_one`: what `dd_fresh` needs to
-/// tell, from the variables an action changed, whether a successor is a state already visited, so
-/// that it is neither built into the buffer nor packed. Such a successor is still counted as
+/// While `next` computes the successors of a state for `expand_safety_one` or `async_expand`: what
+/// `dd_fresh` needs to tell, from the variables an action changed, whether a successor is a state
+/// already visited, so that it is neither built into the buffer nor packed. Such a successor is still counted as
 /// generated, in its place among the others. Used only where nothing else is done with a successor
 /// before it is looked up (`DEDUP`: no CONSTRAINT, ACTION_CONSTRAINT, action property, VIEW,
 /// SYMMETRY, TLCGet or printed lines kept in order). -dumpgraph writes the edge to such a successor
@@ -3791,13 +3791,24 @@ struct Dedup {
     /// The sums of the parts of its words (see `fingerprint`)
     h: u64,
     g: u64,
-    seen: *const Shards,
-    mine: *mut Seen,
+    look: DdLook,
     /// The successors left out: where each was generated (the length of the buffer then), its
     /// label and its fingerprint
     skip_at: Vec<(u32, u32, Fp)>,
     /// The successors in the buffer whose fingerprint was computed this way (index, fingerprint)
     pre: Vec<(u32, Fp)>,
+}
+
+/// Where `dd_lookup` looks a successor up
+#[derive(Clone, Copy)]
+enum DdLook {
+    Off,
+    /// The search by levels: this thread's `Seen`, then the table
+    Levels { seen: *const Shards, mine: *mut Seen },
+    /// The search without levels, for a successor at depth `nd`: this thread's `ASeen`, then the
+    /// table. A state there counts as visited only at a depth of at most `nd`; one reached at a
+    /// smaller depth than before is built, so that `async_expand` lowers its depth and queues it
+    Async { tab: *const VTab, mine: *mut ASeen, nd: u32 },
 }
 
 // The pointers are set and read only while a thread expands a state (`DedupOn`)
@@ -3810,7 +3821,7 @@ thread_local! {
 
 impl Dedup {
     fn new() -> Self {
-        Dedup { pw: std::ptr::null(), tw: [0; WORDS], h: 0, g: 0, seen: std::ptr::null(), mine: std::ptr::null_mut(), skip_at: vec![], pre: vec![] }
+        Dedup { pw: std::ptr::null(), tw: [0; WORDS], h: 0, g: 0, look: DdLook::Off, skip_at: vec![], pre: vec![] }
     }
     /// The successor at index i of the buffer: its place among all those generated
     fn ord(&self, i: usize) -> u64 {
@@ -3830,12 +3841,11 @@ impl Dedup {
 struct DedupOn;
 
 impl DedupOn {
-    fn start(d: &mut Dedup, w: &Packed, sfp: Fp, seen: &Shards, mine: &mut Seen) -> Self {
+    fn start(d: &mut Dedup, w: &Packed, sfp: Fp, look: DdLook) -> Self {
         d.pw = w;
         (d.h, d.g) = fp_sums(sfp);
         debug_assert!(fp_finish(d.h, d.g) == fingerprint(&w[..FPW]));
-        d.seen = seen;
-        d.mine = mine;
+        d.look = look;
         d.skip_at.clear();
         d.pre.clear();
         DD.with(|c| c.set(d));
@@ -3898,12 +3908,27 @@ fn dd_lookup(d: &mut Dedup, at: usize, l: u32, fits: bool, vars: &[usize]) -> bo
         return true;
     }
     let fp = fp_finish(h, g);
-    let (mine, seen) = unsafe { (&mut *d.mine, &*d.seen) };
     // A fingerprint the table holds is recorded in `mine` too, so that the next time this thread
     // meets it is cheaper; one that is not is recorded once its successor is a candidate
-    let known = mine.has(fp) || seen.contains(fp) && {
-        mine.fresh(fp);
-        true
+    let known = match d.look {
+        DdLook::Off => false,
+        DdLook::Levels { seen, mine } => {
+            let (mine, seen) = unsafe { (&mut *mine, &*seen) };
+            mine.has(fp) || seen.contains(fp) && {
+                mine.fresh(fp);
+                true
+            }
+        }
+        DdLook::Async { tab, mine, nd } => {
+            let (mine, tab) = unsafe { (&mut *mine, &*tab) };
+            mine.has(fp, nd) || match tab.depth_of(fp) {
+                Some(m) if m <= nd => {
+                    mine.fresh(fp, m);
+                    true
+                }
+                _ => false,
+            }
+        }
     };
     if known {
         d.skip_at.push((at as u32, l, fp));
@@ -4045,7 +4070,7 @@ fn expand_safety_one(
     ws.dd.skip_at.clear();
     ws.dd.pre.clear();
     let failed = if DEDUP {
-        let _on = DedupOn::start(&mut ws.dd, w, sfp, seen, &mut ws.mine);
+        let _on = DedupOn::start(&mut ws.dd, w, sfp, DdLook::Levels { seen, mine: &mut ws.mine });
         successors(&s, &mut ws.buf, careful)
     } else {
         successors(&s, &mut ws.buf, careful)
@@ -4919,6 +4944,18 @@ impl VTab {
         None
     }
 
+    /// The depth of the state whose fingerprint is fp, if the table has it. None for one with 0
+    /// in its first word, which `VSet` keeps apart; and possibly for one a worker is putting in
+    /// meanwhile, whose depth is then not written yet (`vdec(0)` is past every depth)
+    #[inline]
+    fn depth_of(&self, fp: Fp) -> Option<u32> {
+        let (lo, hi) = vwords(fp);
+        if lo == 0 {
+            return None;
+        }
+        self.depth(lo, hi)
+    }
+
     /// The depth of a state in the table
     fn depth(&self, lo: u64, hi: u64) -> Option<u32> {
         use std::sync::atomic::Ordering::Acquire;
@@ -5218,9 +5255,13 @@ struct ASearch<'a> {
 /// A worker's working storage and counts
 struct AWork {
     buf: Vec<(State, u32)>,
-    cand: Vec<(usize, Fp, Packed)>,
+    /// The successors that may be new or lowered: index in `buf`, fingerprint, and the packed
+    /// state if the fingerprint needed it
+    cand: Vec<(usize, Fp, Option<Packed>)>,
     out: Vec<AItem>,
     mine: ASeen,
+    /// The successors left out of `buf` as visited, and the fingerprints computed for those in it
+    dd: Dedup,
     dump: String,
     generated: u64,
     distinct: u64,
@@ -5230,6 +5271,8 @@ struct AWork {
     /// more
     again: u64,
     passed: u64,
+    /// The successors counted as generated that `next` left out as visited (see `dd_fresh`)
+    left_out: u64,
 }
 
 /// The per-thread table of fingerprints looked up lately (as `Seen`), with the depth they were
@@ -5248,6 +5291,12 @@ impl ASeen {
         }
         *e = (fp, d);
         true
+    }
+    /// Whether fp was looked up with a depth of at most d, without recording it
+    #[inline]
+    fn has(&self, fp: Fp, d: u32) -> bool {
+        let e = &self.0[Seen::slot(fp)];
+        fp != 0 && e.0 == fp && e.1 <= d
     }
 }
 
@@ -5334,9 +5383,9 @@ fn run_async(opt: &Opt, inits: &[Qitem], t0: std::time::Instant) -> Option<AResu
     let (generated, distinct) = outs.iter().fold((0, 0), |(g, d), w| (g + w.generated, d + w.distinct));
     let depth = sh.seen.max_depth(workers).max(1);
     if stats {
-        let (again, passed) = outs.iter().fold((0, 0), |(a, p), w| (a + w.again, p + w.passed));
+        let (again, passed, left) = outs.iter().fold((0, 0, 0), |(a, p, k), w| (a + w.again, p + w.passed, k + w.left_out));
         eprintln!(
-            "search without levels: {again} expansions again after a depth was lowered ({passed} entries passed over), {} table doublings in {:.3}s, {} slots",
+            "search without levels: {again} expansions again after a depth was lowered ({passed} entries passed over), {left} successors generated left out as visited, {} table doublings in {:.3}s, {} slots",
             sh.seen.resizes.load(Relaxed),
             sh.seen.resize_us.load(Relaxed) as f64 / 1e6,
             sh.seen.tab().len
@@ -5355,6 +5404,7 @@ fn async_worker(sh: &ASearch, me: usize) -> AWork {
         cand: Vec::with_capacity(64),
         out: vec![],
         mine: ASeen(vec![(0, 0); 1 << SEEN_BITS]),
+        dd: Dedup::new(),
         dump: String::new(),
         generated: 0,
         distinct: 0,
@@ -5362,6 +5412,7 @@ fn async_worker(sh: &ASearch, me: usize) -> AWork {
         deepest: 0,
         again: 0,
         passed: 0,
+        left_out: 0,
     };
     let mut batch: Vec<AItem> = Vec::with_capacity(ABATCH);
     let mut idle = 0u32;
@@ -5461,21 +5512,44 @@ fn async_worker(sh: &ASearch, me: usize) -> AWork {
 
 /// Expands one state at depth d: its first expansion as in `expand_safety_one` (counting and
 /// checking its successors, and writing its edges to the state graph); another only lowers the
-/// depths of its successors. False at an error, which the search by levels will report.
+/// depths of its successors. A successor `next` looked up as visited at depth d + 1 or less is
+/// left out, as in `expand_safety_one` (see `dd_fresh`). False at an error, which the search by
+/// levels will report.
 fn async_expand(sh: &ASearch, tab: &VTab, w: &Packed, sfp: Fp, d: u32, first: bool, ws: &mut AWork) -> bool {
     let s = unpack(w);
+    let nd = d + 1;
     ws.buf.clear();
-    next(&s, &mut ws.buf);
+    ws.dd.skip_at.clear();
+    ws.dd.pre.clear();
+    if DEDUP {
+        let _on = DedupOn::start(&mut ws.dd, w, sfp, DdLook::Async { tab, mine: &mut ws.mine, nd });
+        next(&s, &mut ws.buf);
+    } else {
+        next(&s, &mut ws.buf);
+    }
+    let skips = ws.dd.skip_at.len();
     if first {
-        ws.generated += ws.buf.len() as u64;
-        if ws.buf.is_empty() && sh.opt.check_deadlock {
+        ws.generated += (ws.buf.len() + skips) as u64;
+        ws.left_out += skips as u64;
+        if ws.buf.is_empty() && skips == 0 && sh.opt.check_deadlock {
             return false;
         }
     }
     ws.deepest = ws.deepest.max(d);
-    let nd = d + 1;
     ws.cand.clear();
+    // The edges to the successors left out are written where they were generated
+    let mut skipped = 0;
+    let dump_skips = |upto: usize, skipped: &mut usize, skip_at: &[(u32, u32, Fp)], dump: &mut String| {
+        while let Some(&(_, l, fp)) = skip_at.get(*skipped).filter(|x| x.0 as usize <= upto) {
+            dump_edge(dump, sfp, &fp, l);
+            *skipped += 1;
+        }
+    };
+    let mut pre = 0;
     for (i, &(ref t, l)) in ws.buf.iter().enumerate() {
+        if first && dumping() {
+            dump_skips(i, &mut skipped, &ws.dd.skip_at, &mut ws.dump);
+        }
         if !in_model(&s, t) {
             if first && out_of_model(&s, sfp, t, l).is_some() {
                 return false;
@@ -5490,39 +5564,53 @@ fn async_expand(sh: &ASearch, tab: &VTab, w: &Packed, sfp: Fp, d: u32, first: bo
                 return false;
             }
         }
-        // The first expansion stops at a successor that does not pack; another passes over it
-        let Some(tw) = pack(t) else {
-            if first {
-                return false;
-            }
-            continue;
+        // Its fingerprint is known (see `dd_fresh`), and it is packed only if queued
+        let (fp, tw) = if let Some(fp) = ws.dd.pre_fp(i, &mut pre) {
+            (fp, None)
+        } else {
+            // The first expansion stops at a successor that does not pack; another passes over it
+            let Some(tw) = pack(t) else {
+                if first {
+                    return false;
+                }
+                continue;
+            };
+            (fingerprint(&tw), Some(tw))
         };
-        let fp = fingerprint(&tw);
         if !ws.mine.fresh(fp, nd) {
             continue;
         }
         tab.prefetch(vwords(fp).0);
         ws.cand.push((i, fp, tw));
     }
+    if first && dumping() {
+        dump_skips(usize::MAX, &mut skipped, &ws.dd.skip_at, &mut ws.dump);
+    }
     for k in 0..ws.cand.len() {
         let (i, fp, tw) = ws.cand[k];
-        match sh.seen.visit(tab, fp, nd) {
-            Some(Visit::Old) => {}
-            Some(Visit::Lowered) => ws.out.push((tw, fp, nd)),
-            Some(Visit::New) => {
-                ws.distinct += 1;
-                ws.added += 1;
-                let t = &ws.buf[i].0;
-                if dumping() {
-                    dump_node(&mut ws.dump, &fp, t, false);
-                }
-                if !matches!(eval_invariants(t), Ok(None)) {
-                    return false;
-                }
-                ws.out.push((tw, fp, nd | A_FIRST));
-            }
+        let new = match sh.seen.visit(tab, fp, nd) {
+            Some(Visit::Old) => continue,
+            Some(Visit::Lowered) => false,
+            Some(Visit::New) => true,
             None => return false,
+        };
+        let t = &ws.buf[i].0;
+        let Some(tw) = tw.or_else(|| pack(t)) else {
+            return false;
+        };
+        if !new {
+            ws.out.push((tw, fp, nd));
+            continue;
         }
+        ws.distinct += 1;
+        ws.added += 1;
+        if dumping() {
+            dump_node(&mut ws.dump, &fp, t, false);
+        }
+        if !matches!(eval_invariants(t), Ok(None)) {
+            return false;
+        }
+        ws.out.push((tw, fp, nd | A_FIRST));
     }
     true
 }

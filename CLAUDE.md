@@ -135,7 +135,10 @@ assigns) over the parent's packed state and updates the parent's sum by the word
 successor already visited, in this thread's `Seen` or in the table, is counted as generated where it was generated,
 and its edge goes to `-dumpgraph`, but it is neither pushed into the buffer nor packed; one that may be new is built
 as before, with its fingerprint. Invariants are checked only on new states, so nothing observable changes. A
-successor whose changed variables leave their types is built, so that it is reported as before.
+successor whose changed variables leave their types is built, so that it is reported as before. In the search
+without levels (`async_expand`), a successor at depth d counts as visited only when the table (or the thread's
+`ASeen`) has it at depth d or less; one reached at a smaller depth than before is built, so that its depth is lowered
+and it is queued again as before.
 
 This is off (`DEDUP`) where something is done with each successor before it is looked up: a CONSTRAINT or
 ACTION_CONSTRAINT (an out-of-model successor's invariants are evaluated), an action property, a VIEW or a SYMMETRY
@@ -159,7 +162,7 @@ TLCGET, the strings made (STR_ORDER), VIEW, SYMMETRY, shapes (`SHAPED`, set by `
 At any error (and when its table is full) it stops, drops what it wrote to the state graph, and the search by levels
 (`run_levels`) runs from the initial states and reports as TLC does, so an error costs a second search up to it.
 `TLA2RS_SEARCH=levels` selects the search by levels, and `TLA2RS_PHASES=1` prints on stderr how many states were
-expanded again. The checker takes the last `-workers`, so `\* crosscheck: rsargs -workers 4` runs a configuration
+expanded again and how many successors were left out as visited before they were built. The checker takes the last `-workers`, so `\* crosscheck: rsargs -workers 4` runs a configuration
 with four workers (`tests/tlc/SkipWalk`, whose cells are reached by paths of different lengths).
 
 ### Capacities
