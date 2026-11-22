@@ -2074,6 +2074,10 @@ fn compile_inner(
     // Strings that are only compared for equality, printed and kept need no order
     let str_order = g.str_notes && g.made_order_shows();
     writeln!(src, "const STR_ORDER: bool = {str_order};").unwrap();
+    // Whether a successor may be looked up before it is built (see `dd_fresh` in the runtime):
+    // nothing else is done with a successor before it is looked up
+    let dedup = cons.is_empty() && acons.is_empty() && action_props.is_empty() && view_expr.is_none() && perms.is_empty() && !g.tlcget && !print_order && !str_order;
+    writeln!(src, "const DEDUP: bool = {dedup};").unwrap();
     writeln!(src, "const TRACK_FROM: usize = {track_from};").unwrap();
     let ranked: Vec<String> = (track_from..atoms.len()).map(|a| ranks.contains_key(&atoms.name(a as u32)).to_string()).collect();
     writeln!(src, "static RANKED_LATE: &[bool] = &[{}];", if str_order { ranked.join(", ") } else { String::new() }).unwrap();

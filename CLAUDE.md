@@ -121,6 +121,24 @@ tmpfs (`/tmp` on many Linux systems, where a file takes memory), to the director
 (`default_tmpdir`). A failed read of the spilled queue is a fatal error: skipping it could turn
 an incomplete search into "no error".
 
+### Successors looked up before they are built
+
+Most successors are states already visited (three to twenty per distinct state on the corpus's larger models), so
+the safety path looks a successor up before building it. Each variable is packed at a constant offset (`Gen::gen_pack`;
+a sequence or sparse set packs its elements one after another inside its own span), and the fingerprint is a sum over
+words, so where `next` emits a successor it writes only the variables the action changed (not those only UNCHANGED
+assigns) over the parent's packed state and updates the parent's sum by the words that differ (`dd_fresh`). A
+successor already visited, in this thread's `Seen` or in the table, is counted as generated where it was generated,
+and its edge goes to `-dumpgraph`, but it is neither pushed into the buffer nor packed; one that may be new is built
+as before, with its fingerprint. Invariants are checked only on new states, so nothing observable changes. A
+successor whose changed variables leave their types is built, so that it is reported as before.
+
+This is off (`DEDUP`) where something is done with each successor before it is looked up: a CONSTRAINT or
+ACTION_CONSTRAINT (an out-of-model successor's invariants are evaluated), an action property, a VIEW or a SYMMETRY
+(the fingerprint is of the canonical key), TLCGet, and printed lines or strings made kept in TLC's order. Liveness,
+`-batched` and `-metal` build every successor as before. The state under construction is still a copy of `*s`
+(`work_var`); only the copy into the buffer and the packing are saved.
+
 ### Capacities
 
 A set held as an array (`SSet`, also the (key, value) pairs of a sparse function or bag) and a sequence (`Sq`) are

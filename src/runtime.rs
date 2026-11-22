@@ -249,25 +249,94 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Fingerprint of a packed state. The low 64 bits sum the words, each mixed with its position on
-/// its own: no word waits for the one before it, so the CPU mixes several at a time. (With
-/// WORDS == 1 this is a bijection, so there are no collisions.) With `-fp128`, an independent
-/// 64-bit hash is placed above them to make 128 bits.
+/// A second mixer, with constants of its own, for the upper 64 bits under `-fp128`
 #[inline]
-fn fingerprint(w: &[u64]) -> Fp {
-    let mut h = 0u64;
-    for (i, &x) in w.iter().enumerate() {
-        h = h.wrapping_add(mix(x.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))));
-    }
+fn mix_hi(mut z: u64) -> u64 {
+    z = (z ^ (z >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+    z = (z ^ (z >> 33)).wrapping_mul(0xc4ceb9fe1a85ec53);
+    z ^ (z >> 33)
+}
+
+/// The part word i with value x adds to the low 64 bits of a fingerprint
+#[inline(always)]
+fn fp_lo(i: usize, x: u64) -> u64 {
+    mix(x.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)))
+}
+
+/// The part word i with value x adds to the upper 64 bits under `-fp128`
+#[inline(always)]
+fn fp_hi(i: usize, x: u64) -> u64 {
+    mix_hi(x ^ (i as u64 + 1).wrapping_mul(0xd6e8_feb8_6659_fd93))
+}
+
+/// The fingerprint from the sums of the words' parts
+#[inline(always)]
+fn fp_finish(h: u64, g: u64) -> Fp {
     let lo = mix(h);
     if FP_BITS == 64 {
         return lo as Fp;
     }
-    let mut g = 0x9e37_79b9_7f4a_7c15u64;
-    for (i, &x) in w.iter().enumerate() {
-        g = mix(g ^ x).wrapping_add(i as u64).rotate_left(17);
+    (lo as Fp) | ((mix_hi(g ^ 0x2545_f491_4f6c_dd1d) as Fp) << 64)
+}
+
+/// The inverse of x ^= x >> s
+#[inline(always)]
+fn unshift(y: u64, s: u32) -> u64 {
+    let mut x = y;
+    for _ in 0..64 / s {
+        x = y ^ (x >> s);
     }
-    (lo as Fp) | ((mix(g) as Fp) << 64)
+    x
+}
+
+/// The inverse of an odd number modulo 2^64
+const fn inv64(a: u64) -> u64 {
+    let mut x = a;
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+}
+
+/// The sums of the words' parts a fingerprint was finished from (`fp_finish` undone: both mixers
+/// are bijections), so that a successor's fingerprint can start from its parent's
+#[inline]
+fn fp_sums(fp: Fp) -> (u64, u64) {
+    let unmix = |z: u64| {
+        let z = unshift(z, 31).wrapping_mul(inv64(0x94d049bb133111eb));
+        let z = unshift(z, 27).wrapping_mul(inv64(0xbf58476d1ce4e5b9));
+        unshift(z, 30)
+    };
+    let unmix_hi = |z: u64| {
+        let z = unshift(z, 33).wrapping_mul(inv64(0xc4ceb9fe1a85ec53));
+        let z = unshift(z, 33).wrapping_mul(inv64(0xff51afd7ed558ccd));
+        unshift(z, 33)
+    };
+    let h = unmix(fp as u64);
+    if FP_BITS == 64 {
+        return (h, 0);
+    }
+    (h, unmix_hi(((fp as u128) >> 64) as u64) ^ 0x2545_f491_4f6c_dd1d)
+}
+
+/// Fingerprint of a packed state. The low 64 bits sum the words, each mixed with its position on
+/// its own: no word waits for the one before it, so the CPU mixes several at a time, and a
+/// successor's fingerprint follows from its parent's and the words that differ (`dd_fresh`). (With
+/// one word this is a bijection, so there are no collisions; two states that differ in one word
+/// never collide.) With `-fp128`, a sum of the words mixed by an independent function is placed
+/// above them to make 128 bits.
+#[inline]
+fn fingerprint(w: &[u64]) -> Fp {
+    let (mut h, mut g) = (0u64, 0u64);
+    for (i, &x) in w.iter().enumerate() {
+        h = h.wrapping_add(fp_lo(i, x));
+        if FP_BITS > 64 {
+            g = g.wrapping_add(fp_hi(i, x));
+        }
+    }
+    fp_finish(h, g)
 }
 
 /// The set of visited fingerprints (open addressing). 0 marks an empty slot, so the state whose
@@ -3692,6 +3761,150 @@ impl Seen {
         *slot = fp;
         fresh
     }
+    /// Whether fp is recorded, without recording it
+    #[inline]
+    fn has(&self, fp: Fp) -> bool {
+        fp != 0 && self.0[Self::slot(fp)] == fp
+    }
+}
+
+// ---------------------------------------------------------------- successors looked up before they are built
+
+/// While `next` computes the successors of a state for `expand_safety_one`: what `dd_fresh` needs to
+/// tell, from the variables an action changed, whether a successor is a state already visited, so
+/// that it is neither built into the buffer nor packed. Such a successor is still counted as
+/// generated, in its place among the others. Used only where nothing else is done with a successor
+/// before it is looked up (`DEDUP`: no CONSTRAINT, ACTION_CONSTRAINT, action property, VIEW,
+/// SYMMETRY, TLCGet or printed lines kept in order). -dumpgraph writes the edge to such a successor
+/// from its fingerprint and label
+struct Dedup {
+    /// The state being expanded, packed
+    pw: *const Packed,
+    /// Where a lookup writes the successor's words that may differ, starting from those of `pw`
+    tw: Packed,
+    /// The sums of the parts of its words (see `fingerprint`)
+    h: u64,
+    g: u64,
+    seen: *const Shards,
+    mine: *mut Seen,
+    /// The successors left out: where each was generated (the length of the buffer then), its
+    /// label and its fingerprint
+    skip_at: Vec<(u32, u32, Fp)>,
+    /// The successors in the buffer whose fingerprint was computed this way (index, fingerprint)
+    pre: Vec<(u32, Fp)>,
+}
+
+// The pointers are set and read only while a thread expands a state (`DedupOn`)
+unsafe impl Send for Dedup {}
+unsafe impl Sync for Dedup {}
+
+thread_local! {
+    static DD: std::cell::Cell<*mut Dedup> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+impl Dedup {
+    fn new() -> Self {
+        Dedup { pw: std::ptr::null(), tw: [0; WORDS], h: 0, g: 0, seen: std::ptr::null(), mine: std::ptr::null_mut(), skip_at: vec![], pre: vec![] }
+    }
+    /// The successor at index i of the buffer: its place among all those generated
+    fn ord(&self, i: usize) -> u64 {
+        (i + self.skip_at.partition_point(|x| x.0 as usize <= i)) as u64
+    }
+    /// The fingerprint computed for the successor at index i of the buffer, if any. `k` walks
+    /// `pre`, as the buffer is walked in order
+    fn pre_fp(&self, i: usize, k: &mut usize) -> Option<Fp> {
+        let (_, fp) = *self.pre.get(*k).filter(|(j, _)| *j as usize == i)?;
+        *k += 1;
+        Some(fp)
+    }
+}
+
+/// Makes `next` look up the successors of the state packed as w (fingerprint sfp) before building
+/// them, until the guard is dropped
+struct DedupOn;
+
+impl DedupOn {
+    fn start(d: &mut Dedup, w: &Packed, sfp: Fp, seen: &Shards, mine: &mut Seen) -> Self {
+        d.pw = w;
+        (d.h, d.g) = fp_sums(sfp);
+        debug_assert!(fp_finish(d.h, d.g) == fingerprint(&w[..FPW]));
+        d.seen = seen;
+        d.mine = mine;
+        d.skip_at.clear();
+        d.pre.clear();
+        DD.with(|c| c.set(d));
+        DedupOn
+    }
+}
+
+impl Drop for DedupOn {
+    fn drop(&mut self) {
+        DD.with(|c| c.set(std::ptr::null_mut()));
+    }
+}
+
+/// Called by `next` for a successor the state under construction holds once every variable is
+/// assigned: whether to build it (push it into the buffer). `put` writes the variables the action
+/// changed (`vars`, by number, in order) over the parent's packed state, and the fingerprint
+/// follows from the parent's and the words that differ. A successor already visited (or seen by
+/// this thread, see `Seen`) is left out; one that may be new is built, with its fingerprint kept
+/// for `fingerprint_successors`. One whose changed variables leave their types is built, so that
+/// it is reported as before. `at` is the length of the buffer.
+#[inline(always)]
+fn dd_fresh(at: usize, l: u32, put: impl FnOnce(&mut Packed) -> Option<()>, vars: &[usize]) -> bool {
+    if !DEDUP {
+        return true;
+    }
+    let p = DD.with(|c| c.get());
+    if p.is_null() {
+        return true;
+    }
+    let d = unsafe { &mut *p };
+    let pw = unsafe { &*d.pw };
+    for &v in vars {
+        let (lo, hi) = VW[v];
+        d.tw[lo..hi].copy_from_slice(&pw[lo..hi]);
+    }
+    let fits = put(&mut d.tw).is_some();
+    dd_lookup(d, at, l, fits, vars)
+}
+
+/// The rest of `dd_fresh`, once the changed variables are written into `d.tw`: kept out of line, as
+/// `dd_fresh` is inlined wherever `next` emits a successor
+fn dd_lookup(d: &mut Dedup, at: usize, l: u32, fits: bool, vars: &[usize]) -> bool {
+    let (mut h, mut g) = (d.h, d.g);
+    let pw = unsafe { &*d.pw };
+    let mut from = 0;
+    for &v in vars {
+        let (lo, hi) = VW[v];
+        for j in lo.max(from)..hi {
+            let (o, n) = (pw[j], d.tw[j]);
+            if o != n {
+                h = h.wrapping_sub(fp_lo(j, o)).wrapping_add(fp_lo(j, n));
+                if FP_BITS > 64 {
+                    g = g.wrapping_sub(fp_hi(j, o)).wrapping_add(fp_hi(j, n));
+                }
+            }
+        }
+        from = from.max(hi);
+    }
+    if !fits {
+        return true;
+    }
+    let fp = fp_finish(h, g);
+    let (mine, seen) = unsafe { (&mut *d.mine, &*d.seen) };
+    // A fingerprint the table holds is recorded in `mine` too, so that the next time this thread
+    // meets it is cheaper; one that is not is recorded once its successor is a candidate
+    let known = mine.has(fp) || seen.contains(fp) && {
+        mine.fresh(fp);
+        true
+    };
+    if known {
+        d.skip_at.push((at as u32, l, fp));
+        return false;
+    }
+    d.pre.push((at as u32, fp));
+    true
 }
 
 struct SChunk {
@@ -3786,6 +3999,8 @@ struct SWork {
     held: Held,
     /// With -continue, the successors (index in `buf`) that violate an action property
     acts: Vec<(usize, &'static str)>,
+    /// The successors left out of `buf` as visited, and the fingerprints computed for those in it
+    dd: Dedup,
 }
 
 impl SWork {
@@ -3798,6 +4013,7 @@ impl SWork {
             dump: String::new(),
             held: Held::default(),
             acts: vec![],
+            dd: Dedup::new(),
         }
     }
 }
@@ -3820,9 +4036,16 @@ fn expand_safety_one(
     ws.dpend.clear();
     ws.acts.clear();
     let cap = Capturing::start();
-    let failed = successors(&s, &mut ws.buf, careful);
+    ws.dd.skip_at.clear();
+    ws.dd.pre.clear();
+    let failed = if DEDUP {
+        let _on = DedupOn::start(&mut ws.dd, w, sfp, seen, &mut ws.mine);
+        successors(&s, &mut ws.buf, careful)
+    } else {
+        successors(&s, &mut ws.buf, careful)
+    };
     ws.held = cap.finish();
-    if failed.is_none() && ws.buf.is_empty() && opt.check_deadlock {
+    if failed.is_none() && ws.buf.is_empty() && ws.dd.skip_at.is_empty() && opt.check_deadlock {
         ws.held.flush(u32::MAX);
         return Some(SFound::new(sfp, None, SMsg::Deadlock));
     }
@@ -3852,7 +4075,7 @@ fn expand_safety_one(
     // stops before queueing it
     if let (Ok(Some(f)), Some(&(i, tfp, _))) = (&stopped, ws.cand.last()) {
         let act = f.in_model && matches!(f.msg, SMsg::Action(_) | SMsg::ActionEval(..));
-        if act && base + i as u64 + 1 == examined && c.next.last().is_some_and(|q| q.1 == tfp) {
+        if act && base + ws.dd.ord(i) + 1 == examined && c.next.last().is_some_and(|q| q.1 == tfp) {
             c.next.pop();
         }
     }
@@ -3936,7 +4159,23 @@ fn eager_succ(s: &State, sfp: Fp, t: State, l: u32, seen: &Shards, c: &mut SChun
 /// Fills ws.cand with the successors in ws.buf that may be new and prefetches the table line of
 /// each. Stops at a successor that is an error by itself and returns it.
 fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &mut SWork) -> Option<SFound> {
+    // The successors `next` left out as visited count where they were generated, and their edges
+    // are written there
+    let (mut skipped, mut pre) = (0, 0);
+    let mut skips = |upto: usize, c: &mut SChunk, dpend: &mut Vec<(usize, String)>| {
+        while let Some(&(at, l, fp)) = ws.dd.skip_at.get(skipped).filter(|x| x.0 as usize <= upto) {
+            c.generated += 1;
+            if dumping() {
+                let mut e = String::new();
+                dump_edge(&mut e, sfp, &fp, l);
+                dpend.push((at as usize + skipped, e));
+            }
+            skipped += 1;
+        }
+        skipped
+    };
     for (i, &(ref t, l)) in ws.buf.iter().enumerate() {
+        let ord = i + skips(i, c, &mut ws.dpend);
         c.generated += 1;
         if !in_model(s, t) {
             if let Some(f) = out_of_model(s, sfp, t, l) {
@@ -3947,7 +4186,7 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
         if dumping() {
             let mut e = String::new();
             dump_succ(&mut e, sfp, t, l);
-            ws.dpend.push((i, e));
+            ws.dpend.push((ord, e));
         }
         // A violated action property is reported after t is added (if new) and its invariants are
         // checked, as TLC does: t stays a candidate, and the search stops after it. What it prints
@@ -3978,6 +4217,15 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
                 None if pack(t).is_none() => return Some(pack_failed(sfp, *t, l)),
                 None => type_error("VIEW value", ""),
             }
+        } else if let Some(fp) = ws.dd.pre_fp(i, &mut pre) {
+            // Its fingerprint is known (see `dd_fresh`), and it is packed only if new
+            if !ws.mine.fresh(fp) {
+                if act.is_some() {
+                    return act;
+                }
+                continue;
+            }
+            (fp, None)
         } else {
             let Some(tw) = pack(t) else {
                 return Some(pack_failed(sfp, *t, l));
@@ -3996,6 +4244,7 @@ fn fingerprint_successors(s: &State, sfp: Fp, seen: &Shards, c: &mut SChunk, ws:
             return act;
         }
     }
+    skips(usize::MAX, c, &mut ws.dpend);
     None
 }
 
@@ -4026,7 +4275,7 @@ fn insert_candidates_in(base: u64, sfp: Fp, seen: &Shards, c: &mut SChunk, ws: &
             acts(i + 1, ws);
             continue;
         }
-        c.generated = base + i as u64 + 1;
+        c.generated = base + ws.dd.ord(i) + 1;
         let (t, l) = &ws.buf[i];
         if dumping() {
             dump_node(&mut ws.dump, &tfp, t, false);
