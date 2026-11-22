@@ -11,7 +11,10 @@ It has no crate dependencies.
     and of sequences start; a value that outgrows one makes tla2rs build the checker again with more room (see
     "Capacities")
   - The generated crate goes to `<spec dir>/.tla2rs/<cfg name>/` by default; it is built with
-    `cargo build --release --offline` and then run
+    `cargo build --release --offline` and then run. Its profile has `lto = "off"`: the next-state relation is one
+    function in one codegen unit, so a build is mostly serial (type and borrow checking, then LLVM on that unit),
+    and ThinLTO across codegen units optimized that unit a second time (a tenth to a fifth of a build) without
+    making the search faster
   - `-workers`, `-memlimit`, `-notrace`, `-tmpdir`, `-metal`, `-batched`, `-dumpgraph`, `-lassocheck` and
     `-deadlock` are passed on to the generated checker, which also accepts them directly
 - `target/release/tla2rs --graph FILE` reduces a state graph (TLC's `-dump dot FILE` or a checker's `-dumpgraph
@@ -170,7 +173,13 @@ than N, or the size of a whole union or concatenation, and for a set the capacit
 type (`set_full`, `set_key`). `TLA2RS_GROW` tells the
 checker which kinds may still grow (both stop at 65535, `types::MAX_CAP`; the checker knows which set types are
 there); run directly, or at the maximum, the
-checker reports an evaluation error as before. Output before the line is repeated by the next run, so
+checker reports an evaluation error as before. Beside the build for M, tla2rs builds, in `<dir>/ahead`, the checker
+for the capacities the next growth of the same kind would give when the value then needs no more (`build` in
+`main.rs`): a build keeps about one core busy, so the second costs little wall time. When the value outgrows M too
+and the code generated next is that code, the checker built ahead runs without a build of its own
+(`tests/tlc/CapPerType`: 8, 16, 64 waits for two builds instead of three). A checker built ahead for other
+capacities is stopped, with the rustc its cargo started, when the run ends or something else grows. Output before
+the line is repeated by the next run, so
 `crosscheck.sh` compares only what follows the last such line, and says how many rebuilds there were. A spec that
 stays within its capacities builds and runs exactly as before.
 A constant filter `{x \in S : P}` too large to compute when compiling is no such array where it is only iterated

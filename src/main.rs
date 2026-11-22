@@ -264,10 +264,16 @@ fn main() {
     // Whether the checker prints in TLC's order for the EXCEPT warnings it meets (see `compile`)
     let mut warn_order = false;
     let mut first = true;
+    // The capacities the next growth gives if the kind that just grew outgrows its new capacity
+    // too (QCAP, set types): the checker for them is built ahead, beside the one for this run (see
+    // `build`)
+    let mut predicted: Option<Caps> = None;
     loop {
         let t0 = Instant::now();
         let caps = grown_sets.iter().map(|(k, v)| (k.clone(), v.0)).collect();
-        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, caps, tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect(), fp128, metal, &made, warn_order);
+        let tostr_caps: std::collections::HashMap<String, usize> = tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect();
+        let ahead = predicted.take().map(|(q, sets)| ((q, sets.clone()), compile_thread(&tla, &src, &cfg_src, setcap, q, sets, tostr_caps.clone(), fp128, metal, &made, warn_order)));
+        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, caps, tostr_caps, fp128, metal, &made, warn_order);
         if first {
             for w in &output.warnings {
                 eprintln!("warning: {w}");
@@ -303,9 +309,9 @@ fn main() {
                     exit(2);
                 }
             }
-            exit(*code);
+            quit(*code);
         }
-        let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0) else { return };
+        let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0, ahead) else { return };
         // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs; the
         // checker knows which set types are at the maximum)
         let qcap = output.qcap;
@@ -337,7 +343,7 @@ fn main() {
         }
         if code == codegen::TOSTR_EXIT {
             // As capacities grow (below); the checker asks only while more can be listed
-            let Ok(key) = std::fs::read_to_string(&need_file) else { exit(code) };
+            let Ok(key) = std::fs::read_to_string(&need_file) else { quit(code) };
             let (cap, grown) = tostr.entry(key).or_insert((codegen::TOSTR_START, 0));
             let old = *cap;
             *grown += 1;
@@ -347,7 +353,7 @@ fn main() {
             continue;
         }
         if code != CAP_EXIT_SET && code != CAP_EXIT_SEQ {
-            exit(code)
+            quit(code)
         }
         // Twice the room the first time a sequence or a set type grows, four times the second,
         // eight times the third and so on: a value that keeps outgrowing its capacity is likely
@@ -359,11 +365,17 @@ fn main() {
         let mut lines = text.lines();
         let need = lines.next().and_then(|t| t.trim().parse::<usize>().ok());
         let grow = |old: usize, times: u32| old.saturating_mul(1 << times.min(12)).max(need.unwrap_or(old + 1)).clamp(8, types::MAX_CAP);
+        // What the next growth of the same kind gives when the value then needs no more, for which
+        // a checker is built ahead (see `build`)
+        let ahead_cap = |cap: usize, times: u32| cap.saturating_mul(1 << (times + 1).min(12)).clamp(8, types::MAX_CAP);
+        let sets_now = |grown_sets: &std::collections::HashMap<String, (usize, u32)>| -> std::collections::HashMap<String, usize> { grown_sets.iter().map(|(k, v)| (k.clone(), v.0)).collect() };
+        let mut next = None;
         if code == CAP_EXIT_SEQ {
             grown_seq += 1;
             let new = grow(qcap, grown_seq);
             println!("tla2rs: a sequence grew beyond {qcap} elements; checking again from the start with room for {new}");
             seqcap = new;
+            next = Some((ahead_cap(new, grown_seq), sets_now(&grown_sets)));
         } else {
             let old = lines.next().and_then(|t| t.trim().parse::<usize>().ok());
             match (old, lines.next().filter(|k| !k.is_empty())) {
@@ -373,6 +385,10 @@ fn main() {
                     *cap = grow(old, *times);
                     let what = output.set_names.get(key).map_or("a set", |n| n.as_str());
                     println!("tla2rs: {what} grew beyond {old} elements; checking again from the start with room for {cap}");
+                    let bigger = ahead_cap(*cap, *times);
+                    let mut sets = sets_now(&grown_sets);
+                    sets.insert(key.to_string(), bigger);
+                    next = Some((seqcap, sets));
                 }
                 // No set type named (a checker that did not write the file): every set type starts
                 // higher
@@ -384,37 +400,83 @@ fn main() {
                 }
             }
         }
+        // A checker built ahead for these capacities runs next; one built for others is stopped,
+        // and one is built ahead for the next growth of the kind that grew
+        let now = (seqcap, sets_now(&grown_sets));
+        if !AHEAD.lock().unwrap().as_ref().is_some_and(|a| a.caps == now) {
+            stop_ahead();
+            predicted = next.filter(|n| *n != now);
+        }
         first = false;
     }
 }
 
-/// Compiles the spec, stopping with exit 1 on an error. The compiler runs on a thread with a large
-/// stack: evaluating a recursive operator at compile time nests deeply (up to value::REC_LIMIT
-/// calls)
+/// Compiles the spec, stopping with exit 1 on an error
 #[allow(clippy::too_many_arguments)]
 fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, sets: std::collections::HashMap<String, usize>, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> compile::Output {
-    let (src, cfg_src, made) = (src.to_string(), cfg_src.to_string(), made.to_vec());
-    let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let result = std::thread::Builder::new()
-        .stack_size(1 << 30)
-        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &sets, &tostr, fp128, metal, &made, warn_order))
-        .expect("start the compiler thread")
-        .join()
-        .unwrap_or_else(|_| Err("internal error in the compiler".into()));
+    let result = compile_thread(tla, src, cfg_src, setcap, seqcap, sets, tostr, fp128, metal, made, warn_order).join().unwrap_or_else(|_| Err("internal error in the compiler".into()));
     result.unwrap_or_else(|e| {
         eprintln!("tla2rs: {e}");
-        exit(1)
+        quit(1)
     })
 }
 
-/// Writes the generated crate to `dir` and builds it (or takes the checker built earlier from the
-/// same sources, under TLA2RS_BUILD_CACHE). Returns the checker, or None with --emit-only
-fn build(dir: &Path, crate_name: &str, rust: &str, metal: bool, emit_only: bool, t0: Instant) -> Option<PathBuf> {
+type Compiling = std::thread::JoinHandle<Result<compile::Output, String>>;
+
+/// QCAP and the capacities of the set types that grew
+type Caps = (usize, std::collections::HashMap<String, usize>);
+
+/// Starts compiling the spec. The compiler runs on a thread with a large stack: evaluating a
+/// recursive operator at compile time nests deeply (up to value::REC_LIMIT calls)
+#[allow(clippy::too_many_arguments)]
+fn compile_thread(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, sets: std::collections::HashMap<String, usize>, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> Compiling {
+    let (src, cfg_src, made) = (src.to_string(), cfg_src.to_string(), made.to_vec());
+    let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &sets, &tostr, fp128, metal, &made, warn_order))
+        .expect("start the compiler thread")
+}
+
+/// A checker being built ahead, in `<dir>/ahead`, for the capacities the next growth would give
+/// (see `build`)
+struct Ahead {
+    caps: Caps,
+    rust: String,
+    dir: PathBuf,
+    cargo: std::process::Child,
+}
+
+static AHEAD: std::sync::Mutex<Option<Ahead>> = std::sync::Mutex::new(None);
+
+/// Stops the checker being built ahead, if any. cargo leaves rustc running when it is killed, so
+/// cargo is stopped, its children killed, and then cargo
+fn stop_ahead() {
+    let Some(mut a) = AHEAD.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    if matches!(a.cargo.try_wait(), Ok(None)) {
+        let pid = a.cargo.id().to_string();
+        let _ = Command::new("kill").args(["-STOP", &pid]).status();
+        let _ = Command::new("pkill").args(["-KILL", "-P", &pid]).status();
+        let _ = a.cargo.kill();
+    }
+    let _ = a.cargo.wait();
+}
+
+/// Exits, stopping the checker being built ahead first
+fn quit(code: i32) -> ! {
+    stop_ahead();
+    exit(code)
+}
+
+/// Writes the generated crate to `dir`. The checker is built without ThinLTO across codegen units:
+/// the code of the spec's next-state relation is one function in one codegen unit, which ThinLTO
+/// optimized a second time (a tenth to a fifth of a build), and the search was as fast without it
+fn write_crate(dir: &Path, crate_name: &str, rust: &str, metal: bool) {
     std::fs::create_dir_all(dir.join("src")).expect("create output dir");
     std::fs::write(
         dir.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"{crate_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n\n[profile.release]\nopt-level = 3\ncodegen-units = 16\n\n[workspace]\n"
+            "[package]\nname = \"{crate_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n\n[profile.release]\nopt-level = 3\ncodegen-units = 16\nlto = \"off\"\n\n[workspace]\n"
         ),
     )
     .expect("write Cargo.toml");
@@ -423,38 +485,86 @@ fn build(dir: &Path, crate_name: &str, rust: &str, metal: bool, emit_only: bool,
         std::fs::write(dir.join("metal.m"), metal::METAL_M).expect("write metal.m");
         std::fs::write(dir.join("build.rs"), metal::BUILD_RS).expect("write build.rs");
     }
-    eprintln!("tla2rs: generated {} in {:.0} ms", dir.join("src/main.rs").display(), t0.elapsed().as_secs_f64() * 1e3);
-    if emit_only {
-        return None;
-    }
-    // TLA2RS_BUILD_CACHE=DIR reuses a checker built earlier from the same sources, so test runs only
-    // compile the specs whose generated code changed
-    let cache = std::env::var_os("TLA2RS_BUILD_CACHE").map(|c| PathBuf::from(c).join(build_key(dir)));
-    if let Some(hit) = cache.as_ref().map(|c| c.join("checker")).filter(|b| b.is_file()) {
-        eprintln!("tla2rs: reusing the checker in {}", hit.display());
-        return Some(hit);
-    }
-    let t1 = Instant::now();
-    let st = Command::new("cargo")
-        .args(["build", "--release", "--quiet", "--offline"])
-        .current_dir(dir)
-        .status()
-        .expect("run cargo");
-    if !st.success() {
-        eprintln!("tla2rs: building the generated checker failed (this is a tla2rs bug; please report the spec)");
-        exit(1);
-    }
-    eprintln!("tla2rs: built in {:.1} s", t1.elapsed().as_secs_f64());
-    let bin = dir.join("target/release").join(crate_name);
-    if let Some(c) = &cache {
-        // Copy under a unique name and rename, so a parallel run never sees a half-written file
+}
+
+/// Where TLA2RS_BUILD_CACHE=DIR keeps the checker built from the crate in `dir`, so test runs only
+/// compile the specs whose generated code changed
+fn cache_entry(dir: &Path) -> Option<PathBuf> {
+    std::env::var_os("TLA2RS_BUILD_CACHE").map(|c| PathBuf::from(c).join(build_key(dir)))
+}
+
+fn cargo_build(dir: &Path) -> std::process::Child {
+    Command::new("cargo").args(["build", "--release", "--quiet", "--offline"]).current_dir(dir).spawn().expect("run cargo")
+}
+
+/// Copies a checker into the build cache, under a unique name renamed into place, so a parallel run
+/// never sees a half-written file
+fn store(cache: &Option<PathBuf>, bin: &Path) {
+    if let Some(c) = cache {
         let tmp = c.with_extension(format!("tmp{}", std::process::id()));
         let stored = std::fs::create_dir_all(&tmp)
-            .and_then(|_| std::fs::copy(&bin, tmp.join("checker")))
+            .and_then(|_| std::fs::copy(bin, tmp.join("checker")))
             .and_then(|_| std::fs::rename(&tmp, c));
         if stored.is_err() {
             let _ = std::fs::remove_dir_all(&tmp);
         }
     }
+}
+
+/// Writes the generated crate to `dir` and builds it (or takes the checker built earlier from the
+/// same sources, under TLA2RS_BUILD_CACHE). Returns the checker, or None with --emit-only.
+///
+/// After a capacity grew, `ahead` compiles the spec with the capacities the next growth of that
+/// kind would give. A build keeps one core busy for most of its time (the next-state relation is
+/// one function, whose type check, borrow check and optimization are serial), so the checker for
+/// those capacities is built beside this one, in `<dir>/ahead`; when the value outgrows the new
+/// capacity too and the code generated next is the same, that checker runs without a build of its
+/// own (a spec that grew 8 -> 16 -> 64 waits for two builds instead of three). Otherwise it is
+/// stopped
+#[allow(clippy::too_many_arguments)]
+fn build(dir: &Path, crate_name: &str, rust: &str, metal: bool, emit_only: bool, t0: Instant, ahead: Option<(Caps, Compiling)>) -> Option<PathBuf> {
+    write_crate(dir, crate_name, rust, metal);
+    eprintln!("tla2rs: generated {} in {:.0} ms", dir.join("src/main.rs").display(), t0.elapsed().as_secs_f64() * 1e3);
+    if emit_only {
+        return None;
+    }
+    let cache = cache_entry(dir);
+    let pending = AHEAD.lock().unwrap().take();
+    if let Some(mut a) = pending {
+        if a.rust == rust {
+            let t1 = Instant::now();
+            if a.cargo.wait().is_ok_and(|s| s.success()) {
+                eprintln!("tla2rs: this checker was built ahead, while the one before was built and run");
+                eprintln!("tla2rs: built in {:.1} s", t1.elapsed().as_secs_f64());
+                let bin = a.dir.join("target/release").join(crate_name);
+                store(&cache, &bin);
+                return Some(bin);
+            }
+        } else {
+            *AHEAD.lock().unwrap() = Some(a);
+            stop_ahead();
+        }
+    }
+    if let Some(hit) = cache.as_ref().map(|c| c.join("checker")).filter(|b| b.is_file()) {
+        eprintln!("tla2rs: reusing the checker in {}", hit.display());
+        return Some(hit);
+    }
+    let t1 = Instant::now();
+    let mut cargo = cargo_build(dir);
+    if let Some((caps, next)) = ahead.and_then(|(caps, h)| Some((caps, h.join().ok()?.ok()?))).filter(|(_, o)| o.rejected.is_none() && o.rust != rust) {
+        let ahead_dir = dir.join("ahead");
+        write_crate(&ahead_dir, crate_name, &next.rust, metal);
+        if !cache_entry(&ahead_dir).is_some_and(|c| c.join("checker").is_file()) {
+            *AHEAD.lock().unwrap() = Some(Ahead { caps, rust: next.rust, cargo: cargo_build(&ahead_dir), dir: ahead_dir });
+        }
+    }
+    let st = cargo.wait().expect("run cargo");
+    if !st.success() {
+        eprintln!("tla2rs: building the generated checker failed (this is a tla2rs bug; please report the spec)");
+        quit(1);
+    }
+    eprintln!("tla2rs: built in {:.1} s", t1.elapsed().as_secs_f64());
+    let bin = dir.join("target/release").join(crate_name);
+    store(&cache, &bin);
     Some(bin)
 }
