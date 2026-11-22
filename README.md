@@ -135,8 +135,10 @@ not finish.
    enumerated by the checker from its parts, in TLC's order, where it iterates over it.
    Actions are generated in continuation-passing style, threading "the remaining conjuncts" through; every `\/`,
    `\E`, and `IF` becomes a branch, and `x' = e` becomes a `let`
-5. **Runtime** (`runtime.rs`): BFS, level by level, with each level split across threads. States are bit-packed to fit
-   their types, and the visited set holds only 64-bit fingerprints. A state of 64 bits or fewer has a reversible
+5. **Runtime** (`runtime.rs`): a breadth-first search in which each thread expands states from a queue of its own
+   and takes work from the others, without waiting for a level to end; when it meets an error, a search level by
+   level reports it as TLC does. States are bit-packed to fit their types, and the visited set holds only 64-bit
+   fingerprints. A state of 64 bits or fewer has a reversible
    fingerprint, so it cannot collide
 6. **Liveness** (`live.rs`, `ltl.rs`): a property becomes a formula over state predicates, `ENABLED`, and action
    predicates, whose negation is turned into a Büchi automaton (tableau). During the search each state records which

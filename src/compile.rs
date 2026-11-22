@@ -2141,7 +2141,8 @@ fn compile_inner(
                 "fn fingerprint(w: &[u64]) -> Fp {\n    let w = if !HAS_VIEW && w.len() == WORDS { &w[..WORDS - SHW] } else { w };\n",
                 1,
             )
-            .replace("WORDS * 64 > FP_BITS", "(WORDS - SHW) * 64 > FP_BITS");
+            .replace("WORDS * 64 > FP_BITS", "(WORDS - SHW) * 64 > FP_BITS")
+            .replacen("const SHAPED: bool = false;", "const SHAPED: bool = true;", 1);
         src += &rt;
     }
     src += crate::runtime::PPR;
