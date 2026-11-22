@@ -90,7 +90,7 @@ It has no crate dependencies.
 | `src/pcal.rs` | TLC's check of the checksums a PlusCal translator wrote: the warnings for the root module and the modules it extends, and the algorithm's syntax tree as TLC's translator prints it (see "PlusCal checksums") |
 | `src/lasso.rs` | The spec's parts written back as TLA+ (`tla`) for the module `-lassocheck` writes (see "Counterexamples") |
 | `src/ppr.rs` | TLC's pretty printer for values (`ppr`, ported from `tlc2.pprint` and checked against TLC's on 25,000 random values): used by the compiler for what Print and PrintT print when TLC starts, and pasted into every generated checker, which prints states and printed values with it |
-| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, one property per thread, the first violated in order reported; counterexamples are lassos). `TLA2RS_PHASES=1` prints the time of each phase of a liveness check to stderr. Also the `-dumpgraph` output. `LIVE_SIM_RT` is pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
+| `src/runtime.rs` | The runtime pasted into generated code: level-by-level parallel BFS (threads started once per search take pieces of a level as they finish, `Pool`), bit-packed states, 64-bit fingerprints (with VIEW / SYMMETRY, of the canonical key), and liveness (per state and edge, which property atoms and fairness conditions hold; then an SCC search in the product with each property's automaton, with WF / SF as conditions on components, the first violated in order reported; counterexamples are lassos). With one worker the properties are searched one after another; with more, the threads take (property, component of the state graph) pairs, as each component of a product lies in the product of one component of the state graph with the automaton (`first_violated`), and the lasso is then the one the search with one worker finds on the first property violated, so it does not depend on the workers. `TLA2RS_PHASES=1` prints the time of each phase of a liveness check to stderr. Also the `-dumpgraph` output. `LIVE_SIM_RT` is pasted, with hooks that `compile.rs` writes into the runtime, only for a spec that prints (see "Messages and printed lines") |
 
 ### Memory use (`runtime.rs`)
 
@@ -112,7 +112,9 @@ cache holds what fits. A level is expanded a slice of `LEVEL_SLICE` states at a 
 it is merged stays small. The search in the product with a property's automaton numbers the product nodes in BFS
 order in arrays (`Rank`, dense over all product nodes for an automaton of at most 16 nodes), and its Tarjan keeps a
 cursor per node on its stack (`At`) instead of the node's successors; the BFS keeps only each node's parent, and the
-label of a step on the counterexample's prefix is found again from the parent's successors. Under a VIEW or a SYMMETRY the verdict comes from
+label of a step on the counterexample's prefix is found again from the parent's successors. With several workers the
+verdict comes first from a search that keeps a bit per product node for what is reachable, and numbers only the nodes
+of one component of the state graph at a time. Under a VIEW or a SYMMETRY the verdict comes from
 TLC's liveness graph instead (see "Counterexamples"), which `tlc_lasso` builds in memory: per node of a state and a
 particle, a vector of its transitions.
 

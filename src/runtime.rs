@@ -5429,12 +5429,14 @@ struct At {
     selfloop: bool,
 }
 /// The product of the state graph with the automaton of one negated property; with `ea`, only the
-/// steps that keep the property's <>[]A parts
+/// steps that keep the property's <>[]A parts; with `within` (the component of each state, and
+/// one), only the steps between states of that component
 struct Product<'a> {
     st: &'a Steps,
     nodes: &'static [LNode],
     q: usize,
     ea: &'static [LP],
+    within: Option<(&'a [u32], u32)>,
 }
 impl Product<'_> {
     fn valid(&self, s: u32, q: usize) -> bool {
@@ -5454,12 +5456,18 @@ impl Product<'_> {
         let n = &self.nodes[at.q as usize];
         let end = self.st.edges(at.s as usize).end;
         while at.e <= end {
+            if at.e < end && self.within.is_some_and(|(comp, c)| comp[self.st.dst.get(at.e) as usize] != c) {
+                at.e += 1;
+                continue;
+            }
             let (t, l, a, f) = if at.e < end { self.st.edge(at.e) } else { (at.s, STUTTER, self.st.stut(at.s as usize), 0) };
             if a & n.a_pos == n.a_pos && a & n.a_neg == 0 && self.ea.iter().all(|x| self.holds(x, self.node(at), a, f)) {
+                let b = self.st.sbits(t as usize);
                 while (at.j as usize) < n.succ.len() {
                     let q2 = n.succ[at.j as usize] as usize;
                     at.j += 1;
-                    if self.valid(t, q2) {
+                    let m = &self.nodes[q2];
+                    if b & m.s_pos == m.s_pos && b & m.s_neg == 0 {
                         return Some((t as usize * self.q + q2, l, f, a));
                     }
                 }
@@ -5734,6 +5742,245 @@ fn path_to(
     }
     vec![]
 }
+/// The strongly connected components of the state graph (iterative Tarjan): per state, the number
+/// of its component, numbered as they complete
+fn state_sccs(st: &Steps) -> (Vec<u32>, u32) {
+    const NEW: u32 = u32::MAX;
+    let n = st.n();
+    let mut index = vec![NEW; n];
+    let mut low = vec![0u32; n];
+    let mut comp = vec![NEW; n];
+    let mut stack: Vec<u32> = vec![];
+    let mut call: Vec<(u32, usize)> = vec![];
+    let (mut idx, mut count) = (0u32, 0u32);
+    for root in 0..n {
+        if index[root] != NEW {
+            continue;
+        }
+        index[root] = idx;
+        low[root] = idx;
+        idx += 1;
+        stack.push(root as u32);
+        call.push((root as u32, st.edges(root).start));
+        while let Some(&mut (u, ref mut e)) = call.last_mut() {
+            let u = u as usize;
+            if *e < st.edges(u).end {
+                let v = st.dst.get(*e) as usize;
+                *e += 1;
+                if index[v] == NEW {
+                    index[v] = idx;
+                    low[v] = idx;
+                    idx += 1;
+                    stack.push(v as u32);
+                    call.push((v as u32, st.edges(v).start));
+                } else if comp[v] == NEW {
+                    low[u] = low[u].min(index[v]);
+                }
+                continue;
+            }
+            call.pop();
+            if let Some(&(p, _)) = call.last() {
+                low[p as usize] = low[p as usize].min(low[u]);
+            }
+            if low[u] == index[u] {
+                loop {
+                    let w = stack.pop().unwrap() as usize;
+                    comp[w] = count;
+                    if w == u {
+                        break;
+                    }
+                }
+                count += 1;
+            }
+        }
+    }
+    (comp, count)
+}
+/// The components of the state graph as lists of states (`state_sccs`), the largest first: a
+/// component of a property's product lies in the product of one of them with the automaton
+struct Blocks {
+    comp: Vec<u32>,
+    /// The states of component c are `states[start[c]..start[c + 1]]`; `pos` is the place of each
+    /// state there
+    start: Vec<usize>,
+    states: Vec<u32>,
+    pos: Vec<u32>,
+    by_size: Vec<u32>,
+}
+impl Blocks {
+    fn new(st: &Steps) -> Self {
+        let (comp, count) = state_sccs(st);
+        let mut start = vec![0usize; count as usize + 1];
+        for &c in &comp {
+            start[c as usize + 1] += 1;
+        }
+        for c in 0..count as usize {
+            start[c + 1] += start[c];
+        }
+        let mut at = start.clone();
+        let mut states = vec![0u32; comp.len()];
+        let mut pos = vec![0u32; comp.len()];
+        for (s, &c) in comp.iter().enumerate() {
+            states[at[c as usize]] = s as u32;
+            pos[s] = (at[c as usize] - start[c as usize]) as u32;
+            at[c as usize] += 1;
+        }
+        let mut by_size: Vec<u32> = (0..count).collect();
+        by_size.sort_by_key(|&c| std::cmp::Reverse(start[c as usize + 1] - start[c as usize]));
+        Blocks { comp, start, states, pos, by_size }
+    }
+    fn of(&self, c: u32) -> &[u32] {
+        &self.states[self.start[c as usize]..self.start[c as usize + 1]]
+    }
+}
+/// The product nodes of a property reachable from its initial ones by any step, a bit per
+/// automaton node in `w` words per state, found breadth first by the threads
+struct Reached {
+    w: usize,
+    bits: Vec<u64>,
+}
+impl Reached {
+    fn new(all: &Product, inits: &[u32], workers: usize) -> Self {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+        let (q, n) = (all.q, all.st.n());
+        let w = q.div_ceil(64);
+        let bits: Vec<AtomicU64> = std::iter::repeat_with(|| AtomicU64::new(0)).take(n * w).collect();
+        let mark = |p: usize| {
+            let (s, k) = (p / q, p % q);
+            let (b, x) = (1u64 << (k % 64), &bits[s * w + k / 64]);
+            x.load(Relaxed) & b == 0 && x.fetch_or(b, Relaxed) & b == 0
+        };
+        let mut level: Vec<usize> = vec![];
+        for &s in inits {
+            for (k, nd) in all.nodes.iter().enumerate() {
+                let p = s as usize * q + k;
+                if nd.init && all.valid(s, k) && mark(p) {
+                    level.push(p);
+                }
+            }
+        }
+        let expand = |part: &[usize], out: &mut Vec<usize>, buf: &mut Vec<(usize, u32, FMask, u64)>| {
+            for &u in part {
+                all.succ(u, buf);
+                for &(v, _, _, _) in buf.iter() {
+                    if mark(v) {
+                        out.push(v);
+                    }
+                }
+            }
+        };
+        let mut buf = vec![];
+        while !level.is_empty() {
+            const PART: usize = 1024;
+            let mut next = vec![];
+            if level.len() <= PART || workers <= 1 {
+                expand(&level, &mut next, &mut buf);
+            } else {
+                let at = AtomicUsize::new(0);
+                let parts: Vec<Vec<usize>> = std::thread::scope(|sc| {
+                    let hs: Vec<_> = (0..workers.min(level.len().div_ceil(PART)))
+                        .map(|_| {
+                            spawn_worker(sc, || {
+                                let (mut out, mut buf) = (vec![], vec![]);
+                                loop {
+                                    let a = at.fetch_add(PART, Relaxed);
+                                    if a >= level.len() {
+                                        break out;
+                                    }
+                                    expand(&level[a..(a + PART).min(level.len())], &mut out, &mut buf);
+                                }
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+                });
+                next = parts.concat();
+            }
+            level = next;
+        }
+        Reached { w, bits: bits.into_iter().map(AtomicU64::into_inner).collect() }
+    }
+    fn of(&self, s: usize) -> &[u64] {
+        &self.bits[s * self.w..(s + 1) * self.w]
+    }
+    /// Among the reachable nodes of state s, the number of node k (None: k is not reachable)
+    #[inline]
+    fn rank(&self, s: usize, k: usize) -> Option<u32> {
+        let ws = self.of(s);
+        if ws[k / 64] >> (k % 64) & 1 == 0 {
+            return None;
+        }
+        Some(ws[..k / 64].iter().map(|x| x.count_ones()).sum::<u32>() + (ws[k / 64] & ((1u64 << (k % 64)) - 1)).count_ones())
+    }
+}
+/// The first property in order that is violated, found by the threads, which search the product
+/// of each component of the state graph with each automaton apart: a component of a product lies
+/// in one of them, so `check_prop` finds a fair accepting component exactly when one of these does
+fn first_violated(st: &Steps, inits: &[u32], workers: usize) -> Option<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let tph = std::time::Instant::now();
+    let blocks = Blocks::new(st);
+    live_ph("blocks", tph);
+    let tph = std::time::Instant::now();
+    let reached: Vec<Option<Reached>> = LPROPS
+        .iter()
+        .map(|prop| {
+            let all = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1), ea: &[], within: None };
+            assert!(all.q <= 1 << 16, "an automaton too large for the liveness search");
+            (!prop.nodes.is_empty()).then(|| Reached::new(&all, inits, workers))
+        })
+        .collect();
+    live_ph("reach", tph);
+    let tph = std::time::Instant::now();
+    // The tasks are (property, component) pairs, the largest components of each property first,
+    // taken a few at a time
+    let nb = blocks.by_size.len();
+    let tasks = LPROPS.len() * nb;
+    let (next, first_bad) = (AtomicUsize::new(0), AtomicUsize::new(usize::MAX));
+    // A task numbers the reachable product nodes of its component state by state (`base`: the
+    // number of the first node of each state)
+    let task = |t: usize, roots: &mut Vec<usize>, base: &mut Vec<u32>| {
+        let (i, c) = (t / nb, blocks.by_size[t % nb]);
+        let quit = || first_bad.load(Relaxed) <= i;
+        let Some(r) = reached[i].as_ref().filter(|_| !quit()) else { return };
+        let prop = &LPROPS[i];
+        let pr = Product { st, nodes: prop.nodes, q: prop.nodes.len(), ea: prop.ea, within: Some((&blocks.comp, c)) };
+        roots.clear();
+        base.clear();
+        for &s in blocks.of(c) {
+            base.push(u32::try_from(roots.len()).expect("more product nodes than the liveness search can number"));
+            roots.extend((0..pr.q).filter(|&k| r.rank(s as usize, k).is_some()).map(|k| s as usize * pr.q + k));
+        }
+        let id = |p: usize| r.rank(p / pr.q, p % pr.q).map(|k| base[blocks.pos[p / pr.q] as usize] + k);
+        let mut bad = false;
+        sccs(&pr, roots, roots.len(), &id, &mut |comp| {
+            bad = search(&pr, prop, comp, st.n() * pr.q).is_some();
+            bad || quit()
+        });
+        if bad {
+            first_bad.fetch_min(i, Relaxed);
+        }
+    };
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            spawn_worker(sc, || {
+                const TAKE: usize = 64;
+                let (mut roots, mut base) = (vec![], vec![]);
+                loop {
+                    let a = next.fetch_add(TAKE, Relaxed);
+                    if a >= tasks {
+                        break;
+                    }
+                    for t in a..(a + TAKE).min(tasks) {
+                        task(t, &mut roots, &mut base);
+                    }
+                }
+            });
+        }
+    });
+    live_ph("components", tph);
+    Some(first_bad.into_inner()).filter(|&i| i < LPROPS.len())
+}
 /// f over lo..hi on `threads` threads, in order
 fn par_map<T: Send>(lo: usize, hi: usize, threads: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
     let per = (hi - lo).div_ceil(threads.max(1)).max(1);
@@ -5829,6 +6076,16 @@ fn liveness(g: &Graph, mut live: LiveGraph, workers: usize) -> bool {
     // one found violated is given up.
     let own = || -> Option<Lasso> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        // With several threads they find the property first violated, and the lasso is that
+        // `check_prop` finds on it, as with one thread
+        if workers > 1 {
+            let i = first_violated(&st, &inits, workers)?;
+            let tph = std::time::Instant::now();
+            let l = check_prop(&st, &LPROPS[i], &inits, &|| false);
+            live_ph("lasso", tph);
+            assert!(l.is_some(), "the liveness search found no lasso through the component it found");
+            return l;
+        }
         let (next, first_bad) = (AtomicUsize::new(0), AtomicUsize::new(usize::MAX));
         let found: Vec<Vec<(usize, Lasso)>> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..workers.clamp(1, LPROPS.len().max(1)))
@@ -5932,7 +6189,7 @@ type Lasso = (Vec<(u32, u32)>, Vec<(u32, u32)>);
 /// graph that the property's automaton accepts. None also when `quit` says to give up.
 fn check_prop(st: &Steps, prop: &LProp, inits: &[u32], quit: &dyn Fn() -> bool) -> Option<Lasso> {
     // The path to a cycle may take any step; the cycle only steps that keep the <>[]A parts
-    let all = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1), ea: &[] };
+    let all = Product { st, nodes: prop.nodes, q: prop.nodes.len().max(1), ea: &[], within: None };
     let pr = Product { ea: prop.ea, ..all };
     if prop.nodes.is_empty() {
         return None;
