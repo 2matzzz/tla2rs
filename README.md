@@ -37,8 +37,10 @@ cargo build --release
   then it is the directory of the generated checker's executable
 - `-notrace` stops recording what is needed to rebuild a counterexample (16 bytes per state drops to 8)
 - `-setcap N` and `-seqcap N` set where the capacity of sets held as arrays (and of the domains of functions and
-  bags over large types) and the maximum length of sequences start. They are never needed: a value that outgrows
-  its capacity makes tla2rs build the checker again with twice the room and check from the start (see Limitations)
+  bags over large types) and the maximum length of sequences start. `-setcap` is the least every type of such set
+  starts at, so it widens all of them; leave it out unless every set type needs the room. They are never needed: a
+  value that outgrows its capacity makes tla2rs build the checker again with twice the room for that kind of set
+  (or for sequences) and check from the start (see Limitations)
 - `-fp128` uses 128-bit fingerprints instead of 64-bit ones
 - `-metal` runs the "already seen?" lookups on the GPU (Apple Metal); `-batched` runs the same three-phase pipeline on
   the CPU
@@ -133,8 +135,10 @@ not finish.
    enumerated by the checker from its parts, in TLC's order, where it iterates over it.
    Actions are generated in continuation-passing style, threading "the remaining conjuncts" through; every `\/`,
    `\E`, and `IF` becomes a branch, and `x' = e` becomes a `let`
-5. **Runtime** (`runtime.rs`): BFS, level by level, with each level split across threads. States are bit-packed to fit
-   their types, and the visited set holds only 64-bit fingerprints. A state of 64 bits or fewer has a reversible
+5. **Runtime** (`runtime.rs`): a breadth-first search in which each thread expands states from a queue of its own
+   and takes work from the others, without waiting for a level to end; when it meets an error, a search level by
+   level reports it as TLC does. States are bit-packed to fit their types, and the visited set holds only 64-bit
+   fingerprints. A state of 64 bits or fewer has a reversible
    fingerprint, so it cannot collide
 6. **Liveness** (`live.rs`, `ltl.rs`): a property becomes a formula over state predicates, `ENABLED`, and action
    predicates, whose negation is turned into a Büchi automaton (tableau). During the search each state records which
@@ -200,13 +204,17 @@ bounds the size of a model with temporal properties (one property per thread, so
   (`[i \in 0..n |-> e]` for different n)
 - A set whose element type has at most 128 values is a bitmask; a larger one (including sets of sets) is a sorted array
   of a fixed capacity, and a sequence is an array of a fixed maximum length, so that states can be copied and
-  packed without allocating. A set's capacity starts at 8 (or `Cardinality(x) <= K` in `TypeOK`, or the largest
-  constant set Init assigns), and never exceeds the number of values of its element type. A sequence's starts at
+  packed without allocating. Each kind of such set (by the representation of its elements: integers of any range
+  count as one kind, records by their fields) has a capacity of its own, so one that needs many elements does not
+  widen the others: it starts at 8 (or `-setcap`, or `Cardinality(x) <= K` in `TypeOK` for the type of x, or
+  the largest constant set Init assigns to a variable of the type), and never exceeds the number of values of its
+  element type. A sequence's starts at
   one more than a bound `Len(x) <= N` in `TypeOK` or a `CONSTRAINT` (or `UNION {[1..n -> S] : n \in 0..N}`);
   otherwise at the longest length Init and Next reach, computed until it stops growing (a length test such as
   `Len(q) < N` in an action bounds `q` there); otherwise at a length test in the spec, or 8. When a value outgrows
-  its capacity, tla2rs prints `tla2rs: a set grew beyond N elements; checking again from the start with room for
-  2N` (or a sequence), builds the checker again and runs it from the start; output printed before that line
+  its capacity, tla2rs prints `tla2rs: a set in `x` grew beyond N elements; checking again from the start with room
+  for 2N` (naming the variables that hold sets of that kind, or a sequence), builds the checker again with more
+  room for that kind only and runs it from the start; output printed before that line
   (progress, and Print in ASSUMEs) is repeated. Each rebuild costs a build (a few seconds), and a spec that stays
   within its capacities runs as fast as before. Both are at most 65535; beyond that a value is an evaluation error
 - Standard modules: `Naturals`, `Integers`, `FiniteSets`, `Sequences` (with `SortSeq`; strings are sequences of

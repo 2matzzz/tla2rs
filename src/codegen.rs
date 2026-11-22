@@ -30,6 +30,9 @@ pub struct Env {
     shapes: HashMap<String, (String, Ty)>,
     /// Primed variables that have already been assigned
     primed: HashMap<String, (String, Ty)>,
+    /// Of those, the ones only UNCHANGED assigned: the successor holds them as `*s` does, so
+    /// they leave its fingerprint as it is (see `emit_state`)
+    kept: HashSet<String>,
     init: bool,
     /// The action the successors are labelled with in traces (an index into `labels`)
     label: Option<u32>,
@@ -142,8 +145,6 @@ pub struct Gen<'a> {
     if_replay: bool,
     /// The types a value is printed of with its shape (`fmtsh_` functions)
     pub fmtsh_need: BTreeSet<Ty>,
-    /// Maximum cardinality of a sparse set (SSet)
-    pub scap: usize,
     /// Maximum length of a sequence (QCAP); 0 while no bound is known
     pub qcap: usize,
     /// During type inference, collects the types of assigned values
@@ -241,7 +242,6 @@ impl<'a> Gen<'a> {
             if_sites: HashMap::new(),
             if_replay: false,
             fmtsh_need: BTreeSet::new(),
-            scap: 8,
             qcap: 0,
             infer: None,
             infer_errs: HashMap::new(),
@@ -1091,7 +1091,7 @@ impl<'a> Gen<'a> {
             }
             // A sparse one: as many keys as D has elements, each in D
             Ty::PFun(dt, _) | Ty::Bag(dt) if is_sparse_fun(xt) => {
-                if dom.len() > self.scap || dom.iter().any(|k| !dt.conforms(k)) {
+                if dom.len() > crate::types::set_cap(xt) || dom.iter().any(|k| !dt.conforms(k)) {
                     return Ok("false".into());
                 }
                 let dl = self.lit(&Value::Set(dom.clone()), &Ty::Set(dt.clone()))?;
@@ -2171,7 +2171,7 @@ impl<'a> Gen<'a> {
     /// The widest window w (see `types::int_window`) whose values of `t` number at most `cap`,
     /// with those values
     fn tostr_window(&self, t: &Ty, cap: usize) -> Option<(u64, Vec<Value>)> {
-        let fits = |w: u64| all_values(t, Some(w), self.qcap, self.scap, cap);
+        let fits = |w: u64| all_values(t, Some(w), self.qcap, cap);
         let mut best = (1, fits(1)?);
         let mut over = None;
         while best.0 < 1 << 63 {
@@ -3471,7 +3471,7 @@ impl<'a> Gen<'a> {
                     // Too many values (integers the type inference leaves unbounded): only those whose
                     // integers lie in the window nearest 0 that TOSTR_CAP strings allow, and the
                     // checker built again with more when it meets one outside (`tostring_miss`)
-                    let (vals, window) = match crate::types::all_values(&t, None, self.qcap, self.scap, room) {
+                    let (vals, window) = match crate::types::all_values(&t, None, self.qcap, room) {
                         Some(v) => (v, None),
                         None => {
                             let key = format!("{t:?}");
@@ -3852,7 +3852,7 @@ impl<'a> Gen<'a> {
                     let Un(_, x) = s.strip() else { unreachable!() };
                     let (c, t) = self.gen(x, env, None)?;
                     let Ty::Set(el) = &t else { return Err("SUBSET of a non-set".into()) };
-                    let n = if is_sparse(&t) { crate::types::set_cap(&t, self.scap) as u32 } else { el.size().unwrap_or(0) as u32 };
+                    let n = if is_sparse(&t) { crate::types::set_cap(&t) as u32 } else { el.size().unwrap_or(0) as u32 };
                     let hi = if n >= 62 { BIG } else { 1i64 << n };
                     (format!("(1i64 << {})", self.s_card(&c, &t)), Ty::Int(1, hi))
                 }
@@ -4014,6 +4014,7 @@ impl<'a> Gen<'a> {
                         let mut inner = env.clone();
                         inner.init = false;
                         inner.primed.clear();
+                        inner.kept.clear();
                         inner.work = None;
                         let (c, _) = self.gen(&Un(UOp::Enabled, x.clone()), &inner, None)?;
                         (format!("{{ let __st = State {{ {}{} }}; let s = &__st; {c} }}", fields.join(", "), self.sh_field("SH0")), Ty::Bool)
@@ -4024,6 +4025,7 @@ impl<'a> Gen<'a> {
                 let mut inner = env.clone();
                 inner.split = false;
                 inner.primed.clear();
+                inner.kept.clear();
                 inner.work = None;
                 inner.init = false;
                 inner.partial = true;
@@ -6555,6 +6557,7 @@ impl<'a> Gen<'a> {
                             Some(w) => format!("{w}.v_{v}"),
                             None => format!("s.v_{v}"),
                         };
+                        env2.kept.insert(v.clone());
                         env2.primed.insert(v.clone(), (p, t));
                     }
                 }
@@ -6732,6 +6735,7 @@ impl<'a> Gen<'a> {
             let mut env2 = env.clone();
             env2.work = Some(w.clone());
             env2.primed = HashMap::new();
+            env2.kept.clear();
             for &k in &self.assigned_sets[mask as usize] {
                 let (v, t) = self.vars[k].clone();
                 env2.primed.insert(v.clone(), (format!("{w}.v_{v}"), t));
@@ -7191,6 +7195,19 @@ impl<'a> Gen<'a> {
         };
         if env.init {
             writeln!(out, "out.push({st});").unwrap();
+        } else if let Some(changed) = self.changed_vars(env).filter(|_| !self.tlcget) {
+            // The fingerprint first, from the variables the action changed, and the successor only
+            // if it may be new (see `dd_fresh` in the runtime)
+            let w = env.work.clone().unwrap_or_default();
+            let pks: String = changed.iter().map(|k| format!("pk_{k}(&{w}, __tw)?; ")).collect();
+            let ks: Vec<String> = changed.iter().map(|k| k.to_string()).collect();
+            writeln!(
+                out,
+                "if dd_fresh(out.len(), {l}, |__tw: &mut Packed| {{ {pks}Some(()) }}, &[{}]) {{ out.push(({st}, {l})); }}",
+                ks.join(", "),
+                l = env.label.unwrap_or(1)
+            )
+            .unwrap();
         } else {
             writeln!(out, "out.push(({st}, {}));", env.label.unwrap_or(1)).unwrap();
         }
@@ -7206,6 +7223,24 @@ impl<'a> Gen<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The variables (their numbers) a successor about to be emitted may hold otherwise than `*s`:
+    /// those assigned other than by UNCHANGED. None when the successor is not the state under
+    /// construction with every other variable as in `*s`
+    fn changed_vars(&self, env: &Env) -> Option<Vec<usize>> {
+        let mut changed = vec![];
+        for (k, (v, _)) in self.vars.iter().enumerate() {
+            let slot = &env.primed.get(v)?.0;
+            if *slot == format!("s.v_{v}") || env.kept.contains(v) {
+                continue;
+            }
+            if env.work.as_ref().is_none_or(|w| *slot != format!("{w}.v_{v}")) {
+                return None;
+            }
+            changed.push(k);
+        }
+        Some(changed)
     }
 
     /// Environment for expressions over a transition (s, t): x' is t.v_x
@@ -7849,7 +7884,7 @@ impl<'a> Gen<'a> {
             Ty::Set(e) if is_sparse(t) => {
                 // The count, followed by that many elements (the rest stay 0). The offset is only
                 // known at runtime from here on, so thread it
-                let cap = crate::types::set_cap(t, self.scap);
+                let cap = crate::types::set_cap(t);
                 let lb = Self::bits_for(cap as u64 + 1);
                 let k = self.fresh("k");
                 let n = self.fresh("n");
@@ -7954,7 +7989,7 @@ impl<'a> Gen<'a> {
                 )
             }
             Ty::Set(e) if is_sparse(t) => {
-                let lb = Self::bits_for(crate::types::set_cap(t, self.scap) as u64 + 1);
+                let lb = Self::bits_for(crate::types::set_cap(t) as u64 + 1);
                 // Thread the offset from here on, assigning to the outer p (a fresh `let` inside
                 // the block would reset the offset to 0 on leaving it, so later fields would be
                 // read from the start)
@@ -8015,21 +8050,53 @@ impl<'a> Gen<'a> {
         })
     }
 
-    /// pack / unpack and the word count
+    /// pack / unpack and the word count. Each variable starts at a constant offset, the sum of the
+    /// widest the variables before it can be (a sequence or a sparse set inside one still packs
+    /// its elements one after another), so that a successor's fingerprint can be updated from the
+    /// variables an action changed: `pk_<k>` writes variable k alone, and `VW` gives the words
+    /// each one spans (see `dd_fresh` in the runtime)
     pub fn gen_pack(&mut self) -> R<String> {
         let mut body = String::new();
+        let mut pks = String::new();
+        let mut offsets = vec![];
+        let mut spans = vec![];
         let mut total = 0;
-        let mut at = Some(0u32);
-        for (v, t) in self.vars.clone() {
-            total += self.pack_value(&format!("s.v_{v}"), &t, &mut body, &mut at)?;
+        for (k, (v, t)) in self.vars.clone().into_iter().enumerate() {
+            let mut one = String::new();
+            let b = self.pack_value(&format!("s.v_{v}"), &t, &mut one, &mut Some(total))?;
+            let (lo, hi) = if b == 0 { (0, 0) } else { (total / 64, (total + b - 1) / 64 + 1) };
+            // Clears the variable's bits: the words it shares with others by mask, the rest whole
+            let mut clear = String::new();
+            let mut whole = vec![];
+            for j in lo..hi {
+                let from = total.max(j * 64) - j * 64;
+                let to = (total + b).min(j * 64 + 64) - j * 64;
+                if to - from == 64 {
+                    whole.push(j);
+                } else {
+                    write!(clear, "w[{j}] &= {:#x}; ", !(((1u64 << (to - from)) - 1) << from)).unwrap();
+                }
+            }
+            match whole[..] {
+                [] => {}
+                [j] => write!(clear, "w[{j}] = 0; ").unwrap(),
+                [a, .., z] => write!(clear, "w[{a}..{}].fill(0); ", z + 1).unwrap(),
+            }
+            let one_w = one.replace("put(&mut w, ", "put(w, ");
+            writeln!(pks, "#[inline]\nfn pk_{k}(s: &State, w: &mut Packed) -> Option<()> {{ {clear}{one_w}Some(()) }}").unwrap();
+            spans.push(format!("({lo}, {hi})"));
+            offsets.push(total);
+            body += &one;
+            total += b;
         }
-        // If the offset stayed constant, p is unused; omit it to avoid an unused-variable warning
-        let pack_p = if at.is_some() { "" } else { "let mut p = 0u32; " };
         let mut words = total.div_ceil(64).max(1);
-        let mut at = Some(0u32);
+        let fp_words = words;
+        let mut threaded = false;
         let mut un = String::from("State { ");
-        for (v, t) in self.vars.clone() {
-            write!(un, "v_{v}: {}, ", self.unpack_value(&t, &mut at)?).unwrap();
+        for ((v, t), &o) in self.vars.clone().iter().zip(&offsets) {
+            let mut at = Some(o);
+            write!(un, "v_{v}: {}, ", self.unpack_value(t, &mut at)?).unwrap();
+            threaded |= at.is_none();
         }
         // The shape, in words of its own after the state, which fingerprints leave out
         if !self.shaped.is_empty() {
@@ -8049,11 +8116,17 @@ impl<'a> Gen<'a> {
             write!(un, "sh: Sh([{}]), ", ws.join(", ")).unwrap();
         }
         un += "}";
-        let unpack_p = if at.is_some() { "" } else { "let mut p = 0u32; " };
+        // A variable whose offset turns into one known only at run time reads it into p
+        let unpack_p = if threaded { "let mut p = 0u32; " } else { "" };
+        let nvars = self.vars.len();
         Ok(format!(
             "// {total} bits per state\nconst WORDS: usize = {words};\ntype Packed = [u64; WORDS];\n\
-             fn pack(s: &State) -> Option<Packed> {{ let mut w: Packed = [0; WORDS]; {pack_p}{body}Some(w) }}\n\
-             fn unpack(w: &Packed) -> State {{ {unpack_p}{un} }}\n"
+             /// The words fingerprints are taken of (the shape after them is left out)\n\
+             const FPW: usize = {fp_words};\n\
+             fn pack(s: &State) -> Option<Packed> {{ let mut w: Packed = [0; WORDS]; {body}Some(w) }}\n\
+             fn unpack(w: &Packed) -> State {{ {unpack_p}{un} }}\n\
+             static VW: [(usize, usize); {nvars}] = [{}];\n{pks}",
+            spans.join(", ")
         ))
     }
 
@@ -8269,7 +8342,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> PartialOrd for Sq<T, N> {
 }
 #[cold]
 fn seq_too_long(n: usize, need: usize) -> ! {
-    capacity_exceeded(CAP_SEQ, need, format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
+    capacity_exceeded(CAP_SEQ, need, "", format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
 }
 impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     fn new() -> Self {
@@ -8992,7 +9065,7 @@ impl Gen<'_> {
     /// a bitmask
     fn set_slots(&self, t: &Ty) -> u64 {
         match t {
-            _ if is_sparse(t) => crate::types::set_cap(t, self.scap) as u64,
+            _ if is_sparse(t) => crate::types::set_cap(t) as u64,
             Ty::Set(e) => e.size().unwrap_or(0),
             _ => 0,
         }
