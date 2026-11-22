@@ -579,19 +579,20 @@ impl<T: ConstDefault, const N: usize> ConstDefault for [T; N] {
     const DEFAULT: Self = [T::DEFAULT; N];
 }
 
-impl<T: Copy + Ord + ConstDefault, const N: usize> ConstDefault for SSet<T, N> {
+impl<T: Copy + Ord + ConstDefault, const N: usize, const K: usize> ConstDefault for SSet<T, N, K> {
     const DEFAULT: Self = SSet { len: 0, items: [T::DEFAULT; N] };
 }
 
 /// A set over a large element type, stored as a fixed-size sorted array so it can stay `Copy`.
-/// Unused slots hold the default value.
+/// Unused slots hold the default value. Each set type has a capacity N of its own, and K numbers
+/// the type, so that a set that outgrows N names its type (`set_full`)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct SSet<T: Copy + Ord + ConstDefault, const N: usize> {
+struct SSet<T: Copy + Ord + ConstDefault, const N: usize, const K: usize> {
     len: u16,
     items: [T; N],
 }
 
-impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
+impl<T: Copy + Ord + ConstDefault, const N: usize, const K: usize> SSet<T, N, K> {
     fn new() -> Self {
         Self::DEFAULT
     }
@@ -618,7 +619,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
         if let Err(i) = self.slice().binary_search(&x) {
             let n = self.len as usize;
             if n == N {
-                capacity_exceeded(CAP_SET, N + 1, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
+                set_full(K, N, N + 1, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
             }
             self.items.copy_within(i..n, i + 1);
             self.items[i] = x;
@@ -640,7 +641,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
         if self.len as usize + o.len as usize > N {
             let need = self.len as usize + o.iter().filter(|x| !self.contains(x)).count();
             if need > N {
-                capacity_exceeded(CAP_SET, need, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
+                set_full(K, N, need, format!("a set grew beyond {N} elements; raise the capacity with `Cardinality(x) <= K` in TypeDecl / TypeOK or -setcap"));
             }
         }
         for x in o.iter() {
@@ -671,7 +672,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> SSet<T, N> {
 
 /// A function over part of a large type (or a bag over one), held as the set of its (key, value)
 /// pairs. The pairs sort by key first and no two share a key, so a key is found by binary search.
-impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize> SSet<(K, V), N> {
+impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize, const T: usize> SSet<(K, V), N, T> {
     #[inline]
     fn find(&self, k: &K) -> Result<usize, usize> {
         self.slice().binary_search_by(|p| p.0.cmp(k))
@@ -687,7 +688,7 @@ impl<K: Copy + Ord + ConstDefault, V: Copy + Ord + ConstDefault, const N: usize>
             Err(i) => {
                 let n = self.len as usize;
                 if n == N {
-                    capacity_exceeded(CAP_SET, N + 1, format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
+                    set_full(T, N, N + 1, format!("the domain of a function or bag grew beyond {N} elements; raise the capacity with `Cardinality(DOMAIN f) <= K` in TypeDecl / TypeOK or -setcap"));
                 }
                 self.items.copy_within(i..n, i + 1);
                 self.items[i] = (k, v);
@@ -724,21 +725,34 @@ const CAP_SEQ: u8 = 1;
 /// The exit code that tells tla2rs which capacity to raise: CAP_EXIT + the kind
 const CAP_EXIT: i32 = 70;
 
+/// A set of the set type numbered k held as an array of capacity n (or the pairs of a sparse
+/// function or bag) outgrew it (see `capacity_exceeded`). Each set type has a capacity of its own,
+/// so the checker names the type by its key (`set_key`); a size is 16 bits (types::MAX_CAP), so a
+/// set at 65535 cannot grow
+#[cold]
+fn set_full(k: usize, n: usize, need: usize, msg: String) -> ! {
+    if n < 65535 {
+        capacity_exceeded(CAP_SET, need, &format!("{n}\n{}\n", set_key(k)), msg)
+    }
+    eval_error(msg)
+}
+
 /// A set (or the domain of a sparse function or bag) or a sequence outgrew the capacity this checker
 /// was built with. TLC has no such bound, so this is not an error of the spec: when tla2rs runs the
 /// checker, it sets TLA2RS_GROW to the kinds it can raise (`s` for sets, `q` for sequences), and the
 /// checker then exits at once with CAP_EXIT + kind so that tla2rs builds it again with more room and
 /// checks from the start. `need` is how many elements the value needs, at least: one more than the
 /// capacity, or all of a union's or a concatenation's; it is written to the file TLA2RS_NEED names,
-/// so that tla2rs builds with room for it at once. Otherwise (the checker run directly, or the
-/// capacity at its maximum) it is an evaluation error.
+/// followed by `which` (for a set: its capacity and the key of its type, see `set_full`), so that
+/// tla2rs builds with room for it at once. Otherwise (the checker run directly, or the capacity at
+/// its maximum) it is an evaluation error.
 #[cold]
-fn capacity_exceeded(kind: u8, need: usize, msg: String) -> ! {
+fn capacity_exceeded(kind: u8, need: usize, which: &str, msg: String) -> ! {
     let letter = if kind == CAP_SET { 's' } else { 'q' };
     if std::env::var("TLA2RS_GROW").is_ok_and(|g| g.contains(letter)) {
         use std::io::Write;
         if let Some(f) = std::env::var_os("TLA2RS_NEED") {
-            let _ = std::fs::write(f, format!("{need}\n"));
+            let _ = std::fs::write(f, format!("{need}\n{which}"));
         }
         let _ = std::io::stdout().flush();
         std::process::exit(CAP_EXIT + kind as i32);

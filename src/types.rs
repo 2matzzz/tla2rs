@@ -183,13 +183,153 @@ pub const SET_BITS: u64 = 128;
 /// bits)
 pub const MAX_CAP: usize = 65535;
 
-/// The capacity of a set of type `t` held as an array (`is_sparse`) when sets are given `scap`
-/// elements: never more than its element type has values
-pub fn set_cap(t: &Ty, scap: usize) -> usize {
-    match t {
-        Ty::Set(e) => e.size().map_or(scap, |n| scap.min(n.min(MAX_CAP as u64) as usize)),
-        _ => scap,
+/// The capacities of the sets held as arrays (`is_sparse`), one per set type (see "Capacities" in
+/// CLAUDE.md): a set type that needs many elements widens only the sets of that type, not every
+/// set in the state. The table lives for one compilation (`reset_set_caps`)
+#[derive(Default)]
+struct SetCaps {
+    /// Where every set type starts (`-setcap`, else 8)
+    base: usize,
+    /// Starts above `base`, by `cap_key`: derived from TypeOK and Init, or grown by tla2rs
+    starts: HashMap<String, usize>,
+    /// The set types named in the generated code, by `cap_key`, each with its number (`SC<n>`)
+    named: HashMap<String, usize>,
+}
+
+thread_local! {
+    static SET_CAPS: std::cell::RefCell<SetCaps> = std::cell::RefCell::new(SetCaps { base: 8, ..Default::default() });
+}
+
+/// Starts a compilation's table of set capacities: every set type starts at `base`, the types in
+/// `grown` (by `cap_key`) at least at what tla2rs gave them after they outgrew their capacity
+pub fn reset_set_caps(base: usize, grown: &HashMap<String, usize>) {
+    SET_CAPS.with(|c| *c.borrow_mut() = SetCaps { base, starts: grown.clone(), named: HashMap::new() });
+}
+
+/// Raises where the set type `t` (a sparse set, or the pairs of a sparse function or bag) starts
+pub fn raise_set_cap(t: &Ty, cap: usize) {
+    let key = cap_key(&cap_ty(t));
+    SET_CAPS.with(|c| {
+        let mut c = c.borrow_mut();
+        let s = c.starts.entry(key).or_insert(0);
+        *s = (*s).max(cap);
+    });
+}
+
+/// Raises where every set type starts
+pub fn raise_set_cap_base(cap: usize) {
+    SET_CAPS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.base = c.base.max(cap);
+    });
+}
+
+/// The largest start any set type has, for the check against MAX_CAP
+pub fn max_set_start() -> usize {
+    SET_CAPS.with(|c| {
+        let c = c.borrow();
+        c.starts.values().copied().fold(c.base, usize::max)
+    })
+}
+
+/// The sparse set a sparse function or bag is held as, or the set type itself
+fn cap_ty(t: &Ty) -> Ty {
+    if is_sparse_fun(t) { fun_pairs(t) } else { t.clone() }
+}
+
+/// The key of a set type in the table of capacities, and in the file through which a checker
+/// tells tla2rs which type outgrew its capacity: the shape of its representation. The generated
+/// code moves values between types of one representation without converting them (integers of
+/// different ranges, strings and model values of different sets, sequences and functions over
+/// part of a type of such elements: `Gen::trivial`), so such types share an `SSet` type and a
+/// capacity: integers count as one kind, as do strings and model values. That also keeps a key the
+/// same when tla2rs builds again with strings numbered in another order
+pub fn cap_key(t: &Ty) -> String {
+    fn go(t: &Ty, out: &mut String) {
+        use std::fmt::Write;
+        match t {
+            Ty::Bool => out.push('b'),
+            Ty::Int(..) | Ty::IntAtom(..) => out.push('i'),
+            Ty::Enum(_) => out.push('e'),
+            Ty::Rec(fs) => {
+                out.push('[');
+                for (i, (n, t)) in fs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write!(out, "{n}:").unwrap();
+                    go(t, out);
+                }
+                out.push(']');
+            }
+            _ if is_sparse(t) => {
+                out.push_str("set(");
+                go(&elem(t), out);
+                out.push(')');
+            }
+            Ty::Set(_) => out.push_str("bits"),
+            Ty::Bag(_) | Ty::PFun(..) if is_sparse_fun(t) => go(&fun_pairs(t), out),
+            Ty::Fun(d, c) | Ty::PFun(d, c) => {
+                write!(out, "{}{}(", if matches!(t, Ty::Fun(..)) { "f" } else { "p" }, d.size().unwrap_or(0)).unwrap();
+                go(c, out);
+                out.push(')');
+            }
+            Ty::Bag(e) => write!(out, "bag{}", e.size().unwrap_or(0)).unwrap(),
+            Ty::Seq(e) | Ty::Opt(e) => {
+                out.push_str(if matches!(t, Ty::Seq(_)) { "seq(" } else { "opt(" });
+                go(e, out);
+                out.push(')');
+            }
+        }
     }
+    fn elem(t: &Ty) -> Ty {
+        match t {
+            Ty::Set(e) => e.as_ref().clone(),
+            _ => unreachable!(),
+        }
+    }
+    let mut s = String::new();
+    go(t, &mut s);
+    s
+}
+
+/// The capacity of the set types of key `key` (`cap_key`): where they start
+pub fn key_cap(key: &str) -> usize {
+    SET_CAPS.with(|c| {
+        let c = c.borrow();
+        c.starts.get(key).copied().unwrap_or(0).max(c.base)
+    })
+}
+
+/// The capacity of a set of type `t` held as an array (`is_sparse`; or of the pairs of a sparse
+/// function or bag): where its type starts, and never more than its element type has values
+pub fn set_cap(t: &Ty) -> usize {
+    let t = cap_ty(t);
+    let cap = key_cap(&cap_key(&t));
+    match &t {
+        Ty::Set(e) => e.size().map_or(cap, |n| cap.min(n.min(MAX_CAP as u64) as usize)),
+        _ => cap,
+    }
+}
+
+/// The number of the set type `t` in the generated code, which names it in its `SSet` and in the
+/// constant `SC<n>` that holds the capacity of its key (emitted by `compile::set_cap_items` once
+/// the code is generated, so that a type named before its start was raised still gets its final
+/// capacity)
+fn set_cap_number(t: &Ty) -> usize {
+    let key = cap_key(t);
+    SET_CAPS.with(|c| {
+        let mut c = c.borrow_mut();
+        let n = c.named.len();
+        *c.named.entry(key).or_insert(n)
+    })
+}
+
+/// The keys of the set types named in the generated code, by their number
+pub fn named_set_keys() -> Vec<String> {
+    let mut v: Vec<(usize, String)> = SET_CAPS.with(|c| c.borrow().named.iter().map(|(k, n)| (*n, k.clone())).collect());
+    v.sort();
+    v.into_iter().map(|x| x.1).collect()
 }
 
 /// A function over part of a type (or a bag) whose domain type has at most this many values is an
@@ -382,11 +522,15 @@ impl Ty {
             Ty::Enum(_) => "u16".into(),
             Ty::Rec(fs) => rec_build(&fs.iter().map(|(_, t)| t.repr()).collect::<Vec<_>>()),
             Ty::Fun(d, c) => format!("[{}; {}]", c.repr(), d.size().unwrap_or(0)),
+            // Each set type has a capacity of its own (`set_cap`)
             // A set holds at most as many elements as its element type has values (`set_cap`)
-            Ty::Set(e) if is_sparse(self) => match e.size() {
-                Some(n) if n < MAX_CAP as u64 => format!("SSet<{}, {{ set_cap({n}) }}>", e.repr()),
-                _ => format!("SSet<{}, SCAP>", e.repr()),
-            },
+            Ty::Set(e) if is_sparse(self) => {
+                let k = set_cap_number(self);
+                match e.size() {
+                    Some(n) if n < MAX_CAP as u64 => format!("SSet<{}, {{ set_cap(SC{k}, {n}) }}, {k}>", e.repr()),
+                    _ => format!("SSet<{}, SC{k}, {k}>", e.repr()),
+                }
+            }
             Ty::Seq(e) => format!("Sq<{}, QCAP>", e.repr()),
             Ty::Bag(_) | Ty::PFun(..) if is_sparse_fun(self) => fun_pairs(self).repr(),
             Ty::Bag(e) => format!("[i64; {}]", e.size().unwrap_or(0)),
@@ -858,11 +1002,11 @@ pub fn int_window(t: &Ty, w: u64) -> Ty {
     }
 }
 
-/// Every value of type `t`, for types whose values can be listed: sets of at most `scap`
+/// Every value of type `t`, for types whose values can be listed: sets of at most `set_cap`
 /// elements (when held as arrays), sequences of at most `qcap` elements. None when there are more
 /// than `limit` values or the type is unbounded. With `window`, only the values whose integers
 /// lie in `int_window` of it are listed.
-pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, scap: usize, limit: usize) -> Option<Vec<Value>> {
+pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, limit: usize) -> Option<Vec<Value>> {
     use crate::value::fun_value;
     let out: Vec<Value> = match t {
         _ if t.size().is_some() && !matches!(t, Ty::Rec(_)) => {
@@ -877,8 +1021,8 @@ pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, scap: usize, limit: 
             let mut rows: Vec<Vec<Option<Value>>> = vec![vec![]];
             for (_, ft) in fs {
                 let (vals, opt) = match ft {
-                    Ty::Opt(i) => (all_values(i, window, qcap, scap, limit)?, true),
-                    ft => (all_values(ft, window, qcap, scap, limit)?, false),
+                    Ty::Opt(i) => (all_values(i, window, qcap, limit)?, true),
+                    ft => (all_values(ft, window, qcap, limit)?, false),
                 };
                 let mut next = vec![];
                 for r in &rows {
@@ -905,8 +1049,8 @@ pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, scap: usize, limit: 
                 .collect()
         }
         Ty::Set(e) => {
-            let elems = all_values(e, window, qcap, scap, limit)?;
-            let cap = if is_sparse(t) { scap.min(elems.len()) } else { elems.len() };
+            let elems = all_values(e, window, qcap, limit)?;
+            let cap = if is_sparse(t) { set_cap(t).min(elems.len()) } else { elems.len() };
             let mut out: Vec<BTreeSet<Value>> = vec![BTreeSet::new()];
             for x in &elems {
                 let mut more = vec![];
@@ -929,7 +1073,7 @@ pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, scap: usize, limit: 
                 return None;
             }
             let keys = d.enumerate();
-            let vals = all_values(c, window, qcap, scap, limit)?;
+            let vals = all_values(c, window, qcap, limit)?;
             let partial = matches!(t, Ty::PFun(..));
             let mut maps: Vec<std::collections::BTreeMap<Value, Value>> = vec![Default::default()];
             for k in &keys {
@@ -952,7 +1096,7 @@ pub fn all_values(t: &Ty, window: Option<u64>, qcap: usize, scap: usize, limit: 
             maps.into_iter().map(fun_value).collect()
         }
         Ty::Seq(e) => {
-            let elems = all_values(e, window, qcap, scap, limit)?;
+            let elems = all_values(e, window, qcap, limit)?;
             let mut out = vec![Value::Tuple(vec![])];
             let mut last = vec![vec![]];
             for _ in 0..qcap {

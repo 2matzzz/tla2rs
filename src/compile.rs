@@ -18,9 +18,11 @@ pub struct Output {
     /// code: an ASSUME that is false or fails to evaluate (10), a temporal formula TLC cannot check
     /// (150 or 255). When set, no checker is generated.
     pub rejected: Option<(String, i32)>,
-    /// The capacity of sets held as arrays and the longest sequence the checker was built with
-    /// (SCAP and QCAP)
-    pub caps: (usize, usize),
+    /// The longest sequence the checker was built with (QCAP)
+    pub qcap: usize,
+    /// What tla2rs calls the values of each set type held as arrays when one outgrows its
+    /// capacity, by `types::cap_key` ("a set in `x`")
+    pub set_names: HashMap<String, String>,
     /// The name of each string and model value, by its number in the checker
     pub atoms: Vec<String>,
 }
@@ -129,6 +131,8 @@ thread_local! {
     static MADE_ORDER: std::cell::RefCell<(Vec<String>, Vec<String>)> = const { std::cell::RefCell::new((vec![], vec![])) };
     /// Set when a checker built earlier met an EXCEPT warning while exploring (see `compile`)
     static WARN_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The capacities tla2rs gave the set types that outgrew theirs, by `types::cap_key`
+    static GROWN_SETS: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// The bounded sequences `UNION {[1..n -> S] : n \in R}`: (R, S)
@@ -1037,8 +1041,9 @@ fn instantiate(out: &mut Module, inst: &Instance, dir: &std::path::Path, warning
 /// meets when tla2rs runs it (WARN_EXIT in runtime.rs), so a spec that never warns keeps its
 /// faster search
 #[allow(clippy::too_many_arguments)]
-pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, tostr: &HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> R<Output> {
+pub fn compile(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, seqcap: usize, grown_sets: &HashMap<String, usize>, tostr: &HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> R<Output> {
     crate::codegen::TOSTR_CAP.with(|c| *c.borrow_mut() = tostr.clone());
+    GROWN_SETS.with(|g| *g.borrow_mut() = grown_sets.clone());
     WARN_ORDER.with(|w| w.set(warn_order));
     let mut at_start: Vec<String> = vec![];
     // Each round numbers the strings made at the start in the order the round before made them;
@@ -1094,7 +1099,7 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
             }
-            return Ok((Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), caps: (0, 0), atoms: vec![] }, vec![]));
+            return Ok((Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), qcap: 0, set_names: HashMap::new(), atoms: vec![] }, vec![]));
         }
         r => r?,
     };
@@ -1351,6 +1356,8 @@ fn compile_inner(
 ) -> R<Output> {
     let mut warnings = vec![];
     INTEGERS.with(|i| i.set(false));
+    // Every set type starts at -setcap (else 8), or where tla2rs grew it to
+    GROWN_SETS.with(|g| crate::types::reset_set_caps(if setcap > 0 { setcap } else { 8 }, &g.borrow()));
     crate::sany::take_warnings();
     let mut m = load_module(tla, dir, &mut warnings, 0)?;
     startup.sany = crate::sany::take_warnings();
@@ -1492,7 +1499,7 @@ fn compile_inner(
                 .and_then(|m| m.strip_prefix(crate::ast::SPAN).and_then(|m| m.split_once('\n')).map(|(at, m)| (at.to_string(), m.to_string())));
             let (at, msg) = at.unwrap_or_else(|| (format!("in definition {}", d.name), msg));
             let msg = format!("Semantic errors:\n\n*** Errors: 1\n\n{at}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.");
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), caps: (0, 0), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
         }
     }
 
@@ -1559,7 +1566,7 @@ fn compile_inner(
                 Ok(Value::Bool(true)) | Err(_) => {}
                 Ok(v) => {
                     let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), caps: (0, 0), atoms: vec![] });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
                 }
             }
         }
@@ -1575,7 +1582,7 @@ fn compile_inner(
     } else {
         match resolve_spec(&m, &cfg, &mut ex)? {
             Ok(p) => p,
-            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), caps: (0, 0), atoms: vec![] }),
+            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), qcap: 0, set_names: HashMap::new(), atoms: vec![] }),
         }
     };
     // Where the strings the ASSUMEs make start (those TLC makes while it splits the next-state
@@ -1600,14 +1607,15 @@ fn compile_inner(
                         rust: String::new(),
                         warnings,
                         rejected: Some((format!("Error: Assumption {at} is false."), 10)),
-                        caps: (0, 0),
+                        qcap: 0,
+                        set_names: HashMap::new(),
                         atoms: vec![],
                     })
                 }
                 Ok(v) => return Err(format!("ASSUME at {at} is not a boolean: {v:?}")),
                 Err(e) if crate::value::is_eval_failure(&e) => {
                     let msg = format!("Error: Evaluating assumption {at} failed.\n{e}");
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), caps: (0, 0), atoms: vec![] });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
                 }
                 Err(e) => return Err(format!("cannot evaluate the ASSUME at {at}: {e}")),
             }
@@ -1632,7 +1640,7 @@ fn compile_inner(
         made_split_at = startup.made.len();
     }
     if no_behavior {
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), caps: (0, 0), atoms: vec![] });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
     }
     if uses_real_time(&init) || next.as_ref().is_some_and(uses_real_time) {
         return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
@@ -1667,9 +1675,6 @@ fn compile_inner(
         Some(o) if o.len() == m.variables.len() && m.variables.iter().all(|v| o.contains(v)) => o,
         _ => m.variables.clone(),
     };
-    if setcap > 0 {
-        g.scap = setcap;
-    }
     g.qcap = seq_cap(&m, &cfg, &mut ex, &g, seqcap, &init, &next)?;
 
     // The temporal conjuncts of the spec other than [][Next]_v (only relevant when checking
@@ -1700,6 +1705,8 @@ fn compile_inner(
     // Without a TypeOK, every type is inferred
     let tok = if ex.has_def(tname) && !infer_all { ex.expand_def(tname)? } else { Expr::Bool(true) };
     let mut decl: HashMap<String, Ty> = HashMap::new();
+    // The bounds `Cardinality(x) <= K` (or of DOMAIN x) on variables: (x, DOMAIN?, K)
+    let mut card_bounds: Vec<(String, bool, usize)> = vec![];
     let mut conj = vec![];
     flatten_and(&tok, &mut conj);
     // Conjuncts that could not be read as type declarations. If there are none, pack enforces this
@@ -1727,9 +1734,19 @@ fn compile_inner(
                     leftover += 1;
                 }
             }
+            // `Cardinality(x) <= K` and `Cardinality(DOMAIN x) <= K` raise where the type of x
+            // starts, once it is known; a bound on another expression, where every set type does
             Expr::Bin(BOp::Le, c, k) if matches!(c.strip(), Expr::Call(f, _) if f == "Cardinality") => {
                 if let Ok(Value::Int(k)) = g.ce.eval(k, &HashMap::new()) {
-                    g.scap = g.scap.max(k as usize);
+                    let Expr::Call(_, a) = c.strip() else { unreachable!() };
+                    let (x, domain) = match a.first().map(|x| x.strip()) {
+                        Some(Expr::Un(UOp::Domain, x)) => (Some(x.strip()), true),
+                        x => (x, false),
+                    };
+                    match x {
+                        Some(Expr::Ident(v, _)) if m.variables.contains(v) => card_bounds.push((v.clone(), domain, k as usize)),
+                        _ => crate::types::raise_set_cap_base(k as usize),
+                    }
                 }
             }
             Expr::Bin(BOp::Subseteq, v, s) => {
@@ -1748,23 +1765,38 @@ fn compile_inner(
             _ => leftover += 1,
         }
     }
-    if g.scap > crate::types::MAX_CAP {
-        return Err(format!("sets of up to {} elements are not supported (at most {}: a size is 16 bits)", g.scap, crate::types::MAX_CAP));
+    let too_large = |n: usize| format!("sets of up to {n} elements are not supported (at most {}: a size is 16 bits)", crate::types::MAX_CAP);
+    if let Some(&(_, _, k)) = card_bounds.iter().find(|b| b.2 > crate::types::MAX_CAP) {
+        return Err(too_large(k));
+    }
+    if crate::types::max_set_start() > crate::types::MAX_CAP {
+        return Err(too_large(crate::types::max_set_start()));
     }
     // Variables whose type TypeOK leaves open are inferred from the assignments in Init and Next
     let undeclared: Vec<String> = m.variables.iter().filter(|v| !decl.contains_key(*v)).cloned().collect();
     if !undeclared.is_empty() {
-        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.scap, g.qcap, (g.empty_tuples, g.empty_funs))?;
+        let inferred = infer_types(&atoms, &constants, &m.variables, &decl, &undeclared, &init, &next, g.qcap, (g.empty_tuples, g.empty_funs))?;
         decl.extend(inferred);
     }
     for v in &m.variables {
         g.vars.push((v.clone(), decl.remove(v).unwrap()));
     }
-    let start = set_cap_start(&g, &init);
-    if std::env::var_os("TLA2RS_DEBUG_CAP").is_some() && start > g.scap {
-        eprintln!("DEBUGCAP scap {} -> {}", g.scap, start);
+    for (v, domain, k) in &card_bounds {
+        let t = &g.vars.iter().find(|(n, _)| n == v).unwrap().1;
+        match t {
+            _ if crate::types::is_sparse(t) && !domain => crate::types::raise_set_cap(t, *k),
+            // The bound is on DOMAIN x too, a set of the keys
+            Ty::PFun(d, _) | Ty::Bag(d) if crate::types::is_sparse_fun(t) && *domain => {
+                crate::types::raise_set_cap(t, *k);
+                crate::types::raise_set_cap(&Ty::Set(d.clone()), *k);
+            }
+            // A bitmask, or an array over the whole domain type, has no capacity
+            Ty::Set(_) if !domain => {}
+            Ty::Fun(..) | Ty::PFun(..) | Ty::Bag(_) if *domain => {}
+            _ => crate::types::raise_set_cap_base(*k),
+        }
     }
-    g.scap = g.scap.max(start);
+    set_cap_start(&g, &init);
 
     // Init / Next. When they or an invariant print (Print, PrintT), the checker follows TLC's
     // order of the lines printed (see PRINT_ORDER in the runtime)
@@ -1840,7 +1872,7 @@ fn compile_inner(
         if uses_real_time(&e) {
             startup.liveness_warnings(&cfg, true);
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
         }
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, None, &mut parts)?;
@@ -1887,13 +1919,13 @@ fn compile_inner(
     }
     if no_next && (!inv_list.is_empty() || !cfg.invariants.is_empty() || !action_props.is_empty() || !live_parts.is_empty()) {
         let msg = "Error: The configuration file did not specify the next state predicate.";
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), caps: (0, 0), atoms: vec![] });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
     }
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), caps: (0, 0), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
         }
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
@@ -1905,7 +1937,7 @@ fn compile_inner(
         Err(crate::live::Rejected(m, code)) => {
             // TLC converts the temporal formulas before it evaluates the ASSUMEs
             startup.assumes.clear();
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), caps: (0, 0), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
         }
     };
     let mut prop_code = String::new();
@@ -2080,9 +2112,6 @@ fn compile_inner(
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     writeln!(src, "static STARTUP_PRINTS: &[&str] = &{:?};", startup.lines()).unwrap();
     writeln!(src, "static STARTUP_PRINTS_NOWARN: &[&str] = &{:?};", startup.lines_with(true)).unwrap();
-    writeln!(src, "const SCAP: usize = {};", g.scap).unwrap();
-    // The capacity of a set whose element type has n values (types::set_cap)
-    writeln!(src, "const fn set_cap(n: usize) -> usize {{ if SCAP < n {{ SCAP }} else {{ n }} }}").unwrap();
     writeln!(src, "const QCAP: usize = {};", g.qcap).unwrap();
     src += crate::codegen::SQ_RUNTIME;
     let fp_bits = if fp128 { 128 } else { 64 };
@@ -2119,8 +2148,9 @@ fn compile_inner(
     if cons_print {
         src += crate::runtime::CONS_PRINT_RT;
     }
+    let set_names = set_cap_items(&mut src, &g.vars);
     let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
-    Ok(Output { rust: src, warnings, rejected: None, caps: (g.scap, g.qcap), atoms: names })
+    Ok(Output { rust: src, warnings, rejected: None, qcap: g.qcap, set_names, atoms: names })
 }
 
 /// `rt` with the hooks of `LIVE_SIM_RT`: TLC's evaluations for its liveness graph, on each new
@@ -2240,25 +2270,85 @@ fn collect_strings(e: &Expr, atoms: &mut Atoms) {
     }
 }
 
-/// A capacity for the sets held as arrays that Init is known to need: the size of the largest
-/// constant set it assigns to a variable of such a set type. A bound from TypeOK (`x \subseteq T`
-/// with T constant) is not used: it is often far above what the search reaches (5002 for a test
-/// whose sets hold a few elements), and the capacity decides the width of every such set
-fn set_cap_start(g: &Gen, init: &Expr) -> usize {
-    let mut best = 0;
+/// Raises where a set type held as an array starts to what Init is known to need: the size of the
+/// largest constant set it assigns to a variable of that type. A bound from TypeOK (`x \subseteq
+/// T` with T constant) is not used: it is often far above what the search reaches (5002 for a test
+/// whose sets hold a few elements), and the capacity decides the width of every set of the type
+fn set_cap_start(g: &Gen, init: &Expr) {
     let mut conj = vec![];
     flatten_and(init, &mut conj);
     for c in &conj {
         let Expr::Bin(BOp::Eq, v, e) = c.strip() else { continue };
         let Expr::Ident(v, _) = v.strip() else { continue };
-        if !g.vars.iter().any(|(n, t)| n == v && crate::types::is_sparse(t)) {
-            continue;
-        }
+        let Some((_, t)) = g.vars.iter().find(|(n, t)| n == v && crate::types::is_sparse(t)) else { continue };
         if let Ok(Value::Set(s)) = g.ce.eval(e, &HashMap::new()) {
-            best = best.max(s.len());
+            if std::env::var_os("TLA2RS_DEBUG_CAP").is_some() && s.len() > crate::types::set_cap(t) {
+                eprintln!("DEBUGCAP {v}: {} -> {}", crate::types::set_cap(t), s.len());
+            }
+            crate::types::raise_set_cap(t, s.len());
         }
     }
-    best
+}
+
+/// Writes the capacity of each set type the generated code names (`SC<n>`, see `types::set_cap`)
+/// and `set_key`, by which a checker tells tla2rs which set type outgrew its capacity. Returns
+/// what tla2rs calls the values of each type then: the variables that hold such sets
+fn set_cap_items(src: &mut String, vars: &[(String, Ty)]) -> HashMap<String, String> {
+    use crate::types::{cap_key, fun_pairs, is_sparse, is_sparse_fun};
+    let types = crate::types::named_set_keys();
+    let mut keys = String::new();
+    for (n, key) in types.iter().enumerate() {
+        writeln!(src, "const SC{n}: usize = {};", crate::types::key_cap(key)).unwrap();
+        writeln!(keys, "        {n} => {key:?},").unwrap();
+    }
+    // The capacity of a set whose element type has n values (types::set_cap)
+    writeln!(src, "const fn set_cap(c: usize, n: usize) -> usize {{ if c < n {{ c }} else {{ n }} }}").unwrap();
+    writeln!(
+        src,
+        "/// The key (`types::cap_key`) of the set type numbered k (see `set_full`)\n\
+         #[allow(dead_code)]\nfn set_key(k: usize) -> &'static str {{\n    match k {{\n{keys}        _ => \"\",\n    }}\n}}"
+    )
+    .unwrap();
+    // The variables whose values hold sets of each type: (variable, as the domain of a function?)
+    fn holds(t: &Ty, v: &str, out: &mut HashMap<String, Vec<(String, bool)>>) {
+        let mut add = |k: String, f: bool| {
+            let e = out.entry(k).or_default();
+            if !e.iter().any(|(n, _)| n == v) {
+                e.push((v.to_string(), f));
+            }
+        };
+        if is_sparse(t) {
+            add(cap_key(t), false);
+        } else if is_sparse_fun(t) {
+            add(cap_key(&fun_pairs(t)), true);
+        }
+        match t {
+            Ty::Rec(fs) => fs.iter().for_each(|(_, t)| holds(t, v, out)),
+            Ty::Fun(d, c) | Ty::PFun(d, c) => {
+                holds(d, v, out);
+                holds(c, v, out);
+            }
+            Ty::Set(e) | Ty::Seq(e) | Ty::Bag(e) | Ty::Opt(e) => holds(e, v, out),
+            _ => {}
+        }
+    }
+    let mut held = HashMap::new();
+    for (v, t) in vars {
+        holds(t, v, &mut held);
+    }
+    types
+        .iter()
+        .map(|key| {
+            let name = match held.get(key) {
+                Some(vs) => {
+                    let what = if vs.iter().all(|x| x.1) { "the domain of a function or bag" } else { "a set" };
+                    format!("{what} in {}", vs.iter().map(|(v, _)| format!("`{v}`")).collect::<Vec<_>>().join(", "))
+                }
+                None => "a set".to_string(),
+            };
+            (key.clone(), name)
+        })
+        .collect()
 }
 
 fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {
@@ -2650,7 +2740,6 @@ fn infer_types(
     undeclared: &[String],
     init: &Expr,
     next: &Expr,
-    scap: usize,
     qcap: usize,
     (empty_tuples, empty_funs): (bool, bool),
 ) -> R<HashMap<String, Ty>> {
@@ -2662,7 +2751,6 @@ fn infer_types(
     let mut grew: HashMap<String, u32> = HashMap::new();
     for _ in 0..40 {
         let mut g = Gen::new(atoms, constants);
-        g.scap = scap;
         g.qcap = qcap;
         g.empty_tuples = empty_tuples;
         g.empty_funs = empty_funs;

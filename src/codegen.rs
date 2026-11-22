@@ -142,8 +142,6 @@ pub struct Gen<'a> {
     if_replay: bool,
     /// The types a value is printed of with its shape (`fmtsh_` functions)
     pub fmtsh_need: BTreeSet<Ty>,
-    /// Maximum cardinality of a sparse set (SSet)
-    pub scap: usize,
     /// Maximum length of a sequence (QCAP); 0 while no bound is known
     pub qcap: usize,
     /// During type inference, collects the types of assigned values
@@ -241,7 +239,6 @@ impl<'a> Gen<'a> {
             if_sites: HashMap::new(),
             if_replay: false,
             fmtsh_need: BTreeSet::new(),
-            scap: 8,
             qcap: 0,
             infer: None,
             infer_errs: HashMap::new(),
@@ -1091,7 +1088,7 @@ impl<'a> Gen<'a> {
             }
             // A sparse one: as many keys as D has elements, each in D
             Ty::PFun(dt, _) | Ty::Bag(dt) if is_sparse_fun(xt) => {
-                if dom.len() > self.scap || dom.iter().any(|k| !dt.conforms(k)) {
+                if dom.len() > crate::types::set_cap(xt) || dom.iter().any(|k| !dt.conforms(k)) {
                     return Ok("false".into());
                 }
                 let dl = self.lit(&Value::Set(dom.clone()), &Ty::Set(dt.clone()))?;
@@ -2171,7 +2168,7 @@ impl<'a> Gen<'a> {
     /// The widest window w (see `types::int_window`) whose values of `t` number at most `cap`,
     /// with those values
     fn tostr_window(&self, t: &Ty, cap: usize) -> Option<(u64, Vec<Value>)> {
-        let fits = |w: u64| all_values(t, Some(w), self.qcap, self.scap, cap);
+        let fits = |w: u64| all_values(t, Some(w), self.qcap, cap);
         let mut best = (1, fits(1)?);
         let mut over = None;
         while best.0 < 1 << 63 {
@@ -3471,7 +3468,7 @@ impl<'a> Gen<'a> {
                     // Too many values (integers the type inference leaves unbounded): only those whose
                     // integers lie in the window nearest 0 that TOSTR_CAP strings allow, and the
                     // checker built again with more when it meets one outside (`tostring_miss`)
-                    let (vals, window) = match crate::types::all_values(&t, None, self.qcap, self.scap, room) {
+                    let (vals, window) = match crate::types::all_values(&t, None, self.qcap, room) {
                         Some(v) => (v, None),
                         None => {
                             let key = format!("{t:?}");
@@ -3852,7 +3849,7 @@ impl<'a> Gen<'a> {
                     let Un(_, x) = s.strip() else { unreachable!() };
                     let (c, t) = self.gen(x, env, None)?;
                     let Ty::Set(el) = &t else { return Err("SUBSET of a non-set".into()) };
-                    let n = if is_sparse(&t) { crate::types::set_cap(&t, self.scap) as u32 } else { el.size().unwrap_or(0) as u32 };
+                    let n = if is_sparse(&t) { crate::types::set_cap(&t) as u32 } else { el.size().unwrap_or(0) as u32 };
                     let hi = if n >= 62 { BIG } else { 1i64 << n };
                     (format!("(1i64 << {})", self.s_card(&c, &t)), Ty::Int(1, hi))
                 }
@@ -7849,7 +7846,7 @@ impl<'a> Gen<'a> {
             Ty::Set(e) if is_sparse(t) => {
                 // The count, followed by that many elements (the rest stay 0). The offset is only
                 // known at runtime from here on, so thread it
-                let cap = crate::types::set_cap(t, self.scap);
+                let cap = crate::types::set_cap(t);
                 let lb = Self::bits_for(cap as u64 + 1);
                 let k = self.fresh("k");
                 let n = self.fresh("n");
@@ -7954,7 +7951,7 @@ impl<'a> Gen<'a> {
                 )
             }
             Ty::Set(e) if is_sparse(t) => {
-                let lb = Self::bits_for(crate::types::set_cap(t, self.scap) as u64 + 1);
+                let lb = Self::bits_for(crate::types::set_cap(t) as u64 + 1);
                 // Thread the offset from here on, assigning to the outer p (a fresh `let` inside
                 // the block would reset the offset to 0 on leaving it, so later fields would be
                 // read from the start)
@@ -8269,7 +8266,7 @@ impl<T: Copy + Ord + ConstDefault, const N: usize> PartialOrd for Sq<T, N> {
 }
 #[cold]
 fn seq_too_long(n: usize, need: usize) -> ! {
-    capacity_exceeded(CAP_SEQ, need, format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
+    capacity_exceeded(CAP_SEQ, need, "", format!("a sequence grew beyond {n} elements; raise the bound with `Len(x) <= N` in TypeOK or a CONSTRAINT, or with -seqcap"))
 }
 impl<T: Copy + Ord + ConstDefault, const N: usize> Sq<T, N> {
     fn new() -> Self {
@@ -8992,7 +8989,7 @@ impl Gen<'_> {
     /// a bitmask
     fn set_slots(&self, t: &Ty) -> u64 {
         match t {
-            _ if is_sparse(t) => crate::types::set_cap(t, self.scap) as u64,
+            _ if is_sparse(t) => crate::types::set_cap(t) as u64,
             Ty::Set(e) => e.size().unwrap_or(0),
             _ => 0,
         }

@@ -252,9 +252,12 @@ fn main() {
     let mut order_runs = 0;
     let order_file = dir.join("strings-made.txt");
     // How many elements the value that outgrew its capacity needs, at least (see
-    // `capacity_exceeded` in runtime.rs), and how many times each kind has grown
+    // `capacity_exceeded` in runtime.rs), and how many times sequences and each set type (by
+    // `types::cap_key`; each has a capacity of its own) have grown, with the capacities given to the
+    // set types that grew
     let need_file = dir.join("capacity-needed.txt");
-    let mut grown = [0u32; 2];
+    let mut grown_seq = 0u32;
+    let mut grown_sets: std::collections::HashMap<String, (usize, u32)> = Default::default();
     // How many strings ToString may list for a type with more values than strings can be added,
     // by type (see TOSTR_CAP in codegen.rs), and how many times each has grown
     let mut tostr: std::collections::HashMap<String, (usize, u32)> = Default::default();
@@ -263,7 +266,8 @@ fn main() {
     let mut first = true;
     loop {
         let t0 = Instant::now();
-        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect(), fp128, metal, &made, warn_order);
+        let caps = grown_sets.iter().map(|(k, v)| (k.clone(), v.0)).collect();
+        let output = compile_spec(&tla, &src, &cfg_src, setcap, seqcap, caps, tostr.iter().map(|(k, v)| (k.clone(), v.0)).collect(), fp128, metal, &made, warn_order);
         if first {
             for w in &output.warnings {
                 eprintln!("warning: {w}");
@@ -302,9 +306,10 @@ fn main() {
             exit(*code);
         }
         let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0) else { return };
-        // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs)
-        let (scap, qcap) = output.caps;
-        let grow: String = [('s', scap), ('q', qcap)].iter().filter(|(_, c)| *c < types::MAX_CAP).map(|(k, _)| *k).chain(['t', 'w']).collect();
+        // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs; the
+        // checker knows which set types are at the maximum)
+        let qcap = output.qcap;
+        let grow: String = ['s'].into_iter().chain((qcap < types::MAX_CAP).then_some('q')).chain(['t', 'w']).collect();
         let mut cmd = Command::new(bin);
         cmd.args(&pass).env("TLA2RS_GROW", grow).env("TLA2RS_NEED", &need_file);
         let _ = std::fs::remove_file(&need_file);
@@ -341,25 +346,44 @@ fn main() {
             first = false;
             continue;
         }
-        let (what, old) = match code {
-            CAP_EXIT_SET => ("a set", scap),
-            CAP_EXIT_SEQ => ("a sequence", qcap),
-            _ => exit(code),
-        };
-        // Twice the room the first time a kind grows, four times the second, eight times the third
-        // and so on: a value that keeps outgrowing its capacity is likely far beyond it, and each
-        // build costs seconds (`SimplifiedFastPaxos` `FastPaxos` needs more than 256: 3 rebuilds to
-        // 512 instead of 4 to 1024 at four times after the first). Never less than the value needs
-        let kind = (code - CAP_EXIT_SET) as usize;
-        grown[kind] += 1;
-        let need = std::fs::read_to_string(&need_file).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(old + 1);
-        let new = old.saturating_mul(1 << grown[kind].min(12)).max(need).clamp(8, types::MAX_CAP);
-        if code == CAP_EXIT_SET {
-            setcap = new;
-        } else {
-            seqcap = new;
+        if code != CAP_EXIT_SET && code != CAP_EXIT_SEQ {
+            exit(code)
         }
-        println!("tla2rs: {what} grew beyond {old} elements; checking again from the start with room for {new}");
+        // Twice the room the first time a sequence or a set type grows, four times the second,
+        // eight times the third and so on: a value that keeps outgrowing its capacity is likely
+        // far beyond it, and each build costs seconds (`SimplifiedFastPaxos` `FastPaxos` needs more
+        // than 256: 3 rebuilds to 512 instead of 4 to 1024 at four times after the first). Never
+        // less than the value needs. For a set, the checker also writes the capacity it outgrew and
+        // the key of its type, which grows alone
+        let text = std::fs::read_to_string(&need_file).unwrap_or_default();
+        let mut lines = text.lines();
+        let need = lines.next().and_then(|t| t.trim().parse::<usize>().ok());
+        let grow = |old: usize, times: u32| old.saturating_mul(1 << times.min(12)).max(need.unwrap_or(old + 1)).clamp(8, types::MAX_CAP);
+        if code == CAP_EXIT_SEQ {
+            grown_seq += 1;
+            let new = grow(qcap, grown_seq);
+            println!("tla2rs: a sequence grew beyond {qcap} elements; checking again from the start with room for {new}");
+            seqcap = new;
+        } else {
+            let old = lines.next().and_then(|t| t.trim().parse::<usize>().ok());
+            match (old, lines.next().filter(|k| !k.is_empty())) {
+                (Some(old), Some(key)) => {
+                    let (cap, times) = grown_sets.entry(key.to_string()).or_insert((old, 0));
+                    *times += 1;
+                    *cap = grow(old, *times);
+                    let what = output.set_names.get(key).map_or("a set", |n| n.as_str());
+                    println!("tla2rs: {what} grew beyond {old} elements; checking again from the start with room for {cap}");
+                }
+                // No set type named (a checker that did not write the file): every set type starts
+                // higher
+                _ => {
+                    let old = old.unwrap_or(0).max(setcap).max(8);
+                    let new = grow(old, 1);
+                    println!("tla2rs: a set grew beyond {old} elements; checking again from the start with room for {new}");
+                    setcap = new;
+                }
+            }
+        }
         first = false;
     }
 }
@@ -368,12 +392,12 @@ fn main() {
 /// stack: evaluating a recursive operator at compile time nests deeply (up to value::REC_LIMIT
 /// calls)
 #[allow(clippy::too_many_arguments)]
-fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> compile::Output {
+fn compile_spec(tla: &Path, src: &str, cfg_src: &str, setcap: usize, seqcap: usize, sets: std::collections::HashMap<String, usize>, tostr: std::collections::HashMap<String, usize>, fp128: bool, metal: bool, made: &[String], warn_order: bool) -> compile::Output {
     let (src, cfg_src, made) = (src.to_string(), cfg_src.to_string(), made.to_vec());
     let dir = tla.parent().unwrap_or(Path::new(".")).to_path_buf();
     let result = std::thread::Builder::new()
         .stack_size(1 << 30)
-        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &tostr, fp128, metal, &made, warn_order))
+        .spawn(move || compile::compile(&src, &cfg_src, &dir, setcap, seqcap, &sets, &tostr, fp128, metal, &made, warn_order))
         .expect("start the compiler thread")
         .join()
         .unwrap_or_else(|_| Err("internal error in the compiler".into()));
