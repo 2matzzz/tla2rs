@@ -19,8 +19,8 @@ It has no crate dependencies.
     `-deadlock` are passed on to the generated checker, which also accepts them directly
 - `target/release/tla2rs Spec.tla --emit-lib [-o DIR]` writes the checker as a library crate
   (`<spec dir>/.tla2rs/<cfg name>-lib/`, crate `spec_<cfg name>`) and builds nothing (see "The checker as a
-  library"). `scripts/lib.sh [X.cfg ...]` (default `examples/*.cfg`) checks such libraries against TLC's state
-  graphs in `tests/expected/`; run it after a change to `src/conform.rs`, `Gen::lib_code` or the representation of
+  library"). `scripts/lib.sh [X.cfg ...]` (default `examples/*.cfg` and the configurations of `tests/lib.txt`)
+  checks such libraries against TLC's state graphs in `tests/expected/`; run it after a change to `src/conform.rs`, `Gen::lib_code` or the representation of
   a type
 - `target/release/tla2rs --graph FILE` reduces a state graph (TLC's `-dump dot FILE` or a checker's `-dumpgraph
   FILE`) to `states N <sha256>` and `edges M <sha256>`; `--graph-text FILE` prints the canonical form itself, for
@@ -1663,8 +1663,9 @@ of the runs the tests make, with coverage of the spec's state graph). It generat
   module `conform` (`conform::lib_rs`). A child module reaches the checker's private items, so `init`, `next`,
   `pack`, the invariants and the action properties the library uses are the ones the checker runs; nothing is
   generated twice. `Output::rust` is the same with or without `--emit-lib`: `Gen::lib_code` runs after everything
-  that goes into it and registers no type. Check this after a change near it by comparing `--emit-only` output
-  for every configuration before and after
+  that goes into it and registers no type, and only for `--emit-lib` (`conform::wanted`), so compiling for a
+  checker runs none of it. Check this after a change near it by comparing `--emit-only` output for every
+  configuration before and after
 - `next` is called outside a search: `dd_fresh` returns true when no search runs on the thread, so every
   successor is built
 - `conform` is `conform::CONFORM` (the same for every spec: `Val`, `Abs`, `Checker`, `Violation`, `Graph`) and
@@ -1673,20 +1674,42 @@ of the runs the tests make, with coverage of the spec's state graph). It generat
   (`enc_<n>`), so the error names the variable and the value. A type not converted yet (a set held as an array,
   a function or bag over a large type, a record that may be a model value) reads as `Val::Opaque` and fails to
   build: nothing is converted approximately
-- Where the spec fails to evaluate, the checker's code panics with an `EvalErr`; `conform::eval` catches it, and
-  `Checker` returns it as `Violation::Eval` with TLC's message. That includes a set or sequence outgrowing its
-  capacity: the compiler grows capacities by running the checker (see "Capacities"), and nothing runs with
-  `--emit-lib`, so the library has the capacities it was written with and the message says which option raises them
-- Refused: a state with a shape (`Gen::shaped`), and TLCGet / TLCSet (their values belong to a search).
-  `Graph::explore` refuses VIEW and SYMMETRY at run time: its states would not be the checker's. `Graph` leaves
-  out states outside the CONSTRAINT and steps outside the ACTION_CONSTRAINT, as the checker does; `Checker`
-  does not apply them (a step of Next into such a state is still a step of the spec)
+- What a `Checker` checks: the first state is an initial state and satisfies the properties that are state
+  predicates (`INIT_PROPS`); each step is a step of Next (or changes nothing) and satisfies the action properties;
+  each state is within its types and satisfies the invariants (`[]P` among them). Not checked: the temporal
+  properties (`LPROPS`) and fairness, which are about infinite behaviors. `conform::temporal_properties` lists
+  them, and `main.rs` says so on stderr when it writes a library for a configuration that has some, since
+  nothing in a test that passes would
+- Nothing runs with `--emit-lib`, so what the compiler otherwise learns from a run of the checker is missing:
+  - The order of the strings made while exploring (see "The order of strings"). A library built with the order
+    the compiler met them in chooses from, enumerates and prints their sets otherwise than TLC
+    (`tests/tlc/StrMade`: CHOOSE gave "ca" where TLC and the checker give "cb"), so such a spec is refused
+    (`STR_ORDER`, in `compile`). Running the checker first would not settle it: a run that stops at an error has
+    measured only the strings made up to it
+  - Capacities (see "Capacities"). A set or sequence that outgrows the capacity the library was written with
+    is an evaluation error whose message names `-setcap` / `-seqcap`, which `--emit-lib` takes
+  - The strings ToString lists for a type with too many values. A value outside them is an evaluation error,
+    and no option widens the list: such a spec cannot be checked through a library where it reaches such a value
+- Where the spec fails to evaluate, the checker's code panics with an `EvalErr`; `conform::eval` catches it
+  (and resets the depth guard of recursive operators, whose `rec_leave` the panic passed), and `Checker`
+  returns it as `Violation::Eval` with TLC's message
+- Also refused: a state with a shape (`Gen::shaped`), and TLCGet / TLCSet (their values belong to a search). A
+  spec TLC stops on before exploring, or one with nothing to explore (`NO_BEHAVIOR`), gets no library, and
+  `--emit-lib` says so and fails (exit 1 where TLC's code is 0). `Graph::explore` refuses VIEW and SYMMETRY at
+  run time: its states would not be the checker's. `Graph` leaves out states outside the CONSTRAINT and steps
+  outside the ACTION_CONSTRAINT, as the checker does; `Checker` does not apply them (a step of Next into such a
+  state is still a step of the spec)
 - `scripts/lib.sh` builds the library of each configuration with `tests/lib/driver.rs`. The driver writes the
   graph `Graph::explore` built (with the stuttering steps) in the form of `-dumpgraph`, and the script compares
   its `tla2rs --graph` hashes with TLC's `states` and `edges` lines in `tests/expected/`. The driver also reads
   every state as values and builds it again (it must be the same state), and takes every step of the graph with
-  a `Checker` under the name of its action, and has it refuse a state that is no successor. Configurations TLC
-  reports an error in are skipped (their graphs stop at the error), as are those that outgrow a capacity
+  a `Checker` under the name of its action, and has it refuse a state that is no successor. By default it takes
+  `examples/*.cfg` and the configurations of `tests/lib.txt`, chosen so that their variables use every
+  conversion and every check, and then checks that `--emit-lib` refuses what it must. Over every configuration
+  (`scripts/lib.sh examples/*.cfg tests/tlc/*.cfg`, a quarter of an hour on two cores) 346 are compared and
+  match. Not compared: the configurations TLC reports an error in, as their graphs stop at the error (two
+  thirds of `tests/tlc/`; this is how the string order above went unseen at first), and those that outgrow a
+  capacity
 - `examples/conform` is a package of its own that depends on the library of `examples/TwoPhase.cfg`
 
 ### TLC's options

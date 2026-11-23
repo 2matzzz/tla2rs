@@ -5,7 +5,7 @@
 # `tla2rs --graph`; the driver also builds every state again from its values and takes every step
 # with a Checker. This script does not run TLC.
 #
-#   scripts/lib.sh [X.cfg ...]     (default: examples/*.cfg)
+#   scripts/lib.sh [X.cfg ...]     (default: examples/*.cfg and the configurations of tests/lib.txt)
 #
 # A configuration is skipped when TLC reports an error (its graph is the part explored before the
 # error), when it has a VIEW or SYMMETRY (conform::Graph refuses those), when TLC's graph has more
@@ -27,10 +27,10 @@ one() {
   work="target/lib/$(basename "$dir")-$base"
   rm -rf "$work/driver/src"; mkdir -p "$work/driver/src"
   if ! target/release/tla2rs "$tla" -config "$cfg" --emit-lib -o "$work/lib" > "$work/emit.log" 2>&1; then
-    if grep -q 'emit-lib does not support' "$work/emit.log"; then echo "skip  $cfg  (not supported by --emit-lib)"; else echo "FAIL  $cfg  (emit: $(tail -1 "$work/emit.log"))"; fi
+    if grep -q 'emit-lib does not support' "$work/emit.log"; then echo "skip  $cfg  (not supported by --emit-lib)"
+    elif grep -q 'emit-lib wrote no library' "$work/emit.log"; then echo "skip  $cfg  (nothing to explore)"; else echo "FAIL  $cfg  (emit: $(tail -1 "$work/emit.log"))"; fi
     return
   fi
-  [[ -f "$work/lib/Cargo.toml" ]] || { echo "skip  $cfg  (nothing to explore)"; return; }
   local name; name=$(awk -F'"' '/^name/ { print $2; exit }' "$work/lib/Cargo.toml")
   cp tests/lib/driver.rs "$work/driver/src/main.rs"
   printf '[package]\nname = "driver"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\nspec = { path = "../lib", package = "%s" }\n\n[profile.release]\nopt-level = 1\n\n[workspace]\n' "$name" > "$work/driver/Cargo.toml"
@@ -51,7 +51,20 @@ one() {
 }
 export -f one
 log=$(mktemp); trap 'rm -f "$log"' EXIT
-cfgs=("$@"); [[ ${#cfgs[@]} -gt 0 ]] || cfgs=(examples/*.cfg)
+cfgs=("$@"); [[ ${#cfgs[@]} -gt 0 ]] || cfgs=(examples/*.cfg $(grep -v '^#' tests/lib.txt | awk 'NF { print $1 }'))
 printf '%s\n' "${cfgs[@]}" | xargs -P "${JOBS:-2}" -I{} bash -c 'one "$@"' _ {} | tee "$log"
+# With the default configurations: what --emit-lib must refuse. A library of a spec whose strings a
+# run of the checker orders would choose from their sets otherwise than TLC, and that spec stops at
+# an error, so the comparison above never sees it
+if [[ $# -eq 0 ]]; then
+  for t in StrMade StrMadeToString TlcGet; do
+    out=$(target/release/tla2rs "tests/tlc/$t.tla" --emit-lib -o "target/lib/refused-$t" 2>&1)
+    if [[ $? -ne 0 && "$out" == *"emit-lib does not support"* && ! -e "target/lib/refused-$t" ]]; then
+      echo "ok    tests/tlc/$t.tla  refused"
+    else
+      echo "FAIL  tests/tlc/$t.tla  (--emit-lib did not refuse it)"
+    fi
+  done | tee -a "$log"
+fi
 echo "total: $(grep -c '^ok' "$log") ok, $(grep -c '^skip' "$log") skipped, $(grep -c '^FAIL' "$log") FAIL"
 ! grep -q '^FAIL' "$log"

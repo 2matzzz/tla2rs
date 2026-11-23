@@ -5,6 +5,17 @@
 //! the state are the ones the checker runs) followed by a public module `conform`, made of
 //! `CONFORM` below and of the conversions `Gen::lib_code` generates for the spec's types.
 
+static WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--emit-lib` was given: `compile` then makes `Output::lib`
+pub fn want() {
+    WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn wanted() -> bool {
+    WANTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The text of a library crate's `src/lib.rs`: the checker `rust` and the module `conform` with
 /// the generated `lib` part
 pub fn lib_rs(rust: &str, lib: &str) -> String {
@@ -233,10 +244,14 @@ impl std::fmt::Debug for Abs {
 fn eval<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(x) => Ok(x),
-        Err(e) => match e.downcast::<EvalErr>() {
-            Ok(e) => Err(e.msg().to_string()),
-            Err(e) => std::panic::resume_unwind(e),
-        },
+        Err(e) => {
+            // The panic passed the recursive operators it was raised in without their rec_leave
+            REC_DEPTH.with(|d| d.set(0));
+            match e.downcast::<EvalErr>() {
+                Ok(e) => Err(e.msg().to_string()),
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        }
     }
 }
 
@@ -247,6 +262,15 @@ fn eval_or_panic<T>(f: impl FnOnce() -> T) -> T {
 /// The name of the action a label of a step stands for ("RMPrepare"), as in TLC's traces
 pub fn action_name(l: u32) -> &'static str {
     LABELS[l as usize].split(" line ").next().unwrap_or("?")
+}
+
+/// The names of the temporal properties of the configuration (`<>P`, `P ~> Q`, `[]<>P`, ...). A
+/// `Checker` does not check them, nor the spec's fairness: they are about infinite behaviors, and
+/// a run of an implementation is a finite one. (`[]P` for a state predicate P is among the
+/// invariants, `[][A]_v` among the action properties, and a state predicate is checked on the
+/// first state: those are checked.)
+pub fn temporal_properties() -> Vec<&'static str> {
+    LPROPS.iter().map(|p| p.name).collect()
 }
 
 /// The initial states. Panics with TLC's message if the spec fails to evaluate
@@ -287,6 +311,8 @@ pub enum Violation {
     Invariant(&'static str),
     /// The step violates an action property (`[][A]_v`) of the configuration
     ActionProperty(&'static str),
+    /// A PROPERTY of the configuration that is a state predicate is false in the first state
+    InitProperty(&'static str),
     /// The spec failed to evaluate here (TLC's message): the successors of the state before, an
     /// invariant or an action property
     Eval(String),
@@ -309,6 +335,7 @@ impl std::fmt::Display for Violation {
             Violation::WrongAction { claimed, actual } => write!(f, "the step is not one of {claimed}; it is one of: {}", actual.join(", ")),
             Violation::Invariant(n) => write!(f, "invariant {n} is violated"),
             Violation::ActionProperty(n) => write!(f, "action property {n} is violated"),
+            Violation::InitProperty(n) => write!(f, "property {n} is violated by the initial state"),
             Violation::Eval(m) => write!(f, "the spec failed to evaluate: {m}"),
         }
     }
@@ -327,7 +354,8 @@ fn check_state(s: Abs) -> Result<(), Violation> {
 /// Checks a run of the implementation against the spec one step at a time: each state the
 /// implementation reports must be a successor of the one before by the next-state relation, or
 /// the same state (a stuttering step), and must satisfy the invariants. Only the current state is
-/// kept, so the size of the spec's state space does not matter.
+/// kept, so the size of the spec's state space does not matter. Temporal properties and fairness
+/// are not checked (see `temporal_properties`).
 ///
 /// Where the spec fails to evaluate, the error is `Violation::Eval` with TLC's message.
 pub struct Checker {
@@ -350,6 +378,9 @@ impl Checker {
             return Err(Violation::NotInitial);
         }
         check_state(s0)?;
+        if let Some((name, _)) = eval(|| INIT_PROPS.iter().find(|(_, f)| !f(&s0.0))).map_err(Violation::Eval)? {
+            return Err(Violation::InitProperty(name));
+        }
         Ok(Checker { cur: s0, states: HashSet::from([s0]), steps: HashSet::new() })
     }
 

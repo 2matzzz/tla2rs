@@ -158,11 +158,22 @@ checker.step(abs(&sys), None)?;                 // must be a step of Next (or ch
 This is a check of the runs the tests make, not a proof: a path no test takes is not checked, which is what the
 coverage is for. And it is as good as the abstraction function.
 
-What a library does not do yet: specs with TLCGet / TLCSet and specs whose records change their fields from state
-to state are refused; values of some types (sets held as arrays, functions over a large type) can be read but not
-built; `Graph` refuses VIEW and SYMMETRY; and where the checker would build itself again with more room for a set
-or a sequence, a library fails with the message that says to pass `-setcap` / `-seqcap`. `scripts/lib.sh` checks
-libraries against TLC's state graphs (see CLAUDE.md, "The checker as a library").
+What a library checks and what it does not:
+
+- Checked: the first state (an initial state, and the properties that are state predicates), each step (a step
+  of Next, and the action properties `[][A]_v`), and each state (its types, the invariants, `[]P`)
+- Not checked: temporal properties (`<>P`, `P ~> Q`, ...) and fairness, which are about infinite behaviors.
+  `conform::temporal_properties()` lists them, and `--emit-lib` says so when the configuration has some
+- Refused by `--emit-lib`: a spec that makes strings while exploring (`\o`, ToString, ...) and holds them in
+  sets, whose order TLC decides by the order it makes them in, which only a run of the checker measures; specs
+  with TLCGet / TLCSet; specs whose records change their fields from state to state; and a spec TLC stops on
+  before exploring
+- Values of some types (sets held as arrays, functions over a large type) can be read but not built
+- `Graph` refuses VIEW and SYMMETRY
+- Where the checker would build itself again with more room for a set or a sequence, a library fails with the
+  message that says to pass `-setcap` / `-seqcap` to `--emit-lib`
+
+`scripts/lib.sh` checks libraries against TLC's state graphs (see CLAUDE.md, "The checker as a library").
 
 ## Speed
 

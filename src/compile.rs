@@ -26,8 +26,8 @@ pub struct Output {
     /// The name of each string and model value, by its number in the checker
     pub atoms: Vec<String>,
     /// The generated part of a library crate's module `conform` (`--emit-lib`, see conform.rs),
-    /// or why there is none for this spec. It is computed for every spec, after everything that
-    /// goes into `rust`, which is the same with or without a library
+    /// or why there is none for this spec; computed only for `--emit-lib` (`conform::wanted`),
+    /// after everything that goes into `rust`, which is the same with or without a library
     pub lib: R<String>,
 }
 
@@ -2160,7 +2160,17 @@ fn compile_inner(
     }
     let set_names = set_cap_items(&mut src, &g.vars);
     let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
-    let lib = g.lib_code();
+    // Only for --emit-lib, so that compiling for a checker runs none of it. The checker's strings
+    // are numbered in the order a run of it made them (see "The order of strings" in CLAUDE.md), and
+    // --emit-lib runs nothing: a library of such a spec would enumerate, choose from and print sets
+    // of those strings in another order than TLC (`tests/tlc/StrMade`: CHOOSE picked "ca", TLC "cb")
+    let lib = if !crate::conform::wanted() {
+        Err(String::new())
+    } else if str_order {
+        Err("--emit-lib does not support this spec: it makes strings while exploring (\\o, ToString, ...) whose order in sets is TLC's only once a run of the checker has measured it".into())
+    } else {
+        g.lib_code()
+    };
     Ok(Output { rust: src, warnings, rejected: None, qcap: g.qcap, set_names, atoms: names, lib })
 }
 

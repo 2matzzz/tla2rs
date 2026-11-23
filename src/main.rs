@@ -132,7 +132,10 @@ fn main() {
             }
             "--emit-only" => emit_only = true,
             // Writes the checker as a library crate instead of building and running it (see conform.rs)
-            "--emit-lib" => emit_lib = true,
+            "--emit-lib" => {
+                emit_lib = true;
+                conform::want();
+            }
             "-fp128" => fp128 = true,
             // -metal affects both code generation (emits the Metal parts) and execution (uses the
             // GPU)
@@ -318,6 +321,12 @@ fn main() {
                     exit(2);
                 }
             }
+            // No library for a spec TLC stops on before exploring; with nothing to explore (code 0)
+            // that must not look like success
+            if emit_lib {
+                eprintln!("tla2rs: --emit-lib wrote no library: {}", if *code == 0 { "the spec has no behavior to check" } else { "TLC refuses the spec before exploring" });
+                quit(if *code == 0 { 1 } else { *code });
+            }
             quit(*code);
         }
         if emit_lib {
@@ -329,6 +338,10 @@ fn main() {
                 }
             }
             eprintln!("tla2rs: generated {} in {:.0} ms", dir.join("src/lib.rs").display(), t0.elapsed().as_secs_f64() * 1e3);
+            // Said here, since nothing in a test that passes would say it
+            if output.rust.contains("\nconst LIVENESS: bool = true;") {
+                eprintln!("tla2rs: note: the library does not check the temporal properties and fairness of the configuration (conform::temporal_properties lists them)");
+            }
             return;
         }
         let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0, ahead) else { return };
