@@ -1,0 +1,10 @@
+[package]
+name = "conform-example"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+# Written by: tla2rs examples/TwoPhase.tla --emit-lib
+spec = { path = "../.tla2rs/TwoPhase-lib", package = "spec_twophase" }
+
+[workspace]

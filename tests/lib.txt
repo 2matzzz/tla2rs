@@ -1,0 +1,12 @@
+# The configurations of tests/tlc/ that scripts/lib.sh checks by default, with those of examples/:
+# chosen so that together their variables use every conversion Gen::lib_code generates and every
+# check a library makes. One per line, then what it is there for.
+tests/tlc/CmDigraph.cfg          records with optional fields, functions over part of a type, sets, tuples, booleans
+tests/tlc/BagInst.cfg            bags, records, a CONSTRAINT
+tests/tlc/CmBag.cfg              bags, sequences, tuples
+tests/tlc/FunMixedKey-Right.cfg  integers and atoms in one type, strings and model values
+tests/tlc/EmptyFunStrOrder.cfg   a set held as an array
+tests/tlc/InstRef.cfg            an action property and a property of the initial state
+tests/tlc/ActCon-Two.cfg         an ACTION_CONSTRAINT
+tests/tlc/HugeSeq.cfg            a deep graph of long sequences
+tests/tlc/NoActInit.cfg          no initial state

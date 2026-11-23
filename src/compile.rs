@@ -25,6 +25,10 @@ pub struct Output {
     pub set_names: HashMap<String, String>,
     /// The name of each string and model value, by its number in the checker
     pub atoms: Vec<String>,
+    /// The generated part of a library crate's module `conform` (`--emit-lib`, see conform.rs),
+    /// or why there is none for this spec; computed only for `--emit-lib` (`conform::wanted`),
+    /// after everything that goes into `rust`, which is the same with or without a library
+    pub lib: R<String>,
 }
 
 /// What TLC prints when it starts, in its order: its warnings that a PlusCal algorithm or its
@@ -1099,7 +1103,7 @@ fn compile_once(tla: &str, cfg_src: &str, dir: &std::path::Path, setcap: usize, 
             if !pcal.is_empty() {
                 msg = format!("{}\n{msg}", pcal.join("\n"));
             }
-            return Ok((Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), qcap: 0, set_names: HashMap::new(), atoms: vec![] }, vec![]));
+            return Ok((Output { rust: String::new(), warnings: notes, rejected: Some((msg, 150)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) }, vec![]));
         }
         r => r?,
     };
@@ -1499,7 +1503,7 @@ fn compile_inner(
                 .and_then(|m| m.strip_prefix(crate::ast::SPAN).and_then(|m| m.split_once('\n')).map(|(at, m)| (at.to_string(), m.to_string())));
             let (at, msg) = at.unwrap_or_else(|| (format!("in definition {}", d.name), msg));
             let msg = format!("Semantic errors:\n\n*** Errors: 1\n\n{at}\n\n{msg}\n\n\n\nError: Parsing or semantic analysis failed.");
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 150)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
         }
     }
 
@@ -1566,7 +1570,7 @@ fn compile_inner(
                 Ok(Value::Bool(true)) | Err(_) => {}
                 Ok(v) => {
                     let msg = format!("Error: The {what} of {name} is equal to {}", show_value(&atoms, &v));
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 151)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
                 }
             }
         }
@@ -1582,7 +1586,7 @@ fn compile_inner(
     } else {
         match resolve_spec(&m, &cfg, &mut ex)? {
             Ok(p) => p,
-            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), qcap: 0, set_names: HashMap::new(), atoms: vec![] }),
+            Err(r) => return Ok(Output { rust: String::new(), warnings, rejected: Some(r), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) }),
         }
     };
     // Where the strings the ASSUMEs make start (those TLC makes while it splits the next-state
@@ -1610,12 +1614,13 @@ fn compile_inner(
                         qcap: 0,
                         set_names: HashMap::new(),
                         atoms: vec![],
+                        lib: Err(String::new()),
                     })
                 }
                 Ok(v) => return Err(format!("ASSUME at {at} is not a boolean: {v:?}")),
                 Err(e) if crate::value::is_eval_failure(&e) => {
                     let msg = format!("Error: Evaluating assumption {at} failed.\n{e}");
-                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+                    return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 10)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
                 }
                 Err(e) => return Err(format!("cannot evaluate the ASSUME at {at}: {e}")),
             }
@@ -1640,7 +1645,7 @@ fn compile_inner(
         made_split_at = startup.made.len();
     }
     if no_behavior {
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((NO_BEHAVIOR.into(), 0)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
     }
     if uses_real_time(&init) || next.as_ref().is_some_and(uses_real_time) {
         return Err("RTnow and RTBound of RealTime are not supported in the spec (TLC cannot check them either)".into());
@@ -1872,7 +1877,7 @@ fn compile_inner(
         if uses_real_time(&e) {
             startup.liveness_warnings(&cfg, true);
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(&e));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
         }
         let mut parts = vec![];
         split_property(&g, &e, &HashMap::new(), name, None, &mut parts)?;
@@ -1919,13 +1924,13 @@ fn compile_inner(
     }
     if no_next && (!inv_list.is_empty() || !cfg.invariants.is_empty() || !action_props.is_empty() || !live_parts.is_empty()) {
         let msg = "Error: The configuration file did not specify the next state predicate.";
-        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+        return Ok(Output { rust: String::new(), warnings, rejected: Some((msg.into(), 151)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
     }
     startup.liveness_warnings(&cfg, !live_parts.is_empty());
     if !live_parts.is_empty() {
         if let Some(f) = assumed.iter().find(|f| uses_real_time(f)) {
             let msg = format!("Error: TLC cannot handle the temporal formula {}", real_time_at(f));
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((msg, 255)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
         }
     }
     let assumed: Vec<(Expr, HashMap<String, Value>)> = assumed.into_iter().map(|f| (f, HashMap::new())).collect();
@@ -1937,7 +1942,7 @@ fn compile_inner(
         Err(crate::live::Rejected(m, code)) => {
             // TLC converts the temporal formulas before it evaluates the ASSUMEs
             startup.assumes.clear();
-            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), qcap: 0, set_names: HashMap::new(), atoms: vec![] });
+            return Ok(Output { rust: String::new(), warnings, rejected: Some((format!("Error: {m}"), code)), qcap: 0, set_names: HashMap::new(), atoms: vec![], lib: Err(String::new()) });
         }
     };
     let mut prop_code = String::new();
@@ -2155,7 +2160,18 @@ fn compile_inner(
     }
     let set_names = set_cap_items(&mut src, &g.vars);
     let names = (0..atoms.len() as u32).map(|a| atoms.name(a)).collect();
-    Ok(Output { rust: src, warnings, rejected: None, qcap: g.qcap, set_names, atoms: names })
+    // Only for --emit-lib, so that compiling for a checker runs none of it. The checker's strings
+    // are numbered in the order a run of it made them (see "The order of strings" in CLAUDE.md), and
+    // --emit-lib runs nothing: a library of such a spec would enumerate, choose from and print sets
+    // of those strings in another order than TLC (`tests/tlc/StrMade`: CHOOSE picked "ca", TLC "cb")
+    let lib = if !crate::conform::wanted() {
+        Err(String::new())
+    } else if str_order {
+        Err("--emit-lib does not support this spec: it makes strings while exploring (\\o, ToString, ...) whose order in sets is TLC's only once a run of the checker has measured it".into())
+    } else {
+        g.lib_code()
+    };
+    Ok(Output { rust: src, warnings, rejected: None, qcap: g.qcap, set_names, atoms: names, lib })
 }
 
 /// `rt` with the hooks of `LIVE_SIM_RT`: TLC's evaluations for its liveness graph, on each new
