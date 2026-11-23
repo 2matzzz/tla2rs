@@ -20,8 +20,8 @@ It has no crate dependencies.
 - `target/release/tla2rs Spec.tla --emit-lib [-o DIR]` writes the checker as a library crate
   (`<spec dir>/.tla2rs/<cfg name>-lib/`, crate `spec_<cfg name>`) and builds nothing (see "The checker as a
   library"). `scripts/lib.sh [X.cfg ...]` (default `examples/*.cfg` and the configurations of `tests/lib.txt`)
-  checks such libraries against TLC's state graphs in `tests/expected/`; run it after a change to `src/conform.rs`, `Gen::lib_code` or the representation of
-  a type
+  checks such libraries against TLC's state graphs in `tests/expected/`. `scripts/all.sh` without arguments runs
+  it with its defaults after the cross-checks, and fails if it fails
 - `target/release/tla2rs --graph FILE` reduces a state graph (TLC's `-dump dot FILE` or a checker's `-dumpgraph
   FILE`) to `states N <sha256>` and `edges M <sha256>`; `--graph-text FILE` prints the canonical form itself, for
   diffing two graphs (see "State graphs")

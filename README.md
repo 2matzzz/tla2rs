@@ -173,6 +173,8 @@ What a library checks and what it does not:
 - `Graph` refuses VIEW and SYMMETRY
 - Where the checker would build itself again with more room for a set or a sequence, a library fails with the
   message that says to pass `-setcap` / `-seqcap` to `--emit-lib`
+- A failure of the spec to evaluate is caught as a panic and returned as `Violation::Eval`, so panics must unwind:
+  in a binary built with `panic = "abort"` it ends the process instead (`cargo test` ignores that setting)
 
 `scripts/lib.sh` checks libraries against TLC's state graphs (see CLAUDE.md, "The checker as a library").
 

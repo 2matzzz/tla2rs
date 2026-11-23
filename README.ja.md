@@ -119,6 +119,8 @@ checker.step(abs(&sys), None)?;                 // Next の一歩（または変
 - `Graph` は VIEW と SYMMETRY を断ります
 - 検査器なら集合や列の容量を増やして自分を作り直す場面で、ライブラリは `--emit-lib` に `-setcap` / `-seqcap` を
   渡すよう伝えるメッセージで失敗します
+- 仕様の評価の失敗は panic として受け止めて `Violation::Eval` で返すので、panic は unwind でなければなりません。
+  `panic = "abort"` でビルドしたバイナリでは、返す代わりにプロセスが終わります（`cargo test` はこの設定を無視します）
 
 `scripts/lib.sh` がライブラリを TLC の状態グラフと突き合わせます（CLAUDE.md の "The checker as a library"）。
 

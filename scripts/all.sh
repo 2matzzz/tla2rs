@@ -35,9 +35,18 @@ log=$(mktemp); trap 'rm -f "$log"' EXIT
 rm -rf target/crosscheck/fail
 cfgs=(); args=()
 for x in "$@"; do if [[ "$x" == *.cfg ]]; then cfgs+=("$x"); else args+=("$x"); fi; done
-[[ ${#cfgs[@]} -gt 0 ]] || cfgs=(examples/*.cfg tests/tlc/*.cfg)
+full=0
+[[ ${#cfgs[@]} -gt 0 ]] || { cfgs=(examples/*.cfg tests/tlc/*.cfg); full=1; }
 set -- ${args[@]+"${args[@]}"}
 printf '%s\n' "${cfgs[@]}" |
   xargs -P "${JOBS:-4}" -I{} bash -c 'one "$@"' _ {} "$@" | tee "$log"
 echo "total: $(grep -c '^ok' "$log") ok, $(grep -c '^intent' "$log") intentional differences, $(grep -c '^agrees' "$log") intentional differences TLC now agrees with, $(grep -c '^FAIL' "$log") FAIL"
-! grep -q '^FAIL' "$log"
+status=0
+grep -q '^FAIL' "$log" && status=1
+# A full run without options also checks the libraries of --emit-lib, with the configurations
+# scripts/lib.sh takes by default (a few minutes), so that a change to them does not go unseen
+if [[ $full -eq 1 && $# -eq 0 ]]; then
+  echo "libraries (scripts/lib.sh):"
+  scripts/lib.sh || status=1
+fi
+exit $status
