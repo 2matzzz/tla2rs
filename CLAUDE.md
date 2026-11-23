@@ -1671,8 +1671,9 @@ of the runs the tests make, with coverage of the spec's state graph). It generat
 - `conform` is `conform::CONFORM` (the same for every spec: `Val`, `Abs`, `Checker`, `Violation`, `Graph`) and
   what `Gen::lib_code` generates: `from_val_<n>` / `to_val_<n>` for each type that has helpers, `state` (a state
   from the values of the variables) and `var_vals`. A value is checked against its type where it is converted
-  (`enc_<n>`), so the error names the variable and the value. A type not converted yet (a set held as an array,
-  a function or bag over a large type, a record that may be a model value) reads as `Val::Opaque` and fails to
+  (`enc_<n>`), so the error names the variable and the value. A set held as an array is built with `insert` and read in TLC's order of its
+  elements (`s_iter`). A type not converted yet (a function or bag over a large type, a record that may be a model
+  value) reads as `Val::Opaque` and fails to
   build: nothing is converted approximately
 - What a `Checker` checks: the first state is an initial state and satisfies the properties that are state
   predicates (`INIT_PROPS`); each step is a step of Next (or changes nothing) and satisfies the action properties;

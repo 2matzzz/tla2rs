@@ -10478,8 +10478,8 @@ impl<'a> Gen<'a> {
     /// the values of the variables, and `var_vals`, which reads one. Called after `helpers`, so
     /// that it registers no type: the checker's code is the same with or without a library.
     ///
-    /// A type it cannot convert yet (a set held as an array, a function or bag over a large type,
-    /// a value that is a record or a model value) reads as `Val::Opaque` and fails to build, with
+    /// A type it cannot convert yet (a function or bag over a large type, a value that is a record
+    /// or a model value) reads as `Val::Opaque` and fails to build, with
     /// a message that names it: nothing is converted approximately.
     pub fn lib_code(&mut self) -> R<String> {
         if !self.shaped.is_empty() {
@@ -10672,6 +10672,20 @@ impl<'a> Gen<'a> {
                     format!("Val::Set(bits(*v).map(|i| to_val_{eid}(&dec_{eid}(i))).collect())"),
                 )
             }
+            // A set held as an array: `insert` keeps it sorted, and fails as the checker does when the
+            // set outgrows its capacity (an evaluation error that names -setcap, caught by `state`).
+            // Read in TLC's order of its elements
+            Ty::Set(e) => {
+                let eid = self.ty_id(e)?;
+                let it = self.s_iter("*v", t)?;
+                (
+                    format!(
+                        "let Val::Set(es) = v else {{ return Err(mismatch(\"a set\", v)); }}; \
+                         let mut s = {dflt}; for x in es {{ s.insert(from_val_{eid}(x)?); }} Ok(s)"
+                    ),
+                    format!("Val::Set({it}.map(|x| to_val_{eid}(&x)).collect())"),
+                )
+            }
             Ty::Seq(e) => {
                 let eid = self.ty_id(e)?;
                 (
@@ -10683,7 +10697,7 @@ impl<'a> Gen<'a> {
                     format!("Val::Seq(v.iter().map(|x| to_val_{eid}(&x)).collect())"),
                 )
             }
-            Ty::Opt(_) | Ty::Set(_) | Ty::PFun(..) | Ty::Bag(_) => return Ok(None),
+            Ty::Opt(_) | Ty::PFun(..) | Ty::Bag(_) => return Ok(None),
         }))
     }
 }

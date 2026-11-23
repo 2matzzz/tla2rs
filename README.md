@@ -168,7 +168,8 @@ What a library checks and what it does not:
   sets, whose order TLC decides by the order it makes them in, which only a run of the checker measures; specs
   with TLCGet / TLCSet; specs whose records change their fields from state to state; and a spec TLC stops on
   before exploring
-- Values of some types (sets held as arrays, functions over a large type) can be read but not built
+- Values of some types (functions over a large type, a value that is a record or a model value) can be read
+  but not built
 - `Graph` refuses VIEW and SYMMETRY
 - Where the checker would build itself again with more room for a set or a sequence, a library fails with the
   message that says to pass `-setcap` / `-seqcap` to `--emit-lib`
