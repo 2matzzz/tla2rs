@@ -26,6 +26,7 @@ cargo build --release
 ./target/release/tla2rs Spec.tla -config Other.cfg -deadlock -workers 8
 ./target/release/tla2rs Spec.tla -memlimit 64 -notrace        # メモリを絞る
 ./target/release/tla2rs Spec.tla --emit-only      # Rust を書くだけ（.tla2rs/<cfg名>/src/main.rs）
+./target/release/tla2rs Spec.tla --emit-lib       # 検査器を、実装のテストから使うライブラリとして書き出す
 ```
 
 - `-deadlock` / `CHECK_DEADLOCK FALSE` は TLC と同じ意味（デッドロックを誤りにしない）
@@ -61,6 +62,55 @@ tla2rs は、TLC 2.19 のコマンドラインオプションのうち、状態�
 - `-userFile FILE` を付けると、仕様が表示する行（Print と PrintT。ASSUME や定数の定義の中のものも）を標準出力ではなく FILE に書く。TLC 自身のメッセージと警告は標準出力に残る。TLC と同じく、ファイルには値をそのまま 1 行で書き、標準出力のような整形はしない
 - 受け付けるが何もしないオプションは、TLC のディスク上のファイル（`-cleanup`、`-gzip`、`-metadir`、`-checkpoint`。TLC はチェックポイントのたびに 1 行出し、既定では 30 分おきだが、tla2rs は出さない）、指紋とそのメモリ（`-fp`、`-fpbits`、`-fpmem`。tla2rs は自前の指紋を使う）、時相の性質を確かめる時期（`-lncheck`。tla2rs は最後に確かめ、TLC の `final` にあたる）だけを変える。`-modelcheck` は既定の動きそのもの
 - 使えないものとその理由。`-simulate`・`-depth`・`-seed`・`-aril` は乱択のシミュレーション用で、漏れなく調べる検査ではない。`-dfid` は反復深化の深さ優先探索で、状態にたどり着く順が違うので、数も反例も幅優先とは変わる。tla2rs は幅優先しかしない。`-generateSpecTE` と `-tool` は Toolbox とトレースエクスプローラのためのもの（SpecTE モジュールを書く、出力をメッセージコードで囲む）。`-debug` は TLC 自身のデバッグ出力。`-recover` は TLC 独自の形式のチェックポイントから再開するもので、tla2rs はそれを書かない。`-coverage` は TLC のインタプリタが部分式をそれぞれ何回評価したかを数える。コンパイルした検査器は定数を一度だけ評価し、式をまとめてしまうので、回数は TLC の評価器の動きに左右される。`-terse` は TLC が内部で遅延評価のまま持っている集合を、その形のまま表示する（`SUBSET S`、`[S -> T]`）。コンパイルした検査器はその形を持っていない。`-maxSetSize` は TLC のインタプリタが列挙する集合の大きさの上限で、そのエラーがどこで出るかはインタプリタがどこで列挙するかで決まる
+
+## 実装を仕様と突き合わせる
+
+`tla2rs Spec.tla --emit-lib` は、検査器をビルドして走らせる代わりに、ライブラリクレートとして書き出します
+（`.tla2rs/<cfg名>-lib/`、または `-o DIR`）。手書きの実装のテストがこれにパスで依存し、モジュール `conform` を
+使って、実装が仕様の許すとおりに動いているかを実行しながら確かめます。実装のコードは生成しません。ライブラリの
+`init`・`next`・不変条件は検査器のものそのままで、判定役として使います。
+
+```toml
+[dev-dependencies]
+spec = { path = "spec/.tla2rs/TwoPhase-lib", package = "spec_twophase" }
+```
+
+```rust
+use spec::conform::{state, Checker, Val};
+
+// 抽象化関数（手書き）：実装がいま仕様のどの状態にいるか
+fn abs(sys: &System) -> spec::conform::Abs {
+    state(&[("tmState", "init".into()), ("tmPrepared", Val::set(/* ... */)), /* 全変数 */]).unwrap()
+}
+
+let mut checker = Checker::begin(abs(&sys))?;   // 初期状態でなければエラー
+sys.apply(event);
+checker.step(abs(&sys), None)?;                 // Next の一歩（または変化なし）でなければエラー
+```
+
+- `Checker::step` は何が起きたかを返します：その一歩を作るアクションが仕様にない（直前の状態から仕様が許す
+  アクションつき）、不変条件やアクション性質の違反、変数が型の外。持つのは現在の状態だけなので、仕様の状態空間の
+  大きさには左右されません
+- `Graph::explore()` は到達可能な状態グラフをメモリ上に作ります（収まる大きさのモデル向け）。`Checker` が記録した
+  状態と遷移を渡すと網羅率が出ます：テストが仕様のどの状態・遷移・アクションを踏んだか、まだ踏んでいない遷移への
+  最短経路
+- `examples/conform` が一通りの例です：2相コミットの実装を `examples/TwoPhase.tla` と突き合わせ、ランダム実行、
+  網羅率の報告、未到達の遷移への誘導実行をします。仕込んだ2つのバグを仕様から外れた一歩で見つけ（片方は不変条件を
+  何も破りません）、実装が決して取らない仕様の遷移81個（1つの設計判断から来るもの）を列挙します
+
+  ```sh
+  target/release/tla2rs examples/TwoPhase.tla --emit-lib
+  cd examples/conform && cargo run --release                 # -- --bug quorum-commit、-- --policy happy も
+  ```
+
+これはテストが走らせた実行の検査で、証明ではありません。どのテストも通らない経路は検査されず、網羅率はそのために
+あります。また、抽象化関数が正しい範囲でしか意味を持ちません。
+
+まだできないこと：TLCGet / TLCSet を使う仕様と、状態によってレコードのフィールドが変わる仕様は断ります。一部の型の
+値（配列で持つ集合、大きな型の上の関数）は読めますが組み立てられません。`Graph` は VIEW と SYMMETRY を断ります。
+検査器なら集合や列の容量を増やして自分を作り直す場面で、ライブラリは `-setcap` / `-seqcap` を渡すよう伝える
+メッセージで失敗します。`scripts/lib.sh` がライブラリを TLC の状態グラフと突き合わせます（CLAUDE.md の
+"The checker as a library"）。
 
 ## 速さ
 

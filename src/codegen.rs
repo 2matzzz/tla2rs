@@ -10468,3 +10468,222 @@ impl Gen<'_> {
         Ok(s)
     }
 }
+
+// ---------------------------------------------------------------- The checker as a library
+
+impl<'a> Gen<'a> {
+    /// The generated part of the module `conform` of a library crate (`--emit-lib`, see
+    /// conform.rs): for each type the checker has helpers for, the conversions between its values
+    /// and `Val` (`from_val_<n>`, `to_val_<n>`), and with them `state`, which builds a state from
+    /// the values of the variables, and `var_vals`, which reads one. Called after `helpers`, so
+    /// that it registers no type: the checker's code is the same with or without a library.
+    ///
+    /// A type it cannot convert yet (a set held as an array, a function or bag over a large type,
+    /// a value that is a record or a model value) reads as `Val::Opaque` and fails to build, with
+    /// a message that names it: nothing is converted approximately.
+    pub fn lib_code(&mut self) -> R<String> {
+        if !self.shaped.is_empty() {
+            return Err("--emit-lib does not support this spec yet: its state has a shape (variables whose records change their fields)".into());
+        }
+        // What TLCGet gives and TLCSet does ("level", "exit") belongs to a search: a library runs none
+        if self.tlcget {
+            return Err("--emit-lib does not support this spec: it uses TLCGet or TLCSet, whose values depend on the search".into());
+        }
+        let known = self.tys.len();
+        let mut s = String::new();
+        let names: Vec<String> = (0..self.atoms.len()).map(|i| format!("{:?}", self.atoms.name(i as u32))).collect();
+        writeln!(s, "/// The strings and model values of the spec, by their number in the checker\nstatic ATOM_NAMES: [&str; {}] = [{}];", names.len(), names.join(", ")).unwrap();
+        for i in 0..known {
+            let t = self.tys[i].clone();
+            let r = t.repr();
+            let (from, to) = match self.lib_conv(&t)? {
+                Some(c) => c,
+                None => (
+                    format!("Err(format!(\"a value of this type cannot be built yet (--emit-lib): {{v}}\"))"),
+                    format!("Val::Opaque(fmt_{i}(v))"),
+                ),
+            };
+            // A value of a type with enc_ is checked against the type here, where the message can
+            // name it; the others are checked when the state is packed
+            let check = match &t {
+                Ty::Bool | Ty::Int(..) | Ty::Enum(_) | Ty::IntAtom(..) | Ty::Rec(_) if t.size().is_some() => {
+                    format!("if enc_{i}(x) == u64::MAX {{ return Err(format!(\"{{v}} is outside the type of the spec here\")); }} ")
+                }
+                _ => String::new(),
+            };
+            writeln!(s, "fn from_val_{i}(v: &Val) -> Result<{r}, String> {{ let x: {r} = (|| -> Result<{r}, String> {{ {from} }})()?; {check}Ok(x) }}").unwrap();
+            writeln!(s, "fn to_val_{i}(v: &{r}) -> Val {{ {to} }}").unwrap();
+        }
+        let vars = self.vars.clone();
+        let mut build = vec![];
+        let mut read = vec![];
+        for (v, t) in &vars {
+            let id = self.ty_id(t)?;
+            build.push(format!("v_{v}: from_val_{id}(get({v:?})?).map_err(|e| format!(\"{v}: {{e}}\"))?"));
+            read.push(format!("({v:?}, to_val_{id}(&s.v_{v}))"));
+        }
+        if self.tys.len() != known {
+            return Err("--emit-lib: a type of the spec has no helpers (internal error)".into());
+        }
+        let list: Vec<String> = vars.iter().map(|(v, _)| format!("{v:?}")).collect();
+        writeln!(s, "/// The variables of the spec\npub static VARIABLES: &[&str] = &[{}];", list.join(", ")).unwrap();
+        writeln!(
+            s,
+            "/// The state in which each variable has the value given: every variable once. A value outside\n\
+             /// what the checker can hold (a string the spec does not have, a set element outside its\n\
+             /// type) is an error that names the variable\n\
+             pub fn state(vars: &[(&str, Val)]) -> Result<Abs, String> {{\n\
+             \x20   for (k, (n, _)) in vars.iter().enumerate() {{\n\
+             \x20       if !VARIABLES.contains(n) {{ return Err(format!(\"the spec has no variable {{n}}\")); }}\n\
+             \x20       if vars[..k].iter().any(|(m, _)| m == n) {{ return Err(format!(\"variable {{n}} is given twice\")); }}\n\
+             \x20   }}\n\
+             \x20   let get = |n: &str| vars.iter().find(|(k, _)| *k == n).map(|(_, v)| v).ok_or_else(|| format!(\"variable {{n}} is missing\"));\n\
+             \x20   eval(|| -> Result<Abs, String> {{ Ok(Abs(State {{ {} }})) }}).unwrap_or_else(Err)\n}}",
+            build.iter().map(|b| format!("{b}, ")).collect::<String>()
+        )
+        .unwrap();
+        writeln!(s, "fn var_vals(s: &State) -> Vec<(&'static str, Val)> {{ vec![{}] }}", read.join(", ")).unwrap();
+        Ok(s)
+    }
+
+    /// The bodies of `from_val_<n>` (of `v: &Val`, a `Result`) and `to_val_<n>` (of `v`, a
+    /// reference to the value) for type `t`; None for a type not converted yet
+    fn lib_conv(&mut self, t: &Ty) -> R<Option<(String, String)>> {
+        let dflt = Self::default_code(t);
+        Ok(Some(match t {
+            Ty::Bool => ("match v { Val::Bool(b) => Ok(*b), _ => Err(mismatch(\"a boolean\", v)) }".into(), "Val::Bool(*v)".into()),
+            Ty::Int(..) => ("match v { Val::Int(n) => Ok(*n), _ => Err(mismatch(\"an integer\", v)) }".into(), "Val::Int(*v)".into()),
+            Ty::Enum(_) => ("atom_of(v)".into(), "atom_val(*v)".into()),
+            Ty::IntAtom(..) => (
+                "match v { Val::Int(n) if *n >= i64::MIN + 65536 => Ok(*n), Val::Int(_) => Err(mismatch(\"an integer the checker can hold\", v)), _ => Ok(i64::MIN + atom_of(v)? as i64) }".into(),
+                "if *v < i64::MIN + 65536 { atom_val((*v - i64::MIN) as u16) } else { Val::Int(*v) }".into(),
+            ),
+            Ty::Rec(fs) if fs.iter().any(|(n, _)| n == ATOM_FIELD || n == VAL_FIELD) => return Ok(None),
+            // A tuple (also the empty one, which is the empty function too)
+            Ty::Rec(fs) if fs.iter().all(|(n, _)| n.starts_with('#')) => {
+                let n = fs.len();
+                let (mut parts, mut vals) = (vec![], vec![]);
+                for (k, (_, ft)) in fs.iter().enumerate() {
+                    if matches!(ft, Ty::Opt(_)) {
+                        return Ok(None);
+                    }
+                    let fid = self.ty_id(ft)?;
+                    parts.push(format!("from_val_{fid}(&es[{k}])?"));
+                    vals.push(format!("to_val_{fid}(&v{})", rec_field(n, k)));
+                }
+                (
+                    format!(
+                        "let Some(es) = seq_of(v) else {{ return Err(mismatch(\"a tuple\", v)); }}; \
+                         if es.len() != {n} {{ return Err(mismatch(\"a tuple of {n} elements\", v)); }} Ok({})",
+                        rec_build(&parts)
+                    ),
+                    format!("Val::Seq(vec![{}])", vals.join(", ")),
+                )
+            }
+            // A record; an optional field is one some of the type's records lack
+            Ty::Rec(fs) => {
+                let n = fs.len();
+                let mut parts = vec![];
+                let mut to = String::from("let mut fs: Vec<(String, Val)> = vec![]; ");
+                let mut names = vec![];
+                for (k, (name, ft)) in fs.iter().enumerate() {
+                    let fp = rec_field(n, k);
+                    names.push(format!("{name:?}"));
+                    match ft {
+                        Ty::Opt(inner) => {
+                            let fid = self.ty_id(inner)?;
+                            parts.push(format!("if fs.iter().any(|(n, _)| n == {name:?}) {{ (true, from_val_{fid}(field(&fs, {name:?})?)?) }} else {{ (false, {}) }}", Self::default_code(inner)));
+                            write!(to, "if v{fp}.0 {{ fs.push(({name:?}.to_string(), to_val_{fid}(&v{fp}.1))); }} ").unwrap();
+                        }
+                        ft => {
+                            let fid = self.ty_id(ft)?;
+                            parts.push(format!("from_val_{fid}(field(&fs, {name:?})?)?"));
+                            write!(to, "fs.push(({name:?}.to_string(), to_val_{fid}(&v{fp}))); ").unwrap();
+                        }
+                    }
+                }
+                (
+                    format!(
+                        "let Some(fs) = rec_of(v) else {{ return Err(mismatch(\"a record\", v)); }}; \
+                         const NAMES: [&str; {n}] = [{}]; \
+                         if let Some((n, _)) = fs.iter().find(|(n, _)| !NAMES.contains(&n.as_str())) {{ return Err(format!(\"the records here have no field {{n}}: {{v}}\")); }} Ok({})",
+                        names.join(", "),
+                        rec_build(&parts)
+                    ),
+                    to + "Val::Rec(fs)",
+                )
+            }
+            // A function over every value of its domain type: an array indexed by enc_ of the argument
+            Ty::Fun(d, c) => {
+                let Some(n) = d.size() else { return Ok(None) };
+                let (did, cid) = (self.ty_id(d)?, self.ty_id(c)?);
+                (
+                    format!(
+                        "let Some(ps) = fun_of(v) else {{ return Err(mismatch(\"a function\", v)); }}; \
+                         if ps.len() != {n} {{ return Err(mismatch(\"a function with a domain of {n} elements\", v)); }} \
+                         let mut a = {dflt}; let mut seen = vec![false; {n}]; \
+                         for (k, x) in &ps {{ let e = enc_{did}(from_val_{did}(k)?) as usize; \
+                         if e >= {n} {{ return Err(format!(\"{{k}} is outside the domain of the functions here\")); }} \
+                         if seen[e] {{ return Err(format!(\"{{k}} is in the domain twice\")); }} seen[e] = true; a[e] = from_val_{cid}(x)?; }} Ok(a)"
+                    ),
+                    format!("canon_fun((0..{n}u64).map(|i| (to_val_{did}(&dec_{did}(i)), to_val_{cid}(&v[i as usize]))).collect())"),
+                )
+            }
+            // A function over some values of its domain type: an optional value for each
+            Ty::PFun(d, c) if !is_sparse_fun(t) => {
+                let Some(n) = d.size() else { return Ok(None) };
+                let (did, cid) = (self.ty_id(d)?, self.ty_id(c)?);
+                (
+                    format!(
+                        "let Some(ps) = fun_of(v) else {{ return Err(mismatch(\"a function\", v)); }}; \
+                         let mut a = {dflt}; \
+                         for (k, x) in &ps {{ let e = enc_{did}(from_val_{did}(k)?) as usize; \
+                         if e >= {n} {{ return Err(format!(\"{{k}} is outside the domains of the functions here\")); }} \
+                         if a[e].0 {{ return Err(format!(\"{{k}} is in the domain twice\")); }} a[e] = (true, from_val_{cid}(x)?); }} Ok(a)"
+                    ),
+                    format!("canon_fun((0..{n}u64).filter(|i| v[*i as usize].0).map(|i| (to_val_{did}(&dec_{did}(i)), to_val_{cid}(&v[i as usize].1))).collect())"),
+                )
+            }
+            // A bag: the count of each element, as the function from its elements to their counts
+            Ty::Bag(e) if !is_sparse_fun(t) => {
+                let Some(n) = e.size() else { return Ok(None) };
+                let eid = self.ty_id(e)?;
+                (
+                    format!(
+                        "let Some(ps) = fun_of(v) else {{ return Err(mismatch(\"a bag\", v)); }}; \
+                         let mut a = {dflt}; \
+                         for (k, x) in &ps {{ let e = enc_{eid}(from_val_{eid}(k)?) as usize; \
+                         if e >= {n} {{ return Err(format!(\"{{k}} is outside the type of the bags here\")); }} \
+                         let Val::Int(c) = x else {{ return Err(mismatch(\"a count\", x)); }}; \
+                         if *c <= 0 || a[e] != 0 {{ return Err(mismatch(\"a bag (each element once, with a positive count)\", v)); }} a[e] = *c; }} Ok(a)"
+                    ),
+                    format!("canon_fun((0..{n}u64).filter(|i| v[*i as usize] > 0).map(|i| (to_val_{eid}(&dec_{eid}(i)), Val::Int(v[i as usize]))).collect())"),
+                )
+            }
+            // A set as a bitmask: bit enc_ of each element
+            Ty::Set(e) if !is_sparse(t) => {
+                let eid = self.ty_id(e)?;
+                (
+                    format!(
+                        "let Val::Set(es) = v else {{ return Err(mismatch(\"a set\", v)); }}; let mut m = 0u128; \
+                         for x in es {{ let e = enc_{eid}(from_val_{eid}(x)?); \
+                         if e >= 128 {{ return Err(format!(\"{{x}} is outside the type of the sets here\")); }} m |= 1u128 << e; }} Ok(m)"
+                    ),
+                    format!("Val::Set(bits(*v).map(|i| to_val_{eid}(&dec_{eid}(i))).collect())"),
+                )
+            }
+            Ty::Seq(e) => {
+                let eid = self.ty_id(e)?;
+                (
+                    format!(
+                        "let Some(es) = seq_of(v) else {{ return Err(mismatch(\"a sequence\", v)); }}; \
+                         if es.len() > QCAP {{ return Err(format!(\"a sequence of {{}} elements: this library holds sequences of up to {{QCAP}} (emit it with -seqcap N for longer ones)\", es.len())); }} \
+                         let mut q = {dflt}; for x in &es {{ q.push(from_val_{eid}(x)?); }} Ok(q)"
+                    ),
+                    format!("Val::Seq(v.iter().map(|x| to_val_{eid}(&x)).collect())"),
+                )
+            }
+            Ty::Opt(_) | Ty::Set(_) | Ty::PFun(..) | Ty::Bag(_) => return Ok(None),
+        }))
+    }
+}

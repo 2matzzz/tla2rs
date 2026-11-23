@@ -1,7 +1,7 @@
 //! tla2rs: compiles a TLA+ spec into an explicit-state model checker in Rust, specialized to that
 //! spec.
 //!
-//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-continue] [-difftrace] [-view] [-nowarning] [-dump [dot[,actionlabels]] FILE] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]
+//!   tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [--emit-lib] [-deadlock] [-continue] [-difftrace] [-view] [-nowarning] [-dump [dot[,actionlabels]] FILE] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]
 //!   tla2rs --graph FILE | --graph-text FILE
 //!   tla2rs --trace FILE | --trace-text FILE
 //!   tla2rs --messages FILE | --messages-text FILE
@@ -20,6 +20,7 @@ mod codegen;
 mod community;
 mod community_modules;
 mod compile;
+mod conform;
 mod expand;
 mod graph;
 mod lasso;
@@ -76,7 +77,7 @@ fn build_key(dir: &Path) -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [-deadlock] [-continue] [-difftrace] [-view] [-nowarning] [-dump [dot[,actionlabels]] FILE] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]");
+    eprintln!("usage: tla2rs Spec.tla [-config Spec.cfg] [-o DIR] [--emit-only] [--emit-lib] [-deadlock] [-continue] [-difftrace] [-view] [-nowarning] [-dump [dot[,actionlabels]] FILE] [-workers N] [-memlimit MB] [-notrace] [-tmpdir DIR] [-setcap N] [-seqcap N] [-fp128] [-metal] [-batched] [-dumpgraph FILE] [-lassocheck DIR]");
     eprintln!("       tla2rs --graph FILE | --graph-text FILE");
     eprintln!("       tla2rs --trace FILE | --trace-text FILE");
     eprintln!("       tla2rs --messages FILE | --messages-text FILE");
@@ -112,6 +113,7 @@ fn main() {
     let mut cfg: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut emit_only = false;
+    let mut emit_lib = false;
     let mut setcap: usize = 0;
     let mut seqcap: usize = 0;
     let mut fp128 = false;
@@ -129,6 +131,8 @@ fn main() {
                 out = Some(args.get(i).unwrap_or_else(|| usage()).into());
             }
             "--emit-only" => emit_only = true,
+            // Writes the checker as a library crate instead of building and running it (see conform.rs)
+            "--emit-lib" => emit_lib = true,
             "-fp128" => fp128 = true,
             // -metal affects both code generation (emits the Metal parts) and execution (uses the
             // GPU)
@@ -236,8 +240,13 @@ fn main() {
     };
     let (src, cfg_src) = (read(&tla), read(&cfg));
     let stem = cfg.file_stem().unwrap().to_string_lossy().to_string();
-    let dir = out.unwrap_or_else(|| tla.parent().unwrap_or(Path::new(".")).join(".tla2rs").join(&stem));
-    let crate_name = format!("check_{}", stem.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+    // A library goes to a directory of its own, so that building the checker does not build it too
+    let dir = out.unwrap_or_else(|| tla.parent().unwrap_or(Path::new(".")).join(".tla2rs").join(if emit_lib { format!("{stem}-lib") } else { stem.clone() }));
+    let crate_name = format!("{}_{}", if emit_lib { "spec" } else { "check" }, stem.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+    if emit_lib && metal {
+        eprintln!("tla2rs: --emit-lib does not go with -metal (a library does not search)");
+        exit(2);
+    }
     // Sets held as arrays and sequences have a capacity fixed when the checker is built (-setcap and
     // -seqcap set where it starts). TLC has no such bound, so when a value outgrows it the checker
     // exits with CAP_EXIT + the kind, and the checker is built again with twice the room and run
@@ -310,6 +319,17 @@ fn main() {
                 }
             }
             quit(*code);
+        }
+        if emit_lib {
+            match &output.lib {
+                Ok(lib) => write_lib(&dir, &crate_name, &conform::lib_rs(&output.rust, lib)),
+                Err(e) => {
+                    eprintln!("tla2rs: {e}");
+                    quit(1)
+                }
+            }
+            eprintln!("tla2rs: generated {} in {:.0} ms", dir.join("src/lib.rs").display(), t0.elapsed().as_secs_f64() * 1e3);
+            return;
         }
         let Some(bin) = build(&dir, &crate_name, &output.rust, metal, emit_only, t0, ahead) else { return };
         // The kinds of capacity that can still grow (see `capacity_exceeded` in runtime.rs; the
@@ -485,6 +505,16 @@ fn write_crate(dir: &Path, crate_name: &str, rust: &str, metal: bool) {
         std::fs::write(dir.join("metal.m"), metal::METAL_M).expect("write metal.m");
         std::fs::write(dir.join("build.rs"), metal::BUILD_RS).expect("write build.rs");
     }
+}
+
+/// Writes a library crate (`--emit-lib`) to `dir`: the checker's code with the module `conform`
+/// (see conform.rs), for the tests of an implementation to depend on by path. It has a workspace
+/// of its own, as the checker's crate has, so it can sit inside the directory of another package
+fn write_lib(dir: &Path, crate_name: &str, lib_rs: &str) {
+    std::fs::create_dir_all(dir.join("src")).expect("create output dir");
+    std::fs::write(dir.join("Cargo.toml"), format!("[package]\nname = \"{crate_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n\n[workspace]\n"))
+        .expect("write Cargo.toml");
+    std::fs::write(dir.join("src/lib.rs"), lib_rs).expect("write lib.rs");
 }
 
 /// Where TLA2RS_BUILD_CACHE=DIR keeps the checker built from the crate in `dir`, so test runs only

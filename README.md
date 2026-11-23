@@ -27,6 +27,7 @@ cargo build --release
 ./target/release/tla2rs Spec.tla -config Other.cfg -deadlock -workers 8
 ./target/release/tla2rs Spec.tla -memlimit 64 -notrace        # use less memory
 ./target/release/tla2rs Spec.tla --emit-only      # only write the Rust (.tla2rs/<cfg name>/src/main.rs)
+./target/release/tla2rs Spec.tla --emit-lib       # write the checker as a library for an implementation's tests
 ```
 
 - `-deadlock` / `CHECK_DEADLOCK FALSE` mean the same as in TLC: deadlock is not an error
@@ -112,6 +113,56 @@ TLC's meaning, output and exit codes (each is cross-checked against TLC by a con
   constants once and fuses expressions, so the counts depend on TLC's evaluator. `-terse` prints sets in the lazy
   form TLC holds them in (`SUBSET S`, `[S -> T]`), which a compiled checker does not keep. `-maxSetSize` bounds the sets TLC's interpreter enumerates, and where its error appears depends on
   where the interpreter enumerates
+
+## Checking an implementation against the spec
+
+`tla2rs Spec.tla --emit-lib` writes the checker as a library crate (`.tla2rs/<cfg name>-lib/`, or `-o DIR`) instead
+of building and running it. The tests of a hand-written implementation depend on it by path and use its module
+`conform` to check, as they run, that the implementation does what the spec allows. No implementation code is
+generated: `init`, `next` and the invariants in the library are the checker's own, used as an oracle.
+
+```toml
+[dev-dependencies]
+spec = { path = "spec/.tla2rs/TwoPhase-lib", package = "spec_twophase" }
+```
+
+```rust
+use spec::conform::{state, Checker, Val};
+
+// The abstraction function, written by hand: the state of the spec the implementation is in
+fn abs(sys: &System) -> spec::conform::Abs {
+    state(&[("tmState", "init".into()), ("tmPrepared", Val::set(/* ... */)), /* every variable */]).unwrap()
+}
+
+let mut checker = Checker::begin(abs(&sys))?;   // must be an initial state
+sys.apply(event);
+checker.step(abs(&sys), None)?;                 // must be a step of Next (or change nothing)
+```
+
+- `Checker::step` fails with what went wrong: no action of the spec makes the step (with the actions the spec
+  allows from the state before), a violated invariant or action property, a variable outside its type. It keeps
+  only the current state, so the size of the spec's state space does not matter
+- `Graph::explore()` builds the reachable state graph in memory (a model small enough to hold). With the states
+  and steps a `Checker` recorded, it gives coverage: which states, transitions and actions of the spec the tests
+  exercised, and a shortest path to a transition they have not
+- `examples/conform` is a complete example: an implementation of two-phase commit checked against
+  `examples/TwoPhase.tla` by random runs, a coverage report, and runs guided to every transition not yet taken.
+  It finds two planted bugs at the step that leaves the spec (one of them violates no invariant), and lists the
+  81 transitions of the spec the implementation never takes, which come from one design choice
+
+  ```sh
+  target/release/tla2rs examples/TwoPhase.tla --emit-lib
+  cd examples/conform && cargo run --release                 # add: -- --bug quorum-commit, -- --policy happy
+  ```
+
+This is a check of the runs the tests make, not a proof: a path no test takes is not checked, which is what the
+coverage is for. And it is as good as the abstraction function.
+
+What a library does not do yet: specs with TLCGet / TLCSet and specs whose records change their fields from state
+to state are refused; values of some types (sets held as arrays, functions over a large type) can be read but not
+built; `Graph` refuses VIEW and SYMMETRY; and where the checker would build itself again with more room for a set
+or a sequence, a library fails with the message that says to pass `-setcap` / `-seqcap`. `scripts/lib.sh` checks
+libraries against TLC's state graphs (see CLAUDE.md, "The checker as a library").
 
 ## Speed
 
